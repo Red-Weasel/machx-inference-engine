@@ -141,4 +141,6 @@ If Mach X saved you time — or you just want to see more fast inference land on
 
 [![Ko-fi](https://img.shields.io/badge/Support%20on-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/redweasel)
 
-☕ **[ko-fi.com/redweasel](https://ko-fi.com/redweasel)** — every bit helps keep fast inference landing on Intel Arc.
+☕ **[ko-fi.com/redweasel](https://ko-fi.com/redweasel)**
+
+**All donations go straight back into the project.** Requests and suggestions are welcome — [open an issue](https://github.com/Red-Weasel/machx-inference-engine/issues).
