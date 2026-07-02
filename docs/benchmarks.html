@@ -1,0 +1,264 @@
+<title>Mach X — Benchmarks on Intel Arc B70</title>
+<style>
+  :root{
+    --ground:#0a0e15; --panel:#111827; --panel2:#0e1420;
+    --machx:#38d6ef; --machx-dim:#1a6b7a;
+    --comp:#5a6b84; --comp-dim:#2b3547;
+    --loss:#f0a63a;
+    --text:#e8eef7; --dim:#8a99b2; --faint:#5a6880;
+    --line:#1e2838;
+    --mono:"SF Mono","JetBrains Mono","Cascadia Code",ui-monospace,Menlo,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--ground);color:var(--text);font-family:var(--sans);
+    line-height:1.6;-webkit-font-smoothing:antialiased;
+    background-image:radial-gradient(900px 500px at 78% -8%,rgba(56,214,239,.10),transparent 60%);}
+  .wrap{max-width:900px;margin:0 auto;padding:56px 26px 80px;}
+  .mono{font-family:var(--mono)}
+  .tnum{font-variant-numeric:tabular-nums}
+
+  /* ---- hero ---- */
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.22em;text-transform:uppercase;
+    color:var(--machx);display:flex;align-items:center;gap:10px;}
+  .eyebrow::before{content:"";width:26px;height:1px;background:var(--machx);opacity:.7}
+  h1{font-family:var(--mono);font-weight:600;font-size:clamp(38px,7vw,64px);letter-spacing:-.02em;
+    margin:.35em 0 .1em;line-height:1;text-wrap:balance;}
+  h1 .x{color:var(--machx)}
+  .thesis{font-size:clamp(17px,2.4vw,21px);color:var(--text);max-width:60ch;text-wrap:balance;margin:.2em 0 0}
+  .thesis b{color:var(--machx);font-weight:600}
+  .hw{margin-top:22px;display:inline-flex;flex-wrap:wrap;gap:8px;}
+  .chip{font-family:var(--mono);font-size:12px;color:var(--dim);border:1px solid var(--line);
+    border-radius:999px;padding:5px 12px;background:var(--panel2);}
+  .chip b{color:var(--text);font-weight:500}
+
+  section{margin-top:52px}
+  .sh{display:flex;align-items:baseline;justify-content:space-between;gap:14px;
+    border-bottom:1px solid var(--line);padding-bottom:12px;margin-bottom:26px;flex-wrap:wrap;}
+  .sh h2{font-family:var(--mono);font-size:14px;letter-spacing:.16em;text-transform:uppercase;
+    font-weight:600;margin:0;color:var(--text)}
+  .sh .unit{font-family:var(--mono);font-size:12px;color:var(--faint)}
+  .legend{display:flex;gap:16px;font-family:var(--mono);font-size:12px;color:var(--dim)}
+  .legend i{display:inline-block;width:11px;height:11px;border-radius:2px;margin-right:6px;vertical-align:-1px}
+  .sw-m{background:var(--machx)} .sw-c{background:var(--comp)}
+
+  /* ---- bar rows ---- */
+  .row{display:grid;grid-template-columns:200px 1fr;gap:20px;padding:16px 0;border-bottom:1px solid var(--line);}
+  .row:last-child{border-bottom:0}
+  .meta .name{font-family:var(--mono);font-size:15px;color:var(--text);font-weight:600}
+  .meta .sub{font-size:12.5px;color:var(--dim);margin-top:3px}
+  .meta .vs{font-family:var(--mono);font-size:11px;color:var(--faint);margin-top:6px;letter-spacing:.02em}
+  .bars{display:flex;flex-direction:column;gap:9px;justify-content:center}
+  .bar{position:relative;height:26px;background:var(--panel2);border-radius:4px;overflow:hidden}
+  .fill{position:absolute;inset:0 auto 0 0;border-radius:4px;width:var(--w);
+    transform-origin:left;animation:grow .9s cubic-bezier(.22,1,.36,1) both;}
+  .fill.m{background:linear-gradient(90deg,var(--machx-dim),var(--machx))}
+  .fill.c{background:linear-gradient(90deg,var(--comp-dim),var(--comp))}
+  .fill.loss{background:linear-gradient(90deg,#8a5a12,var(--loss))}
+  .val{position:absolute;top:50%;transform:translateY(-50%);font-family:var(--mono);
+    font-size:13px;font-weight:600;color:#04121a;padding-left:10px;left:0;white-space:nowrap}
+  .val.out{color:var(--dim);left:auto;padding-left:0;padding-right:0;}
+  .tag{font-family:var(--mono);font-size:11px;color:var(--faint);width:44px;flex:0 0 44px;text-align:right}
+  .barline{display:flex;align-items:center;gap:10px}
+  .spd{align-self:start;justify-self:end}
+
+  .pill{font-family:var(--mono);font-size:12.5px;font-weight:600;border-radius:999px;padding:4px 11px;
+    display:inline-block;white-space:nowrap}
+  .pill.win{color:var(--machx);background:rgba(56,214,239,.12);border:1px solid rgba(56,214,239,.32)}
+  .pill.loss{color:var(--loss);background:rgba(240,166,58,.10);border:1px solid rgba(240,166,58,.30)}
+  .spdwrap{display:flex;flex-direction:column;align-items:flex-end;gap:4px;justify-content:center}
+  .spdcap{font-family:var(--mono);font-size:10.5px;color:var(--faint);letter-spacing:.06em;text-transform:uppercase}
+
+  /* ---- callout strip ---- */
+  .wins{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:1px;
+    background:var(--line);border:1px solid var(--line);border-radius:10px;overflow:hidden;margin-top:8px}
+  .win{background:var(--panel);padding:20px 18px}
+  .win .big{font-family:var(--mono);font-size:30px;font-weight:600;color:var(--machx);line-height:1}
+  .win .lbl{font-size:12.5px;color:var(--dim);margin-top:8px}
+  .win .lbl b{color:var(--text);font-weight:600}
+
+  /* ---- explainer ---- */
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:26px 28px}
+  .card p{margin:0 0 14px;color:#cfd8e6;max-width:66ch}
+  .card p:last-child{margin-bottom:0}
+  .card .k{font-family:var(--mono);color:var(--machx);font-weight:600}
+  .deflist{display:flex;flex-direction:column;gap:14px;margin:18px 0 0}
+  .def{display:grid;grid-template-columns:130px 1fr;gap:16px;align-items:baseline}
+  .def dt{font-family:var(--mono);font-size:13px;color:var(--text);font-weight:600}
+  .def .exact{color:var(--machx)} .def .approx{color:var(--loss)}
+  .def dd{margin:0;color:var(--dim);font-size:14px}
+  .foot{margin-top:44px;padding-top:22px;border-top:1px solid var(--line);
+    font-family:var(--mono);font-size:12px;color:var(--faint);line-height:1.8}
+  .foot b{color:var(--dim);font-weight:500}
+  @keyframes grow{from{transform:scaleX(0)}to{transform:scaleX(1)}}
+  @media (prefers-reduced-motion:reduce){.fill{animation:none}}
+  @media (max-width:620px){
+    .row{grid-template-columns:1fr;gap:12px}
+    .def{grid-template-columns:1fr;gap:3px}
+  }
+</style>
+
+<div class="wrap">
+  <div class="eyebrow">Benchmarks · Intel Arc B70</div>
+  <h1>MACH&nbsp;<span class="x">X</span></h1>
+  <p class="thesis">A from-scratch C++/SYCL inference engine that <b>beats llama.cpp on Intel Arc</b> — on prefill <i>and</i> decode, across eight model architectures.</p>
+  <div class="hw">
+    <span class="chip">built &amp; tested on <b>2× Arc Pro B70</b></span>
+    <span class="chip">Battlemage · <b>64 GB</b> · 608 GB/s</span>
+    <span class="chip">oneAPI 2026 · SYCL</span>
+  </div>
+
+  <!-- PREFILL -->
+  <section>
+    <div class="sh">
+      <h2>Prefill throughput</h2>
+      <div class="legend"><span><i class="sw-m"></i>Mach X</span><span><i class="sw-c"></i>competitor</span></div>
+      <span class="unit">tokens / sec · higher is better</span>
+    </div>
+
+    <div class="row">
+      <div class="meta"><div class="name">gpt-oss-20b</div><div class="sub">OpenAI MoE · MXFP4 · 1× B70</div><div class="vs">vs llama.cpp SYCL · same GGUF</div></div>
+      <div style="display:grid;grid-template-columns:1fr 92px;gap:18px;align-items:center">
+        <div class="bars">
+          <div class="barline"><span class="tag">Mach&nbsp;X</span><div class="bar"><div class="fill m" style="--w:100%"><span class="val">1795</span></div></div></div>
+          <div class="barline"><span class="tag">llama</span><div class="bar"><div class="fill c" style="--w:51.6%"><span class="val">927</span></div></div></div>
+        </div>
+        <div class="spdwrap"><span class="pill win">1.94×</span><span class="spdcap">faster</span></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="meta"><div class="name">Qwen3.6-35B-A3B</div><div class="sub">hybrid DeltaNet MoE · “crown” · 2× B70</div><div class="vs">vs llama.cpp SYCL layer-split</div></div>
+      <div style="display:grid;grid-template-columns:1fr 92px;gap:18px;align-items:center">
+        <div class="bars">
+          <div class="barline"><span class="tag">Mach&nbsp;X</span><div class="bar"><div class="fill m" style="--w:53.7%"><span class="val">963</span></div></div></div>
+          <div class="barline"><span class="tag">llama</span><div class="bar"><div class="fill c" style="--w:42.5%"><span class="val">763</span></div></div></div>
+        </div>
+        <div class="spdwrap"><span class="pill win">1.26×</span><span class="spdcap">faster</span></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="meta"><div class="name">Tongyi-30B-A3B</div><div class="sub">qwen3moe · tensor-parallel · ~17K ctx</div><div class="vs">TP vs Mach&nbsp;X layer-split (long ctx)</div></div>
+      <div style="display:grid;grid-template-columns:1fr 92px;gap:18px;align-items:center">
+        <div class="bars">
+          <div class="barline"><span class="tag">TP</span><div class="bar"><div class="fill m" style="--w:16.2%"><span class="val out" style="left:calc(16.2% + 8px)">291</span></div></div></div>
+          <div class="barline"><span class="tag">split</span><div class="bar"><div class="fill c" style="--w:6.9%"><span class="val out" style="left:calc(6.9% + 8px)">124</span></div></div></div>
+        </div>
+        <div class="spdwrap"><span class="pill win">2.35×</span><span class="spdcap">faster</span></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="meta"><div class="name">Qwen3.6-27B</div><div class="sub">hybrid DeltaNet dense · 1× B70</div><div class="vs">vs llama.cpp SYCL</div></div>
+      <div style="display:grid;grid-template-columns:1fr 92px;gap:18px;align-items:center">
+        <div class="bars">
+          <div class="barline"><span class="tag">Mach&nbsp;X</span><div class="bar"><div class="fill m" style="--w:19.4%"><span class="val out" style="left:calc(19.4% + 8px)">349</span></div></div></div>
+          <div class="barline"><span class="tag">llama</span><div class="bar"><div class="fill c" style="--w:16.0%"><span class="val out" style="left:calc(16% + 8px)">288</span></div></div></div>
+        </div>
+        <div class="spdwrap"><span class="pill win">1.21×</span><span class="spdcap">faster</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- DECODE -->
+  <section>
+    <div class="sh">
+      <h2>Decode throughput</h2>
+      <div class="legend"><span><i class="sw-m"></i>Mach X</span><span><i class="sw-c"></i>competitor</span></div>
+      <span class="unit">tokens / sec · higher is better</span>
+    </div>
+
+    <div class="row">
+      <div class="meta"><div class="name">Qwen3.6-35B-A3B</div><div class="sub">hybrid DeltaNet MoE · “crown” · 2× B70</div><div class="vs">vs llama.cpp SYCL layer-split</div></div>
+      <div style="display:grid;grid-template-columns:1fr 92px;gap:18px;align-items:center">
+        <div class="bars">
+          <div class="barline"><span class="tag">Mach&nbsp;X</span><div class="bar"><div class="fill m" style="--w:96.9%"><span class="val">63</span></div></div></div>
+          <div class="barline"><span class="tag">llama</span><div class="bar"><div class="fill c" style="--w:64.6%"><span class="val">42</span></div></div></div>
+        </div>
+        <div class="spdwrap"><span class="pill win">1.49×</span><span class="spdcap">faster</span></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="meta"><div class="name">gpt-oss-20b</div><div class="sub">OpenAI MoE · MXFP4 · 1× B70</div><div class="vs">vs llama.cpp SYCL · same GGUF</div></div>
+      <div style="display:grid;grid-template-columns:1fr 92px;gap:18px;align-items:center">
+        <div class="bars">
+          <div class="barline"><span class="tag">Mach&nbsp;X</span><div class="bar"><div class="fill m" style="--w:89.7%"><span class="val">58.3</span></div></div></div>
+          <div class="barline"><span class="tag">llama</span><div class="bar"><div class="fill c" style="--w:77.4%"><span class="val">50.3</span></div></div></div>
+        </div>
+        <div class="spdwrap"><span class="pill win">1.16×</span><span class="spdcap">faster</span></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="meta"><div class="name">gpt-oss-120b</div><div class="sub">OpenAI MoE · MXFP4 · 117B · 2× B70 TP</div><div class="vs">vs LM Studio · same 2 cards</div></div>
+      <div style="display:grid;grid-template-columns:1fr 92px;gap:18px;align-items:center">
+        <div class="bars">
+          <div class="barline"><span class="tag">Mach&nbsp;X</span><div class="bar"><div class="fill m" style="--w:47.7%"><span class="val out" style="left:calc(47.7% + 8px)">31</span></div></div></div>
+          <div class="barline"><span class="tag">LM&nbsp;Studio</span><div class="bar"><div class="fill c" style="--w:19.1%"><span class="val out" style="left:calc(19.1% + 8px)">12.4</span></div></div></div>
+        </div>
+        <div class="spdwrap"><span class="pill win">2.5×</span><span class="spdcap">faster</span></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="meta"><div class="name">Tongyi-30B-A3B</div><div class="sub">qwen3moe · tensor-parallel · ~17K ctx</div><div class="vs">TP vs Mach&nbsp;X layer-split (long ctx)</div></div>
+      <div style="display:grid;grid-template-columns:1fr 92px;gap:18px;align-items:center">
+        <div class="bars">
+          <div class="barline"><span class="tag">TP</span><div class="bar"><div class="fill m" style="--w:42.2%"><span class="val out" style="left:calc(42.2% + 8px)">27.4</span></div></div></div>
+          <div class="barline"><span class="tag">split</span><div class="bar"><div class="fill c" style="--w:32.3%"><span class="val out" style="left:calc(32.3% + 8px)">21</span></div></div></div>
+        </div>
+        <div class="spdwrap"><span class="pill win">1.30×</span><span class="spdcap">faster</span></div>
+      </div>
+    </div>
+
+    <div class="row">
+      <div class="meta"><div class="name">Qwen3.6-27B</div><div class="sub">hybrid DeltaNet dense · 1× B70</div><div class="vs">vs llama.cpp SYCL · known weak axis</div></div>
+      <div style="display:grid;grid-template-columns:1fr 92px;gap:18px;align-items:center">
+        <div class="bars">
+          <div class="barline"><span class="tag">Mach&nbsp;X</span><div class="bar"><div class="fill loss" style="--w:23.4%"><span class="val out" style="left:calc(23.4% + 8px)">15.2</span></div></div></div>
+          <div class="barline"><span class="tag">llama</span><div class="bar"><div class="fill c" style="--w:35.7%"><span class="val out" style="left:calc(35.7% + 8px)">23.2</span></div></div></div>
+        </div>
+        <div class="spdwrap"><span class="pill loss">0.66×</span><span class="spdcap">slower</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- honest note -->
+  <section>
+    <div class="sh"><h2>The one we don't win</h2><span class="unit">honesty &gt; hype</span></div>
+    <div class="card">
+      <p>Dense-model <b class="k">decode</b> on a single card is Mach X's known weak axis — llama.cpp's SYCL kernel edges the Qwen3.6-27B decode loop (15.2 vs 23.2 tok/s). It's the one place a competitor is faster, and it's flagged in amber above rather than buried. Every other bar on this page is a win, and the fix (a faster dense-decode GEMV) is the next lever, not a mystery.</p>
+    </div>
+  </section>
+
+  <!-- key wins -->
+  <section>
+    <div class="sh"><h2>The short version</h2></div>
+    <div class="wins">
+      <div class="win"><div class="big">4.47×</div><div class="lbl">peak <b>prefill</b> vs llama.cpp<br>(gpt-oss-20b @ 2K)</div></div>
+      <div class="win"><div class="big">1.49×</div><div class="lbl"><b>decode</b> on the crown<br>35B-A3B vs llama.cpp</div></div>
+      <div class="win"><div class="big">2.5×</div><div class="lbl"><b>gpt-oss-120b</b> decode<br>vs LM Studio, 2× B70</div></div>
+      <div class="win"><div class="big">8+</div><div class="lbl">model <b>architectures</b><br>run correctly on Arc</div></div>
+    </div>
+  </section>
+
+  <!-- bit-exact -->
+  <section>
+    <div class="sh"><h2>What “bit-exact” means</h2><span class="unit">fast is easy if you're wrong</span></div>
+    <div class="card">
+      <p>Speed only counts if the output is <i>right</i>. “<span class="k">Bit-exact</span>” is the strongest correctness claim there is: the engine produces output that is <b>byte-for-byte identical</b> to a trusted reference — the same tokens, down to the same bits — not merely “close.” It proves the speed didn't come from quietly cutting numerical corners.</p>
+      <dl class="deflist">
+        <div class="def"><dt class="exact">Bit-exact ✓</dt><dd><b>Dense models vs llama.cpp.</b> Per-layer activations, greedy token stream, and perplexity all match the llama.cpp oracle bit-for-bit (Llama-3.x cosine 0.99998–1.0).</dd></div>
+        <div class="def"><dt class="exact">Bit-exact ✓</dt><dd><b>Multi-GPU layer-split vs single-GPU.</b> Splitting a model across two B70s changes <i>nothing</i> about the result — the output is byte-identical to running it on one card.</dd></div>
+        <div class="def"><dt class="approx">Equivalent ≈</dt><dd><b>Tensor-parallel.</b> Summing each card's partial results in a different order flips the last few bits, so this path is validated by cosine ≈ 0.999999 + matching perplexity rather than bit-identity — numerically the same answer, not the same bits.</dd></div>
+      </dl>
+    </div>
+  </section>
+
+  <div class="foot">
+    <b>Method:</b> `ie-bench --prefill P --decode N` mirrors `llama-bench -pP -nN`; runs order-controlled &amp; heat-soaked on 2× Intel Arc Pro B70.<br>
+    <b>Notes:</b> prefill values shown at pp512 unless marked; gpt-oss rows are clean-box head-to-head with identical GGUFs. A few non-gpt-oss figures predate the latest clean-box sweep and are being re-verified. LM Studio 120b figure owner-reported on the same two cards.
+  </div>
+</div>

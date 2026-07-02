@@ -28,6 +28,8 @@ driver.
 ```
 Models land in `./models` on the host.
 
+> **Which quant to grab.** Best-tested: **`Q4_K_M`, `Q6_K`, `Q8_0`** (and **`MXFP4`** for gpt-oss). If a model fails to load, try one of those first — some quant × architecture combinations (e.g. certain `Q5_K` builds) aren't supported yet. The curated `ie pull` names already use known-good quants.
+
 ## 3. Serve (OpenAI-compatible, port 11435)
 ```bash
 ./scripts/ie-docker serve /models/Meta-Llama-3.1-8B-Instruct-GGUF/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf --gpus 1

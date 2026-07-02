@@ -40,7 +40,7 @@ Same GGUF, same GPU (1× Arc Pro B70), llama.cpp on its *fastest* config (FlashA
 
 ## Benchmarks
 
-All measured on **Arc Pro B70** hardware. gpt-oss rows are clean-box head-to-head with identical GGUFs.
+📊 **[Interactive charts →](https://red-weasel.github.io/machx-inference-engine/benchmarks.html)** · all measured on **Arc Pro B70** hardware; gpt-oss rows are clean-box head-to-head with identical GGUFs.
 
 **gpt-oss-120b** (117B, MXFP4) — 2× B70, tensor-parallel:
 | metric | Mach X | LM Studio (same 2 cards) |
