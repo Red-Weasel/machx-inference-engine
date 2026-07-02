@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# ie-pull — fetch a GGUF model for the engine (like `ollama pull`).
+#
+#   ie-pull <name>                 # a curated, engine-validated model (see --list)
+#   ie-pull <hf-repo> <file.gguf>  # any GGUF from Hugging Face
+#   ie-pull <hf-repo>              # list the .gguf files in a repo
+#   ie-pull --list                 # show curated names
+#
+# Downloads into  $IE_MODELS  (default ~/models), preserving the repo folder.
+# Prefers the `hf` CLI (resume + auth); falls back to curl for public repos.
+# After download it prints the exact path to pass to `ie serve <path>`.
+set -uo pipefail
+MODELS_DIR="${IE_MODELS:-$HOME/models}"
+
+# curated name -> "hf-repo|filename" (validated on the engine; a range of sizes)
+declare -A CURATED=(
+  [llama3b]="bartowski/Llama-3.2-3B-Instruct-GGUF|Llama-3.2-3B-Instruct-Q4_K_M.gguf"
+  [llama8b]="bartowski/Meta-Llama-3.1-8B-Instruct-GGUF|Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf"
+  [qwen4b]="bartowski/Qwen_Qwen3-4B-GGUF|Qwen_Qwen3-4B-Q4_K_M.gguf"
+  [gptoss]="ggml-org/gpt-oss-20b-GGUF|gpt-oss-20b-mxfp4.gguf"
+  [coder]="bartowski/Qwen_Qwen3-Coder-30B-A3B-Instruct-GGUF|Qwen_Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+  [tongyi]="bartowski/Alibaba-NLP_Tongyi-DeepResearch-30B-A3B-GGUF|Alibaba-NLP_Tongyi-DeepResearch-30B-A3B-Q6_K.gguf"
+)
+
+c(){ printf '\033[%sm' "$1"; }; B=$(c 1); D=$(c 2); G=$(c 32); Y=$(c 33); R=$(c 31); Z=$(c 0)
+die(){ printf '%s\n' "${R}✗${Z} $*" >&2; exit 1; }
+
+if [ $# -eq 0 ] || [ "${1:-}" = "-h" ] || [ "${1:-}" = "--help" ]; then
+  sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0
+fi
+if [ "$1" = "--list" ]; then
+  printf '%s\n' "${B}curated models${Z} (ie-pull <name>):"
+  for k in "${!CURATED[@]}"; do printf "  ${B}%-9s${Z} ${D}%s${Z}\n" "$k" "${CURATED[$k]%%|*}"; done | sort
+  printf '%s\n' "${D}or any repo:  ie-pull <hf-repo> <file.gguf>${Z}"; exit 0
+fi
+
+REPO="" FILE=""
+if [ -n "${CURATED[$1]:-}" ]; then REPO="${CURATED[$1]%%|*}"; FILE="${CURATED[$1]##*|}"
+elif [ $# -ge 2 ]; then REPO="$1"; FILE="$2"
+else REPO="$1"; fi   # repo only → list mode below
+
+have_hf(){ command -v hf >/dev/null 2>&1 || command -v huggingface-cli >/dev/null 2>&1; }
+hf_bin(){ command -v hf 2>/dev/null || command -v huggingface-cli; }
+
+# repo-only → list the .gguf files so the user can pick one (HF API only; NO download)
+if [ -z "$FILE" ]; then
+  printf '%s\n' "${B}$REPO${Z} — .gguf files:" >&2
+  curl -fsSL --max-time 20 "https://huggingface.co/api/models/$REPO" 2>/dev/null \
+    | python3 -c 'import sys,json;[print("  "+f["rfilename"]) for f in json.load(sys.stdin).get("siblings",[]) if f["rfilename"].endswith(".gguf")]' 2>/dev/null \
+    || die "could not list $REPO (private? typo? no network?)"
+  printf '%s\n' "${D}then: ie-pull $REPO <file.gguf>${Z}" >&2; exit 0
+fi
+
+DEST="$MODELS_DIR/${REPO##*/}"
+OUT="$DEST/$FILE"
+mkdir -p "$DEST"
+if [ -s "$OUT" ]; then printf '%s\n' "${G}✓ already have${Z} $OUT" >&2; echo "$OUT"; exit 0; fi
+printf '%s\n' "${B}pulling${Z} $REPO / $FILE  →  ${D}$DEST${Z}" >&2
+
+if have_hf; then
+  "$(hf_bin)" download "$REPO" "$FILE" --local-dir "$DEST" >&2 \
+    || die "hf download failed (private repo needs: hf auth login)"
+else
+  URL="https://huggingface.co/$REPO/resolve/main/$FILE?download=true"
+  curl -fL -C - --retry 3 -o "$OUT" "$URL" >&2 \
+    || die "download failed ($URL) — for a private/gated repo, install the hf CLI + login"
+fi
+[ -s "$OUT" ] || die "downloaded file is empty"
+printf '%s\n' "${G}✓ done${Z}  $(du -h "$OUT" | cut -f1)  →  serve it:  ${B}ie serve \"$OUT\"${Z}" >&2
+echo "$OUT"

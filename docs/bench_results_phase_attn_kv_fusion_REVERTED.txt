@@ -1,0 +1,67 @@
+## Tier-2: attn_k(Q4) + attn_v(Q6) mixed-dtype fusion — REVERTED (all prompts regressed)
+
+User flagged this fusion as "both Q4_K", but verified attn_v is actually Q6_K
+in the Q4_K_M default mix:
+  blk.3.attn_k.weight   q4_K   (562 KiB)
+  blk.3.attn_v.weight   q6_K   (820 KiB)
+
+Implemented gemv_q4q6_K_dual_kv — mixed Q4_K + Q6_K dual GEMV with shared
+A_slm and identical out_off topology (both q4 and q6 lane mappings produce
+out_off = lane * 16; verified by enumeration).  Per-lane: dual dequant
+chains (Q4_K algebraic-folded + Q6_K signed offset) plus shared activation
+read.  Gated behind IE_FUSE_ATTN_KV.
+
+Build: clean.  gemv_q4k_test ALL PASS.  PPL: 6.61 → 6.61 (identical math).
+
+Bench (3 runs, lmhead-q4k variant):
+  prompt              before    after    Δ
+  short-chat          51.05  →  50.53   -1.02%   ← regression
+  long-instruction    50.76  →  50.40   -0.71%   ← regression
+  codegen             50.94  →  50.25   -1.35%   ← regression
+  math-reasoning      50.86  →  50.38   -0.94%   ← regression
+  long-context        50.76  →  50.51   -0.49%   ← regression
+
+Every prompt regressed.  Stop rule fired.
+
+Why no win:
+
+  1. Only 6 of 10 full-attn pairs fuse.  Q4_K_M has 6 attn_v as Q6_K and
+     4 as Q4_K (per-layer policy).  Fusion guard requires Q6_K attn_v;
+     other 4 layers fall through to unfused 2-call path.
+
+     Verified: gemv_q4k call count delta = -768/run = exactly 6 calls/step
+     × 128.  Expected -1280 if all 10 pairs fused.
+
+  2. Per-call savings are dimensional noise.  6 fused launches/step
+     replace 12 unfused → 6 launches saved × ~10 µs = 60 µs/step
+     ceiling.  At 50 tok/s that's +0.15 tok/s — already below the +0.5%
+     gate even before counting any kernel-side cost.
+
+  3. Mixed-dtype kernel costs more per call than the two single-dtype
+     kernels combined.  The inner loop runs:
+       - 16 fmas for Q4_K dequant (16 elements)
+       - 16 fmas + bit unpack for Q6_K dequant (16 elements)
+     vs the unfused path where Q4_K and Q6_K each run their own optimized
+     loop independently.  Per-lane register state ~doubles, IGC may
+     spill, the doubled inner loop outpaces the launch overhead saved.
+
+  All three converged to a small but consistent regression.
+
+Lesson: mixed-dtype fusion is fundamentally different from same-dtype
+fusion (ssm α+β, ffn gate+up, both clean wins at +1-2%).  In same-dtype:
+fusion roughly halves kernel time per pair (shared SLM + shared compute
+pipeline), so launch overhead saving is pure bonus.  In mixed-dtype:
+kernel time stays at the SUM of both (no shared compute path), and the
+launch-overhead saving alone isn't enough to clear the +0.5% gate when
+only 60% of layers qualify for fusion.
+
+Future fusion candidates should be filtered by:
+  (a) same-dtype across all matched layers (avoid partial-fusion)
+  (b) shape large enough that launch overhead ≥ +0.5% of decode time
+      (small-N fusions like this one are dimensionally too small).
+
+Revert: file checkout via `git checkout -- src/ops/{gemv_q4k,model/qwen36}.cpp`.
+Engine state remains at deff2a0.  Standing baseline: 50.3-51.0 tok/s on
+lmhead-q4k variant.
+
+No code shipped from this experiment.

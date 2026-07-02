@@ -1,0 +1,109 @@
+## Step 8: memset ws_attn_out_ = 0 at start of attn_full_block — REVERTED
+
+Hypothesis tested: both attention kernels (naive `full_attention` and
+tiled `full_attention_fa2_prefill`) might have a write-coverage bug —
+they fail to write some output positions, so those positions retain
+uninitialized data that varies run-to-run.
+
+Implementation: IE_FA_ZERO_ATTN_OUT compile flag (default OFF).  When
+ON: `q.memset(ws_attn_out_, 0, T * N_q * sizeof(half))` before any
+kernel writes ws_attn_out_ in the full-attn block.
+
+Bench (3 validator A1 vs A2 runs, flag ON):
+
+  metric            run 1     run 2     run 3
+  I7attno_ max_abs  0.0288    0.00147   0.01027   <- still NON-DET
+  I7attno_ rel_L2   1.05%     0.06%     0.36%
+  L41 max_abs       0.464     0.420     0.356
+  L41 rel_L2        5.06%     4.45%     4.22%
+
+Comparison with no-memset baseline (Step 4):
+  I7attno_ max_abs  0.0036    0.0029    0.00098
+  L41 max_abs       0.4443    0.4473    0.4277
+
+Same magnitude as without memset.  Hypothesis #2 RULED OUT.
+
+PPL on built-in 511-tok: 6.65 (vs baseline 6.64, within noise — extra
+memset doesn't affect math).
+PPL on prefill_chunk=1024: 74.52 (vs baseline ~65-73, no improvement).
+
+== Stop-rule evaluation ==
+
+  PPL Δ ≤ +0.10 (built-in):                  PASS  (+0.01)
+  A1 vs A2 I7attno_ max_abs = 0:              FAIL
+  A1 vs A2 stable across 3 runs:              FAIL
+  L41 max_abs < 0.05:                         FAIL  (8-9x over)
+  PPL on prefill_chunk=1024 < 8:              FAIL  (74.52)
+
+  Stability gate AND prefill-spike gate FAILED → REVERT.
+
+== What this RULES OUT ==
+
+ws_attn_out_ being uninitialized is NOT the source of non-determinism.
+Both attention kernels DO fully write their outputs; no positions are
+leaked from prior data.
+
+== Cumulative eliminated suspects (9 hypotheses ruled out across Steps 3-8) ==
+
+  ❌ SG-reduce ordering (Step 3)
+  ❌ Chunk-size-dependent algorithmic difference (Step 4)
+  ❌ DeltaNet recurrence (always BIT-EXACT)
+  ❌ Q/K/V proj, RoPE, RMSNorm at row 1023 (always EXACT)
+  ❌ Cache write/read race / fence enforcement (Step 5)
+  ❌ native::exp precision (Step 6)
+  ❌ Naive full_attention kernel implementation (Step 7)
+  ❌ Tiled fa2_prefill kernel implementation (Step 7)
+  ❌ ws_attn_out_ uninitialized / write-coverage (Step 8)
+
+== Critical observation ==
+
+I have verified bit-exactness of I1-I6 dumps (Q proj, split, QK-norm,
+RoPE) ONLY at row 1023 (the last position).  My L03 cross-position
+spot check (positions 0..1023) was for A vs B, NOT for A1 vs A2.
+
+The attention kernel READS ALL ctx_len positions from K/V cache when
+computing the score.  If positions 0..1022 in the K/V cache have
+non-deterministic content (between A1 and A2) but position 1023 is
+deterministic, the attention output at row 1023 would diverge — even
+though my dumps show I1-I6 EXACT at row 1023.
+
+I have NOT verified that K/V cache contents are bit-exact at ALL
+positions between A1 and A2.  This is the MISSING DATA.
+
+== Disposition ==
+
+REVERT — flag default OFF, no production change.
+
+== Next bounded experiment proposal ==
+
+**Extend validator to compare A1 vs A2 at multiple positions of L04
+dump** (positions 0, 100, 256, 500, 767, 1023).  L04 is the residual
+after the first full-attn layer.  If A1 vs A2 diverges at intermediate
+positions but is exact (or smaller) at row 1023, that pinpoints the
+bug to per-position write variance somewhere.
+
+Strict scope:
+  - Single file: tools/ie_validate_chunking.cpp
+  - Add cross-position spot check identical to the existing L03 check
+    but for L04 (post-first-full-attn-layer).  Compare A1 vs A2 at
+    each spot position.
+
+Expected outcomes:
+  - **Uniform divergence across all positions**: each position has the
+    same non-determinism magnitude.  Suggests a kernel-internal source
+    we haven't isolated (e.g. SG-internal lane shuffling that varies).
+  - **Concentrated divergence at certain positions**: bug is per-
+    position (e.g. boundary between Q-tile chunks, or specific gqa
+    head ranges).
+  - **Divergence ONLY at row 1023, EXACT elsewhere**: extremely
+    unlikely given the L41 magnitude, but would suggest the dump
+    capture itself has a race.
+
+If uniform: pivot to dump K/V cache contents row-by-row, compare A1
+vs A2 to see if cache itself is non-deterministic.
+
+If concentrated: investigate the specific position pattern.
+
+If only row 1023: investigate dump.memcpy() race.
+
+Estimated effort: 30 min for one cycle (validator extension + 3 runs).

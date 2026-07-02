@@ -1,0 +1,11 @@
+Device: Intel(R) Graphics [0xe223]
+Shape : M=4096 N=4096 K=4096  (FP16 in / FP32 out)
+Kernel: ie::gemm_fp16 (SLM-tiled, BM=128 BN=128 BK=16, 4×4 SGs/WG)
+
+Result
+  iters     : 30
+  time/iter : 4.067 ms
+  TFLOPS    : 33.79
+  % peak    : 18.5% of 183 TFLOPS
+  gate (70% peak = 128 TFLOPS): MISS
+  verify    : C[5,7] ref=-1.6351 got=-1.6351 rel=8.7e-07  OK

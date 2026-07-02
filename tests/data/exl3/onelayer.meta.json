@@ -1,0 +1,20 @@
+{
+  "source_key": "model.layers.0.self_attn.k_proj",
+  "bits": 3,
+  "cb": 0,
+  "K": 2048,
+  "N": 512,
+  "tile_k": 128,
+  "tile_n": 32,
+  "words16_per_tile": 48,
+  "u32_per_tile": 24,
+  "had_dim": 128,
+  "codebook_scale_folded_in_suh": true,
+  "files": {
+    "trellis": "onelayer.trellis (int16 LE [tile_k,tile_n,16*bits])",
+    "suh": "onelayer.suh.f16 (fp16 [K])",
+    "svh": "onelayer.svh.f16 (fp16 [N])",
+    "wrot": "onelayer.wrot.f16 (fp16 [K,N] row-major; decode only)",
+    "weight": "onelayer.weight.f16 (fp16 [K,N]; full had+scale)"
+  }
+}

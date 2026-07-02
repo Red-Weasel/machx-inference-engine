@@ -1,0 +1,9 @@
+# GitHub "Sponsor" button. Uncomment + fill in the platform(s) you use, then delete
+# the rest. This puts a Sponsor button at the top of the repo page.
+# Docs: https://docs.github.com/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/displaying-a-sponsor-button-in-your-repository
+#
+# github: [Red-Weasel]            # requires enabling GitHub Sponsors on your account first
+# ko_fi: your-ko-fi-handle
+# buy_me_a_coffee: your-bmac-handle
+# liberapay: your-liberapay-handle
+# custom: ["https://paypal.me/your-handle"]

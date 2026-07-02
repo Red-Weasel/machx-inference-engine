@@ -1,0 +1,360 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>llama.cpp Architecture Diagrams (Qwen3-MoE)</title>
+<script src="file:///home/weezy/.npm/_npx/668c188756b835f3/node_modules/mermaid/dist/mermaid.min.js"></script>
+<style>
+  body { font-family: 'Segoe UI', Arial, sans-serif; max-width: 1100px; margin: 0 auto; padding: 20px 40px; color: #1a1a1a; }
+  h1 { color: #4a148c; border-bottom: 3px solid #4a148c; padding-bottom: 8px; }
+  h2 { color: #6a1b9a; border-bottom: 2px solid #e1bee7; padding-bottom: 4px; margin-top: 48px; }
+  h3 { color: #7b1fa2; margin-top: 32px; }
+  pre, code { background: #f5f5f5; border: 1px solid #e0e0e0; border-radius: 4px; padding: 2px 6px; font-family: 'Consolas', 'Courier New', monospace; font-size: 13px; }
+  pre { padding: 14px 18px; line-height: 1.5; overflow-x: auto; }
+  pre code { background: none; border: none; padding: 0; }
+  .mermaid { background: #fdf9ff; border: 1px solid #ce93d8; border-radius: 6px; padding: 16px; margin: 20px 0; text-align: center; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 13px; }
+  th { background: #6a1b9a; color: white; padding: 8px 12px; text-align: left; }
+  td { padding: 7px 12px; border: 1px solid #e0e4ef; }
+  tr:nth-child(even) { background: #fdf5ff; }
+  .warn { background: #fff8e1; border-left: 4px solid #f9a825; padding: 10px 16px; margin: 12px 0; border-radius: 2px; }
+  .info { background: #f3e5f5; border-left: 4px solid #6a1b9a; padding: 10px 16px; margin: 12px 0; border-radius: 2px; }
+  .subtitle { color: #546e7a; font-size: 14px; margin-top: -12px; margin-bottom: 24px; }
+  @media print { body { padding: 10px 20px; } h2 { page-break-before: always; } }
+</style>
+</head>
+<body>
+
+<h1>llama.cpp — Architecture Diagrams (Qwen3-MoE Focus)</h1>
+<div class="subtitle">Source: Claude training knowledge (~Aug 2025) — NOT verified against live source code this session</div>
+
+<div class="warn">
+  <strong>⚠️ Important disclaimer:</strong> This document is based on Claude's training knowledge of the llama.cpp
+  codebase as of approximately August 2025. It was <strong>not produced by reading the actual llama.cpp source files
+  in this session.</strong> Architecture details, function names, and file paths are accurate to the best of the
+  author's knowledge but should be verified against the real codebase before acting on them.
+  Cross-reference: <code>https://github.com/ggml-org/llama.cpp</code>
+</div>
+
+<h2>1. Overview &amp; Architecture Philosophy</h2>
+<pre>
+llama.cpp uses a GRAPH-BASED execution model — different from the IE engine's imperative style.
+
+Steps for each llama_decode() call:
+  1. BUILD a computation graph (DAG of ggml_tensor nodes)
+     via model-specific llm_build_*() function (e.g. llm_build_qwen2moe)
+  2. SCHEDULE graph nodes across backends
+     via ggml_backend_sched_graph_compute()
+  3. EXECUTE each node via its backend's kernel
+     (ggml-sycl.cpp for Intel GPU, ggml-cuda.cu for NVIDIA, etc.)
+
+Key source files (approximate):
+  llama.cpp                  — API surface, decode loop, KV cache mgmt
+  src/llama-model.cpp        — model architecture definitions
+  src/llama-context.cpp      — graph building, scheduling
+  ggml/src/ggml.c            — tensor ops, graph builder
+  ggml/src/ggml-cpu/         — CPU backend kernels
+  ggml/src/ggml-sycl/        — SYCL backend (Intel GPU Arc)
+  ggml/src/ggml-cuda/        — CUDA backend (NVIDIA)
+  ggml/src/ggml-metal/       — Metal backend (Apple)
+  ggml/src/ggml-vulkan/      — Vulkan backend
+</pre>
+
+<h2>2. Top-Level Inference Flow</h2>
+<pre>
+llama_new_context_with_model()
+      │  Allocates KV cache, work buffers, backend scheduler
+      ▼
+llama_tokenize()
+      │  BPE → token IDs (host)
+      ▼
+llama_batch_init() + populate tokens
+      ▼
+┌──────────────────────────────────────────────────────────────┐
+│  llama_decode(ctx, batch)                                    │
+│                                                              │
+│  ① llm_decode()                                              │
+│       → llama_build_graph()                                  │
+│           → llm_build_qwen2moe()  for Qwen3-MoE             │
+│             (Builds DAG — no execution yet)                  │
+│                                                              │
+│  ② ggml_backend_sched_graph_compute()                        │
+│       → assigns each node to a backend                       │
+│       → executes kernels on GPU / CPU                        │
+│                                                              │
+│  ③ Logits in ctx->logits buffer (last token by default)     │
+└──────────────────────────────────────────────────────────────┘
+      │
+      ▼
+llama_sampler_chain_apply()   OR   llama_sample_token()
+      │  temp → min-p → top-k → top-p → greedy/multinomial
+      ▼
+next token ID
+</pre>
+
+<h2>3. Computation Graph: How llama.cpp Executes Ops</h2>
+<div class="mermaid">
+flowchart TD
+    BLD["llm_build_qwen2moe\nBuilds DAG of ggml_tensor nodes\nNo execution yet"]
+
+    BLD --> OPS["ggml ops added to graph:\nggml_mul_mat        — GEMM / GEMV\nggml_add            — elementwise add\nggml_rms_norm       — RMS normalization\nggml_rope           — RoPE\nggml_soft_max       — softmax\nggml_flash_attn_ext — fused attention\nggml_silu           — SiLU\nggml_cpy            — copy / quantize-to-cache"]
+
+    OPS --> SCHED["ggml_backend_sched_graph_compute\nAssigns each node to a backend\nbased on tensor location and capabilities"]
+
+    SCHED --> B2["SYCL backend  Intel GPU Arc B70\nggml-sycl.cpp\nHandles GEMM  attn  norm  rope  etc."]
+    SCHED --> B1["CPU backend\nggml-cpu kernels\nFallback ops not supported by GPU"]
+
+    B2 --> EX["Op dispatch in ggml_sycl_mul_mat:\n  M=1  weight=Q4_K → GEMV kernel  inline dequant\n  M&gt;1  weight=Q4_K → tiled GEMM kernel\n  FP16×FP16       → DPAS/joint_matrix\nggml_sycl_rms_norm  WG reduction\nggml_sycl_rope      fused rotary\nggml_sycl_flash_attn_ext  if enabled"]
+</div>
+
+<h2>4. Qwen3-MoE Layer Structure (per layer)</h2>
+<pre>
+Input embeddings [T, hidden]
+      │
+      ▼  (for each of N layers)
+┌────────────────────────────────────────────────────────────────┐
+│  LAYER  (standard transformer MoE)                             │
+│                                                                │
+│  ① attn_norm   ggml_rms_norm                                  │
+│                                                                │
+│  ② Self-Attention                                              │
+│     Q = ggml_mul_mat(x, W_q)                                  │
+│     K = ggml_mul_mat(x, W_k)                                  │
+│     V = ggml_mul_mat(x, W_v)                                  │
+│     Q,K = ggml_rope(Q), ggml_rope(K)                         │
+│     [with --flash-attn]:                                       │
+│       out = ggml_flash_attn_ext(Q, K_cache, V_cache)          │
+│     [without --flash-attn]:                                    │
+│       scores = ggml_mul_mat(Q, K_cache^T) / sqrt(head_dim)   │
+│       scores = ggml_soft_max(scores + causal_mask)            │
+│       out = ggml_mul_mat(scores, V_cache)                     │
+│     O proj = ggml_mul_mat(out, W_o)                           │
+│                                                                │
+│  ③ Residual add   ggml_add                                    │
+│                                                                │
+│  ④ ffn_norm   ggml_rms_norm                                   │
+│                                                                │
+│  ⑤ MoE FFN                                                     │
+│     Router: ggml_mul_mat(x, W_router) → logits [T, E]         │
+│     top-k + softmax + renorm  (CPU-side; tensor is small)     │
+│     For each active expert e:                                  │
+│       gate = ggml_mul_mat(x_e, W_gate_e)                      │
+│       up   = ggml_mul_mat(x_e, W_up_e)                        │
+│       h    = ggml_mul(ggml_silu(gate), up)   (SwiGLU)         │
+│       down = ggml_mul_mat(h, W_down_e)                        │
+│       accumulate: out += router_weight_e * down                │
+│     Shared expert: same gate/up/silu/down, weight=1           │
+│                                                                │
+│  ⑥ Residual add   ggml_add                                    │
+└────────────────────────────────────────────────────────────────┘
+      │
+      ▼
+Final norm   ggml_rms_norm
+lm_head      ggml_mul_mat(last_x, W_output)
+Logits [vocab]  → sampler
+</pre>
+
+<h2>5. KV Cache: Every Write and Read Point</h2>
+<h3>Cache Layout</h3>
+<pre>
+llama.cpp KV cache (struct llama_kv_cache):
+
+Per layer:
+  k_cache: [n_kv_heads, max_ctx, head_dim]  dtype configurable
+  v_cache: [n_kv_heads, max_ctx, head_dim]  dtype configurable
+
+Default dtype: FP16  (GGML_TYPE_F16)
+Quantized with CLI flags:
+  -ctk q4_0    → Q4_0 keys    (rare)
+  -ctk q8_0    → Q8_0 keys    (common; 1 scale per 32 elements)
+  -ctv q8_0    → Q8_0 values
+
+Cell-based management:
+  llama_kv_cache_find_slot()  — find free positions for new tokens
+  llama_kv_cache_update()     — clear / defragment
+</pre>
+
+<h3>Write and Read Points</h3>
+<pre>
+WRITE  (same path for both T=1 and T&gt;1):
+  ggml_cpy(K_new[T, kv_h, hd], k_cache[cur_slot..cur_slot+T, kv_h, hd])
+  ggml_cpy(V_new[T, kv_h, hd], v_cache[...])
+
+  If cache dtype = FP16:  straight copy
+  If cache dtype = Q8_0:  FP16 → Q8_0 quantization inline in ggml_cpy kernel
+                          One scale per 32 elements; no row-level scale
+
+  KEY DIFFERENCE from IE engine:
+    Unified write path → no INT8 prefill bug.
+    T=1 and T&gt;1 both use the same ggml_cpy node in the graph.
+
+READ  (inside flash_attn_ext or naive SDPA):
+  Flash attention (--flash-attn):
+    ggml_flash_attn_ext reads K_cache and V_cache tiles
+    Dequantization (if Q8_0): inline during read
+    Causal mask applied inside kernel
+
+  Without flash attention:
+    ggml_mul_mat(Q, K_cache^T):  dequant via mul_mat dispatch
+    ggml_mul_mat(scores, V_cache): same
+</pre>
+
+<h2>6. INT8 vs FP16 Decision Tree</h2>
+<div class="mermaid">
+flowchart TD
+    INIT["Model loaded\n-ctk and -ctv flags set\nor default FP16"] --> C1
+
+    C1{"KV cache dtype\nflag"}
+
+    C1 -->|"default  no flag"| F16["FP16 KV cache\nggml_cpy: FP16 → FP16\nSDPA reads FP16 K/V\nNo quantization overhead"]
+
+    C1 -->|"-ctk q8_0 / -ctv q8_0"| Q80["Q8_0 KV cache\nggml_cpy quantizes inline\nFP16 → Q8_0  32-elem blocks\n1 scale per block\nSDPA dequants inline\nBandwidth: ~half of FP16"]
+
+    C1 -->|"-ctk q4_0 etc."| Q4["Q4_0 / Q4_1\nMore compression\nHigher quant error"]
+
+    F16 --> NOTE["Same ggml_cpy write path\nfor T=1 AND T&gt;1\nNo prefill/decode split\n→ no INT8 prefill bug"]
+    Q80 --> NOTE
+    Q4 --> NOTE
+</div>
+
+<h2>7. T=1 vs T&gt;1 (Decode vs Prefill)</h2>
+<pre>
+In llama.cpp the computation GRAPH is IDENTICAL for T=1 and T&gt;1.
+The graph is rebuilt each call (or re-planned from cache).
+
+Differences driven by T:
+
+GEMM shape:
+  T=1:  ggml_mul_mat with M=1 → backend dispatches as GEMV
+  T&gt;1:  M&gt;1                  → backend dispatches as GEMM
+  SYCL backend: ggml_sycl_mul_mat selects kernel at runtime by shape
+
+Flash attention:
+  T=1:  decode  — Q[1, h, d] × K_cache^T; trivial causal
+  T&gt;1:  prefill — Q[T, h, d] × K_cache^T; causal mask needed
+  Same ggml_flash_attn_ext kernel; shape drives inner tiling
+
+KV cache writes:
+  T=1 AND T&gt;1: both use ggml_cpy into cache cells  (unified path)
+
+Logits:
+  Default: only last token logits  (lm_head applied to x[T-1])
+  --logits-all: all T tokens' logits
+</pre>
+
+<h2>8. MoE Expert Routing</h2>
+<pre>
+llm_build_qwen2moe — MoE FFN section:
+
+ws_x_normed [T, hidden]
+  → router logits: ggml_mul_mat(x, W_router[E, H])  → [T, E] FP32
+  → top-k + softmax + renorm  (small tensor, done CPU-side in most backends)
+  → expert_ids [T, k] INT32, expert_weights [T, k] FP32
+
+For each expert e in the active set:
+  gather tokens routing to e  → x_e [n_tok, H]
+  gate_out = ggml_mul_mat(x_e, W_gate_e)
+  up_out   = ggml_mul_mat(x_e, W_up_e)
+  h_out    = ggml_mul(ggml_silu(gate_out), up_out)  [SwiGLU]
+  down_out = ggml_mul_mat(h_out, W_down_e)
+  scatter-add into output:  out[token] += weight_e * down_out
+
+Shared expert (always applied, weight from sigmoid gate in Qwen2-MoE):
+  same gate/up/silu/down graph nodes, separate weights
+
+Key difference from IE engine:
+  NO dedicated fused moe_decode_gate_up_silu kernel.
+  Each op is a separate ggml_tensor node in the graph.
+  Batching/fusion happens only if the backend supports op fusion
+  (limited for the SYCL backend as of 2025).
+</pre>
+
+<h2>9. Backend Dispatch for Intel GPU (SYCL)</h2>
+<pre>
+ggml-sycl.cpp — dispatch for Arc GPU:
+
+ggml_sycl_mul_mat():
+  ┌────────────────────────────────────────────────────────┐
+  │  M=1, weight=Q4_K  → mul_mat_vec_q4_K_q8_1_sycl       │
+  │                       inline dequant; decode hot path  │
+  │  M=1, weight=Q6_K  → mul_mat_vec_q6_K_sycl             │
+  │  M&gt;1, weight=Q4_K  → mul_mat_q4_K (tiled GEMM)         │
+  │  FP16×FP16          → DPAS/joint_matrix if shapes fit  │
+  └────────────────────────────────────────────────────────┘
+
+ggml_sycl_flash_attn_ext():
+  Tile-based SDPA; WG per (batch, head)
+  KV quant (Q8_0) dequanted inline during K/V reads
+  Causal mask inside kernel
+
+ggml_sycl_rms_norm():  per-row WG reduction
+ggml_sycl_rope():       fused rotary position encoding
+
+Notable differences vs IE engine:
+  - No custom FA-2 split-K with CHUNKS_PER_WG=8 super-chunk amortisation
+  - No dedicated fused MoE decode kernel (2 launches for 8 experts)
+  - KV cache quantization is block-level Q8_0 (32-elem), not per-row INT8
+  - Graph approach means each op is a separate kernel dispatch (less fusion)
+  - No DeltaNet support (non-standard arch)
+</pre>
+
+<h2>10. Kernel Inventory (SYCL Backend)</h2>
+<div class="info">Function names are approximate; verify against ggml-sycl.cpp in the repository.</div>
+<table>
+<tr><th>Kernel (approx name)</th><th>Status</th><th>Used For</th><th>Notes</th></tr>
+<tr><td>mul_mat_vec_q4_K_q8_1_sycl</td><td>✅ Active</td><td>GEMV  Q4_K×FP16  M=1</td><td>Decode hot path; inline dequant</td></tr>
+<tr><td>mul_mat_vec_q6_K_sycl</td><td>✅ Active</td><td>GEMV  Q6_K×FP16  M=1</td><td></td></tr>
+<tr><td>mul_mat_q4_K</td><td>✅ Active</td><td>GEMM  Q4_K  M&gt;1</td><td>Prefill; tiled</td></tr>
+<tr><td>mul_mat_q8_0</td><td>✅ Active</td><td>GEMM  Q8_0 KV dequant</td><td>KV cache dequant during SDPA</td></tr>
+<tr><td>rms_norm_sycl</td><td>✅ Active</td><td>LayerNorm</td><td>Per-row WG reduction</td></tr>
+<tr><td>rope_neox_sycl</td><td>✅ Active</td><td>RoPE encoding</td><td>NeoX style (Qwen uses this)</td></tr>
+<tr><td>flash_attn_ext_sycl</td><td>✅ Active</td><td>SDPA</td><td>Requires --flash-attn flag</td></tr>
+<tr><td>soft_max_sycl</td><td>✅ Active</td><td>Softmax (naive SDPA)</td><td>Used without --flash-attn</td></tr>
+<tr><td>silu_sycl</td><td>✅ Active</td><td>SiLU activation</td><td>SwiGLU in MoE</td></tr>
+<tr><td>add_sycl</td><td>✅ Active</td><td>Elementwise add</td><td>Residual connections</td></tr>
+<tr><td>cpy_f16_q8_0_sycl</td><td>✅ Active</td><td>KV cache write with quant</td><td>FP16 → Q8_0 for -ctk q8_0</td></tr>
+<tr><td>argsort_sycl</td><td>✅ Active</td><td>Sampling top-k</td><td></td></tr>
+<tr><td>dequant_row_q4_K_sycl</td><td>✅ Active</td><td>Weight dequant helper</td><td>Called from mul_mat dispatch</td></tr>
+<tr><td>dequant_row_q6_K_sycl</td><td>✅ Active</td><td>Weight dequant helper</td><td></td></tr>
+</table>
+
+<h2>11. Key Architecture Differences: IE Engine vs llama.cpp</h2>
+<table>
+<tr><th>Aspect</th><th>IE Engine (this project)</th><th>llama.cpp</th></tr>
+<tr><td>Execution model</td><td>Imperative: kernels called directly</td><td>Graph-based: build DAG, then schedule</td></tr>
+<tr><td>Backend</td><td>Single SYCL (B70 only)</td><td>Multi-backend: CPU, CUDA, Metal, SYCL, Vulkan</td></tr>
+<tr><td>Attention T=1</td><td>FA-2 split-K, custom SLM tiling, super-chunk amortisation</td><td>flash_attn_ext (if --flash-attn) or naive SDPA</td></tr>
+<tr><td>Attention T&gt;1</td><td>Naive O(T×ctx), fp16 only</td><td>Same kernel handles both T; flash or naive</td></tr>
+<tr><td>INT8 KV write</td><td>Per-row symmetric INT8 + 1 FP16 scale per row</td><td>Block Q8_0: 1 scale per 32 elements</td></tr>
+<tr><td>INT8 prefill</td><td>⚠️ BUG: prefill never writes INT8 rows</td><td>✅ Unified ggml_cpy path for T=1 and T&gt;1</td></tr>
+<tr><td>MoE fused decode</td><td>2 kernels for all K_top=8 experts (fused)</td><td>Separate graph nodes per op per expert</td></tr>
+<tr><td>MoE prefill</td><td>1 launch for all 256 experts (packed)</td><td>Per-expert ggml_mul_mat nodes</td></tr>
+<tr><td>DeltaNet</td><td>✅ Fully implemented (30 layers)</td><td>❓ Non-standard arch; likely not supported</td></tr>
+<tr><td>ESIMD path</td><td>Researched; device-lost on G31 C0</td><td>N/A</td></tr>
+<tr><td>XMX/DPAS</td><td>joint_matrix for T&gt;1 GEMM (IE_NO_XMX flag)</td><td>DPAS in SYCL backend for FP16 GEMM</td></tr>
+<tr><td>Decode GEMV Q4_K</td><td>~92% BW efficiency (custom kernel)</td><td>~60-80% estimated (backend-dependent)</td></tr>
+</table>
+
+<hr>
+<p style="color:#546e7a;font-size:12px;">
+  Based on Claude training knowledge (~August 2025). Not verified against live source code.<br>
+  Cross-reference: <a href="https://github.com/ggml-org/llama.cpp">https://github.com/ggml-org/llama.cpp</a>
+</p>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#f3e5f5',
+      primaryBorderColor: '#6a1b9a',
+      primaryTextColor: '#4a148c',
+      lineColor: '#6a1b9a',
+      fontSize: '14px'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true }
+  });
+</script>
+</body>
+</html>

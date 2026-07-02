@@ -1,0 +1,14 @@
+Device: Intel(R) Graphics [0xe223]
+
+  compute_g_beta(0,0,0,0)→(-ln2, 0.5)            OK
+  l2_norm_scale 1×16                              OK
+  gated_rms_norm closed-form 1×8                  OK
+  single-step S=0 → β·(qᵀk)·v               OK
+  vs CPU ref T=1                                   OK  out_max_abs=1.304e-08  state_max_abs=0 (gates: out≤1e-2, state≤5e-3)
+  vs CPU ref T=16                                  OK  out_max_abs=4.47e-08  state_max_abs=1.676e-08 (gates: out≤1e-2, state≤5e-3)
+  vs CPU ref T=256                                 OK  out_max_abs=4.47e-08  state_max_abs=9.313e-09 (gates: out≤1e-2, state≤5e-3)
+  vs CPU ref T=4096                                OK  out_max_abs=6.706e-08  state_max_abs=1.118e-08 (gates: out≤1e-2, state≤5e-3)
+  prefill T=8 + decode T=1 == prefill T=9          OK  out_diff=0 state_diff=0
+  depthwise_conv1d_causal smoke                    OK
+
+ALL PASS

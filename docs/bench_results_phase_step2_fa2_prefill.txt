@@ -1,0 +1,135 @@
+## Step 2: full_attention_fa2_prefill — REVERTED (worse than naive at pp512)
+
+Per the Option A plan: Step 2 implements `full_attention_fa2_prefill`,
+a tiled FA-2 kernel for T>1 prefill, gated by IE_ENABLE_FA2_PREFILL_TILED
+(default OFF), with a single dispatch #if/#endif in qwen36.cpp's
+attn_full_block.
+
+The kernel design:
+  - WG layout: 1 WG per (kv_head, br_chunk_of_Br=8) — at T=512 with
+    n_kv_heads=2, that's 2 × 64 = 128 WGs (vs naive's 8192)
+  - gqa SGs per WG (one per q_head in group), 16 lanes per SG
+  - Each WG cooperatively SLM-loads K_tile + V_tile (Bc=64 × head_dim=256)
+    once per K-tile, all gqa SGs reuse it
+  - Online softmax accumulators (m, l, out) per Br row in registers
+  - Causal mask: per-(q_row, k_pos) check vs absolute positions
+  - Compute: scalar SG.reduce_over_group for each (Br_row, K_pos) score
+
+Theoretical motivation: naive `full_attention` reads each KV element
+8× (gqa redundancy) and dispatches 8192 small WGs (one per (t, h)).
+Tiled FA-2 should eliminate both inefficiencies.
+
+== Verification ==
+
+Build: clean both flag=0 and flag=1 paths.
+PPL on 1791-tok corpus: 14.86 (Δ vs baseline 14.90 = -0.04, within noise).
+Decode unchanged at all ctx (kernel only fires for T>1 prefill).
+Zero GuC/DEVICE_LOST events.
+
+== Bench: pp512, head-to-head, same thermal session ==
+
+  flag                                            pp512 (3 runs)        median
+  --------                                         -----------------     ------
+  Step1 OFF, Step2 OFF (baseline)                  155.1 / 155.1 / 154.7  155.1
+  Step1 OFF, Step2 ON (this experiment)            150.6 / 150.5 / 151.2  150.6
+  Step1 ON,  Step2 OFF (Step 1 alone)              181.2 / 181.1 / 182.9  181.2
+  Step1 ON,  Step2 ON  (combined)                  144.3 / 172.5 / 172.6  172.5
+
+Step 2 standalone:        Δ = -4.5 tok/s (-2.9%) vs baseline.
+Combined Step1+Step2:     Δ = -8.7 tok/s (-4.8%) vs Step 1 alone.
+
+== Stop-rule evaluation ==
+
+  PPL Δ ≤ +0.05:                                   PASS (-0.04)
+  Step 2 alone: pp512 ≥ 165 (baseline +10):       FAIL (150.6)
+  No decode regression:                            PASS (T=1 unchanged)
+  No GuC/DEVICE_LOST:                              PASS
+  Combined Step1+Step2: pp512 ≥ 250:              FAIL (172.5)
+
+  Step 2 alone gate AND combined gate both FAIL → REVERT.
+
+== Why the kernel lost to naive (postmortem) ==
+
+Naive `full_attention` runs 8192 tiny WGs (one per token-q_head pair),
+each WG just 1 SG of 16 lanes doing a serial SG-reduce loop over
+ctx_len.  On B70's 24 Xe-cores, that's ~341 waves of 24 WGs each — the
+GPU pipelines launch + memory + compute extremely well at this granularity.
+
+The tiled FA-2 kernel has only 128 WGs (5.3 waves on 24 cores) but each
+WG is bigger.  The intended win was eliminating 8× GQA-redundant KV
+reads.  Two issues killed it:
+
+  1. **Inner score loop is SG-reduce-bound.**  For each Br row × K-pos
+     pair (8 × 64 = 512 per K-tile per SG), the score is a scalar
+     `sycl::reduce_over_group(sg, partial, plus<float>())` — ~5 cycles
+     per reduce.  Per K-tile per SG: 512 × 5 = 2560 cycles ≈ 1 µs.
+     With 8 K-tiles per WG: 8 µs of pure reduce overhead per SG.
+     Aggregated across the WG: 8 µs (SGs run in parallel within a WG).
+     The naive avoids this by structuring score loops as serial-per-token
+     instead of batched-per-tile, which the compiler pipelines tighter.
+
+  2. **head_dim=256 makes K/V tiles large.**  K_tile + V_tile = 64 KB
+     per WG.  Each K-tile load streams 32 KB+32 KB = 64 KB from DRAM
+     per WG per K-tile.  At 8 K-tiles per WG × 128 WGs = 64 MB total.
+     But the cooperative-load distribution across 128 lanes (8 SGs × 16)
+     loading 16K halfs per tile = 128 halfs/lane — that's a wide enough
+     load BUT the SLM write pressure (all 128 lanes hit B_smem in the
+     same cycle) creates contention that doesn't show up in the
+     per-token naive.
+
+Combined effect: the WG count drop (8192 → 128) didn't pay off because
+the per-WG cost grew proportionally (and then some, due to SG-reduce
+overhead).  Naive's 8192-WG saturation actually helps on B70's
+launch-pipelined architecture.
+
+== Disposition ==
+
+**REVERT — flag default OFF, kernel preserved as scaffold.**
+
+  - src/ops/attention.cpp                  contains full_attention_fa2_prefill
+                                           (preserved for future joint_matrix
+                                           rewrite — see "Future direction")
+  - src/model/qwen36.cpp                   IE_ENABLE_FA2_PREFILL_TILED = 0
+                                           (default).  Production uses naive
+                                           full_attention as before.
+
+No production behavior change.  The kernel is dormant infrastructure.
+
+== Future direction (NOT in current scope) ==
+
+To make tiled FA-2 prefill actually win on this hardware, the inner
+score computation needs joint_matrix mat_mad instead of scalar
+SG-reduces.  Specifically:
+
+  - Compute Score[Br=8, Bc=64] via a sequence of joint_matrix_mad
+    using TM=8, TN=16, TK=16 — 16 K-iters (head_dim/TK) × 4 N-tiles
+    (Bc/TN) = 64 mat_mads per WG per K-tile.
+  - Vs current 512 SG-reduces per WG per K-tile (4× more ops, but
+    each reduce is cheaper than a mat_mad).  However, mat_mad uses XMX
+    units which run in parallel with the SG ALU — so wall-time ratio
+    is much more favorable than op-count suggests.
+  - This is a substantially bigger kernel rewrite — full FA-2 with
+    register-resident Q + SLM K/V + joint_matrix score compute.
+    Estimated 3-5 days of focused work.
+
+The naive full_attention remains the production path.  This experiment
+verified that "tiled FA-2 with scalar SG-reduce" is NOT a win on B70 at
+pp512; the next attempt (if pursued) needs joint_matrix mat_mad.
+
+== Lesson ==
+
+Bounded "one kernel + one dispatch flip" is the right scope for a single
+session, but doesn't always produce wins.  Real progress sometimes
+requires substantial multi-day rewrites — and we should be honest about
+this rather than ship marginal changes.
+
+After Step 1 (+16.8% pp512 but below 200 gate) and Step 2 (-2.9%, revert),
+the engine still sits at pp512 = 158 tok/s in production state.  Future
+work to close the prefill gap needs either:
+  (a) Combined Step 1 + a JOINT_MATRIX-based FA-2 prefill rewrite, OR
+  (b) Multi-expert MoE prefill XMX rewrite (PLAN.md item 11), OR
+  (c) Wait for HW driver/firmware unblock of cl_intel_subgroup_2d_block_io
+      and pivot to ESIMD with full register-resident weights.
+
+None are session-sized.  The honest current state is: prefill is hard,
+and the bounded experiments aren't enough.

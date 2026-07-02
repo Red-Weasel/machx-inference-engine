@@ -1,0 +1,127 @@
+## Step 5: hard fence between full_attention's append and compute — REVERTED
+
+Hypothesis tested: full_attention's intrinsic non-determinism (Step 4)
+is caused by the compute kernel reading K/V cache positions that the
+append kernel just wrote on the same in-order queue.  The
+`compute_evt depends_on(append_evt)` should be a full memory fence
+per SYCL spec; if SYCL/L0/IGC enforces the fence incompletely,
+compute could see stale or partially-written cache data → exactly
+the run-to-run variance observed.
+
+Implementation:
+  - Added `IE_FA_NAIVE_HARD_FENCE` compile flag (default OFF).
+  - When ON: `append_evt.wait()` is called between submitting append
+    and submitting compute, replacing the implicit depends_on fence
+    with an explicit host-blocking wait.
+
+Verification:
+  - Build: clean both flag=0 and flag=1.
+  - PPL on built-in 511-tok corpus: 6.64 (flag ON) vs 6.64 (baseline)
+    = bit-equivalent.
+
+Bench (3 validator A1 vs A2 runs, flag ON):
+
+  metric                  run 1    run 2     run 3
+  -------------           -------  --------  -------
+  I7attno_ max_abs         0.7322   0.00195   0.0364
+  I7attno_ rel_L2          13.2%    0.046%    0.731%
+  L41 max_abs              0.4326   0.2461    0.6777
+  L41 rel_L2               4.39%    2.82%     6.47%
+
+Compared to Step 4 baseline (no fence, A1 vs A2):
+  metric                  run 1     run 2     run 3
+  I7attno_ max_abs         0.0036    0.0029    0.00098
+  L41 max_abs              0.4443    0.4473    0.4277
+
+PPL spike test on prefill_chunk=1024 (which exercises the bug at scale):
+  baseline (flag OFF):   ~65 PPL
+  flag ON:                73.38 PPL  (no improvement, slightly worse)
+
+== Stop-rule evaluation ==
+
+  PPL Δ ≤ +0.10 (built-in):                          PASS  (0.00)
+  A1 vs A2 I7attno_ max_abs = 0 (decisive):          FAIL  (0.732 worst run)
+  A1 vs A2 stable across runs:                       FAIL  (350x variance)
+  PPL on prefill_chunk=1024:                         FAIL  (73 vs ~65)
+  No decode regression:                              PASS  (T=1 unchanged)
+  No GuC events:                                     PASS
+
+  Stability gate AND prefill-spike gate FAILED → REVERT.
+
+== What this rules out ==
+
+The K/V cache write-vs-read race on `full_attention`'s implicit
+depends_on(append_evt) fence is **NOT** the source of non-determinism.
+Forcing a host-blocking wait does not eliminate the variance — and in
+fact makes some runs WORSE (run 1 at 0.732 max_abs is 200x worse than
+the no-fence baseline of 0.0036).
+
+The "worse" behavior may be from the host-side wait introducing thermal
+or scheduler variance that affects subsequent kernels' timing — but
+either way, the ordering-fence hypothesis is wrong.
+
+== What's left in the suspect list ==
+
+Eliminated:
+  ❌ SG-reduce ordering (Step 3)
+  ❌ Chunk-size-dependent algorithmic difference (Step 4)
+  ❌ DeltaNet recurrence chunking (always BIT-EXACT)
+  ❌ Q/K/V proj, RoPE, RMSNorm (always EXACT, I1-I6)
+  ❌ Cache write/read race / fence enforcement (Step 5)
+
+Remaining (in priority order, narrowed):
+
+  1. **`sycl::native::exp` non-determinism** — Intel docs:
+     "implementation-defined precision."  Should be deterministic for
+     fixed input bit pattern.  The full_attention kernel calls
+     `native::exp(m - m_new)` and `native::exp(s_i - m_new)` per
+     position per WG.  If native::exp uses a hardware approximation
+     that has thermal-dependent rounding or some non-determinism, that
+     would manifest exactly like this.  **Highest probability remaining.**
+
+  2. **Out-of-bounds memory read** in the kernel.  `q_in[q_off]`,
+     `k_cache[kv_row + d_loc]`, `v_cache[v_off]` — if any of these
+     index into uninitialized device memory (e.g. due to an off-by-one
+     or T-dependent indexing bug), we'd read whatever happens to be
+     in that memory at compute time → non-deterministic.
+
+  3. **Workspace buffer pollution** — ws_q_split_, ws_k_, ws_v_,
+     ws_attn_out_ are reused across forward calls.  If something else
+     writes to them BETWEEN the prior layer's writes and full_attention's
+     reads (e.g. a kernel from a different layer/section running
+     concurrently), we'd see non-determinism.  But the in-order queue
+     should serialize this.
+
+== Disposition ==
+
+**REVERT — flag default OFF.**  Code preserved as dormant
+infrastructure.  Production behavior unchanged.
+
+== Next bounded experiment proposal ==
+
+Replace `sycl::native::exp` with `sycl::exp` (the precise IEEE-compliant
+variant) inside `full_attention` ONLY, gated by `IE_FA_NAIVE_PRECISE_EXP`
+(default OFF).  If non-determinism vanishes, `native::exp` is the
+source.
+
+Strict scope:
+  - Single file: `src/ops/attention.cpp`.
+  - Replace 2 calls inside `full_attention`'s compute kernel:
+    `sycl::native::exp(m - m_new)` → `sycl::exp(m - m_new)`
+    `sycl::native::exp(s_i - m_new)` → `sycl::exp(s_i - m_new)`
+  - Gate behind compile flag.
+  - Other `native::exp` call sites (fa2_decode, fa2_decode_int8) untouched.
+
+Hard gates:
+  - PPL Δ ≤ +0.10 (built-in 511-tok)
+  - A1 vs A2 I7attno_ max_abs = 0 in all 3 validator runs (decisive:
+    if true, native::exp is the source; ship the fix)
+  - L41 max_abs < 0.05
+  - No decode regression (T=1 path doesn't go through full_attention)
+  - PPL on prefill_chunk=1024 returns to expected baseline (~6 on
+    built-in, ~14-15 on PLAN.md corpus, NOT the 65-73 spike)
+
+Estimated effort: 30 min for one cycle.
+
+If `native::exp` is NOT the source, pivot to suspect #2 (memory bounds
+audit on q_in / k_cache / v_cache reads).

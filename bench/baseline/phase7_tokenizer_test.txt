@@ -1,0 +1,17 @@
+Device: Intel(R) Graphics [0xe223]
+
+  Tokenizer::load_from_gguf                      OK vocab=248320 bos=248044 eos=248046 pad=248044 add_bos=0
+  special token IDs match research/04            OK
+  encode('Hello, world') = [Hello, , world]      OK ids=[9419,11,1814] decode=['Hello',',',' world']
+  round-trip ASCII 'Hello, world'                OK (3 tokens for 12 bytes)
+  round-trip ASCII pangram                       OK (10 tokens for 44 bytes)
+  round-trip CJK '你好,世界'                 OK (3 tokens for 13 bytes)
+  round-trip mixed emoji+text                    OK (10 tokens for 25 bytes)
+  round-trip whitespace edge cases               OK (6 tokens for 22 bytes)
+  ChatML build + encode special tokens           OK prompt=128 bytes, 28 tokens, has_specials=1
+  sample_argmax                                  OK expected=313 got=313
+  sample temp=0 falls back to argmax             OK expected=42 got=42
+  sample top_k=1 always picks argmax             OK
+  sampling reproducible per seed                 OK seed1=180, seed1_again=180, seed2=168
+
+ALL PASS

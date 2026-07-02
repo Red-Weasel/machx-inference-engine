@@ -1,0 +1,152 @@
+## Step 10: defensive internal chunking in QwenModel::forward() — REVERTED
+
+Hypothesis tested: the prefill-PPL spike is purely gated on T > ~256 in a
+single forward() call.  Step 9's cross-position L04 A1 vs A2 check
+showed stochastic HW-level non-determinism that compounds across layers,
+but production tools chunk externally at T=256 and don't see the spike.
+Internalizing that chunking inside model.forward() should:
+  (a) eliminate the prefill_chunk=1024 PPL spike entirely (force the
+      external 1024-token call onto the same internal 4× T=256 path
+      that production already uses),
+  (b) leave built-in 511-tok PPL unchanged (T=511 stays a single call —
+      already below the cap; no chunking triggered),
+  (c) cost <1% on perf (just one extra branch / loop).
+
+If true, ship as default ON.  All future callers (server, chat, batch)
+get the safe path automatically with zero API change.
+
+Implementation:
+  - Single file: src/model/qwen36.cpp.
+  - Add compile flag IE_FA_FORWARD_CHUNK_T (default ON in trial build).
+  - At top of QwenModel::forward(), before workspace alloc:
+      if (T > MAX_T) {
+          sycl::event last;
+          for (uint32_t off = 0; off < T; off += MAX_T) {
+              const uint32_t chunk = std::min(MAX_T, T - off);
+              last = forward(q, input_ids + off, chunk, start_pos + off,
+                             kv, dn, out_logits);
+          }
+          return last;
+      }
+  - IE_FA_FORWARD_CHUNK_MAX_T = 256 (matches production chunk).
+  - Recursive call self-bypasses (chunk <= MAX_T, guard inert).
+  - KvCache + DeltaNetState persist across recursive sub-calls
+    automatically (already mutable references).
+  - out_logits gets overwritten by each sub-call; final value is the
+    last chunk's logits, which is what the caller wanted (logits for
+    the last token of the batch).
+
+Verification:
+  - Build: clean both flag=0 and flag=1.
+  - Built-in 511-tok PPL with chunking ON: 6.65 (baseline 6.64) — match.
+  - prefill_chunk=512 PPL with chunking ON: 20.23 (baseline 20.02) — match.
+  - PLAN.md 1791-tok streaming PPL with chunking ON: 14.97
+    (baseline 14.93) — match (streaming uses T=1; chunking inert).
+
+== Decisive test: prefill_chunk=1024 ==
+
+  configuration                       PPL    spike?
+  chunking OFF (baseline)             73.77  YES
+  chunking ON (cap T=256)             74.40  YES (no improvement)
+
+  Δ = +0.63 (within run-to-run noise, see Step 4 a1 vs a2 = ±0.6).
+
+== Stop-rule evaluation ==
+
+  PPL Δ ≤ +0.10 (built-in):                          PASS  (+0.01)
+  PPL on prefill_chunk=1024 < 8 (spike resolved):    FAIL  (74.40 vs 73.77)
+  No decode regression:                              PASS
+  No perf regression on chunking-active calls:       PASS  (only 4× T=256 sub-calls)
+
+  Spike-resolution gate FAILED → REVERT.
+
+== Critical finding: bug is NOT gated purely on T > 256 ==
+
+The chunking change forces a T=1024 external call to run as 4× T=256
+internal calls.  This is BIT-IDENTICAL (call sequence, kernel dispatch
+shape, workspace usage) to running ie-perplexity --prefill-chunk 256
+externally.  Yet PPL at the chunking-ON 1024 case is 74.40, exactly
+matching the chunking-OFF 1024 case (73.77).
+
+Two possible explanations:
+  (A) The bug fires at T=256 too (production chunk size), but only
+      the "1024 / 4 chunks" path triggers a stable failure mode that
+      ie-perplexity --prefill-chunk 256 also triggers — and we just
+      never noticed because we never tested chunk=256 followed by
+      decode of position 1024.
+  (B) The bug is in the ie-perplexity tool's stitching of chunked
+      prefills (the SAME prefill_chunk=1024 ie-perplexity call test),
+      not in the engine itself.
+
+Run discriminating test:
+  ie-perplexity --prefill-chunk 256 /tmp/ppl_test_2048.txt
+  ie-perplexity --prefill-chunk 1024 /tmp/ppl_test_2048.txt
+  ie-perplexity --prefill-chunk 2048 /tmp/ppl_test_2048.txt
+
+If (A): all three PPLs spike.
+If (B): chunk=256 is normal, chunk=1024 spikes, chunk=2048 spikes worse.
+
+== Cumulative eliminated suspects (10 hypotheses ruled out) ==
+
+  ❌ SG-reduce ordering (Step 3)
+  ❌ Chunk-size-dependent algorithmic difference (Step 4)
+  ❌ DeltaNet recurrence (always BIT-EXACT)
+  ❌ Q/K/V proj, RoPE, RMSNorm at row 1023 (always EXACT)
+  ❌ Cache write/read race / fence enforcement (Step 5)
+  ❌ native::exp precision (Step 6)
+  ❌ Naive full_attention kernel implementation (Step 7)
+  ❌ Tiled fa2_prefill kernel implementation (Step 7)
+  ❌ ws_attn_out_ uninitialized / write-coverage (Step 8)
+  ❌ T > 256 single-call gating (Step 10)
+
+== Disposition ==
+
+REVERT — IE_FA_FORWARD_CHUNK_T flag default flipped back to 0.
+Code retained (no behavior change at default OFF) for any future test
+that needs T-shape gating as a knob.
+
+== Next bounded experiment proposal ==
+
+**Decode-only A1 vs A2 determinism test.**
+
+Strict question: does full_attention also produce non-deterministic
+output when T == 1 (the decode kernel path is split-K fa2_decode, NOT
+the naive full_attention — but the same K/V cache contamination from
+prior prefill could carry through)?  More importantly: if we run the
+ENTIRE forward path in pure-streaming mode (T=1 throughout, no large
+prefill), is A1 vs A2 still non-deterministic?
+
+Why: this is the cleanest possible separation between "the bug is in
+prefill (T>1) full_attention" vs "the bug is systemic across all
+attention paths".  All Steps 3-10 worked with T>1 prefill.  We have
+NEVER tested A1 vs A2 with pure T=1 streaming.
+
+If T=1 streaming is BIT-EXACT across A1/A2:
+  → bug is specifically in T>1 full_attention.
+  → workaround: run prefill at T=1 (token-by-token, slow but
+    deterministic).  Loses ~10× pp512 perf but produces correct
+    output.  Could be a temporary fallback.
+
+If T=1 streaming is also non-deterministic:
+  → bug is ALSO in fa2_decode or the cache itself.  The HW-level
+    non-determinism diagnosis is correct.  Must find amplification
+    fix (Step 11+).
+
+Strict scope:
+  - Single file: tools/ie_validate_chunking.cpp.
+  - Add a "Path C": forward(T=1, start_pos=k) called 1024 times in a
+    loop, with KV cache fresh.  Run twice (C1 and C2).  Compare
+    L00..L41 dumps at the LAST step (k=1023) between C1 and C2.
+  - Also run Path C in the same process as A1 (so cache state /
+    workspace state is similar to a real run).
+  - Report: I7attno_ max_abs (C1 vs C2) and L41 max_abs (C1 vs C2)
+    across 3 invocations.
+
+Hard gates:
+  - C1 vs C2 I7attno_ max_abs = 0 in all 3 runs → pure-T=1 path
+    is deterministic, bug isolated to T>1 full_attention.
+  - C1 vs C2 I7attno_ max_abs > 0 → bug is systemic; T=1 path also
+    affected.  Pivot to amplification investigation.
+
+Estimated effort: 30 min (validator extension + 3 runs).  Zero engine
+changes.

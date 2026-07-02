@@ -1,0 +1,137 @@
+## Chunking-equivalence bisect — single T=1024 vs 4×T=256
+
+Tool: `tools/ie_validate_chunking.cpp` → built as `build/tools/ie-validate-chunking`.
+Methodology: load model, tokenize /tmp/ppl_test.txt → 1024 tokens.
+  Path A: forward(T=1024, start_pos=0) once.
+  Path B: forward(T=256) × 4 at start_pos = 0, 256, 512, 768.
+  Both paths use fp16 KV cache, fresh state at start.
+  Compare per-layer dumped activations at the LAST POSITION (1023 in
+  both paths — single's row 1023 vs chunked's chunk-3 row 255).
+
+== Per-layer comparison @ position 1023 ==
+
+  layer  max_abs       max_rel       L2_diff       L2_A    L2_B    rel_L2     status
+  -----  ------------  ------------  ------------  ------  ------  ---------  ------
+  L00    0             0             0             0.411   0.411   0          OK     <- post-embed
+  L01    0             0             0             0.853   0.853   0          OK     <- DN layer 0
+  L02    0             0             0             1.03    1.03    0          OK     <- DN layer 1
+  L03    0             0             0             1.41    1.41    0          OK     <- DN layer 2
+  L04    0.000389      1.73          0.00366       1.55    1.55    0.00236    OK     <- FULL-ATTN layer 3 — first divergence
+  L05    0.000488      1.72          0.00403       1.84    1.84    0.00219    OK
+  L06    0.000977      1.81          0.00407       1.88    1.88    0.00216    OK
+  L07    0.00195       1.4           0.00673       1.86    1.86    0.00361    drift  <- FULL-ATTN layer 7
+  L08    0.000702      1.79          0.00850       1.89    1.89    0.00451    OK
+  L09    0.00110       1.47          0.01151       1.86    1.86    0.00617    drift
+  L10    0.00107       1.88          0.01298       1.99    1.99    0.00651    drift
+  L11    0.00195       1.65          0.01556       2.53    2.53    0.00615    drift  <- FULL-ATTN layer 11
+  L12    0.00148       1.76          0.02006       2.74    2.74    0.00731    drift
+  L13    0.00488       1.93          0.02815       2.71    2.72    0.0104     drift
+  L14    0.00366       1.75          0.03082       2.84    2.84    0.0109     drift
+  L15    0.00977       1.94          0.03935       3.18    3.19    0.0124     drift  <- FULL-ATTN layer 15
+  L16    0.00684       1.97          0.07185       3.11    3.12    0.0231     drift
+  L17    0.0137        1.99          0.12452       3.47    3.48    0.0359     drift  <- crosses 1e-2 threshold
+  L18    0.0117        1.99          0.13485       3.41    3.42    0.0396     drift
+  L19    0.0104        1.96          0.12795       3.40    3.40    0.0377     drift  <- FULL-ATTN layer 19
+  L20    0.0117        1.98          0.13131       3.99    4.00    0.0329     drift
+  L21    0.0122        1.88          0.16373       3.74    3.74    0.0437     drift
+  L22    0.0112        2.00          0.14975       3.74    3.73    0.0401     drift
+  L23    0.0121        2.00          0.14174       4.03    4.03    0.0352     drift  <- FULL-ATTN layer 23
+  L24    0.0215        1.99          0.14754       4.15    4.14    0.0355     drift
+  L25    0.0234        1.96          0.15874       4.48    4.46    0.0354     drift
+  L26    0.0150        1.92          0.18715       4.56    4.55    0.0410     drift
+  L27    0.0273        1.92          0.17216       4.74    4.76    0.0363     drift  <- FULL-ATTN layer 27
+  L28    0.0130        1.94          0.17183       4.98    4.97    0.0345     drift
+  L29    0.0195        1.99          0.24348       5.55    5.56    0.0439     drift
+  L30    0.0192        1.96          0.23313       5.33    5.33    0.0437     drift
+  L31    0.0201        1.99          0.26799       5.52    5.53    0.0485     drift  <- FULL-ATTN layer 31
+  L32    0.0271        1.99          0.36165       5.78    5.78    0.0626     drift
+  L33    0.0267        1.97          0.36767       5.78    5.80    0.0636     drift
+  L34    0.0391        1.98          0.37967       6.66    6.67    0.0570     drift
+  L35    0.0391        1.96          0.36433       7.06    7.08    0.0516     drift  <- FULL-ATTN layer 35
+  L36    0.0977        1.92          0.44378       9.30    9.27    0.0477     drift
+  L37    0.0859        1.98          0.48811       10.0    10.0    0.0488     drift
+  L38    0.0898        1.99          0.57103       11.2    11.3    0.0509     drift
+  L39    0.0673        1.92          0.81647       12.8    12.9    0.0637     drift  <- FULL-ATTN layer 39
+  L40    0.0977        1.96          0.85489       16.2    16.3    0.0529     drift
+  L41    0.477         1.97          6.18          113     113     0.0546     DIVERGE  <- post-final-norm input to lm_head
+
+== Findings ==
+
+1. **L00 (post-embed) and L01-L03 (DN layers) are BIT-EXACT.**
+   Embedding lookup, DeltaNet projections, conv1d_silu, alpha+beta gate,
+   QKV split + l2_norm, deltanet_recurrence, gated_rms_norm, ssm_out —
+   ALL produce identical activations at chunk T=256 vs T=1024.
+   (rel_L2 = 0 across all three DN layers → no chunk-size-dependent
+   reordering in DeltaNet kernels.)
+
+2. **First non-zero divergence is at L04** = residual after layer index 3 =
+   first **FULL-ATTENTION** layer.  max_abs = 3.9e-4 (sub-fp16-ULP for
+   activations of magnitude ~1.5).  rel_L2 = 0.24% — small but
+   non-zero.
+
+3. **The divergence COMPOUNDS through layers** at ~1.08-1.09× per layer.
+   For pure fp16 reordering noise this should be ~1.01-1.03× per layer
+   — 9%/layer growth indicates real chunk-size-dependent math, not
+   just ULP noise.
+
+4. **Final hidden state (L41, input to lm_head) diverges by 5.5% rel_L2**
+   (max_abs = 0.48 on values of magnitude ~113).  After the lm_head
+   matmul + softmax, this 5.5% hidden-state divergence yields the PPL
+   spikes I measured earlier (PPL 65 on first 50 tokens after T=1024
+   prefill vs PPL 4.94 after T=256 prefill).
+
+5. **Bug localized to one of the kernels in the FULL-ATTENTION block:**
+   - `gemv_q_T` (Q proj, K proj, V proj, O proj) — uses Q4_K weights
+     but DN layers also use these and are bit-exact, so likely NOT
+     these.
+   - `split_q_gate_per_head` — element rearrangement, DN doesn't use
+     this; SUSPECT.
+   - `rms_norm_f32w` (QK-Norm) — DN uses different rms_norm variants.
+   - `rope_partial` — DN doesn't use RoPE; SUSPECT.
+   - `full_attention` — naive WG-per-(t,h) SDPA; SUSPECT.
+   - `sigmoid_gate` — element-wise on Q-gate fold-in; DN doesn't use.
+
+== Decision ==
+
+**Bug REPRODUCED** — a single forward(T=1024) call produces a final
+hidden-state row 1023 that differs from the equivalent chunked path's
+final hidden-state row 255 by 5.5% rel_L2 (0.48 max_abs on magnitude
+~113).  This explains the PPL spikes observed in `ie-perplexity` with
+prefill_chunk ≥ 512.
+
+The divergence is per-layer ~9% compounding.  Even though L04's initial
+divergence is small (4e-4, sub-fp16-ULP), 36 more layers of compound
+growth pushes the final state to a regime where lm_head produces
+materially different logits.
+
+**Confirmed: production users sending prompts > 256 tokens in a single
+batch would receive degraded output for the first ~50-200 generated
+tokens until KV cache "settles" past the chunk boundary.**
+
+Production paths (`ie-bench-suite`) chunk at T=256 and don't see this
+bug.  `ie-perplexity` with default `--prefill-chunk 256` also doesn't
+trigger it.  The bug is hidden behind the chunked-prefill convention.
+
+== Next bounded experiment ==
+
+Extend `ie-validate-chunking` to dump and compare INTERMEDIATE
+activations WITHIN layer 3:
+
+  - Q after `gemv_q_T(attn_q)` proj
+  - Q after `split_q_gate_per_head`
+  - Q after `rms_norm_f32w` (QK-norm)
+  - Q after `rope_partial`
+  - K after RoPE (already in cache)
+  - attn_out after `full_attention`
+  - attn_out after `sigmoid_gate`
+  - layer_out after `gemv_q_T(attn_output)`
+
+Bisecting these 8 intermediate points isolates the kernel.  Each
+intermediate dump is T*H_inner fp32 = ~16 MB.  Eight dumps × 2 paths =
+256 MB total.  Negligible.
+
+Estimated effort: ~1 hour.  Single new dump variant in qwen36.cpp,
+small extension to validator to compare them.
+
+This narrows from "somewhere in the full-attn block" to "this specific
+kernel" — at which point the fix is small.

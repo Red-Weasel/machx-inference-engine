@@ -1,0 +1,73 @@
+## lm_head Q6_K → Q4_K offline conversion — REVERTED (quality regression)
+
+Implemented host-side Q6_K → Q4_K converter at model-load time, gated behind
+IE_LM_HEAD_USE_Q4K compile flag.  Code touched:
+  src/ops/gemv_q6k.cpp   — added q6_K_to_q4_K_offline(src, dst, n_blocks)
+                           with q6_K_dequant_block + q4_K_quantize_block helpers
+  src/model/qwen36.cpp   — gated dispatch in load(): when output.weight is
+                           Q6_K and flag is set, run conversion host-side and
+                           upload Q4_K to device, set output_dtype_ = kQ4_K
+
+Algorithm: greedy Q4_K quantization (no iterative refinement of d/m pairs).
+  - dequant Q6_K block to fp32
+  - per 32-elem sub-block: d_i = (max - min)/15, m_i = -min (forced m≥0 via
+    "if (mn > 0) mn = 0")
+  - super_d = max(d_i), super_dmin = max(m_i), encode each as 6-bit
+  - pack scales[12] per Q4_K bit-packing layout
+  - re-quantize using rounded-back scales so reconstruction matches kernel
+
+Build: clean.
+Correctness (gemv_q4k_test): ALL PASS.
+Memory: 397.9 MiB Q6_K → 272.8 MiB Q4_K (ratio 144/210 = 0.686, matches).
+
+Performance signal (early, 16-token sample):
+  short-chat   ~44.05 → 49.65 tok/s  (+12.7%)
+That tracked the user's expected "+5-7 tok/s" prediction.
+
+Quality (ie-perplexity, 511 tokens of built-in corpus):
+  baseline (Q6_K lm_head):       avg NLL 1.8732   PPL  6.51
+  audit (Q4_K lm_head):          avg NLL 79.8326  PPL  4.69e34
+
+That's NLL 42× higher than baseline — model output is unusable garbage
+(near-uniform-random-or-worse).  log(vocab=248320) ≈ 12.4, so 79.8
+significantly EXCEEDS uniform-random NLL — meaning some logits are
+producing fp16 Inf/NaN that propagate through softmax and concentrate
+probability mass on incorrect tokens.
+
+Revert: file checkout via `git checkout -- src/ops/gemv_q6k.cpp
+src/model/qwen36.cpp`.  Baseline PPL re-verified at 6.51 after revert.
+
+Likely bug surfaces (un-debugged at revert time):
+  1. host_fp32_to_fp16: my round-to-zero version may produce unintended
+     Inf for fp32 values that round to fp16 max-exponent in edge cases.
+  2. lm_head Q6_K likely has blocks with values outside the dynamic range
+     a single fp16 super-scale can represent in Q4_K format (Q4_K's range
+     = 15 × max_d, while Q6_K's range = 32 × max_int8 × max_d ≈ 4096×).
+     Some lm_head blocks may genuinely require iterative refinement to
+     fit cleanly in Q4_K's 4-bit quantization grid.
+  3. The "if (mn > 0) mn = 0" greedy simplification can over-extend the
+     quantization range for sub-blocks with all-positive narrow data,
+     wasting precision and potentially producing weights that overflow
+     when multiplied by activations into fp32 logits.
+  4. Greedy d_i/m_i selection (no make_qkx2_quants iterative search)
+     accumulates error worse than llama.cpp's algorithm — could push
+     individual quants over the saturation boundary.
+
+Next steps (out of this experiment's scope):
+  - Port llama.cpp's quantize_row_q4_K_impl with make_qkx2_quants
+    iterative search.  Would add ~150 lines to gemv_q6k.cpp.
+  - Use llama.cpp directly via the existing ie_llama_dump linkage.
+  - Run llama-quantize offline to produce a Qwen3.6-35B-A3B-Q4_K_M-LMQ4
+    GGUF variant with the lm_head pre-converted.  Avoids implementing
+    Q4_K quantization in this codebase entirely.
+
+Engine state: unchanged at d3d4562.
+  short-chat        44.05 tok/s
+  long-instruction  44.15
+  codegen           44.16
+  math-reasoning    44.12
+  long-context      44.19
+
+Stop condition met: quality regression on first run → immediate revert
+per the user's "any prompt regresses" rule (quality regression is a
+per-prompt regression on every prompt by definition).

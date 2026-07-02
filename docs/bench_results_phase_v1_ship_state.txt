@@ -1,0 +1,106 @@
+## v1 ship-state numbers (2026-05-02)
+
+Engine state at commit `ee0fdd9` — after the FA-2 super-chunk regression fix
+(item 16, commit `c7a581b`) and the M_TILE=8 SLM-amortized stage-2 down
+kernels (item 15, commit `0e0d4c2`).
+
+Hardware: Intel Arc Pro B70 (BMG-G31, 32 GB GDDR6, 24 Xe-cores).
+Model:    Qwen3.6-35B-A3B-Q4_K_M-lmhead-q4k.gguf (19.7 GiB).
+Backend:  SYCL/Level Zero, Q4_K_M quant, INT8 KV cache (fp16 KV similar).
+
+== Decode tok/s (ctx-sweep, ie-bench --fastforward --int8-kv) ==
+
+  ctx       ms/tok    tok/s
+  -----     ------    -----
+  1         19.01     52.6
+  512       19.83     50.4
+  1024      19.72     50.7
+  2048      20.11     49.7
+  4096      21.16     47.2
+  8192      24.65     40.6
+  16384     28.58     35.0
+  32000     34.68     28.8
+
+== 5-prompt bench-suite (ie-bench-suite, fp16 KV, 3 runs/prompt) ==
+
+  prompt              prompt toks   median tok/s   spread
+  -------             -----------   ------------   ------
+  short-chat          51            49.89          0.3%
+  long-instruction    80            49.85          0.3%
+  codegen             78            49.95          0.3%
+  math-reasoning      86            49.94          1.0%
+  long-context        219           49.83          0.3%
+
+  Decode median across all prompts: 49.89 tok/s (very tight, all ~50)
+  Top kernel (decode):    gemv_q4k 27.3% of decode time
+  Second kernel (decode): gemv_q6k_med 14.7-15.1%
+
+== Prefill tok/s (real prompts via bench-suite, post-item-15) ==
+
+  prompt              prefill ms (median)   tok/s
+  short-chat (T=51)   ~378                  130-138
+  long-instruction    ~554                  144-149
+  codegen             ~543                  144-149
+  math-reasoning      ~586                  146-150
+  long-context (T=219) ~1397                 156-159
+
+== PPL gate ==
+
+  Corpus:   /tmp/ppl_test.txt (PLAN.md head, ~9.8k words → 1791 tokens)
+  Mode:     fp16 KV, prefill-chunk 256, max-tokens 2048
+  PPL:      14.95 (3-run median 14.84-14.96)
+  Pre-FA2-fix baseline: 14.90 — Δ within run-to-run reordering noise.
+
+== Cumulative wins this session (since 2026-05-01 start) ==
+
+  Decode @ ctx=1:       33.8 → 52.6 tok/s   (+55%)
+  Decode @ ctx=1k:      33.3 → 50.7 tok/s   (+52%)
+  Decode @ ctx=4k:      30.2 → 47.2 tok/s   (+56%)
+  Decode @ ctx=16k:     26.4 → 35.0 tok/s   (+33%)
+  Decode @ ctx=32k:     22.0 → 28.8 tok/s   (+31%)
+  Prefill @ T~80-219:   89  → 144-159       (+62-79%)
+
+== vs llama.cpp Vulkan baseline (same B70, same GGUF, llama-bench) ==
+
+  ctx=1:    36.3 (llama)  vs  52.6 (ours)   = 145%   ✅ exceed
+  ctx=1k:  ~34.7 (llama)  vs  50.7 (ours)   = 146%   ✅ exceed
+  ctx=4k:  ~30.7 (llama)  vs  47.2 (ours)   = 154%   ✅ exceed
+  ctx=16k: (n/a)          vs  35.0 (ours)   = (n/a)
+  ctx=32k: (n/a)          vs  28.8 (ours)   = (n/a)
+
+  PP @ T=512:  865 (llama) vs ~150 (ours)   = 17%    ⚠ HW-blocked gap
+  PP @ T=1k:  ~865 (llama) vs ~140 (ours)   = 16%    ⚠ HW-blocked gap
+
+  Prefill gap is structural — llama.cpp Vulkan uses
+  cl_intel_subgroup_2d_block_io which hangs on BMG-G31 stepping C0 in our
+  driver matrix.  v1.5 work either waits for driver fix or pivots to
+  oneDNN f16:u4 (requires Q4_K_M repack + PPL re-validation).
+
+== Status against original Phase 9 gates ==
+
+  ≥50 tok/s decode @ small ctx (bare-min):  ✅ PASSES at ctx≤1k (52.6 / 50.7)
+  ≥50 tok/s decode @ ctx=4k:                ⚠ 47.2 (5% short of gate)
+  ≥50 tok/s decode @ ctx=32k:               ❌ 28.8 (gap is 1.7×, was 2.9× pre-FA2-fix)
+  ≥95% llama.cpp Vulkan TG @ small/mid:     ✅ EXCEEDS (146-154%)
+  PP @ T=512 ≥ 50% of llama.cpp Vulkan:     ❌ 17% (HW-blocked, defer to v1.5)
+  Long-ctx 32k functional + correct:        ✅ done
+  Correctness (PPL within drift):           ✅ 14.95 stable
+
+== Open levers (deferred to v1.5+) ==
+
+  - 2D block I/O (cl_intel_subgroup_2d_block_io): HW-blocked on BMG-G31 C0.
+    Re-test in 2-3 weeks per PLAN.md item 13.  +200-300% prefill if it works.
+  - oneDNN f16:u4 pivot: requires Q4_K_M → groupwise INT4 repack + PPL gate.
+    ~3-week scope.  +60-70% prefill if quality holds.
+  - Multi-expert MoE stage 1 XMX (PLAN.md item 11): 4-SG-per-WG design (prior
+    2-SG attempt was -11-13%).  ~5-10% prefill if it works.
+  - Algorithmic long-ctx: paged attention, fp8 KV, MTP speculative head.
+    Multi-week each, all out of v1 scope.
+
+== Architectural takeaway ==
+
+The engine has hit a local maximum on the fusion + scheduling + SLM-tile
+optimization track.  TG decode now exceeds llama.cpp Vulkan by 45-55% at
+the ctx range where real chat sessions live (≤4k), with the remaining
+gaps being either small-but-structural (5% short at 4k decode) or
+HW-blocked (long-ctx decode and prefill).

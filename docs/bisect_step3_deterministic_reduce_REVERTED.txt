@@ -1,0 +1,122 @@
+## Step 3: deterministic butterfly reduce in full_attention — REVERTED
+
+Hypothesis tested: the chunk-size-dependent + run-to-run non-determinism
+in `full_attention`'s I7attno_ output (localized in Steps 1-2 of bisect)
+is caused by `sycl::reduce_over_group` emitting different reduction
+orders / IGC codegen paths across launches with different total WG
+counts.  Pinning the butterfly order should fix it.
+
+Implementation:
+  - Added `IE_FA_NAIVE_DETERMINISTIC_REDUCE` compile flag (default OFF).
+  - Added `fa_naive_butterfly_sum16` helper that does explicit
+    butterfly XOR reduction with fixed mask order 8, 4, 2, 1.
+  - Replaced the single `sycl::reduce_over_group(sg, partial, plus<float>())`
+    call site in `full_attention` with the helper, gated by the flag.
+  - All other reduce_over_group sites in attention.cpp untouched.
+
+Verification:
+  - Build: clean both flag=0 and flag=1 paths.
+  - PPL on built-in 511-tok corpus: 6.64 (flag ON) vs 6.64 (baseline) =
+    bit-equivalent within precision floor.
+  - PPL on /tmp/ppl_test.txt 1791-tok: 14.98 (flag ON) vs 14.87-14.98
+    (baseline) = within run-to-run noise.
+
+Bench (3 validator runs of `ie-validate-chunking`, all flag ON):
+
+  metric        run 1     run 2     run 3
+  -----------   --------  --------  --------
+  I7attno_ max_abs   0.0784    0.00208   0.000977
+  L41 max_abs        0.4375    0.5802    0.2520
+  L41 rel_L2         3.83%     4.99%     2.96%
+
+I7attno_ varies by 80x across runs (0.001 to 0.078).  L41 max_abs
+varies 2.3x (0.25 to 0.58).  Same code, same fixed inputs, same
+deterministic butterfly — yet the kernel still produces different
+outputs each run.
+
+== Stop-rule evaluation ==
+
+  PPL Δ ≤ +0.10 (built-in):                          PASS  (0.00)
+  PPL Δ ≤ +0.10 (PLAN.md):                           PASS  (~0.0)
+  I7attno_ stable across 3 runs (within ±10%):       FAIL  (80x var)
+  I7attno_ max_abs < 1e-4:                           FAIL  (best run 1e-3)
+  L41 max_abs < 0.05:                                FAIL  (5-12x over)
+  No decode regression:                              PASS  (T=1 unchanged)
+  No GuC/DEVICE_LOST:                                PASS
+
+  Primary stability gate FAILED → REVERT.
+
+== What this rules out ==
+
+The non-determinism is **NOT** from `sycl::reduce_over_group` choosing
+different butterfly orders across launches.  Pinning the order to a
+specific 8/4/2/1 mask sequence does not stabilize the kernel output.
+
+This is genuinely informative: it eliminates one of the four candidates
+listed in the prior bisect doc.  Remaining candidates (in updated
+order of suspicion):
+
+  1. **K_cache / V_cache read race**  — compute reads cache positions
+     [0, ctx_len) but append wrote those same positions in a separate
+     kernel on the same in-order queue with explicit
+     `compute_evt depends_on(append_evt)`.  By SYCL spec this should be
+     a full memory-fence, but a real race here would cause exactly the
+     pattern observed.
+
+  2. **`sycl::native::exp` non-determinism**  — Intel docs state
+     `native::exp` is "implementation-defined precision" but typically
+     deterministic for fixed input bit pattern.  Could be wrong on this
+     IGC version / Xe2 hardware.
+
+  3. **Compiler-emitted FMA reordering across different launch shapes**
+     — the kernel body is identical between paths, but IGC's
+     instruction scheduling could differ when total WG count differs
+     (16384 for T=1024, 4096 for T=256), affecting fp32 ALU sequence.
+
+  4. **Hardware scheduler ordering** affecting cache hit/miss timing
+     in a way that changes ALU result rounding.  Unlikely on Xe2 but
+     possible in pathological cases.
+
+== Disposition ==
+
+**REVERT — flag stays default OFF.**
+
+  - src/ops/attention.cpp: keeps the `IE_FA_NAIVE_DETERMINISTIC_REDUCE`
+    flag and the `fa_naive_butterfly_sum16` helper as dormant
+    infrastructure.  Default-OFF means production uses the original
+    `sycl::reduce_over_group` path unchanged.
+
+  - The flag remains togglable for future investigations or as a
+    fallback if `reduce_over_group` is later proven to be the cause
+    on a different driver/firmware combo.
+
+== Next bounded experiment proposal ==
+
+**Test whether path A run twice with bit-identical inputs produces the
+same output.**  This isolates whether the kernel is intrinsically
+non-deterministic OR whether the divergence is specifically
+chunk-size-dependent.
+
+Strict scope:
+  - Single file: `tools/ie_validate_chunking.cpp`
+  - Modify the validator to run **path A twice** (instead of path A
+    once + path B four times), then compare path-A-run-1 vs path-A-run-2
+    activations at position 1023 across all dump files.
+
+Expected outcomes:
+  - **If A1 == A2 bit-exact:** the kernel IS deterministic for fixed
+    inputs.  The earlier observed run-to-run variance was somehow due
+    to path B's intervening kernels affecting some shared state (KV
+    cache contents? workspace pollution?) that path A read from.
+    → Investigation pivots to "what state does path A inherit from
+       path B's run".
+  - **If A1 != A2 (varying):** the `full_attention` kernel itself has
+    non-determinism.
+    → Investigation pivots to candidates 1-4 above, starting with the
+       cache-read-race hypothesis (test by inserting an explicit
+       `q.wait()` between append and compute, see if non-determinism
+       vanishes).
+
+Estimated effort: 30 minutes — the validator already has the dump-and-
+compare infrastructure; just add a second path-A run with a different
+prefix.

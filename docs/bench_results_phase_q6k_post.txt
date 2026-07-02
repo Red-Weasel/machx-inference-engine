@@ -1,0 +1,134 @@
+Device: Intel(R) Graphics [0xe223]
+Loading model...
+Loaded.
+
+ie-bench-suite   model=Qwen3.6-35B-A3B-Q4_K_M   kv=fp16   decode=128   runs=3
+device: Intel(R) Graphics [0xe223]
+================================================================
+
+>>> short-chat
+    file: benchmark_prompts/01_short_chat.txt
+    prompt tokens: 51   decode budget: 128
+
+    run 1/3  prefill...  warmup...  decode...  521.3 ms prefill (97.8 tok/s)   38.45 tok/s decode (26.008 ms/tok)
+    run 2/3  prefill...  warmup...  decode...  551.1 ms prefill (92.5 tok/s)   38.33 tok/s decode (26.092 ms/tok)
+    run 3/3  prefill...  warmup...  decode...  553.2 ms prefill (92.2 tok/s)   38.14 tok/s decode (26.218 ms/tok)
+
+    ── Summary ──────────────────────────────────────────
+    Decode:  median 38.33  min 38.14  max 38.45 tok/s  (spread 0.8%)
+    Prefill (median run): 551.1 ms → 92.5 tok/s
+    Avg ms/tok (median run): 26.092 ms
+
+    ── Top-5 kernels (median run, 128 decode steps aggregated) ──
+  [1mKernel                    calls   total ms   avg ms      %[0m
+  ----------------------------------------------------------
+  [31mgemv_q6k_huge               128    660.559   5.1606  27.7%  ████[0m
+  [33mgemv_q4k                  34560    448.818   0.0130  18.9%  ███[0m
+  [33mgemv_q6k_med               4352    354.593   0.0815  14.9%  ██[0m
+  [0mmoe_dec_down_q6k           2560    248.646   0.0971  10.4%  ██[0m
+  [0mmoe_dec_gate_q4k           5120    171.323   0.0335   7.2%  █[0m
+  ----------------------------------------------------------
+
+>>> long-instruction
+    file: benchmark_prompts/02_long_instruction.txt
+    prompt tokens: 80   decode budget: 128
+
+    run 1/3  prefill...  warmup...  decode...  808.2 ms prefill (99.0 tok/s)   38.14 tok/s decode (26.222 ms/tok)
+    run 2/3  prefill...  warmup...  decode...  812.5 ms prefill (98.5 tok/s)   38.08 tok/s decode (26.264 ms/tok)
+    run 3/3  prefill...  warmup...  decode...  801.5 ms prefill (99.8 tok/s)   38.21 tok/s decode (26.171 ms/tok)
+
+    ── Summary ──────────────────────────────────────────
+    Decode:  median 38.14  min 38.08  max 38.21 tok/s  (spread 0.4%)
+    Prefill (median run): 808.2 ms → 99.0 tok/s
+    Avg ms/tok (median run): 26.222 ms
+
+    ── Top-5 kernels (median run, 128 decode steps aggregated) ──
+  [1mKernel                    calls   total ms   avg ms      %[0m
+  ----------------------------------------------------------
+  [31mgemv_q6k_huge               128    665.635   5.2003  27.8%  ████[0m
+  [33mgemv_q4k                  34560    446.100   0.0129  18.6%  ███[0m
+  [33mgemv_q6k_med               4352    358.438   0.0824  15.0%  ██[0m
+  [0mmoe_dec_down_q6k           2560    247.505   0.0967  10.3%  ██[0m
+  [0mmoe_dec_gate_q4k           5120    173.939   0.0340   7.3%  █[0m
+  ----------------------------------------------------------
+
+>>> codegen
+    file: benchmark_prompts/03_codegen.txt
+    prompt tokens: 78   decode budget: 128
+
+    run 1/3  prefill...  warmup...  decode...  795.0 ms prefill (98.1 tok/s)   38.23 tok/s decode (26.155 ms/tok)
+    run 2/3  prefill...  warmup...  decode...  793.1 ms prefill (98.4 tok/s)   38.08 tok/s decode (26.263 ms/tok)
+    run 3/3  prefill...  warmup...  decode...  801.5 ms prefill (97.3 tok/s)   38.04 tok/s decode (26.290 ms/tok)
+
+    ── Summary ──────────────────────────────────────────
+    Decode:  median 38.08  min 38.04  max 38.23 tok/s  (spread 0.5%)
+    Prefill (median run): 793.1 ms → 98.4 tok/s
+    Avg ms/tok (median run): 26.263 ms
+
+    ── Top-5 kernels (median run, 128 decode steps aggregated) ──
+  [1mKernel                    calls   total ms   avg ms      %[0m
+  ----------------------------------------------------------
+  [31mgemv_q6k_huge               128    660.319   5.1587  27.5%  ████[0m
+  [33mgemv_q4k                  34560    452.592   0.0131  18.9%  ███[0m
+  [33mgemv_q6k_med               4352    356.148   0.0818  14.8%  ██[0m
+  [0mmoe_dec_down_q6k           2560    250.087   0.0977  10.4%  ██[0m
+  [0mmoe_dec_gate_q4k           5120    175.800   0.0343   7.3%  █[0m
+  ----------------------------------------------------------
+
+>>> math-reasoning
+    file: benchmark_prompts/04_math_reasoning.txt
+    prompt tokens: 86   decode budget: 128
+
+    run 1/3  prefill...  warmup...  decode...  872.6 ms prefill (98.6 tok/s)   38.17 tok/s decode (26.196 ms/tok)
+    run 2/3  prefill...  warmup...  decode...  874.1 ms prefill (98.4 tok/s)   38.04 tok/s decode (26.286 ms/tok)
+    run 3/3  prefill...  warmup...  decode...  866.8 ms prefill (99.2 tok/s)   38.03 tok/s decode (26.295 ms/tok)
+
+    ── Summary ──────────────────────────────────────────
+    Decode:  median 38.04  min 38.03  max 38.17 tok/s  (spread 0.4%)
+    Prefill (median run): 874.1 ms → 98.4 tok/s
+    Avg ms/tok (median run): 26.286 ms
+
+    ── Top-5 kernels (median run, 128 decode steps aggregated) ──
+  [1mKernel                    calls   total ms   avg ms      %[0m
+  ----------------------------------------------------------
+  [31mgemv_q6k_huge               128    657.551   5.1371  27.4%  ████[0m
+  [33mgemv_q4k                  34560    455.514   0.0132  19.0%  ███[0m
+  [33mgemv_q6k_med               4352    360.378   0.0828  15.0%  ██[0m
+  [0mmoe_dec_down_q6k           2560    249.561   0.0975  10.4%  ██[0m
+  [0mmoe_dec_gate_q4k           5120    178.830   0.0349   7.4%  █[0m
+  ----------------------------------------------------------
+
+>>> long-context
+    file: benchmark_prompts/05_long_context.txt
+    prompt tokens: 219   decode budget: 128
+
+    run 1/3  prefill...  warmup...  decode...  2130.1 ms prefill (102.8 tok/s)   38.02 tok/s decode (26.304 ms/tok)
+    run 2/3  prefill...  warmup...  decode...  2128.9 ms prefill (102.9 tok/s)   38.10 tok/s decode (26.245 ms/tok)
+    run 3/3  prefill...  warmup...  decode...  2120.8 ms prefill (103.3 tok/s)   38.17 tok/s decode (26.197 ms/tok)
+
+    ── Summary ──────────────────────────────────────────
+    Decode:  median 38.10  min 38.02  max 38.17 tok/s  (spread 0.4%)
+    Prefill (median run): 2128.9 ms → 102.9 tok/s
+    Avg ms/tok (median run): 26.245 ms
+
+    ── Top-5 kernels (median run, 128 decode steps aggregated) ──
+  [1mKernel                    calls   total ms   avg ms      %[0m
+  ----------------------------------------------------------
+  [31mgemv_q6k_huge               128    663.677   5.1850  27.7%  ████[0m
+  [33mgemv_q4k                  34560    455.160   0.0132  19.0%  ███[0m
+  [33mgemv_q6k_med               4352    359.185   0.0825  15.0%  ██[0m
+  [0mmoe_dec_down_q6k           2560    245.577   0.0959  10.2%  ██[0m
+  [0mmoe_dec_gate_q4k           5120    175.108   0.0342   7.3%  █[0m
+  ----------------------------------------------------------
+
+================================================================
+## Results  (kv=fp16, decode=128 toks, runs=3)
+
+| Prompt           | Prompt toks | Gen toks | Median tok/s | Min tok/s | Max tok/s | Top kernel             |
+| ---------------- | -----------: | -------: | ------------: | ---------: | ---------: | ---------------------- |
+| short-chat       |          51 |      128 |        38.33 |     38.14 |     38.45 | gemv_q6k_huge          |
+| long-instruction |          80 |      128 |        38.14 |     38.08 |     38.21 | gemv_q6k_huge          |
+| codegen          |          78 |      128 |        38.08 |     38.04 |     38.23 | gemv_q6k_huge          |
+| math-reasoning   |          86 |      128 |        38.04 |     38.03 |     38.17 | gemv_q6k_huge          |
+| long-context     |         219 |      128 |        38.10 |     38.02 |     38.17 | gemv_q6k_huge          |
+

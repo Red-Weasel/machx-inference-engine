@@ -1,0 +1,7 @@
+Device: Intel(R) Graphics [0xe223]
+Workload: ~256 MiB packed per format, 5 warmup + 20 iters
+
+  Q8_0   256.0 MiB packed -> 481.9 MiB fp16  | 2.570 ms/iter  in=104.4 GB/s  out=196.6 GB/s
+  Q4_K   256.0 MiB packed -> 910.2 MiB fp16  | 2.383 ms/iter  in=112.7 GB/s  out=400.6 GB/s  (gate ≥ 350 GB/s)
+  Q5_K   256.0 MiB packed -> 744.7 MiB fp16  | 3.091 ms/iter  in=86.8 GB/s  out=252.6 GB/s
+  Q6_K   256.0 MiB packed -> 624.2 MiB fp16  | 1.896 ms/iter  in=141.6 GB/s  out=345.1 GB/s

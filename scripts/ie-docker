@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# ie-docker — run the engine container with Intel Arc GPU passthrough.
+#
+#   ie-docker pull  <name|hf-repo> [file.gguf]   # download into ./models
+#   ie-docker serve <model.gguf> [--gpus N ...]  # OpenAI server on :11435
+#   ie-docker run   <model.gguf> [...]           # interactive chat
+#   ie-docker <any ie args>                      # e.g. ie-docker pull --list
+#
+# Models live in ./models on the host (override with IE_MODELS), mounted at
+# /models in the container. Point Hermes / any OpenAI client at :11435/v1.
+set -euo pipefail
+IMAGE="${IE_IMAGE:-ie-engine}"
+MODELS="${IE_MODELS:-$PWD/models}"; mkdir -p "$MODELS"
+PORT="${IE_PORT:-11435}"
+# /dev/dri render-node group so the container can open the GPU.
+RENDER_GID="$(getent group render 2>/dev/null | cut -d: -f3 || echo 992)"
+
+# `serve` must bind 0.0.0.0 to be reachable from the host (unless caller set --host).
+if [ "${1:-}" = "serve" ] && [[ " $* " != *" --host "* ]]; then set -- "$@" --host 0.0.0.0; fi
+
+exec docker run --rm -it \
+  --device /dev/dri \
+  --group-add "$RENDER_GID" \
+  -v "$MODELS:/models" \
+  -p "${PORT}:11435" \
+  "$IMAGE" "$@"

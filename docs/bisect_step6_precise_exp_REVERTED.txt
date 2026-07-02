@@ -1,0 +1,122 @@
+## Step 6: replace native::exp with precise sycl::exp in full_attention — REVERTED
+
+Hypothesis tested: full_attention's intrinsic non-determinism (Steps 4-5)
+is caused by `sycl::native::exp` on Xe2 having thermal/cache-state-
+dependent rounding ("implementation-defined precision" per SYCL spec).
+Replacing the 2 native::exp calls inside full_attention's online softmax
+loop with the precise IEEE `sycl::exp` should eliminate it if true.
+
+Implementation:
+  - IE_FA_NAIVE_PRECISE_EXP compile flag (default OFF)
+  - Two single-line edits inside full_attention's compute kernel:
+    `sycl::native::exp(m - m_new)` → `sycl::exp(m - m_new)`
+    `sycl::native::exp(s_i - m_new)` → `sycl::exp(s_i - m_new)`
+  - Other native::exp call sites (fa2_decode, fa2_decode_int8) untouched.
+
+Verification:
+  - Build: clean both flag=0 and flag=1.
+  - PPL on built-in 511-tok corpus: 6.64 (flag ON) vs 6.64 (baseline)
+    = bit-equivalent (math is identical, only precision differs).
+
+Bench (3 validator A1 vs A2 runs, flag ON):
+
+  metric                  run 1     run 2     run 3
+  I7attno_ max_abs         0.0400    0.00146   0.00122
+  I7attno_ rel_L2          0.91%     0.045%    0.040%
+  L41 max_abs              0.380     0.583     0.563
+  L41 rel_L2               4.86%     6.27%     5.63%
+  L04 max_abs              5.6e-4    6.1e-5    6.1e-5
+
+L04 in 2/3 runs is at sub-fp16-ULP (6.1e-5).  Compound through 36 more
+layers reaches 0.5+ at L41.  Compound rate ≈ 1.29× per layer, far above
+normal fp16 reordering (1.01-1.03×).
+
+PPL on prefill_chunk=1024 (the bug-trigger): 73.89 vs baseline ~65.
+No improvement (slightly worse, within noise).
+
+== Stop-rule evaluation ==
+
+  PPL Δ ≤ +0.10 (built-in):                          PASS  (0.00)
+  A1 vs A2 I7attno_ max_abs = 0 (decisive):          FAIL
+  A1 vs A2 stable across 3 runs:                     FAIL  (33x variance)
+  L41 max_abs < 0.05:                                FAIL  (8-12x over)
+  PPL on prefill_chunk=1024 < 70:                    FAIL  (73.89)
+  No decode regression:                              PASS
+
+  Stability gate AND prefill-spike gate FAILED → REVERT.
+
+== What this rules out ==
+
+`sycl::native::exp`'s precision is **NOT** the source of full_attention's
+non-determinism.  Replacing it with the precise IEEE variant produces
+identical PPL (math equivalence holds) but does not eliminate the
+run-to-run variance.
+
+== Eliminated suspect list ==
+
+  ❌ SG-reduce ordering (Step 3)
+  ❌ Chunk-size-dependent algorithmic difference (Step 4)
+  ❌ DeltaNet recurrence (always BIT-EXACT)
+  ❌ Q/K/V proj, RoPE, RMSNorm (always EXACT)
+  ❌ Cache write/read race / fence enforcement (Step 5)
+  ❌ native::exp precision (Step 6)
+
+== Remaining hypothesis space ==
+
+After 4 elimination experiments, the bug must be either:
+
+  1. **Out-of-bounds memory read** — `q_in[]`, `k_cache[]`, or `v_cache[]`
+     reads landing on uninitialized device memory due to T-dependent
+     indexing.  Would explain perfect run-to-run variance: each run sees
+     different garbage in the unallocated regions.
+
+  2. **Workspace buffer pollution** — ws_q_split_, ws_k_, ws_v_, or the
+     KV cache itself being written by some kernel concurrently with
+     full_attention's reads.  In-order queue should serialize, but if a
+     prior kernel's writes haven't FULLY committed (despite event
+     completion) there could be partial reads.
+
+  3. **A bug in the attention compute kernel itself** that depends on
+     some HW-level state (e.g. DRAM bank rotation, EU thread priority
+     queue) that varies between runs.  Hard to isolate without GPU
+     vendor tooling.
+
+== Disposition ==
+
+REVERT — flag default OFF.
+
+== Next bounded experiment proposal ==
+
+**Test whether `full_attention_fa2_prefill` (Step 2 scaffold) is
+deterministic on the same workload.**  This is decisive between:
+
+  - **fa2_prefill is DETERMINISTIC and matches expected output**:
+    the bug is specific to the NAIVE `full_attention` kernel.  Ship
+    fa2_prefill as a CORRECTNESS FIX (default ON) — accept its slower
+    performance (~3% pp512 cost, measured in Step 2) as the price for
+    quality.  This is a BIG result.
+
+  - **fa2_prefill is also non-deterministic**: bug is more systemic
+    (HW-level or SYCL-impl-level).  Pivot to memory-bounds audit
+    (manual review of every q_in/k_cache/v_cache read in
+    full_attention for off-by-one or T-dependent OOB).
+
+Strict scope:
+  - No code changes in this experiment — `full_attention_fa2_prefill`
+    is already implemented (commit f0ec8c5, Step 2 scaffold).
+  - Build with `-DIE_ENABLE_FA2_PREFILL_TILED=1` (existing flag).
+  - Run validator (existing A1 vs A2 + A vs B comparisons).
+  - Report whether non-determinism vanishes or persists.
+
+Hard gates:
+  - A1 vs A2 I7attno_ max_abs = 0 in all 3 validator runs (decisive)
+  - L41 max_abs < 0.05
+  - PPL on prefill_chunk=1024: <= 8 (i.e. spike eliminated, model
+    actually works at this prefill size)
+
+If gates pass: ship the tiled FA-2 prefill kernel as the production
+T>1 prefill path.  Even though it's ~3% slower than naive, it produces
+CORRECT output.  Quality > 3% prefill perf.
+
+Estimated effort: zero engine code change, just rebuild + 3 validator
+runs + PPL spike test.

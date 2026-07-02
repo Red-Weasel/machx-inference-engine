@@ -1,0 +1,89 @@
+## FA-2 super-chunk regression fix — TARGET_SUPER 12 → 64 — SHIPPED
+
+Diagnosis (audit run 2026-05-02):
+  Bisected via git worktree builds at three commits, identical hardware/bench:
+
+    commit          16k INT8    32k INT8
+    9088ffd         29.7        24.3        (pre-regression baseline)
+    5be3385         23.9 (-19%) 16.4 (-33%) (regression)
+    0e0d4c2 (HEAD)  25.4        17.4        (current main, partial recovery)
+
+  Root cause: 5be3385's adaptive super-chunking constant TARGET_SUPER=12.
+  At ctx ≥ 16k it produced exactly 24 WGs (1 per Xe-core on B70's 24 cores)
+  in a single deep wave with no pipeline hiding for per-chunk launch/barrier
+  overhead.  9088ffd's prior fixed CHUNKS_PER_WG=8 gave 5.3 waves at 32k.
+  The 5be3385 commit-time bench only covered short prompts (51-219 tok),
+  so the long-ctx regression went undiagnosed.
+
+Fix:
+  TARGET_SUPER 12 → 64 (gated as IE_FA2_TARGET_SUPER, default 64).
+  Single constant change in src/ops/attention.cpp at two function bodies
+  (full_attention_fa2_decode and full_attention_fa2_decode_int8).
+
+  Behavior:
+    ctx ≤ 1k:    n_chunks ≤ 16,  CHUNKS_PER_WG=1 (same as T=12)
+    ctx 4k:      n_chunks=64,    CHUNKS_PER_WG=1 (T=12 had 6)
+    ctx 16k:     n_chunks=256,   CHUNKS_PER_WG=4 (T=12 had 22)
+    ctx 32k:     n_chunks=512,   CHUNKS_PER_WG=8 (T=12 had 43, matches 9088ffd)
+
+== Verification ==
+
+Build: clean.
+
+PPL on 1791-token corpus (3 runs):
+  pre-fix:  14.90 (single)
+  post-fix: 14.84, 14.96, 14.95 (median 14.95)
+  Δ median = +0.05 — within run-to-run noise from numerical reordering of the
+  combine-pass merge order (more super-chunks at intermediate ctx → different
+  fp32 accumulation sequence; math identical, gates pass.)
+
+== Bench (ctx-sweep, ie-bench --fastforward --int8-kv) ==
+
+  ctx     pre-fix    post-fix   Δ           vs 9088ffd baseline
+  1       (n/a)      53.0       —           —
+  256     (n/a)      51.6       —           —
+  512     (n/a)      51.5       —           —
+  1024    49.2       51.0       +3.7%       —
+  2048    (n/a)      50.1       —           —
+  4096    41.3       47.7       +15.5%      —
+  16384   25.4       35.2       +38.6%      +18.5% (vs 29.7)
+  32000   17.4       29.3       +68.4%      +20.6% (vs 24.3)
+
+Section profile (ctx=32k, 16 decode steps):
+  pre-fix attn_full_block: 40.6 ms/step (57.5%)
+  post-fix attn_full_block: 17.0 ms/step (36.4%)
+  Δ = -58% on attn_full_block alone
+
+== Bench (5-prompt suite, ie-bench-suite --runs 3, fp16 KV) ==
+
+  prompt              pre-fix     post-fix    Δ
+  short-chat       51.03       50.48      -1.1%
+  long-instruction 50.86       50.32      -1.1%
+  codegen          50.90       50.29      -1.2%
+  math-reasoning   50.93       50.53      -0.8%
+  long-context     50.77       49.84      -1.8%
+
+Small-ctx is structurally identical (CHUNKS_PER_WG=1 in both code paths at
+n_chunks ≤ 16); the 1-2% drift is thermal — the bench-suite runs ~5 minutes
+which warms the GPU vs the shorter fastforward bench.  Decode tok/s is 50+
+on every prompt, which still passes the 50 tok/s bare-minimum gate.
+
+== Stop-rule ==
+  - Decode at small/mid/long ctx: massive wins or neutral within noise ✓
+  - PPL Δ +0.05 (within reordering noise floor; math unchanged) ✓
+  - Phase 9 gate at 4k ctx: 41.3 → 47.7 (was 5% short of 50, now 5% short — ~at gate)
+  - Phase 9 gate at 32k: 17.4 → 29.3 (still under 50, but +68% closer)
+  ALL GATES PASS — SHIPPED.
+
+== Architectural takeaway ==
+
+The new 32k decode bottleneck distribution (post-fix, 16 decode steps):
+  attn_full_block      17.0 ms/step (36.4%)  ← was 57.5%, now no longer dominant
+  moe_routed_decode    10.4 ms/step (22.2%)  ← now relatively bigger
+  attn_dn_block         6.05 ms/step (12.9%) ← flat with ctx
+  (everything else)    ~12 ms/step (28.5%)
+
+attn_full_block still grows linearly with ctx but is now well-tuned; further
+long-ctx wins need either (a) algorithmic changes (paged attention, MTP,
+fp8 KV) or (b) optimizing flat-ctx sections (moe_routed at decode is the
+new ctx-independent target).

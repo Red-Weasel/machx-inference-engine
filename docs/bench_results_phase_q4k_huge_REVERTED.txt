@@ -1,0 +1,57 @@
+## Tier 1: gemv_q4_K shape-split + SLM-bypass for lm_head — REVERTED (below threshold + codegen regression)
+
+Mirrored the q6k_huge dispatch pattern onto gemv_q4_K.  Templated body
+gemv_q4_K_impl<int N_PER_WG_T, bool USE_SLM_T> with two paths:
+
+  N >= 32768 (lm_head only after the offline GGUF conversion):
+    gemv_q4_K_impl<64, /*USE_SLM=*/false> → "gemv_q4k_huge"
+    1024 work-items / WG, 3880 WGs (vs 7760), no cooperative A-SLM staging
+  else (everything else):
+    gemv_q4_K_impl<32, /*USE_SLM=*/true>  → "gemv_q4k"
+    same as before (32 SGs × 16 lanes = 512 work-items / WG, A in SLM)
+
+Tested against /home/weezy/.seal/models/Qwen3.6-35B-A3B-Q4_K_M-lmhead-q4k.gguf.
+
+Build: clean.
+Correctness (gemv_q4k_test): ALL PASS.
+Dispatch worked: gemv_q4k bucket dropped from 34688 → 34560 calls/run
+                 (delta = 128 = lm_head calls correctly split off into the
+                 gemv_q4k_huge bucket).
+
+Bench (3 runs, 5-prompt suite):
+  prompt              before    after    Δ
+  short-chat          49.43  →  49.63   +0.40%
+  long-instruction    49.45  →  49.64   +0.38%
+  codegen             49.66  →  49.53   -0.26%   ← regression
+  math-reasoning      49.53  →  49.54   +0.02%
+  long-context        49.33  →  49.59   +0.53%
+
+Two stop-rule violations:
+  1. codegen median regressed (per-prompt regression triggers revert)
+  2. wins on other prompts are 0.4-0.5%, well below the +4% gate
+
+Why the win was small: the lm_head Q4_K call was already at 2× off peak
+BW (the q6k version had been at 12× off peak — that's where the big
+3.5× speedup came from, when we converted Q6→Q4 offline).  Going from
+2× → ~1.7× off peak on the same kernel is a much smaller absolute
+improvement and runs into the floor of L1/L2 cache hierarchy efficiency.
+
+Per-bucket time check (estimated from before/after totals):
+  gemv_q4k_huge bucket time: ~110 ms (didn't appear in top-5 cutoff,
+                                       was ranked 6th-7th by % of total)
+  gemv_q4k normal bucket:    460 ms (basically unchanged, was 451 ms)
+  Net delta: -5 to -10 ms / run = -0.04 to -0.08 ms / token = +0.2-0.4
+  tok/s — matches the measured per-prompt deltas.
+
+Decision: REVERT.  Stop condition met (any prompt regresses + below
++4% gate).  Engine state remains at 413243f.
+
+Lesson: the q6k_huge dispatch pattern's WIN was load-pattern-driven
+(Q6_K kernel was strided-byte-gather limited, going wide+SLM-bypass
+helped). On Q4_K's already-coalesced load pattern with algebraic fold
+already in place, the wide+SLM-bypass lever produces only a noise-
+level improvement.  The same template structure isn't transferable to
+all kernels — the original kernel's bottleneck profile matters.
+
+Next-best lever for the 100 tok/s push remains kernel-fusion to attack
+the ~5 ms/step launch overhead — out of scope for this experiment.

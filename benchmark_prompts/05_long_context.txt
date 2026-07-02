@@ -1,0 +1,12 @@
+Read the following design notes and produce a prioritized engineering plan.
+
+Design notes:
+The inference engine currently runs on Intel Arc Pro B70 using a custom kernel monitor. The runtime supports quantized matrix-vector kernels, RMSNorm, rotary embeddings, FlashAttention-like partial attention, MoE expert routing, and FP16 KV cache. Previous testing showed instability around 2D block load paths, so the engine currently favors known-safe memory paths. Current decode performance varies by prompt, with top kernel time usually spent in gemv_q6k, gemv_q4k, fa2_partial_int8, rms_norm_f32w, and MoE down/gate kernels. The benchmark must distinguish synthetic random tokens from real prompts. The team wants stable, repeatable measurements before changing kernels.
+
+Create a plan with:
+1. benchmark methodology
+2. required metrics
+3. kernel hotspot analysis
+4. optimization order
+5. stability guardrails
+6. acceptance criteria

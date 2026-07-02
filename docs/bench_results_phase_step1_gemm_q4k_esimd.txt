@@ -1,0 +1,105 @@
+## Step 1: gemm_q4_K_esimd — kernel landed, BELOW gate, flag stays default OFF
+
+Per the Option A plan: Step 1 implements gemm_q4_K_esimd as a strict
+drop-in for gemm_q4_K_xmx, gated by IE_ENABLE_GEMM_Q4K_ESIMD (default
+OFF), with a single dispatch flip in src/model/qwen36.cpp's gemv_q_T.
+
+The kernel uses cooperative SG block reads (sub_group::load<8>) for the
+A-matrix loads — the primitive verified working on BMG-G31 C0 in Step 0
+(scripts/esimd_smoke/sgbr_smoke_multi.cpp).  Q4_K weight dequant uses
+explicit sycl::vec<uint8_t,16> loads instead of the byte-by-byte
+#pragma unroll pattern in gemm_q4_K_xmx.  Compute path unchanged
+(joint_matrix mat_mad).
+
+== Verification ==
+
+Build: clean both flag=0 and flag=1 paths.
+Hardware: same BMG-G31 C0 / NEO 26.14.37833.4 / IGC 2.32.7 / GuC 70.60.0.
+moe_test, attention_test, gemv_q4k_test: ALL PASS (none touched).
+PPL on 1791-token corpus (3-run, fp16-pfc):
+  flag=0 baseline:   14.90
+  flag=1 esimd:      14.87
+  Δ = -0.03 (improvement; well within run-to-run noise floor of ±0.05)
+
+== Bench: pp512 head-to-head, same thermal session ==
+
+  flag                    pp512 ms (3 runs)              tok/s (median)
+  ---------------         -------------------------      --------------
+  IE_ENABLE_GEMM_Q4K_ESIMD=0  3300, 3300, 3309 (median 3300)    155.1
+  IE_ENABLE_GEMM_Q4K_ESIMD=1  2826, 2828, 2800 (median 2826)    181.2
+
+  Δ pp512: +26.1 tok/s (+16.8%)
+  Δ pp512 wall: -474 ms / token batch
+
+== Decode (ie-bench --fastforward --int8-kv, single run each) ==
+
+  ctx     baseline (flag=0)    esimd (flag=1)    Δ
+  1024    51.0                 51.1              +0.2% (noise)
+  4096    47.6                 48.1              +1.1%
+  16384   35.2                 35.2              0.0%
+  32000   29.3                 29.2              -0.3% (noise)
+
+Decode is unchanged (gemm_q4_K_esimd only fires for T>1 prefill;
+T=1 decode uses gemv_q4_K).  No regression.
+
+== Stop-rule evaluation ==
+
+  PPL Δ ≤ +0.05:                       ✅ PASS  (-0.03)
+  pp512 ≥ 200 tok/s (intermediate):    ❌ FAIL (181.2; 90.6% of gate)
+  no decode regression:                ✅ PASS
+  no GuC/DEVICE_LOST/xe reset:         ✅ PASS  (0 events; journalctl clean)
+
+  pp512 gate FAIL → strict rule = revert.
+
+== Disposition ==
+
+The kernel is correct and meaningfully faster on the affected work
+(~50% reduction in gemm_q4_K kernel time, +16.8% on overall pp512).
+The intermediate gate of 200 tok/s isn't reachable from this kernel
+alone given Q4_K GEMM is only ~30% of pp512 wall time at this batch
+size; the rest is per-token FA-2 attention loop (~10%) and multi-expert
+MoE prefill stages (~33%) which are out of Step 1 scope.
+
+**Disposition: dormant scaffold.**  All of:
+  - src/ops/gemm_q4k_esimd.cpp           (kernel implementation)
+  - src/CMakeLists.txt                   (file unconditionally compiled)
+  - src/model/qwen36.cpp                 (forward decl, compile flag,
+                                          dispatch #if/#endif)
+  remain in tree.  IE_ENABLE_GEMM_Q4K_ESIMD defaults to 0 — production
+  uses gemm_q4_K_xmx unchanged.  No behavior change to the engine.
+
+This satisfies the user's "default OFF until proven" rule: the kernel
+is code-complete and correctness-validated, but does not gain
+production traffic until the combined Step 1 + Step 2 gate (pp512 ≥
+250 tok/s) is met.
+
+== Why pp512 ≥ 200 wasn't reachable from Step 1 alone ==
+
+Pre-implementation math (delivered to the user before coding):
+  Q4_K GEMM kernels at pp512: ~30% of wall time = ~970 ms of 3238 ms.
+  Even infinite GEMM speedup → 158 → 226 tok/s pp512 (saves all 970 ms).
+  To reach 250 needs the per-token FA-2 prefill loop (~340 ms in
+  attn_full_block) and/or multi-expert MoE prefill to also speed up.
+
+Actual: gemm_q4_K_esimd halves the kernel time → saves ~485 ms →
+pp512 158 → 181 tok/s.  Consistent with the projection.  The 200
+gate was an aspirational midpoint between 158 and 250; in retrospect,
+~190 would have been the realistic Step-1-alone ceiling.
+
+== Next bounded step (Step 2) ==
+
+Tiled flash-attention for T>1 prefill (PDF P1 lever).  Replaces the
+current per-token loop of full_attention_fa2_decode with a single
+tiled-attention kernel that processes the entire T-batch in one
+launch (mirrors llama.cpp's flash_attn_ext).  Estimated impact:
++50-100% on attn_full_block at pp512, projected pp512 contribution
+~+10-15 tok/s on top of Step 1's 181 → combined target ~195-210
+tok/s pp512.
+
+For combined Step 1 + Step 2 to clear the 250 tok/s gate, additional
+levers may also be needed (multi-expert MoE prefill XMX rewrite,
+PLAN.md item 11 — needs wider 4-SG-per-WG design after the prior
+2-SG attempt was reverted).
+
+Step 2 is the next experiment.  When it lands, the combined bench
+flips both flags ON and re-measures pp512 against the 250 gate.

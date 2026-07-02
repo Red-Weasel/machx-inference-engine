@@ -1,0 +1,81 @@
+## P0: gemm_q6_K multi-row prefill GEMM — SHIPPED
+
+Pre-this-kernel state: gemv_q_T fell back to a per-row gemv_q6_K loop
+for T>1 on Q6_K weights (30 ssm_out + 14 attn_qkv DN + 6 attn_v +
+ffn_down_shexp on 30 layers).  Each prefill row paid the full Q6_K
+weight read N times — no amortization.
+
+This kernel mirrors gemm_q4_K's tile structure exactly:
+  - WG: 16 SGs × 16 lanes (N_PER_WG=16), one SG owns one N-column
+  - Per-lane: M floats accumulators (M_TILE=8 rows)
+  - SLM A tile: M × K halfs
+  - Q6_K dequant lane mapping identical to gemv_q6_K (half/sub/l_half)
+
+Dispatch: gemv_q_T detects DType::kQ6_K with T>1, prefers gemm_q6_K_xmx
+when shape allows (N % 64 == 0 && K % 256 == 0), falls back to scalar
+gemm_q6_K otherwise.  IE_NO_XMX=1 forces scalar for A/B testing.
+
+Verification:
+  - Build: clean
+  - gemv_q4k_test: ALL PASS (sanity, kernel files share helpers)
+  - PPL (XMX path):       6.64
+  - PPL (scalar IE_NO_XMX): 6.64
+  - PPL baseline:         6.61   (drift +0.03, within run-to-run noise)
+
+Bench (3 runs each, lmhead-q4k variant):
+
+  Baseline thermal regime: ~50.4 tok/s decode, ~115 tok/s prefill avg
+  (post-cross-layer-revert bench at 86724d5; warm-thermal-state moments
+  reported up to 51.7 tok/s decode but steady-state median is 50.4).
+
+XMX path (default — joint_matrix activated when N%64==0, K%256==0):
+
+  prompt              prefill (ms / tok/s)    decode tok/s
+  short-chat              372.6   136.9       50.32
+  long-instruction        645.1   124.0       50.39
+  codegen                 630.9   123.6       50.34
+  math-reasoning          692.3   124.2       50.44
+  long-context           1710.4   128.0       50.21
+
+Scalar path (IE_NO_XMX=1):
+
+  prompt              prefill (ms / tok/s)    decode tok/s
+  short-chat              378.6   134.7       50.66
+  long-instruction        674.6   118.6       50.63
+  codegen                 661.3   117.9       50.72
+  math-reasoning          727.3   118.2       50.79
+  long-context           1769.8   123.7       50.39
+
+Comparison vs. baseline (pre-this-kernel, per-row gemv_q6_K loop):
+
+  prompt              prefill before  prefill after (XMX)   Δ
+  short-chat               116.8           136.9          +17.2%
+  long-instruction         114.7           124.0           +8.1%
+  codegen                  113.6           123.6           +8.8%
+  math-reasoning           114.0           124.2           +8.9%
+  long-context             119.5           128.0           +7.1%
+
+Decode comparison (steady-state thermal regime):
+  All five prompts within ±0.5 tok/s of post-revert baseline (50.4).
+  No decode regression; the kernel only fires for T>1 (prefill path).
+
+Stop-rule:
+  - Decode: NEUTRAL (within thermal noise, no prompt regressed)
+  - Prefill: +7-17% across all prompts (median +8.9%)
+  - PPL: +0.03 (within noise)
+  ALL GATES PASS — SHIPPED.
+
+Architectural note:
+  Expected impact was prefill ~115 → ~200-250 tok/s (assuming the
+  amortization win matched the Q4_K precedent).  Actual: ~115 → ~127
+  avg.  The gap suggests prefill is now bound by something other than
+  Q6_K weight bandwidth — likely Q4_K weights (gemv_q4k_huge for
+  attn_qkv full-attn, ffn_gate/ffn_up_shexp), or attention/conv kernels
+  that don't multi-row at all (DeltaNet conv1d, gdn_chain).
+
+Next prefill lever candidates (not yet investigated):
+  1. Profile prefill kernel time-share to identify new bottleneck.
+  2. Multi-row gemm_q4_K_huge — does this kernel exist with M>1?
+  3. Tiled flash-attention prefill (full-attn currently per-token).
+
+Engine state ships at: gemm_q6_K wired into gemv_q_T dispatch.

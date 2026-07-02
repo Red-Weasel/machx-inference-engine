@@ -1,0 +1,14 @@
+add_executable(bench_gemm_fp16 bench_gemm_fp16.cpp)
+target_link_libraries(bench_gemm_fp16 PRIVATE ie_sycl_flags)
+
+add_executable(bench_dequant bench_dequant.cpp)
+target_link_libraries(bench_dequant PRIVATE ie_core ie_sycl_flags)
+
+add_executable(bench_gemv_q4k bench_gemv_q4k.cpp)
+target_link_libraries(bench_gemv_q4k PRIVATE ie_core ie_sycl_flags)
+
+add_executable(bench_gemm_slm bench_gemm_slm.cpp)
+target_link_libraries(bench_gemm_slm PRIVATE ie_core ie_sycl_flags)
+
+add_executable(bench_attention bench_attention.cpp)
+target_link_libraries(bench_attention PRIVATE ie_core ie_sycl_flags)

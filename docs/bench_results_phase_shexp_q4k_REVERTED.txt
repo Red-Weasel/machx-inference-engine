@@ -1,0 +1,64 @@
+## C-corrected: ffn_down_shexp Q6→Q4 offline conversion — REVERTED (no net win)
+
+Generated Qwen3.6-35B-A3B-Q4_K_M-lmhead-shexp-q4k.gguf via patched
+llama-quantize (b8902 + 1-line patch to llama-quant.cpp removing the
+"if (qtype != new_type)" silent-skip).  20 ffn_down_shexp Q6_K tensors
+correctly converted to Q4_K, model size dropped 20050.67 → 20045.52 MiB
+(-5.15 MiB, matches 20 × 0.258 MiB exactly).
+
+PPL gate (ie-perplexity, 511 tokens):
+  baseline (lmhead-q4k):     PPL 6.61   NLL 1.8878
+  variant (+shexp-q4k):      PPL 6.70   NLL 1.9022
+  Δ PPL +0.09 — within ±0.10 budget.
+
+Bench (3 runs, 5-prompt suite):
+  prompt              before    after    Δ
+  short-chat          51.05  →  51.02   -0.06%
+  long-instruction    50.76  →  50.73   -0.06%
+  codegen             50.94  →  50.23   -1.39%   ← regression
+  math-reasoning      50.86  →  50.46   -0.79%   ← regression
+  long-context        50.76  →  50.60   -0.32%   ← regression
+
+Three prompts regressed.  Stop rule "any prompt regresses" triggered.
+
+Why the experiment didn't pay off:
+
+  Per-kernel verification (long-context):
+    gemv_q6k_med:  230 → 211 ms  (-19 ms,  -8.3%)
+    gemv_q4k:      425 → 444 ms  (+19 ms,  +4.5%)
+    NET:           ~0 ms
+
+  20 ffn_down_shexp calls/step migrated from gemv_q6k_med (Q6_K bucket)
+  into gemv_q4k (Q4_K bucket).  The kernel-time delta perfectly cancels:
+
+    - gemv_q6k_med shrunk by exactly the time the 20 small calls were
+      taking (each K=512 N=2048).  The remaining attn_qkv calls (K=2048
+      N=8192) are bigger so the bucket avg ms/call went UP from 0.053 ms
+      to 0.118 ms, but total bucket time is dominated by call count not
+      avg, so total dropped 19 ms.
+
+    - gemv_q4k grew by the same 19 ms when those 20 calls joined,
+      because launch overhead (~10 µs/launch × 2560 launches/run = 26 ms
+      added) plus a tiny per-call BW saving (Q4_K is 0.258 MiB lighter
+      per weight tensor) roughly cancels.
+
+  Bandwidth-side math (theoretical):
+    Q6_K → Q4_K saves 0.258 MiB per call × 40 calls/step = 10.3 MiB/step
+    At 608 GB/s peak: 17 µs/step saved = 0.85 ms / 50 token/s baseline
+    Predicted: +0.04 tok/s.  Actual: noise-floor or slight regression.
+
+  The shape is too small for bytes-per-call savings to dominate over
+  the per-launch overhead.  Different bottleneck profile from lm_head
+  (which had K=2048 N=248k — 286 MB per call, where Q6→Q4 saved 81 MB
+  and the BW arithmetic genuinely matters).
+
+Revert: GGUF file deleted, llama-quant.cpp patch reverted.  Engine
+state remains at 45f3f2c.  Baseline confirmed: 50.17–50.65 tok/s on
+all 5 prompts via single-run bench (matches the standing 50.3–51.0
+median range from the post-ffn-fusion commit).
+
+Lesson logged: offline Q6→Q4 conversion only pays off where individual
+calls move enough BYTES to matter (lm_head: 286 MB/call → +12% decode).
+For small-N tensors (ffn_down_shexp at 0.82 MiB/call), launch overhead
+swallows the BW savings.  Future Q6→Q4 candidates should be filtered
+by bytes-per-call > some threshold, not by tensor count.

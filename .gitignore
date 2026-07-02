@@ -1,0 +1,56 @@
+# Build
+build/
+build-*/
+out/
+.cache/
+compile_commands.json
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Models (huge — never commit)
+models/
+*.gguf
+*.safetensors
+*.bin
+
+# Profiling
+*.csv
+*.json.trace
+unitrace_*.json
+*.itt
+profile-*/
+
+# Local secrets / env
+.env
+.envrc
+
+# Claude Code tooling + internal agent memory — NOT part of the engine.
+# (Already-tracked files still need `git rm -r --cached .claude docs/superpowers`
+#  before publishing — see the publishing checklist.)
+.claude/
+docs/superpowers/
+
+# Local temp
+*.tmp
+*.log
+/core
+core.*
+
+# Generated
+src/*.generated.*
+
+# Don't commit cmake/ninja binaries
+.local/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# EXL3 oracle test vectors — Llama-derived weight data; regenerate via
+# tools/exl3/make_oracle.py (see tests/data/exl3/README.md). Meta JSON is kept.
+tests/data/exl3/*.f16
+tests/data/exl3/*.trellis

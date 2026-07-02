@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# hermes-engine — one command to run the local inference engine under Hermes Agent.
+#
+#   Pick a model, set context + GPUs, and it: starts SearXNG (if down), starts
+#   `ie serve` for the chosen GGUF, waits until it's ready, then launches the
+#   Hermes TUI pointed at it (web_search wired to SearXNG). On exit it stops the
+#   engine (frees the GPU); SearXNG is left running (lightweight, reusable).
+#
+#   Non-destructive: Hermes is pointed at the engine via ENV VARS ONLY
+#   (HERMES_INFERENCE_PROVIDER/CUSTOM_BASE_URL/HERMES_INFERENCE_MODEL/SEARXNG_URL
+#   + `--provider custom -m <id>`). Your ~/.hermes/config.yaml is never touched.
+#
+#   Usage:
+#     hermes-engine                          # interactive: pick model, ctx, gpus
+#     hermes-engine --model coder --ctx 32768 --gpus 1
+#     hermes-engine --list                   # just list discovered models
+#   Flags:
+#     --model <substr>   pick the model whose path matches <substr> (skip menu)
+#     --ctx <N>          context length          (default: prompt, else 32768)
+#     --gpus <N|auto>    GPU count               (default: prompt, else auto)
+#     --port <N>         engine port             (default: a free port)
+#     --tui              use Hermes' modern TUI instead of the classic REPL
+#     --tp               tensor-parallel (qwen3moe --gpus 2): faster LONG-context
+#                        decode + prefill (~1.3x / ~2.3x @17k), slightly slower at
+#                        short ctx. Best for long chats; else the default layer-split.
+#     --no-search        don't start/require SearXNG
+#     --keep-engine      don't stop `ie serve` on exit
+#     --stop-search      also stop SearXNG on exit
+#     -h, --help
+set -uo pipefail
+
+# ----------------------------------------------------------------- config ----
+IE_ROOT="${IE_ROOT:-/home/weezy/00 - Inference Engine}"
+IE_BIN="$IE_ROOT/build/src/ie"
+ENV_SH="$IE_ROOT/scripts/env.sh"
+SEARXNG_DIR="${SEARXNG_DIR:-$HOME/searxng}"
+SEARXNG_PORT="${SEARXNG_PORT:-8888}"
+SEARXNG_URL="http://127.0.0.1:${SEARXNG_PORT}"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/hermes-engine"
+mkdir -p "$RUN_DIR"
+MODELS_DIRS=("$HOME/models" "$HOME/.seal/models")
+
+MODEL_ARG="" CTX="" GPUS="" PORT="" TUI=0 USE_SEARCH=1 KEEP_ENGINE=0 STOP_SEARCH=0 LIST_ONLY=0 TP_MODE=0
+
+c() { printf '\033[%sm' "$1"; }; BOLD=$(c '1'); DIM=$(c '2'); GRN=$(c '32'); YLW=$(c '33'); RED=$(c '31'); CYN=$(c '36'); Z=$(c '0')
+say()  { printf '%s\n' "${CYN}▸${Z} $*" >&2; }
+warn() { printf '%s\n' "${YLW}⚠${Z} $*" >&2; }
+die()  { printf '%s\n' "${RED}✗${Z} $*" >&2; exit 1; }
+
+# ------------------------------------------------------------- arg parsing ---
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model)  MODEL_ARG="${2:-}"; shift 2;;
+    --ctx)    CTX="${2:-}"; shift 2;;
+    --gpus)   GPUS="${2:-}"; shift 2;;
+    --port)   PORT="${2:-}"; shift 2;;
+    --tui)    TUI=1; shift;;
+    --tp)     TP_MODE=1; shift;;
+    --no-search)   USE_SEARCH=0; shift;;
+    --keep-engine) KEEP_ENGINE=1; shift;;
+    --stop-search) STOP_SEARCH=1; shift;;
+    --list)   LIST_ONLY=1; shift;;
+    -h|--help) sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    *) die "unknown arg: $1 (try --help)";;
+  esac
+done
+
+[ -x "$IE_BIN" ] || die "engine binary not found/executable: $IE_BIN (build it first)"
+
+# ---------------------------------------------------------- arch heuristic ---
+# Best-effort label from the filename (the engine does the real detection at
+# load). Also tells us which arches currently have a >1-GPU path.
+arch_of() {
+  local n; n="$(basename "$1" | tr 'A-Z' 'a-z')"
+  case "$n" in
+    *gpt-oss*|*gptoss*)               echo "gpt-oss";;
+    *coder*30b*|*tongyi*|*qwen3-coder*|*deepresearch*) echo "qwen3moe";;
+    *35b-a3b*|*35b*a3b*|*agentworld*) echo "qwen35moe";;
+    *gemma-4*|*gemma4*)               echo "gemma4";;
+    *27b*)                            echo "qwen35dense";;
+    *phi-4*|*phi4*)                   echo "phi";;
+    *granite*)                        echo "granite";;
+    *codestral*|*mistral*)            echo "mistral";;
+    *llama-3*|*llama3*|*meta-llama*)  echo "llama3";;
+    *)                                echo "dense";;
+  esac
+}
+# Arches with a working multi-GPU (split/TP) path in the engine today.
+mgpu_ok() { case "$1" in gpt-oss|qwen35moe|qwen35dense|qwen3next|dense|llama3|granite|mistral|phi) return 0;; qwen3moe) return 0;; *) return 1;; esac; }
+
+# ------------------------------------------------------------- discovery -----
+mapfile -t GGUFS < <(
+  for d in "${MODELS_DIRS[@]}"; do [ -d "$d" ] && find "$d" -type f -iname '*.gguf' 2>/dev/null; done \
+    | grep -viE 'mmproj|lora|mtp|draft|exl3' \
+    | while read -r f; do printf '%s\t%s\n' "$(stat -c%s "$f" 2>/dev/null || echo 0)" "$f"; done \
+    | sort -rn | cut -f2-
+)
+[ "${#GGUFS[@]}" -gt 0 ] || die "no GGUF models found under: ${MODELS_DIRS[*]}"
+
+human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1"; }
+list_models() {
+  local i=1 f sz
+  for f in "${GGUFS[@]}"; do
+    sz=$(stat -c%s "$f" 2>/dev/null || echo 0)
+    printf "  ${BOLD}%2d${Z}  %-9s ${DIM}%7s${Z}  %s\n" "$i" "$(arch_of "$f")" "$(human "$sz")" "${f/#$HOME\//~/}" >&2
+    i=$((i+1))
+  done
+}
+
+if [ "$LIST_ONLY" = 1 ]; then list_models; exit 0; fi
+
+# --------------------------------------------------------- select model ------
+GGUF=""
+if [ -n "$MODEL_ARG" ]; then
+  matches=(); for f in "${GGUFS[@]}"; do case "$(echo "$f" | tr 'A-Z' 'a-z')" in *"$(echo "$MODEL_ARG" | tr 'A-Z' 'a-z')"*) matches+=("$f");; esac; done
+  [ "${#matches[@]}" -ge 1 ] || die "no model matches '--model $MODEL_ARG'"
+  GGUF="${matches[0]}"
+  [ "${#matches[@]}" -gt 1 ] && warn "'$MODEL_ARG' matched ${#matches[@]}; using biggest: ${GGUF/#$HOME\//~/}"
+else
+  printf '%s\n' "${BOLD}Select a model:${Z}" >&2
+  list_models
+  printf '%s' "model # ${DIM}[1]${Z}: " >&2; read -r pick </dev/tty || true
+  pick="${pick:-1}"; [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "${#GGUFS[@]}" ] || die "invalid selection"
+  GGUF="${GGUFS[$((pick-1))]}"
+fi
+ARCH="$(arch_of "$GGUF")"
+say "model: ${BOLD}$(basename "$GGUF")${Z}  ${DIM}($ARCH)${Z}"
+
+# --------------------------------------------------------- ctx + gpus --------
+if [ -z "$CTX" ]; then printf '%s' "context length ${DIM}[32768]${Z}: " >&2; read -r CTX </dev/tty || true; CTX="${CTX:-32768}"; fi
+[[ "$CTX" =~ ^[0-9]+$ ]] || die "ctx must be a number, got '$CTX'"
+if [ -z "$GPUS" ]; then printf '%s' "GPUs (1, 2, or auto) ${DIM}[auto]${Z}: " >&2; read -r GPUS </dev/tty || true; GPUS="${GPUS:-auto}"; fi
+
+GPUS_FLAG=()
+if [ "$GPUS" != "auto" ]; then
+  [[ "$GPUS" =~ ^[0-9]+$ ]] || die "gpus must be a number or 'auto', got '$GPUS'"
+  if [ "$GPUS" -gt 1 ] && ! mgpu_ok "$ARCH"; then
+    warn "arch '$ARCH' has no multi-GPU path in the engine yet — the engine will use 1 card."
+  fi
+  GPUS_FLAG=(--gpus "$GPUS")
+fi
+
+# --------------------------------------------------------- free port ---------
+if [ -z "$PORT" ]; then
+  PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()' 2>/dev/null || echo 8080)"
+fi
+
+# ---------------------------------------------------------- teardown ---------
+IE_PID="" SX_STARTED=0
+pid_on_port() { ss -ltnpH 2>/dev/null | grep -F ":$1 " | grep -oP 'pid=\K[0-9]+' | head -1; }
+cleanup() {
+  if [ "$KEEP_ENGINE" = 0 ] && [ -n "${IE_PID:-}" ]; then
+    kill "$IE_PID" 2>/dev/null && say "stopped engine (pid $IE_PID)"
+  fi
+  if [ "$STOP_SEARCH" = 1 ] && [ "$SX_STARTED" = 1 ]; then
+    local p; p="$(pid_on_port "$SEARXNG_PORT")"
+    [ -n "$p" ] && kill "$p" 2>/dev/null && say "stopped SearXNG"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+# ---------------------------------------------------------- SearXNG ----------
+searxng_up() { curl -s -o /dev/null --max-time 2 "$SEARXNG_URL/healthz" 2>/dev/null || curl -s -o /dev/null --max-time 2 "$SEARXNG_URL/" 2>/dev/null; }
+if [ "$USE_SEARCH" = 1 ]; then
+  if searxng_up; then say "SearXNG already up at $SEARXNG_URL"
+  elif [ -x "$SEARXNG_DIR/manage" ]; then
+    say "starting SearXNG…"
+    ( cd "$SEARXNG_DIR" && GRANIAN_INTERFACE=wsgi GRANIAN_HOST="127.0.0.1" GRANIAN_PORT="$SEARXNG_PORT" \
+        setsid ./manage pyenv.cmd granian searx.webapp:app >"$RUN_DIR/searxng.log" 2>&1 & echo $! >"$RUN_DIR/searxng.pid" )
+    SX_STARTED=1
+    for _ in $(seq 1 30); do searxng_up && break; sleep 0.5; done
+    if searxng_up; then say "SearXNG ${GRN}ready${Z}"; else warn "SearXNG didn't come up (see $RUN_DIR/searxng.log); continuing without it"; USE_SEARCH=0; fi
+  else warn "no SearXNG at $SEARXNG_DIR; continuing without web search"; USE_SEARCH=0; fi
+fi
+
+# ---------------------------------------------------------- engine -----------
+TP_ENV=""; [ "$TP_MODE" = 1 ] && { TP_ENV="IE_QWEN3MOE_TP=1"; say "tensor-parallel ${GRN}on${Z} (qwen3moe: head-shard attn + expert-shard MoE — long-ctx lever)"; }
+say "starting engine on port ${BOLD}$PORT${Z}  (ctx $CTX, gpus $GPUS)…"
+IE_LOG="$RUN_DIR/ie-serve.log"; IE_PIDFILE="$RUN_DIR/ie.pid"; rm -f "$IE_PIDFILE"
+# setsid → the engine runs in its own session so a Ctrl-C inside Hermes doesn't
+# reach it. The wrapper records the REAL `ie` pid to a file (using `exec` would
+# hide it behind the short-lived setsid), so readiness + teardown track it.
+# $TP_ENV (env-assignment prefix) propagates IE_QWEN3MOE_TP through to `ie serve`.
+$TP_ENV setsid bash -c '
+  PIDF="$1"; ENVSH="$2"; IE="$3"; GG="$4"; PT="$5"; CX="$6"; shift 6
+  source "$ENVSH" >/dev/null 2>&1; export IE_FA2_VEC=1
+  "$IE" serve "$GG" --port "$PT" --ctx "$CX" "$@" &
+  echo $! > "$PIDF"; wait' \
+  _ "$IE_PIDFILE" "$ENV_SH" "$IE_BIN" "$GGUF" "$PORT" "$CTX" "${GPUS_FLAG[@]}" >"$IE_LOG" 2>&1 &
+for _ in $(seq 1 50); do [ -s "$IE_PIDFILE" ] && break; sleep 0.1; done
+IE_PID="$(cat "$IE_PIDFILE" 2>/dev/null || true)"
+[ -n "$IE_PID" ] || { tail -n 20 "$IE_LOG" >&2; die "engine failed to launch"; }
+
+BASE_URL="http://127.0.0.1:${PORT}/v1"
+ready=0
+for _ in $(seq 1 300); do
+  kill -0 "$IE_PID" 2>/dev/null || { warn "engine exited early:"; tail -n 20 "$IE_LOG" >&2; die "engine failed to start"; }
+  if curl -s -o /dev/null --max-time 2 "$BASE_URL/models" 2>/dev/null; then ready=1; break; fi
+  sleep 1
+done
+[ "$ready" = 1 ] || { tail -n 20 "$IE_LOG" >&2; die "engine not ready after 300s"; }
+say "engine ${GRN}ready${Z} at $BASE_URL"
+say "📊 live tok/s per turn — run in ANOTHER terminal: ${BOLD}tail -f $IE_LOG | grep --line-buffered '\\[gen\\]'${Z}"
+
+# what model id does the engine report? (fed to Hermes as -m)
+MODEL_ID="$(curl -s --max-time 5 "$BASE_URL/models" 2>/dev/null \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print((d.get("data") or [{}])[0].get("id",""))' 2>/dev/null || true)"
+[ -n "$MODEL_ID" ] || MODEL_ID="$(basename "$GGUF" .gguf)"
+
+# ---------------------------------------------------------- Hermes -----------
+HERMES_BIN="$(command -v hermes || echo "$HOME/.local/bin/hermes")"
+[ -x "$HERMES_BIN" ] || die "hermes not found on PATH"
+say "launching Hermes → ${BOLD}$MODEL_ID${Z}${DIM} (web_search: $([ "$USE_SEARCH" = 1 ] && echo "$SEARXNG_URL" || echo off))${Z}"
+export HERMES_INFERENCE_PROVIDER=custom
+export CUSTOM_BASE_URL="$BASE_URL"
+export HERMES_INFERENCE_MODEL="$MODEL_ID"
+[ "$USE_SEARCH" = 1 ] && export SEARXNG_URL="$SEARXNG_URL"
+HERMES_FLAGS=(--provider custom -m "$MODEL_ID"); [ "$TUI" = 1 ] && HERMES_FLAGS+=(--tui)
+"$HERMES_BIN" "${HERMES_FLAGS[@]}"

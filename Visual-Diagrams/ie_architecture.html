@@ -1,0 +1,424 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IE Inference Engine — Architecture Diagrams</title>
+<script src="file:///home/weezy/.npm/_npx/668c188756b835f3/node_modules/mermaid/dist/mermaid.min.js"></script>
+<style>
+  body { font-family: 'Segoe UI', Arial, sans-serif; max-width: 1100px; margin: 0 auto; padding: 20px 40px; color: #1a1a1a; }
+  h1 { color: #0d47a1; border-bottom: 3px solid #0d47a1; padding-bottom: 8px; }
+  h2 { color: #1565c0; border-bottom: 2px solid #bbdefb; padding-bottom: 4px; margin-top: 48px; }
+  h3 { color: #1976d2; margin-top: 32px; }
+  pre, code { background: #f5f7fa; border: 1px solid #dde1e7; border-radius: 4px; padding: 2px 6px; font-family: 'Consolas', 'Courier New', monospace; font-size: 13px; }
+  pre { padding: 14px 18px; line-height: 1.5; overflow-x: auto; }
+  pre code { background: none; border: none; padding: 0; }
+  .mermaid { background: #fafcff; border: 1px solid #c5cae9; border-radius: 6px; padding: 16px; margin: 20px 0; text-align: center; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 13px; }
+  th { background: #1565c0; color: white; padding: 8px 12px; text-align: left; }
+  td { padding: 7px 12px; border: 1px solid #e0e4ef; }
+  tr:nth-child(even) { background: #f0f4ff; }
+  .warn { background: #fff3e0; border-left: 4px solid #ff6f00; padding: 10px 16px; margin: 12px 0; border-radius: 2px; }
+  .info { background: #e3f2fd; border-left: 4px solid #1565c0; padding: 10px 16px; margin: 12px 0; border-radius: 2px; }
+  .status-ok { color: #2e7d32; font-weight: bold; }
+  .status-warn { color: #e65100; font-weight: bold; }
+  .status-exp { color: #6a1b9a; font-weight: bold; }
+  .status-dead { color: #b71c1c; font-weight: bold; }
+  .subtitle { color: #546e7a; font-size: 14px; margin-top: -12px; margin-bottom: 24px; }
+  @media print { body { padding: 10px 20px; } h2 { page-break-before: always; } }
+</style>
+</head>
+<body>
+<h1>IE Inference Engine — Complete Architecture Diagrams</h1>
+<div class="subtitle">
+  Model: Qwen3.6-35B-A3B &nbsp;|&nbsp; Hardware: Intel Arc Pro B70 (BMG-G31 C0) &nbsp;|&nbsp;
+  Runtime: SYCL / Level Zero &nbsp;|&nbsp; Source verified: 2026-05-01
+</div>
+
+<h2>1. Top-Level Forward Pass</h2>
+<pre>
+prompt (string)
+      │
+      ▼
+┌─────────────────────────────────────────────────────┐
+│  TOKENIZER  (src/tokenizer/tokenizer.cpp)            │
+│  BPE / tiktoken-compatible                          │
+│  Output: int32[T]  token IDs  (host)                │
+└─────────────────────────────────────────────────────┘
+      │  int32[T] copied to device  →  input_ids[T]
+      ▼
+┌─────────────────────────────────────────────────────┐
+│  EMBEDDING LOOKUP                                    │
+│  Q4_K → embedding_lookup_q4k                        │
+│  Q6_K → embedding_lookup_q6k                        │
+│  Weights: token_embd[vocab=248320, hidden=2048]     │
+│  Output: ws_x_[T, 2048]  FP16                       │
+└─────────────────────────────────────────────────────┘
+      │
+      ▼
+┌─────────────────────────────────────────────────────┐
+│  40 LAYERS  (L = 0 … 39)                            │
+│  Full-attn: 3,7,11,15,19,23,27,31,35,39             │
+│  DeltaNet:  all other 30 layers                     │
+│                                                     │
+│  Each layer:                                        │
+│    ① attn_norm  (rms_norm_f32w, 1+w style)          │
+│    ② FullAttn or DeltaNet → ws_attn_block_          │
+│    ③ residual_add  (ws_x_ += ws_attn_block_)        │
+│    ④ post_attn_norm  (rms_norm_f32w)                │
+│    ⑤ MoE block  → ws_attn_block_                    │
+│    ⑥ residual_add  (ws_x_ += ws_attn_block_)        │
+└─────────────────────────────────────────────────────┘
+      │
+      ▼
+┌─────────────────────────────────────────────────────┐
+│  FINAL NORM                                         │
+│  rms_norm_f32w(ws_x_, output_norm.weight F32)       │
+│  Output: ws_x_normed_[T, 2048]  FP16               │
+└─────────────────────────────────────────────────────┘
+      │  last token only: ws_x_normed_[T-1, 2048]
+      ▼
+┌─────────────────────────────────────────────────────┐
+│  LM HEAD GEMV                                        │
+│  gemv_q(ws_x_normed_[T-1], output.weight)           │
+│  output.weight[vocab=248320, 2048] Q4_K/Q6_K        │
+│  XMX ~5% slower for M=1; scalar gemv wins           │
+│  Output: out_logits[248320]  FP16                   │
+└─────────────────────────────────────────────────────┘
+      │
+      ▼
+┌─────────────────────────────────────────────────────┐
+│  SAMPLER  (src/ops/sampling.cpp)                    │
+│  Optional: repetition_penalty                       │
+│  Greedy:   sample_argmax                            │
+│  Stochastic: sample_softmax_topk_topp               │
+│    temperature → top-k → top-p → min-p → sample    │
+└─────────────────────────────────────────────────────┘
+      │
+      ▼
+  next token ID
+</pre>
+
+<h2>2. Per-Layer Structure (All 40 Layers)</h2>
+<div class="mermaid">
+flowchart TD
+    IN([ws_x_ in\nT×2048 FP16]) --> AN
+
+    AN["① attn_norm\nrms_norm_f32w  1+w style\nweights: attn_norm.weight F32\n→ ws_x_normed_"]
+
+    AN --> BR{L mod 4 == 3?}
+
+    BR -->|"YES — full-attn layers\n3,7,11,15,19,23,27,31,35,39\nfull_attn_idx = L / 4"| FA
+
+    BR -->|"NO — DeltaNet layers\nall other 30\ndn_idx = L - L/4"| DN
+
+    FA["② Full Attention Block\nsee Diagram 3\n→ ws_attn_block_ T×2048"]
+    DN["② DeltaNet Block\nsee Diagram 4\n→ ws_attn_block_ T×2048"]
+
+    FA --> RA["③ residual_add\nws_x_ += ws_attn_block_"]
+    DN --> RA
+
+    RA --> PN["④ post_attn_norm\nrms_norm_f32w  1+w style\nweights: post_attention_norm.weight F32\n→ ws_x_normed_"]
+
+    PN --> MOE["⑤ MoE Block\n256 experts  top-8\nsee Diagram 8\n→ ws_attn_block_ T×2048"]
+
+    MOE --> RM["⑥ residual_add\nws_x_ += ws_attn_block_"]
+
+    RM --> OUT([ws_x_ out\nT×2048 FP16])
+</div>
+
+<h2>3. Full Attention Layer Detail  (L%4 == 3)</h2>
+<p>Applies to layers 3, 7, 11, 15, 19, 23, 27, 31, 35, 39. KV cache index = L / 4.</p>
+<div class="mermaid">
+flowchart TD
+    IN([ws_x_normed_\nT×2048 FP16]) --> QP
+
+    QP["Q proj + gate fold\ngemv_q_T  attn_q.weight\n2048 → 8192\n→ ws_q_full_ T×8192"]
+    QP --> SP["split_q_gate_per_head\nper-head interleaved split\n→ ws_q_split_   T×4096\n   ws_gate_split_ T×4096"]
+    SP --> QN["QK-norm on Q\nrms_norm_f32w\nattn_q_norm.weight F32\n16 heads × 256 head_dim"]
+    QN --> RP["rope_partial\nfirst 64 of 256 dims rotated\nrope_theta = 1e7\n→ ws_q_split_ T×16×256"]
+
+    IN --> KP["K proj\ngemv_q_T  attn_k.weight\n2048 → 512\n→ ws_k_ T×512"]
+    KP --> KN["QK-norm on K\nrms_norm_f32w\nattn_k_norm.weight F32\n2 heads × 256"]
+    KN --> KR["rope_partial  first 64 dims\n→ ws_k_ T×2×256"]
+
+    IN --> VP["V proj\ngemv_q_T  attn_v.weight\n2048 → 512\n→ ws_v_ T×2×256"]
+
+    RP --> SDPA
+    KR --> SDPA
+    VP --> SDPA
+
+    SDPA{"SDPA dispatch\nT==1 AND partials?\n  YES → FA-2 decode path\n  NO  → full_attention naive\nsee INT8 / FP16 diagram"}
+
+    SDPA --> |"ws_attn_out_ T×16×256"| SG["sigmoid_gate\nws_attn_out_ × sigmoid ws_gate_split_\nT × 4096 elements"]
+
+    SG --> OP["O proj\ngemv_q_T  attn_output.weight\n4096 → 2048\n→ ws_attn_block_ T×2048"]
+
+    OP --> OUT([ws_attn_block_\nT×2048 FP16])
+</div>
+
+<h2>4. DeltaNet Layer Detail  (L%4 != 3)</h2>
+<p>Applies to 30 of 40 layers. dn_idx = L − (L / 4). No KV cache — recurrent state only.</p>
+<div class="mermaid">
+flowchart TD
+    IN([ws_x_normed_\nT×2048 FP16]) --> QKV
+
+    QKV["QKV proj\ngemv_q_T  attn_qkv.weight\n2048 → 8192\n→ ws_qkv_ T×8192"]
+
+    QKV --> CV["depthwise_conv1d_causal\nkernel=4  channels=8192\nconv_state READ+WRITE\n→ ws_qkv_silu_ T×8192"]
+
+    IN --> ALP["alpha proj\ngemv_q_T  ssm_alpha.weight  2048→32\n→ ws_alpha_fp16_"]
+    IN --> BET["beta proj\ngemv_q_T  ssm_beta.weight  2048→32\n→ ws_beta_fp16_"]
+    IN --> GAT["gate proj\ngemv_q_T  attn_gate.weight  2048→4096\n→ ws_z_fp16_"]
+
+    ALP --> GB["compute_g_beta_h16\nfused FP16→FP32 + math\ng = -exp A_log × softplus\nβ = sigmoid\n→ ws_g_fp32_ T×32\n   ws_beta_fp32_ T×32"]
+    BET --> GB
+
+    CV --> SP["cast_qkv_split_fp16_to_fp32\nfused 3-way split + cast\n→ ws_q_fp32_pre_ T×16×128\n   ws_k_fp32_pre_ T×16×128\n   ws_v_fp32_     T×32×128"]
+
+    SP --> RI["repeat_interleave_heads\n16 k-heads → 32 v-heads\n→ ws_q_fp32_ ws_k_fp32_"]
+
+    RI --> L2["l2_norm_scale\nQ scale = 1/√128  K scale = 1.0\nnormalise Q and K"]
+
+    L2 --> DR
+    GB --> DR
+
+    DR["deltanet_recurrence\nGated delta-rule scan  FP32\nstate READ+WRITE\n32 heads × 128×128 per layer\n→ ws_recurrence_out_ T×32×128 FP32"]
+
+    DR --> GR["gated_rms_norm\nout = weight × x/rms × silu z\n→ ws_gated_norm_ T×4096 FP16"]
+    GAT --> GR
+
+    GR --> OP["ssm_out proj\ngemv_q_T  ssm_out.weight\n4096 → 2048\n→ ws_attn_block_ T×2048"]
+
+    OP --> OUT([ws_attn_block_\nT×2048 FP16])
+</div>
+
+<h2>5. KV Cache: Every Write and Read Point</h2>
+<h3>Cache Layout</h3>
+<pre>
+FP16 cache  (always allocated):
+  k_cache: [L_full=10, n_kv_heads=2, max_ctx, head_dim=256]  FP16
+  v_cache: [L_full=10, n_kv_heads=2, max_ctx, head_dim=256]  FP16
+
+INT8 shadow  (only when KvCacheConfig.use_int8 == true):
+  k_int8_cache: [L_full=10, n_kv_heads=2, max_ctx, head_dim=256]  INT8
+  v_int8_cache: [L_full=10, n_kv_heads=2, max_ctx, head_dim=256]  INT8
+  k_scales:     [L_full=10, n_kv_heads=2, max_ctx]                FP16
+  v_scales:     [L_full=10, n_kv_heads=2, max_ctx]                FP16
+
+Layer index mapping (full_attn_idx = L / 4):
+  L= 3 → idx=0   L= 7 → idx=1   L=11 → idx=2   L=15 → idx=3
+  L=19 → idx=4   L=23 → idx=5   L=27 → idx=6   L=31 → idx=7
+  L=35 → idx=8   L=39 → idx=9
+</pre>
+
+<h3>Kernel-by-Kernel Write / Read Map</h3>
+<pre>
+full_attention  (T > 1 — prefill path)
+  WRITE:  k_cache[kv, start_pos..start_pos+T-1, :]  =  k_in
+          v_cache[kv, start_pos..start_pos+T-1, :]  =  v_in
+          FP16 ONLY.  INT8 cache NOT touched.
+  READ:   k_cache[kv, 0..start_pos+T-1, :]  (fp16, all positions)
+          v_cache[kv, 0..start_pos+T-1, :]
+
+  ⚠️  CRITICAL: If use_int8=true, these rows are never INT8-populated.
+      A subsequent T=1 decode will read UNINITIALIZED INT8 values.
+
+──────────────────────────────────────────────────────────────────────
+
+full_attention_fa2_decode  (T == 1, is_int8 == false)
+  WRITE:  k_cache[kv, start_pos, :]  =  k_in[kv, :]   (fp16)
+          v_cache[kv, start_pos, :]  =  v_in[kv, :]   (fp16)
+  READ:   k_cache[kv, 0..start_pos, :]   all ctx positions, fp16
+          v_cache[kv, 0..start_pos, :]
+  Pattern: Bc=64 tiles, CHUNKS_PER_WG=8 tiles per WG
+           SLM-staged; gqa=8 Q-heads share each SLM tile
+
+──────────────────────────────────────────────────────────────────────
+
+full_attention_fa2_decode_int8  (T == 1, is_int8 == true)
+  WRITE:  k_int8_cache[kv, start_pos*hd .. (start_pos+1)*hd]  =  quantize(k_in)
+          v_int8_cache[...]  =  quantize(v_in)
+          k_scales[kv, start_pos]  =  fp16(maxabs_k / 127)
+          v_scales[kv, start_pos]  =  fp16(maxabs_v / 127)
+          fp16 shadow: NOT written (nullptr passed in qwen36.cpp)
+  READ:   k_int8_cache[kv, 0..start_pos, :]   INT8, all ctx positions
+          v_int8_cache[kv, 0..start_pos, :]
+          k_scales[kv, 0..start_pos]
+          v_scales[kv, 0..start_pos]
+  Dequant: fp16(int8 × scale) inline in SLM
+  Bandwidth: ~half of fp16 path (256 B vs 512 B per row)
+
+  ⚠️  BUG: rows 0..start_pos-1 assumed INT8-populated from prior calls.
+      After T>1 prefill, those rows are uninitialised (zero/garbage).
+</pre>
+
+<h2>6. INT8 vs FP16 Decision Tree</h2>
+<div class="mermaid">
+flowchart TD
+    SDPA([SDPA dispatch\nqwen36.cpp line 558]) --> C1
+
+    C1{"T == 1 AND\nws_attn_partials_ not null?"}
+
+    C1 -->|"NO  T&gt;1 or no scratch"| NA["full_attention NAIVE\nO(T × ctx)\nFP16 cache only\nWRITES: fp16 rows start_pos..start_pos+T\nREADS:  fp16 rows 0..start_pos+T\n\n⚠️ Never writes INT8 cache\n   even when use_int8=true"]
+
+    C1 -->|"YES  T==1 decode path"| C2
+
+    C2{"kv.is_int8() AND\nkv.k_int8_ptr() != null?"}
+
+    C2 -->|"YES  INT8 path"| INT8["full_attention_fa2_decode_int8\nFA-2 split-K  2-pass\nWRITES: INT8 + scales at start_pos\nREADS:  INT8 + scales 0..start_pos\nDequant inline in SLM\nBandwidth: half of FP16\n\n⚠️ BUG: assumes rows 0..start_pos-1\n   are already INT8-populated.\n   FAILS after any T&gt;1 prefill."]
+
+    C2 -->|"NO  FP16 path"| FP16["full_attention_fa2_decode\nFA-2 split-K  2-pass\nWRITES: FP16 at start_pos\nREADS:  FP16 0..start_pos\nSLM-staged Bc=64 tiles\ngqa=8 Q-heads share each tile\nOptimal for FP16"]
+
+    NA --> R["kv.set_length\nstart_pos + T"]
+    INT8 --> R
+    FP16 --> R
+</div>
+
+<h2>7. T=1 vs T&gt;1 Dispatch Summary</h2>
+<table>
+<tr><th>Location</th><th>T=1 path</th><th>T&gt;1 path</th><th>Notes</th></tr>
+<tr><td>gemv_q_T dispatcher</td><td>gemv_q4_K or gemv_q6_K (scalar GEMV)</td><td>gemm_q4_K or gemm_q4_K_xmx (M_TILE=8)</td><td>XMX when N%64==0 && K%256==0 and IE_NO_XMX not set</td></tr>
+<tr><td>SDPA</td><td>FA-2 split-K (fp16 or INT8 variant)</td><td>Naive full_attention (O(T×ctx), fp16 only)</td><td>INT8 path only reachable at T=1</td></tr>
+<tr><td>MoE routed experts</td><td>Fused decode: 2 kernels for K_top=8</td><td>64≤T&lt;2048: multi-expert packed; T≥2048: per-token fused</td><td>See MoE diagram</td></tr>
+<tr><td>Shared expert</td><td>gemv_q + scaled_add_dev_scalar (no host roundtrip)</td><td>Per-token loop + host memcpy for sh_g</td><td>T=1 avoids q.memcpy wait</td></tr>
+<tr><td>INT8 KV</td><td>Available (FA-2 int8 kernel)</td><td><span class="status-warn">NOT available — always fp16</span></td><td>Root of INT8 prefill bug</td></tr>
+</table>
+
+<h2>8. MoE Dispatch Paths</h2>
+<div class="mermaid">
+flowchart TD
+    IN([ws_x_normed_\nT × 2048]) --> RT["moe_router\nW_gate F32 T×H → T×256 logits\nsoftmax + top-8 + renorm + sort asc\n→ ws_topk_idx_ T×8\n   ws_topk_w_   T×8 FP16"]
+
+    RT --> C1{"can_fuse_moe?\ngate=Q4_K AND up=Q4_K\nAND down=Q4_K or Q6_K"}
+
+    C1 -->|"NO  unusual dtype"| SC["Scalar fallback\n5 launches per expert per token\nHost roundtrip for topk\ngemv_q per expert\n(40 launches/token/layer)"]
+
+    C1 -->|YES| C2{"T == 1?"}
+
+    C2 -->|"YES  decode"| FD["Fused decode\nmoe_decode_gate_up_silu_q4k\n1 launch for K_top=8 experts\n→ ws_h_routed_ 8×512\n\nmoe_decode_down_q4k or _q6k\n1 launch  loops K_top inside\n→ ws_attn_block_ 1×2048"]
+
+    C2 -->|"NO  T&gt;1"| C3{"64 ≤ T &lt; 2048\nAND T ≤ ws_T_moe_?"}
+
+    C3 -->|"YES  multi-expert"| MP["Multi-expert packed prefill\nHost counting sort → expert offsets\n\nmoe_prefill_gate_up_silu_q4k\n1 launch  all 256 experts\n→ ws_moe_h_packed_\n\nmoe_prefill_down_packed_q4k/_q6k\n1 launch  atomics-free\n→ ws_moe_out_packed_\n\nmoe_prefill_reduce\nweighted sum → ws_attn_block_"]
+
+    C3 -->|"NO  T≥2048"| PL["Per-token fused loop\nfor t = 0..T-1:\n  moe_decode_gate_up_silu_q4k\n  moe_decode_down_q4k/_q6k\n2 launches per token"]
+
+    FD --> SE
+    MP --> SE
+    PL --> SE
+    SC --> SE
+
+    SE["Shared expert\nshared_expert_gate\nT==1: dev-scalar  no host roundtrip\nT&gt;1: host roundtrip for sh_g\n→ accumulates into ws_attn_block_"]
+
+    SE --> OUT([ws_attn_block_\nT × 2048 FP16])
+</div>
+
+<h2>9. GEMM/GEMV Dispatch Logic</h2>
+<pre>
+gemv_q_T(A[T,K], W[K,N], y[T,N], K, N, T)
+│
+├── T == 0  →  return (no-op)
+│
+├── T == 1  →  gemv_q
+│               W.dt == Q4_K → gemv_q4_K
+│               W.dt == Q6_K → gemv_q6_K
+│
+└── T > 1  AND W.dt == Q4_K:
+             for m = 0, 8, 16, ...  (M_TILE = 8 chunks):
+               mc = min(8, T − m)
+               use_xmx = !IE_NO_XMX AND N%64==0 AND K%256==0
+               use_xmx=true  → gemm_q4_K_xmx  (joint_matrix dpas)
+               use_xmx=false → gemm_q4_K       (scalar, SLM-staged)
+
+    T > 1  AND W.dt == Q6_K or other:
+             scalar per-row loop: for t=0..T-1: gemv_q6_K
+
+Notes:
+  gemm_q4_K_xmx: XMX/DPAS; amortises Q4_K dequant across M_TILE rows.
+  lm_head GEMV:  Always scalar gemv_q (M=1); XMX ~5% slower for M=1.
+</pre>
+
+<h2>10. Complete Kernel Inventory</h2>
+<table>
+<tr><th>Kernel</th><th>File</th><th>Status</th><th>When Used</th><th>Notes</th></tr>
+<tr><td>embedding_lookup_q4k</td><td>ops/embedding.cpp</td><td class="status-ok">✅ Active</td><td>Forward pass start</td><td>vocab×2048 Q4_K → T×2048 FP16</td></tr>
+<tr><td>embedding_lookup_q6k</td><td>ops/embedding.cpp</td><td class="status-ok">✅ Active</td><td>Forward pass start</td><td>Q6_K variant</td></tr>
+<tr><td>rms_norm_f32w</td><td>ops/elementwise.cpp</td><td class="status-ok">✅ Active</td><td>Every layer ×4 + final</td><td>Gemma3-style 1+w; FP32 weight</td></tr>
+<tr><td>rope_partial</td><td>ops/elementwise.cpp</td><td class="status-ok">✅ Active</td><td>Full-attn Q and K</td><td>First 64 of 256 dims; theta=1e7</td></tr>
+<tr><td>split_q_gate_per_head</td><td>ops/elementwise.cpp</td><td class="status-ok">✅ Active</td><td>Full-attn Q proj</td><td>Per-head interleaved Q/gate split</td></tr>
+<tr><td>sigmoid_gate</td><td>ops/elementwise.cpp</td><td class="status-ok">✅ Active</td><td>Full-attn output</td><td>attn_output_gate quirk</td></tr>
+<tr><td>residual_add</td><td>ops/elementwise.cpp</td><td class="status-ok">✅ Active</td><td>Every layer ×2 = 80/fwd</td><td>y = a + b</td></tr>
+<tr><td>swiglu</td><td>ops/elementwise.cpp</td><td class="status-ok">✅ Active</td><td>MoE expert FFN</td><td>silu(gate)×up</td></tr>
+<tr><td>scaled_add</td><td>ops/elementwise.cpp</td><td class="status-ok">✅ Active</td><td>MoE output (T&gt;1)</td><td>Host scalar; y += s×x</td></tr>
+<tr><td>scaled_add_dev_scalar</td><td>ops/elementwise.cpp</td><td class="status-ok">✅ Active</td><td>MoE shared expert T=1</td><td>Device scalar; no host roundtrip</td></tr>
+<tr><td>cast_fp32_to_fp16</td><td>ops/elementwise.cpp</td><td class="status-ok">✅ Active</td><td>Model load</td><td>ssm_conv1d, ssm_norm</td></tr>
+<tr><td>cast_qkv_split_fp16_to_fp32</td><td>ops/elementwise.cpp</td><td class="status-ok">✅ Active</td><td>DeltaNet</td><td>Fused 3-way split + cast; 1 launch</td></tr>
+<tr><td>repeat_interleave_heads</td><td>ops/elementwise.cpp</td><td class="status-ok">✅ Active</td><td>DeltaNet GQA expand</td><td>16 k-heads → 32 v-heads</td></tr>
+<tr><td>l2_norm_scale</td><td>ops/elementwise.cpp</td><td class="status-ok">✅ Active</td><td>DeltaNet Q/K norm</td><td>Q scale=1/√128; K scale=1</td></tr>
+<tr><td>compute_g_beta_h16</td><td>ops/elementwise.cpp</td><td class="status-ok">✅ Active</td><td>DeltaNet</td><td>Fused FP16-input; saves 2 cast launches</td></tr>
+<tr><td>gemv_q4_K</td><td>ops/gemv_q4k.cpp</td><td class="status-ok">✅ Active</td><td>T=1, Q4_K weights</td><td>~92% effective BW; decode hot path</td></tr>
+<tr><td>gemv_q6_K</td><td>ops/gemv_q6k.cpp</td><td class="status-ok">✅ Active</td><td>T=1, Q6_K weights</td><td></td></tr>
+<tr><td>gemm_q4_K</td><td>ops/gemv_q4k.cpp</td><td class="status-ok">✅ Active</td><td>T&gt;1, Q4_K, no XMX</td><td>M_TILE=8; SLM-staged activations</td></tr>
+<tr><td>gemm_q4_K_xmx</td><td>ops/gemm_q4k_xmx.cpp</td><td class="status-ok">✅ Active</td><td>T&gt;1, Q4_K, N%64==0</td><td>joint_matrix dpas; IE_NO_XMX=0</td></tr>
+<tr><td>gemm_q6_K_xmx</td><td>ops/gemm_q4k_xmx.cpp</td><td class="status-warn">🔶 Declared</td><td>Not called from qwen36.cpp</td><td>Prototype present</td></tr>
+<tr><td>gemm_fp16</td><td>ops/gemm_fp16.cpp</td><td class="status-ok">✅ Active</td><td>Dense FP16 GEMM benchmark</td><td>Phase 3 baseline</td></tr>
+<tr><td>gemm_q4k_esimd</td><td>ops/gemm_q4k_esimd.cpp</td><td class="status-exp">🧪 Experimental</td><td>Not wired into forward pass</td><td>v2.0 ESIMD research; untracked</td></tr>
+<tr><td>full_attention</td><td>ops/attention.cpp</td><td class="status-ok">✅ Active</td><td>T&gt;1 prefill</td><td>Naive O(T×ctx); fp16 cache only</td></tr>
+<tr><td>full_attention_fa2_decode</td><td>ops/attention.cpp</td><td class="status-ok">✅ Active</td><td>T=1, FP16 KV</td><td>FA-2 split-K 2-pass; Bc=64; CHUNKS_PER_WG=8</td></tr>
+<tr><td>full_attention_fa2_decode_int8</td><td>ops/attention.cpp</td><td class="status-warn">🔶 Buggy</td><td>T=1, INT8 KV flag</td><td>⚠️ Reads uninitialized rows after T&gt;1 prefill</td></tr>
+<tr><td>esimd_block2d_smoke_tile256</td><td>ops/attention.cpp</td><td class="status-exp">🧪 Disabled</td><td>Gated #ifdef</td><td>All variants cause device-lost on BMG G31 C0</td></tr>
+<tr><td>deltanet_recurrence</td><td>ops/deltanet.cpp</td><td class="status-ok">✅ Active</td><td>DeltaNet layers</td><td>Gated delta-rule scan; FP32; state updated in-place</td></tr>
+<tr><td>gated_rms_norm</td><td>ops/deltanet.cpp</td><td class="status-ok">✅ Active</td><td>DeltaNet output</td><td>FP32→FP16; out = weight × x/rms × silu(z)</td></tr>
+<tr><td>depthwise_conv1d_causal</td><td>ops/conv1d.cpp</td><td class="status-ok">✅ Active</td><td>DeltaNet</td><td>kernel=4, 8192 channels; streaming conv_state</td></tr>
+<tr><td>moe_router</td><td>ops/moe.cpp</td><td class="status-ok">✅ Active</td><td>Every layer</td><td>top-8 of 256; softmax + renorm + sort ascending</td></tr>
+<tr><td>moe_decode_gate_up_silu_q4k</td><td>ops/moe_fused.cpp</td><td class="status-ok">✅ Active</td><td>T=1 fused decode</td><td>1 launch for K_top=8 experts; SLM-stages activation</td></tr>
+<tr><td>moe_decode_down_q4k/q6k</td><td>ops/moe_fused.cpp</td><td class="status-ok">✅ Active</td><td>T=1 decode</td><td>Loops K_top inside kernel; no atomics</td></tr>
+<tr><td>moe_prefill_gate_up_silu_q4k</td><td>ops/moe_fused.cpp</td><td class="status-ok">✅ Active</td><td>64≤T&lt;2048</td><td>1 launch, all 256 experts packed</td></tr>
+<tr><td>moe_prefill_down_packed_q4k/q6k</td><td>ops/moe_fused.cpp</td><td class="status-ok">✅ Active</td><td>64≤T&lt;2048</td><td>Atomics-free; per-packed-row write</td></tr>
+<tr><td>moe_prefill_reduce</td><td>ops/moe_fused.cpp</td><td class="status-ok">✅ Active</td><td>64≤T&lt;2048</td><td>Weighted K_top sum per token; atomic-free</td></tr>
+<tr><td>moe_prefill_gate_up_silu_q4k_xmx</td><td>ops/moe_fused.cpp</td><td class="status-warn">🔶 Declared</td><td>Tried; 10-15% slower</td><td>SLM dequant &gt; dpas savings in fragmented multi-expert</td></tr>
+<tr><td>moe_gather_rows</td><td>ops/moe.cpp</td><td class="status-dead">❌ Dead code</td><td>if(false) block</td><td>Old scatter-gather path</td></tr>
+<tr><td>moe_scatter_add</td><td>ops/moe.cpp</td><td class="status-dead">❌ Dead code</td><td>if(false) block</td><td>Old scatter-gather path</td></tr>
+<tr><td>shared_expert_gate</td><td>ops/moe.cpp</td><td class="status-ok">✅ Active</td><td>Every layer</td><td>sigmoid(W_shg · x) per token</td></tr>
+<tr><td>sample_argmax</td><td>ops/sampling.cpp</td><td class="status-ok">✅ Active</td><td>Greedy decode</td><td></td></tr>
+<tr><td>sample_softmax_topk_topp</td><td>ops/sampling.cpp</td><td class="status-ok">✅ Active</td><td>Stochastic decode</td><td>temp → topk → topp → minp → multinomial</td></tr>
+<tr><td>repetition_penalty</td><td>ops/sampling.cpp</td><td class="status-ok">✅ Active</td><td>Optional</td><td>In-place logit modification</td></tr>
+</table>
+
+<h2>11. Memory Layout Reference</h2>
+<h3>KV Cache & DeltaNet State Memory Costs</h3>
+<pre>
+KV cache (fp16, max_ctx=4096):
+  per token = 10 layers × 2 kv_heads × 256 head_dim × 2 B = 10,240 B ≈ 10 KiB/tok
+  4096 tokens total = 40 MiB
+
+KV cache (INT8 shadow):
+  per token ≈ 5,120 B (INT8) + 10×2×2 B (scales) ≈ 5,160 B ≈ 5 KiB/tok
+  Combined fp16 + INT8: ≈ 15 KiB/tok  →  60 MiB at 4096 ctx
+
+DeltaNet recurrent state (30 layers, CONSTANT regardless of ctx length):
+  recurrent state: 30 × 32 × 128 × 128 × 4 B = 60 MiB
+  conv state:      30 × 8192 × 3 × 2 B ≈ 1.5 MiB
+  Total: ≈ 61.5 MiB   (never grows with context)
+</pre>
+
+<hr>
+<p style="color:#546e7a;font-size:12px;">Generated from actual source code — accurate as of 2026-05-01.</p>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'base',
+    themeVariables: {
+      primaryColor: '#e3f2fd',
+      primaryBorderColor: '#1565c0',
+      primaryTextColor: '#0d47a1',
+      lineColor: '#1565c0',
+      fontSize: '14px'
+    },
+    flowchart: { curve: 'basis', htmlLabels: true }
+  });
+</script>
+</body>
+</html>

@@ -1,0 +1,144 @@
+## Step 7: enable FA-2 prefill tiled kernel for T>1 — REVERTED
+
+Hypothesis tested: full_attention's intrinsic non-determinism is
+specific to the naive WG-per-(t,h) SDPA kernel.  The fa2_prefill kernel
+(Step 2 scaffold, completely independent implementation: tiled FA-2 with
+WG-per-(kv_head, br_chunk), gqa SGs per WG, online softmax in registers,
+SLM-staged K/V tiles) might be deterministic.  If so, ship it as a
+correctness fix and accept its ~3% pp512 perf cost.
+
+Implementation:
+  - Zero engine code changes.
+  - Build with -DIE_ENABLE_FA2_PREFILL_TILED=1 (existing flag, default OFF).
+  - The dispatch in qwen36.cpp routes T>1 attention through the tiled kernel.
+
+Verification:
+  - Build: clean.
+  - PPL on built-in 511-tok corpus: 6.64 (unchanged from baseline).
+
+Bench (3 validator A1 vs A2 runs, FA2 prefill tiled ON):
+
+  metric            run 1     run 2     run 3
+  I7attno_ max_abs  0.00134   0.000977  0.00159
+  I7attno_ rel_L2   0.045%    0.058%    0.046%
+  L41 max_abs       0.459     0.457     0.318
+  L41 rel_L2        4.74%     4.31%     3.66%
+
+Comparison with NAIVE full_attention (Step 4 baseline):
+  metric            run 1     run 2     run 3
+  I7attno_ max_abs  0.0036    0.0029    0.00098
+  L41 max_abs       0.4443    0.4473    0.4277
+
+The two kernels produce non-determinism of IDENTICAL magnitude
+(I7attno_ in 1-3e-3 range, L41 ~0.3-0.6 max_abs ≈ 4-5% rel_L2).
+
+PPL on prefill_chunk=1024 spike test:
+  baseline (naive):   ~65-73
+  FA2 prefill tiled:   68.82
+  → no improvement.
+
+== Stop-rule evaluation ==
+
+  PPL Δ ≤ +0.10 (built-in):                          PASS  (0.00)
+  A1 vs A2 I7attno_ max_abs = 0 (decisive):          FAIL  (1-2e-3)
+  A1 vs A2 stable across 3 runs:                     FAIL
+  L41 max_abs < 0.05:                                FAIL  (0.32-0.46)
+  PPL on prefill_chunk=1024 < 8:                     FAIL  (68.82)
+
+  Stability gate AND prefill-spike gate FAILED → REVERT.
+
+== Decisive finding: bug is SYSTEMIC, not kernel-specific ==
+
+Two completely independent attention kernels:
+  - `full_attention` (naive, WG-per-(t,h), 1 SG, scalar online softmax)
+  - `full_attention_fa2_prefill` (tiled FA-2, WG-per-(kv_head, br_chunk),
+    gqa SGs, SLM-staged K/V tiles, register online softmax)
+
+...produce non-determinism of the same magnitude.  These kernels share
+NOTHING in their compute logic — different WG layouts, different SLM
+usage, different online-softmax structures.  But they DO share:
+
+  1. **Reading from K/V cache** — both read what the append phase
+     wrote to k_cache/v_cache.
+  2. **Reading from ws_q_split_, ws_k_, ws_v_** workspace buffers —
+     written by gemv_q_T (Q/K/V proj) and rope_partial.
+  3. **Writing to ws_attn_out_** — potentially leaving uninitialized
+     positions if the kernel has a bounds bug.
+
+Since kernel-internal logic is RULED OUT (different kernels, same bug),
+the source must be one of these three external/shared elements.
+
+== Eliminated cumulative suspect list ==
+
+  ❌ SG-reduce ordering (Step 3)
+  ❌ Chunk-size-dependent algorithmic difference (Step 4)
+  ❌ DeltaNet recurrence (always BIT-EXACT)
+  ❌ Q/K/V proj, RoPE, RMSNorm (always EXACT, I1-I6)
+  ❌ Cache write/read race / fence enforcement (Step 5)
+  ❌ native::exp precision (Step 6)
+  ❌ Naive full_attention kernel implementation (Step 7)
+  ❌ Tiled fa2_prefill kernel implementation (Step 7)
+
+== Updated remaining hypothesis space ==
+
+  1. **K/V cache contents are non-deterministic.**  Even though we've
+     verified K/V projections (gemv_q_T) and RoPE produce bit-exact
+     outputs at the LAST POSITION, the per-position cache write might
+     have a race or out-of-bounds issue at INTERMEDIATE positions.
+     The attention kernel reads ALL ctx positions from cache — if any
+     intermediate position has garbage, the score reduce diverges.
+     → Test: compare k_cache[kv_head, position_i, :] for various i
+        between A1 and A2 dumps.  If diverges at some position i, the
+        bug is in append (or in the projection that writes ws_k_).
+
+  2. **ws_attn_out_ is not fully overwritten by the attention kernel.**
+     Uninitialized positions retain prior call's data → non-deterministic
+     across runs (since prior data was non-deterministic at allocation
+     time).
+     → Test: explicitly memset ws_attn_out_ to zero before each
+        full-attn block.  If A1 vs A2 becomes bit-exact, the kernel
+        has a write-coverage bug.
+
+  3. **Hardware-level non-determinism on Xe2** (DRAM bank rotation,
+     EU thread priority, cache line eviction).  Difficult to isolate
+     without GPU vendor tooling.  Last resort.
+
+== Disposition ==
+
+REVERT — IE_ENABLE_FA2_PREFILL_TILED stays default OFF.  Production
+unchanged.  No new code committed (zero engine changes in this
+experiment).
+
+== Next bounded experiment proposal ==
+
+**Memset ws_attn_out_ to zero at the start of every layer's attn block.**
+Simplest test of the write-coverage hypothesis.  If non-determinism
+vanishes, the attention kernel has a write-coverage bug (likely an
+off-by-one or T-dependent boundary).  If it persists, pivot to
+hypothesis #1 (cache contents).
+
+Strict scope:
+  - Single file: `src/model/qwen36.cpp`
+  - Single change: add `q.memset(ws_attn_out_, 0, uint64_t(T) * N_q * sizeof(half));`
+    at the START of the `attn_full_block` profile section (BEFORE Q proj).
+  - Gate behind compile flag IE_FA_ZERO_ATTN_OUT (default OFF).
+  - No other behavior change.
+
+Hard gates:
+  - A1 vs A2 I7attno_ max_abs = 0 in all 3 validator runs (decisive)
+  - L41 max_abs < 0.05
+  - PPL on prefill_chunk=1024 < 8 (spike resolved)
+  - PPL Δ ≤ +0.10 (built-in)
+  - No decode regression
+  - pp512 wall-time impact: minor (extra memset per layer, ~10-20µs)
+
+If gates pass: kernel has a write-coverage bug.  Investigate WHICH
+positions it misses (extend dumps to include row-by-row coverage of
+ws_attn_out_ post-attention).  Then fix the kernel.
+
+If gates fail: pivot to hypothesis #1 (cache contents).  Add per-layer,
+per-position dumps of k_cache/v_cache and compare A1 vs A2.  This will
+identify which cache positions have varying contents.
+
+Estimated effort: 30 min for one cycle (single-line code change + 3
+validator runs + PPL spike test).

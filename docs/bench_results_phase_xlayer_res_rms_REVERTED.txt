@@ -1,0 +1,65 @@
+## Cross-layer residual_moe + attn_norm fusion — REVERTED (no gain, thermal noise)
+
+Extended the residual_add_rms_norm_fused kernel (shipped at 86724d5) to
+also fuse the cross-layer pair:
+  end-of-layer-L: residual_moe + (layer-L+1)'s attn_norm
+At the start of layer L (for L > 0), the standalone attn_norm was skipped
+since ws_x_normed_ was already populated by the previous layer's fused
+tail.  Layer 0 keeps unfused attn_norm; last layer keeps unfused
+residual_moe.  Theoretical saving: 39 rms_norm launches/step.
+
+Build clean.  PPL 6.62 (vs 6.61 baseline — within run-to-run noise).
+
+Bench (3 runs, lmhead-q4k variant):
+
+  prompt              before(86724d5)  after-cross-layer    Δ
+  short-chat              51.05    →    50.39           -1.29%
+  long-instruction        50.76    →    50.45           -0.61%
+  codegen                 50.94    →    50.10           -1.65%
+  math-reasoning          50.86    →    50.49           -0.73%
+  long-context            50.76    →    50.40           -0.71%
+
+Stop rule fired.  REVERTED.
+
+Important post-revert finding (thermal):
+
+After revert, ran another 3-run bench at exactly the same git commit
+(86724d5, in-layer fusion only):
+
+  prompt              after-revert (3-run)
+  short-chat              50.41 (range 50.19-50.58)
+  long-instruction        50.33 (range 50.14-50.74)
+  codegen                 50.17 (range 50.08-50.52)
+  math-reasoning          50.31 (range 49.93-50.83)
+  long-context            49.87 (range 49.63-50.27)
+
+That's ~1.0-1.4 tok/s LOWER than the 51.05-51.91 reported when
+86724d5 was first benched.  Same code, same model, same thermal
+regime as the cross-layer experiment.
+
+Conclusion: the cross-layer fusion was effectively NEUTRAL within
+thermal noise (50.39 vs 50.41 on short-chat — both at the same cooler
+GPU state).  The "regression" was thermal-state drift between bench
+sessions, not the experiment itself.  Either way, neutral fails the
++0.5% gate — revert is correct.
+
+This also recalibrates expectations on prior wins: many of the +1-2%
+"clean wins" earlier in the session were measured immediately after
+warm-up runs.  Real run-to-run thermal variance on this hardware/
+configuration is ~1 tok/s on this 35B model.  Standing position should
+be reported as the median of multiple sessions, not the first 3-run
+bench after building.
+
+Reasonable steady-state ceiling for the engine state at 86724d5 is
+50-51 tok/s on this hardware; what we've been calling 51.7 was a
+warm-thermal-state moment.
+
+Architectural takeaway: cross-layer fusion was structurally identical
+to the in-layer fusion (same kernel, just called at a different point).
+Performance was identical.  This suggests the in-layer fusion's gain
+was also smaller than initially reported (probably ~+0.5-1% real gain
+once thermal noise is accounted for).
+
+Engine state remains at 86724d5.
+
+No code shipped from this experiment.

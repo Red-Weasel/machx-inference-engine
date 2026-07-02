@@ -1,0 +1,45 @@
+## Q4_K SG-cooperative dequant — REVERTED (regression)
+
+Mirrored the q6_K SG-coop pattern onto gemv_q4_K. Cooperative load of qs[128]
+as 32 uint32 (each lane reads 2 contiguous uint32s), redistribute via
+select_from_group, dequant from registers. Same bug-fix-already-baked-in
+(shuffle both lo and hi halves, pick per-receiver) as q6_K. Gated behind
+USE_SG_DEQUANT_T template param, applied only to N >= 2048 shapes
+(attn_q, attn_output, attn_gate, attn_qkv-DeltaNet, ssm_x).
+
+Correctness: gemv_q4k_test ALL PASS on first build.
+
+Bench (3 runs, full 5-prompt suite):
+
+| Prompt           | Pre (e462130) | Q4_K SG-coop | Δ      |
+|------------------|---------------|--------------|--------|
+| short-chat       |        42.41  |       40.11  | -5.4%  |
+| long-instruction |        42.29  |       40.49  | -4.3%  |
+| codegen          |        42.42  |       40.39  | -4.8%  |
+| math-reasoning   |        42.17  |       40.40  | -4.2%  |
+| long-context     |        42.30  |       40.37  | -4.6%  |
+
+Per-kernel (long-context):
+  gemv_q4k    451 → 619 ms  (+37%)   ← regression
+  gemv_q6k_*  unchanged
+
+Why it didn't transfer from q6_K:
+  - The original gemv_q4_K already used per-lane vec<uint8_t,16> loads of qs
+    (added in the earlier perf pass). At 16 bytes/lane × 16 lanes with all
+    qs_offs being 16-byte aligned, IGC was already emitting clean coalesced
+    16-byte block transactions per lane.
+  - Q6_K's win came from replacing 16 STRIDED PER-LANE BYTE LOADS per inner
+    iteration (the original pattern in gemv_q6_K) — the scattered access
+    pattern was the bottleneck. Q4_K never had that pattern.
+  - Adding SG shuffles on top of an already-coalesced load just paid the
+    extra register state (my_qs_lo + my_qs_hi held across the loop) plus
+    +8 select_from_group calls per super-block, with no memory-side benefit.
+
+Decision: REVERT.
+Stop condition triggered: every prompt regressed → revert immediately per
+"Revert immediately if any prompt regresses or < +4% decode" rule.
+
+Lesson: SG-cooperative dequant is the right tool ONLY when the original
+load pattern is uncoalesced.  For per-lane vec<N,T> aligned loads where
+N matches the cache-line-friendly granularity, the L1 already gives you
+the coalesced transaction; the redistribution cost dominates.

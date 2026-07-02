@@ -1,0 +1,51 @@
+## moe_decode_down_q4k SG-cooperative dequant — REVERTED (neutral/slight regression)
+
+Mirrored the q6k SG-coop pattern (cooperative uint32 word loads + select_from_group
+redistribution) onto moe_decode_down_q4k.  Since gemv_q4_K SG-coop was REVERTED
+because gemv_q4_K already used sycl::vec<uint8_t,16> per-lane loads (already
+coalesced), but moe_decode_down_q4k uses byte-by-byte qs[qs_off+i] in a
+#pragma unroll loop, hypothesised it was the same uncoalesced pattern that
+won 50% on q6k.  Hypothesis: wrong.
+
+Implementation: templated _impl<bool USE_SG_DEQUANT> + dispatcher (mirrors
+the q6k pattern at lines 310-444 of moe_fused.cpp).  Cooperative load: each
+lane reads 2 uint32 words (lo half + hi half of qs[]); redistribute via
+select_from_group with the same lo/hi pick rule as q6k.
+
+Correctness: moe_test ALL PASS, PPL 14.95 (= baseline, unchanged).
+
+Bench (ie-bench --fastforward --int8-kv, single run):
+  ctx     baseline (T=64 fix)   with Q4_K SG-coop   Δ
+  1024    51.0                  50.8                -0.4%
+  4096    47.7                  47.3                -0.8%
+  16384   35.2                  35.0                -0.6%
+  32000   29.3                  28.8                -1.7%
+
+Why it didn't transfer from q6k (despite the byte-by-byte read pattern):
+  - The 16-iter #pragma unroll loop with `qs[qs_off + i]` reads CONTIGUOUS
+    bytes per lane (qs_off + 0..15).  Even though the source code looks
+    byte-by-byte, IGC's loop unroller can collapse this into a vec<uint8_t,16>
+    style load (16 sequential bytes from the same array, fully unrolled).
+    The compiled asm pattern is similar to gemv_q4_K's explicit vec<16> form.
+  - Q6_K is fundamentally different: ql + qh + scales mixing means the per-lane
+    access has STRIDED qh layout that the compiler can't trivially coalesce.
+    SG-coop's `select_from_group` shuffle replaces that strided pattern with
+    one block transaction.
+  - For Q4_K, the redistribution cost (4 select_from_group per block × 2 blocks
+    per col × K_top experts) doesn't recover what the compiler already
+    coalesces for free.
+
+Decision: REVERT.
+Stop condition: every prompt regressed 0.4-1.7% at every ctx → revert per
+"Revert immediately if any prompt regresses" rule.
+
+Lesson refined: SG-cooperative dequant helps ONLY when:
+  (a) the per-lane access pattern is genuinely STRIDED (not just byte-by-byte
+      contiguous), AND
+  (b) the compiler can't already coalesce via explicit vec<N,T> or unrolled
+      contiguous-byte-loop pattern.
+  Q6_K satisfies (a) due to ql+qh+scales mixing.  Q4_K's qs[] is a single
+  contiguous array; both gemv_q4_K and moe_decode_down_q4k are already
+  optimal-or-near-optimal in their default forms.
+
+Engine state remains at c7a581b (FA-2 TARGET_SUPER fix).
