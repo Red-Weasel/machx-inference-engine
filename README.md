@@ -139,6 +139,6 @@ Free to use, modify, and ship (including commercially). Apache-2.0's patent gran
 
 If Mach X saved you time — or you just want to see more fast inference land on Intel Arc — you can support the work:
 
-[![Ko-fi](https://img.shields.io/badge/Support%20on-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/YOUR_HANDLE)
+[![Ko-fi](https://img.shields.io/badge/Support%20on-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/redweasel)
 
-> Replace `YOUR_HANDLE` above (and fill in `.github/FUNDING.yml`) with your Ko-fi / Buy Me a Coffee / GitHub Sponsors account to activate the button.
+☕ **[ko-fi.com/redweasel](https://ko-fi.com/redweasel)** — every bit helps keep fast inference landing on Intel Arc.
