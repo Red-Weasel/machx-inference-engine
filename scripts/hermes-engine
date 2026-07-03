@@ -38,7 +38,14 @@ SEARXNG_PORT="${SEARXNG_PORT:-8888}"
 SEARXNG_URL="http://127.0.0.1:${SEARXNG_PORT}"
 RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/hermes-engine"
 mkdir -p "$RUN_DIR"
-MODELS_DIRS=("$HOME/models" "$HOME/.seal/models")
+# Model search roots: home dirs, any external-drive `models/` folder (e.g. a big
+# models disk mounted at /media/<you>/<drive>/models or /mnt/<drive>/models), plus
+# IE_MODELS_DIRS (colon-separated extra dirs, e.g. IE_MODELS_DIRS=/data/gguf:/nas/llm).
+_ie_u="${USER:-$(id -un 2>/dev/null || echo user)}"
+MODELS_DIRS=("$HOME/models" "$HOME/.seal/models" /media/"$_ie_u"/*/models /mnt/*/models)
+if [ -n "${IE_MODELS_DIRS:-}" ]; then
+  IFS=':' read -r -a _ie_extra <<< "$IE_MODELS_DIRS"; MODELS_DIRS+=("${_ie_extra[@]}")
+fi
 
 MODEL_ARG="" CTX="" GPUS="" PORT="" TUI=0 USE_SEARCH=1 KEEP_ENGINE=0 STOP_SEARCH=0 LIST_ONLY=0 TP_MODE=0
 
@@ -90,7 +97,7 @@ mgpu_ok() { case "$1" in gpt-oss|qwen35moe|qwen35dense|qwen3next|dense|llama3|gr
 
 # ------------------------------------------------------------- discovery -----
 mapfile -t GGUFS < <(
-  for d in "${MODELS_DIRS[@]}"; do [ -d "$d" ] && find "$d" -type f -iname '*.gguf' 2>/dev/null; done \
+  for d in "${MODELS_DIRS[@]}"; do [ -d "$d" ] && find -L "$d" -type f -iname '*.gguf' 2>/dev/null; done \
     | grep -viE 'mmproj|lora|mtp|draft|exl3' \
     | while read -r f; do printf '%s\t%s\n' "$(stat -c%s "$f" 2>/dev/null || echo 0)" "$f"; done \
     | sort -rn | cut -f2-
