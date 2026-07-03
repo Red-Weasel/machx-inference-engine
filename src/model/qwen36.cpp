@@ -175,6 +175,25 @@ T* upload(DeviceAllocator& alloc, const GgufTensorInfo* t,
           std::vector<void*>& owned, std::string& err,
           DType expected = DType::kCount) {
     if (!t) { err = "tensor not found"; return nullptr; }
+    // Coerce BF16/F16 → F32 when an F32 tensor is expected (norm/gate/router tensors
+    // in community/abliterated/dynamic GGUFs). Small tensors → cheap host convert.
+    if (expected == DType::kF32 &&
+        (t->dtype == DType::kBF16 || t->dtype == DType::kF16)) {
+        const uint64_t n = t->nbytes / sizeof(uint16_t);
+        std::vector<float> f32(n);
+        const auto* src = reinterpret_cast<const uint16_t*>(t->data);
+        if (t->dtype == DType::kBF16)
+            for (uint64_t i = 0; i < n; ++i) {
+                uint32_t b = uint32_t(src[i]) << 16; std::memcpy(&f32[i], &b, sizeof(float));
+            }
+        else
+            for (uint64_t i = 0; i < n; ++i) f32[i] = fp16_to_fp32(src[i]);
+        void* d = alloc.malloc(n * sizeof(float));
+        if (!d) { err = "malloc failed"; return nullptr; }
+        alloc.queue().memcpy(d, f32.data(), n * sizeof(float)).wait();
+        owned.push_back(d);
+        return static_cast<T*>(d);
+    }
     if (expected != DType::kCount && t->dtype != expected) {
         err = std::string("tensor dtype mismatch: ") +
               std::string(type_name(t->dtype)) + " expected " +
