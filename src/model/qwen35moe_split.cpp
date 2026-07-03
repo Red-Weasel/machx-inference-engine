@@ -21,8 +21,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -33,6 +35,39 @@ namespace {
 inline double now_ms() {
     return std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+// Requantize a non-Q8_0 3-D expert tensor (BF16/F16/F32) to the ggml Q8_0 block
+// layout on the host, so the crown's uniform Q8_0 SoA expert path stays unchanged.
+// Unsloth "dynamic"/XL quants keep a few sensitive expert layers at BF16 (higher
+// precision than Q8_0); this makes them load. The tensor is [K, N, E] with each
+// expert's rows contiguous; produces the exact byte layout a native-Q8_0 file has.
+std::vector<block_q8_0> requant_exps_to_q8_0(const GgufTensorInfo* t) {
+    const uint64_t K = t->shape[0], N = t->shape[1], E = t->shape[2];
+    const uint32_t nb = uint32_t(K / 32);
+    std::vector<block_q8_0> out(E * N * nb);
+    const auto* raw16 = reinterpret_cast<const uint16_t*>(t->data);
+    const auto* raw32 = reinterpret_cast<const float*>(t->data);
+    const DType dt = t->dtype;
+    auto getf = [&](uint64_t idx) -> float {
+        if (dt == DType::kF32) return raw32[idx];
+        if (dt == DType::kF16) return fp16_to_fp32(raw16[idx]);
+        uint32_t b = uint32_t(raw16[idx]) << 16;            // BF16 = top 16 bits of fp32
+        float f; std::memcpy(&f, &b, sizeof(f)); return f;
+    };
+    for (uint64_t e = 0; e < E; ++e)
+        for (uint64_t n = 0; n < N; ++n)
+            for (uint32_t bl = 0; bl < nb; ++bl) {
+                const uint64_t off = (e * N + n) * K + uint64_t(bl) * 32;
+                float amax = 0.0f;
+                for (int i = 0; i < 32; ++i) { float a = std::fabs(getf(off + i)); if (a > amax) amax = a; }
+                const float d  = amax / 127.0f;
+                const float id = d > 0.0f ? 1.0f / d : 0.0f;
+                block_q8_0& blk = out[(e * N + n) * nb + bl];
+                blk.d = fp32_to_fp16(d);
+                for (int i = 0; i < 32; ++i) blk.qs[i] = int8_t(std::lround(getf(off + i) * id));
+            }
+    return out;
 }
 
 // COPY of qwen35_split.cpp:upload_f32_proj_fp16 (ssm_alpha/ssm_beta → [K,Npad] fp16).
@@ -186,7 +221,19 @@ std::string Qwen35MoeSplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
         ExpertsW w{};
         if (!t) { e = "experts tensor not found"; return w; }
         if (t->n_dims != 3) { e = "experts: expected 3-D"; return w; }
-        if (t->dtype != DType::kQ8_0) { e = "experts: expected Q8_0"; return w; }
+        std::vector<block_q8_0> requant;   // populated iff the tensor isn't native Q8_0
+        const block_q8_0* base;
+        if (t->dtype == DType::kQ8_0) {
+            base = reinterpret_cast<const block_q8_0*>(t->data);
+        } else if (t->dtype == DType::kBF16 || t->dtype == DType::kF16 ||
+                   t->dtype == DType::kF32) {
+            requant = requant_exps_to_q8_0(t);   // unsloth dynamic/XL: dequant→Q8_0 at load
+            base = requant.data();
+        } else {
+            e = std::string("experts: unsupported dtype ") + std::string(type_name(t->dtype)) +
+                " (need Q8_0, or BF16/F16/F32 for dynamic quants)";
+            return w;
+        }
         w.K = uint32_t(t->shape[0]); w.N = uint32_t(t->shape[1]); w.E = uint32_t(t->shape[2]);
         const uint32_t K = w.K, N = w.N, E = w.E, bpc = K / 32;
         if (K % 32 != 0) { e = "experts Q8_0: K % 32 != 0"; return w; }
@@ -195,7 +242,7 @@ std::string Qwen35MoeSplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
         std::vector<int8_t>   qs(uint64_t(E) * w.qs_stride);
         std::vector<uint16_t> dd(uint64_t(E) * w.d_stride);
         const uint64_t blocks_per_expert = uint64_t(N) * bpc;
-        const auto* base = reinterpret_cast<const block_q8_0*>(t->data);
+        // `base` set above: native Q8_0 view, or the host-requantized copy.
         for (uint32_t ex = 0; ex < E; ++ex)
             repack_q8_0_soa(base + ex * blocks_per_expert,
                             qs.data() + ex * w.qs_stride, dd.data() + ex * w.d_stride, N, K);

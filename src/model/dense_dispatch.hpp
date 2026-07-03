@@ -118,11 +118,39 @@ inline DenseQuantPtr upload_quant_dense(DeviceAllocator& alloc,
         out.dt = DType::kF16;
         return out;
     }
+    if (t->dtype == DType::kBF16) {
+        // BF16 → F16 on the host (BF16 is the top 16 bits of an fp32), then the
+        // same [N,K] → [K,N] transpose-upload as the F16 path. Weights are small,
+        // so BF16's wider exponent doesn't overflow F16. Unsloth "dynamic"/XL
+        // quants keep a few sensitive layers (e.g. late attn/shexp) at BF16.
+        const uint64_t K = t->shape[0], N = t->shape[1];
+        if (t->n_dims != 2 || K == 0 || N == 0 ||
+            t->nbytes != K * N * sizeof(uint16_t)) {
+            err = std::string("bf16 tensor '") + std::string(t->name) +
+                  "': unexpected geometry";
+            return out;
+        }
+        std::vector<uint16_t> staging(K * N);
+        const auto* src = reinterpret_cast<const uint16_t*>(t->data);
+        for (uint64_t n = 0; n < N; ++n)
+            for (uint64_t k = 0; k < K; ++k) {
+                uint32_t bits = uint32_t(src[n * K + k]) << 16;
+                float f; std::memcpy(&f, &bits, sizeof(f));
+                staging[k * N + n] = fp32_to_fp16(f);
+            }
+        void* d = alloc.malloc(K * N * sizeof(uint16_t));
+        if (!d) { err = "malloc failed"; return out; }
+        alloc.queue().memcpy(d, staging.data(), K * N * sizeof(uint16_t)).wait();
+        owned.push_back(d);
+        out.p = d;
+        out.dt = DType::kF16;
+        return out;
+    }
     if (t->dtype != DType::kQ4_K && t->dtype != DType::kQ6_K) {
         err = std::string("tensor '") + std::string(t->name) +
               "' dtype unsupported by dense path: " +
               std::string(type_name(t->dtype)) +
-              " (supported: Q4_K, Q6_K, F16) — refusing to load";
+              " (supported: Q4_K, Q6_K, F16, BF16) — refusing to load";
         return out;
     }
     void* d = alloc.malloc(t->nbytes);

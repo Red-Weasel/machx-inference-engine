@@ -11,14 +11,19 @@ Check the GPU is visible to the host:
 ls /dev/dri/            # expect renderD128 (and renderD129… for multi-GPU)
 ```
 
-## 1. Build the image (one time, ~15–20 min)
+## 1. Get the image
+**Pull the prebuilt image** (fastest):
+```bash
+docker pull ghcr.io/red-weasel/ie-engine:latest && docker tag ghcr.io/red-weasel/ie-engine:latest ie-engine
+```
+**Or build it yourself** (one time, ~15–20 min):
 ```bash
 docker build -t ie-engine .
 ```
-This installs oneAPI 2026.x from Intel's apt repo and compiles the engine to SPIR-V.
-The runtime image bundles the Intel Level-Zero compute runtime (which specializes
-the SPIR-V for your Arc device on first load), so the host only needs the kernel
-driver.
+The build installs oneAPI 2026.x from Intel's apt repo and compiles the engine to
+SPIR-V. The runtime image bundles the Intel Level-Zero compute runtime (which
+specializes the SPIR-V for your Arc device on first load), so the host only needs
+the kernel driver.
 
 ## 2. Pull a model
 ```bash

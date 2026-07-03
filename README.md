@@ -33,7 +33,7 @@ Same GGUF, same GPU (1× Arc Pro B70), llama.cpp on its *fastest* config (FlashA
 - 🧠 **Runs the big ones** — gpt-oss-**120b** (117B) and Qwen3-Next-**80B** on 2× B70 via tensor-parallel; **~2.5× faster than LM Studio** on 120b.
 - 🔀 **Multi-GPU built in** — `ie serve --gpus 2` (tensor-parallel + layer-split), no P2P required.
 - 🔌 **OpenAI-compatible server** + tool-calling (Harmony + Qwen) — point any OpenAI client (or [Hermes](https://github.com/NousResearch)) at `:11435`.
-- 📦 **One-command Docker** — `docker build` → `ie-docker serve` → running on your Arc GPU in minutes.
+- 📦 **One-command Docker** — `docker pull` (or build) → `ie-docker serve` → running on your Arc GPU in minutes.
 - ✅ **Correctness-first** — PPL-validated, per-layer cosine ≈ 1.0 vs a llama.cpp oracle, bit-exact where claimed.
 
 ---
@@ -96,9 +96,10 @@ PPL 6.36. Hybrid gated-DeltaNet + 128-expert MoE — one of the hardest architec
 
 ## Quick start
 
-**Docker (recommended)** — one build, then serve any GGUF on your Arc GPU:
+**Docker (recommended)** — pull the prebuilt image (or build it yourself), then serve any GGUF on your Arc GPU:
 ```bash
-docker build -t ie-engine .                          # ~15 min, one time
+docker pull ghcr.io/red-weasel/ie-engine:latest && docker tag ghcr.io/red-weasel/ie-engine:latest ie-engine
+# ── or build from source (~15 min):   docker build -t ie-engine .
 ./scripts/ie-docker pull llama8b                     # or any Hugging Face GGUF
 ./scripts/ie-docker serve /models/…/model.gguf --gpus 1
 # → OpenAI-compatible server on :11435 (point any OpenAI client at it)
