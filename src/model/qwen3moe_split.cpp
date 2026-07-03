@@ -16,6 +16,7 @@
 #include "ie/qwen3moe_pack.hpp"      // MoePacking, build_moe_packing
 #include "ie/quant_blocks.hpp"
 #include "ie/quant_soa.hpp"          // repack_moe_q{4,6}k_soa_host
+#include "ie/quantize.hpp"           // quantize_row_q6_K (BF16 dynamic-quant experts → Q6_K)
 
 #include "dense_dispatch.hpp"        // dense::upload<T>, dense::upload_quant_dense, dense::gemv_q(_T)
 
@@ -30,6 +31,33 @@
 
 namespace ie {
 namespace {
+
+// Requantize a non-Q4_K/Q6_K 3-D expert tensor (BF16/F16/F32) to Q6_K on the host,
+// to match the split's native Q6_K expert kernel + SoA path. Unsloth "dynamic"/XL
+// qwen3moe quants keep a few sensitive expert layers at BF16 (higher precision than
+// Q6_K); this makes them load. Tensor is [K, N, E]; K must be a multiple of 256.
+std::string requant_exps_to_q6k(const GgufTensorInfo* t, std::vector<block_q6_K>& out) {
+    const uint64_t K = t->shape[0], N = t->shape[1], E = t->shape[2];
+    if (K % 256 != 0) return "requant->Q6_K: expert K % 256 != 0";
+    const uint64_t nsb = K / 256;                          // Q6_K superblocks per row (QK_K=256)
+    out.assign(E * N * nsb, block_q6_K{});
+    const auto* raw16 = reinterpret_cast<const uint16_t*>(t->data);
+    const auto* raw32 = reinterpret_cast<const float*>(t->data);
+    const DType dt = t->dtype;
+    std::vector<float> rowf(K);
+    for (uint64_t e = 0; e < E; ++e)
+        for (uint64_t n = 0; n < N; ++n) {
+            const uint64_t off = (e * N + n) * K;
+            for (uint64_t k = 0; k < K; ++k) {
+                if      (dt == DType::kF32) rowf[k] = raw32[off + k];
+                else if (dt == DType::kF16) rowf[k] = fp16_to_fp32(raw16[off + k]);
+                else { uint32_t b = uint32_t(raw16[off + k]) << 16; float f;
+                       std::memcpy(&f, &b, sizeof(f)); rowf[k] = f; }   // BF16 = top 16 bits of fp32
+            }
+            quantize_row_q6_K(rowf.data(), out.data() + (e * N + n) * nsb, int64_t(K));
+        }
+    return {};
+}
 
 // COPY of qwen3moe.cpp:upload_dequant_to_fp16 (Q5_K/Q8_0 → device F16 [K,N]).
 // copy-not-hoist discipline (the single-GPU path is never edited).
@@ -276,8 +304,22 @@ std::string Qwen3MoeSplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
                            bool& soa) -> std::string {
             const auto* ti = Tl(L, nm);
             if (!ti) return std::string(nm) + ": not found";
-            if (ti->dtype != DType::kQ4_K && ti->dtype != DType::kQ6_K)
-                return std::string(nm) + ": unsupported expert dtype";
+            std::vector<block_q6_K> requant;   // holds requantized data if the tensor isn't Q4_K/Q6_K
+            GgufTensorInfo synth;
+            if (ti->dtype != DType::kQ4_K && ti->dtype != DType::kQ6_K) {
+                if (ti->dtype != DType::kBF16 && ti->dtype != DType::kF16 &&
+                    ti->dtype != DType::kF32)
+                    return std::string(nm) + ": unsupported expert dtype " +
+                           std::string(type_name(ti->dtype)) +
+                           " (need Q4_K/Q6_K, or BF16/F16/F32 for dynamic quants)";
+                if (auto m = requant_exps_to_q6k(ti, requant); !m.empty())
+                    return std::string(nm) + ": " + m;   // unsloth dynamic/XL: dequant→Q6_K at load
+                synth = *ti;
+                synth.dtype  = DType::kQ6_K;
+                synth.data   = reinterpret_cast<const uint8_t*>(requant.data());
+                synth.nbytes = requant.size() * sizeof(block_q6_K);
+                ti = &synth;
+            }
             if (ti->nbytes % E) return std::string(nm) + ": nbytes not divisible by expert_count";
             soa = moe_exps_soa_ && ti->dtype == DType::kQ6_K;
             if (soa) {
