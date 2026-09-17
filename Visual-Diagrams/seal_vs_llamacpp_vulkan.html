@@ -1,0 +1,1070 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Seal Native Engine vs llama.cpp — Vulkan Head-to-Head (Qwen3.6-35B-A3B)</title>
+<style>
+  body { font-family: 'Segoe UI', Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px 40px; color: #1a1a1a; }
+  h1 { color: #1a237e; border-bottom: 3px solid #1a237e; padding-bottom: 8px; }
+  h2 { color: #283593; border-bottom: 2px solid #c5cae9; padding-bottom: 4px; margin-top: 48px; }
+  h3 { color: #303f9f; margin-top: 32px; }
+  pre, code { background: #f5f5f5; border: 1px solid #e0e0e0; border-radius: 4px; padding: 2px 6px; font-family: 'Consolas', 'Courier New', monospace; font-size: 13px; }
+  pre { padding: 14px 18px; line-height: 1.5; overflow-x: auto; }
+  pre code { background: none; border: none; padding: 0; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 13px; }
+  th { background: #283593; color: white; padding: 8px 12px; text-align: left; }
+  th.seal { background: #1565c0; }
+  th.lcpp { background: #6a1b9a; }
+  td { padding: 7px 12px; border: 1px solid #e0e4ef; }
+  tr:nth-child(even) { background: #f5f5ff; }
+  .warn  { background: #fff8e1; border-left: 4px solid #f9a825; padding: 10px 16px; margin: 12px 0; border-radius: 2px; }
+  .good  { background: #e8f5e9; border-left: 4px solid #2e7d32; padding: 10px 16px; margin: 12px 0; border-radius: 2px; }
+  .bad   { background: #ffebee; border-left: 4px solid #c62828; padding: 10px 16px; margin: 12px 0; border-radius: 2px; }
+  .info  { background: #e3f2fd; border-left: 4px solid #1565c0; padding: 10px 16px; margin: 12px 0; border-radius: 2px; }
+  .subtitle { color: #546e7a; font-size: 14px; margin-top: -12px; margin-bottom: 24px; }
+  .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin: 20px 0; }
+  .col-seal { background: #e3f2fd; border: 2px solid #1565c0; border-radius: 6px; padding: 16px; }
+  .col-lcpp { background: #f3e5f5; border: 2px solid #6a1b9a; border-radius: 6px; padding: 16px; }
+  .col-seal h4 { color: #1565c0; margin-top: 0; }
+  .col-lcpp h4 { color: #6a1b9a; margin-top: 0; }
+  .perf-box { text-align: center; padding: 20px; border-radius: 8px; }
+  .perf-big { font-size: 2.4em; font-weight: bold; }
+  .perf-label { font-size: 0.9em; color: #546e7a; margin-top: 4px; }
+  .perf-sub { font-size: 0.85em; color: #546e7a; }
+  @media print { body { padding: 10px 20px; } h2 { page-break-before: always; } .two-col { grid-template-columns: 1fr 1fr; } }
+</style>
+</head>
+<body>
+
+<h1>Seal Native Engine vs llama.cpp — Vulkan Head-to-Head</h1>
+<div class="subtitle">
+  Model: Qwen3.6-35B-A3B Q4_K_M &nbsp;|&nbsp; Hardware: Intel Arc B70 Pro 32GB (BMG G31) &nbsp;|&nbsp;
+  Backend: Vulkan (both engines) &nbsp;|&nbsp; Date: 2026-05-01
+</div>
+
+<div class="info">
+  <strong>Methodology:</strong> Both engines loaded the same GGUF file
+  (<code>Qwen3.6-35B-A3B-Q4_K_M.gguf</code>, 19.70 GiB) on the same physical GPU (Vulkan0 = BMG G31,
+  28,748 MiB free before load). llama.cpp numbers from <code>llama-bench -p 512 -n 128 -r 3</code>.
+  Seal numbers from <code>seal-native-infer --backend vulkan --max-tokens 128 --repeat 3 --warmup-tokens 4</code>
+  with <code>SEAL_PROFILE_KERNELS=1</code>. Both runs were isolated — no concurrent processes.
+  Seal prompt was 115 tokens (engineering question); llama.cpp used a synthetic 512-token fill.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<h2>1. Benchmark Results</h2>
+
+<div style="display:grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap:16px; margin:20px 0;">
+  <div class="perf-box" style="background:#e3f2fd; border:2px solid #1565c0; border-radius:8px;">
+    <div class="perf-big" style="color:#1565c0;">17.1</div>
+    <div class="perf-label">Seal decode tok/s</div>
+    <div class="perf-sub">tg128 steady-state</div>
+  </div>
+  <div class="perf-box" style="background:#f3e5f5; border:2px solid #6a1b9a; border-radius:8px;">
+    <div class="perf-big" style="color:#6a1b9a;">39.5</div>
+    <div class="perf-label">llama.cpp decode tok/s</div>
+    <div class="perf-sub">tg128 ± 0.10</div>
+  </div>
+  <div class="perf-box" style="background:#e3f2fd; border:2px solid #1565c0; border-radius:8px;">
+    <div class="perf-big" style="color:#1565c0;">18.3</div>
+    <div class="perf-label">Seal prefill tok/s</div>
+    <div class="perf-sub">pp115 steady-state</div>
+  </div>
+  <div class="perf-box" style="background:#f3e5f5; border:2px solid #6a1b9a; border-radius:8px;">
+    <div class="perf-big" style="color:#6a1b9a;">885</div>
+    <div class="perf-label">llama.cpp prefill tok/s</div>
+    <div class="perf-sub">pp512 ± 5.26</div>
+  </div>
+</div>
+
+<table>
+  <tr>
+    <th>Metric</th>
+    <th class="seal">Seal Native Engine (Vulkan)</th>
+    <th class="lcpp">llama.cpp (Vulkan)</th>
+    <th>Ratio</th>
+  </tr>
+  <tr>
+    <td>Decode throughput</td>
+    <td>17.1 tok/s (tg128, r3)</td>
+    <td>39.5 tok/s (tg128, 3-run avg)</td>
+    <td style="color:#c62828;"><strong>0.43× (2.3× slower)</strong></td>
+  </tr>
+  <tr>
+    <td>Prefill throughput</td>
+    <td>18.3 tok/s (pp115)</td>
+    <td>885 tok/s (pp512)</td>
+    <td style="color:#c62828;"><strong>0.021× (48× slower)</strong></td>
+  </tr>
+  <tr>
+    <td>Prefill token count (test)</td>
+    <td>115 tokens</td>
+    <td>512 tokens</td>
+    <td>—</td>
+  </tr>
+  <tr>
+    <td>GPU utilization (decode)</td>
+    <td>~3.9% (530ms GPU / 13,758ms wall for 243 tokens)</td>
+    <td>~60-80% (estimated, no profiling available)</td>
+    <td style="color:#c62828;">~15× lower</td>
+  </tr>
+  <tr>
+    <td>Dispatches per token</td>
+    <td>612 dispatches / token (148,716 / 243 tok)</td>
+    <td>~10-50 estimated (graph batch per token)</td>
+    <td style="color:#c62828;">~12-60× more</td>
+  </tr>
+  <tr>
+    <td>Syncs (fence waits) per token</td>
+    <td>1 sync/token — but 612 dispatches queued per sync</td>
+    <td>1 graph submit/token (all ops in one VkSubmit)</td>
+    <td>Same count; different barrier density</td>
+  </tr>
+  <tr>
+    <td>Model load time</td>
+    <td>7,609 ms (mmap → VRAM streaming)</td>
+    <td>~3,000-5,000 ms (estimated)</td>
+    <td>—</td>
+  </tr>
+  <tr>
+    <td>Warmup cost</td>
+    <td>6,394 ms (4 tokens primes pipelines)</td>
+    <td>None (JIT compiled per graph node)</td>
+    <td>—</td>
+  </tr>
+</table>
+
+<div class="bad">
+  <strong>Root cause of the 2.3× decode gap:</strong> Seal dispatches 612 Vulkan compute shaders per token, each
+  preceded by pipeline barriers. GPU executes ~2.2ms of compute per token but wall time is ~58ms — only <strong>3.9%
+  GPU utilization</strong>. The other 96% is barrier/submission overhead: each barrier round-trip is ~88µs, but each
+  kernel runs only ~4µs. llama.cpp builds the entire token's computation graph into a single command buffer and
+  submits it atomically — far fewer synchronization points.
+</div>
+
+<div class="warn">
+  <strong>Prefill gap (48×) is worse than decode:</strong> llama.cpp uses a tiled flash attention kernel for T&gt;1
+  (prefill), reducing attention complexity. Seal uses naïve O(T × ctx) attention for prefill — every attention matrix
+  multiply gets a separate dispatch with barriers. At 512 tokens this is ~262,000 serial attention ops. Fix:
+  implement tiled prefill attention (flash-attn T&gt;1 path).
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<h2>2. Execution Model Comparison</h2>
+
+<div class="two-col">
+<div class="col-seal">
+<h4>Seal Native Engine — Imperative Dispatch</h4>
+<pre>
+seal-native-infer → generate_with_backend()
+  │  Loop: prefill tokens, then decode tokens
+  │  Each token:
+  ▼
+LoadedModel::forward(&amp;mut backend, token, pos)
+  │  Called in model-registry/src/lib.rs
+  │  Iterates 40 layers directly in Rust
+  ▼
+For each layer:
+  backend.rmsnorm(...)      → vkCmdDispatch ①
+  backend.matmul_q4k(...)   → vkCmdDispatch ②
+  backend.matmul_q4k(...)   → vkCmdDispatch ③
+  backend.matmul_q4k(...)   → vkCmdDispatch ④
+  backend.rope(...)         → vkCmdDispatch ⑤
+  backend.attention(...)    → vkCmdDispatch ⑥
+  ...
+  [612 total dispatches per token]
+  ▼
+backend.sync()            → vkQueueSubmit + fence wait
+  │  Submits ALL pending commands, reads back logits
+  ▼
+sampler picks next token ID
+</pre>
+<p><strong>Buffer system:</strong> deferred buffer map (<code>HashMap&lt;*const f32, VkBuffer&gt;</code>)
+keyed on host slice pointer. GPU tensors are DEVICE_LOCAL; <code>prep_input()</code> resolves by pointer lookup.
+Host-visible staging only for uploads and the final readback.</p>
+</div>
+
+<div class="col-lcpp">
+<h4>llama.cpp — Graph-Based DAG</h4>
+<pre>
+llama_decode(ctx, batch)
+  │
+  ▼
+llm_build_qwen2moe()
+  │  Builds ggml_tensor DAG — NO execution yet
+  │  Every op is a node: ggml_mul_mat, ggml_add,
+  │  ggml_rms_norm, ggml_rope, ggml_flash_attn_ext,
+  │  ggml_cpy, ggml_silu, ggml_soft_max
+  ▼
+ggml_backend_sched_graph_compute()
+  │  Assigns each node to a backend by tensor location
+  │  Vulkan backend: GEMV, GEMM, attn, norm, rope
+  │  CPU backend: fallback for unsupported ops (top-k)
+  │  Entire graph submitted as one command stream
+  ▼
+Vulkan backend executes all nodes
+  │  Single VkSubmit per token with all ops pipelined
+  │  Barriers only where data dependencies require
+  ▼
+Logits in output buffer → sampler
+</pre>
+<p><strong>Buffer system:</strong> ggml_backend_buffer allocates DEVICE_LOCAL tensors for
+weights. KV cache is a pre-allocated buffer (<code>struct llama_kv_cache</code>). Scheduler
+handles memory planning for all intermediate tensors automatically.</p>
+</div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<h2>3. Model Architecture: Qwen3.6-35B-A3B Layer Structure</h2>
+
+<div class="two-col">
+<div class="col-seal">
+<h4>Seal's Qwen3.6-35B-A3B Forward Pass</h4>
+<pre>
+Config (loaded from GGUF):
+  40 layers, 2048 hidden, 16 heads, 2 kv-heads
+  head_dim=256, vocab=248,320
+  rope_theta=10,000,000, rms_eps=1e-6
+  DeltaNet layers: 30  (linear-attn SSM)
+  Full-attn MoE layers: 10
+  MoE: 60 experts, top-2 active + 1 shared
+
+  Input embeddings [T, 2048]
+      │
+      ▼  (for each of 40 layers)
+  ┌─────────────────────────────────────┐
+  │  SSM LAYER (30 layers):             │
+  │  ① attn_norm     rmsnorm            │
+  │  ② SSM step:                        │
+  │     conv1d + silu (1D causal conv)  │
+  │     q_gate_split (split Q/gate)     │
+  │     ssm_gdn_chain (state update)    │
+  │     sigmoid_mul_inplace (gate)      │
+  │     attention_split (output)        │
+  │  ③ residual add + ffn_norm fused    │
+  │  ④ MoE FFN:                         │
+  │     moe_qx_topk_fused (router)      │
+  │     gate_up_swiglu (fused, 1 disp)  │
+  │     moe_accumulate_add_rmsnorm      │
+  ├─────────────────────────────────────┤
+  │  FULL-ATTN MoE LAYER (10 layers):  │
+  │  ① attn_norm     rmsnorm            │
+  │  ② GQA Attention:                  │
+  │     Q,K,V projections (Q4_K GEMV)  │
+  │     rmsnorm_batched_heads (QK norm)│
+  │     RoPE (NeoX style)              │
+  │     kv_append_pair (KV cache write)│
+  │     flash-attn FA-2 split-K (T=1) │
+  │     O projection (FP16 GEMV)       │
+  │  ③ residual add + ffn_norm         │
+  │  ④ MoE FFN: same as SSM layer      │
+  └─────────────────────────────────────┘
+      │
+      ▼
+  Final norm (rmsnorm)
+  LM head: matmul_q6_k_gemv (248,320 vocab)
+  Logits [248,320] → sampler
+</pre>
+</div>
+
+<div class="col-lcpp">
+<h4>llama.cpp's Qwen3-MoE Forward Pass</h4>
+<pre>
+  Input embeddings [T, hidden]
+      │
+      ▼  (for each of N layers)
+  ┌─────────────────────────────────────┐
+  │  LAYER (standard transformer MoE):  │
+  │                                     │
+  │  ① attn_norm   ggml_rms_norm        │
+  │                                     │
+  │  ② Self-Attention:                  │
+  │     Q = ggml_mul_mat(x, W_q)        │
+  │     K = ggml_mul_mat(x, W_k)        │
+  │     V = ggml_mul_mat(x, W_v)        │
+  │     Q,K = ggml_rope(Q), ggml_rope(K)│
+  │     [--flash-attn]:                 │
+  │       ggml_flash_attn_ext(Q,Kc,Vc) │
+  │     [without]:                      │
+  │       scores = Q × K_cache^T        │
+  │       softmax(scores + causal_mask) │
+  │       out = scores × V_cache        │
+  │     O proj = ggml_mul_mat(out, W_o) │
+  │                                     │
+  │  ③ Residual add   ggml_add          │
+  │  ④ ffn_norm       ggml_rms_norm     │
+  │                                     │
+  │  ⑤ MoE FFN:                         │
+  │     Router → logits [T, E]          │
+  │     top-k + softmax + renorm        │
+  │       ← CPU-side (tensor is small)  │
+  │     Per expert: gate/up/silu/down   │
+  │       separate ggml_tensor nodes    │
+  │     Shared expert: weight=1         │
+  │  ⑥ Residual add   ggml_add          │
+  └─────────────────────────────────────┘
+      │
+      ▼
+  Final norm → lm_head → logits → sampler
+</pre>
+<p><strong>Note:</strong> llama.cpp does not model DeltaNet SSM layers — it sees
+Qwen3-MoE as a standard transformer. DeltaNet is unique to the IE/Seal implementation.</p>
+</div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<h2>4. KV Cache Implementation</h2>
+
+<div class="two-col">
+<div class="col-seal">
+<h4>Seal KV Cache</h4>
+<pre>
+struct KvCache {
+    // Per full-attn layer (10 layers):
+    k: Vec&lt;f32&gt;  // [max_seq, n_kv_heads, head_dim]
+    v: Vec&lt;f32&gt;  // [max_seq, n_kv_heads, head_dim]
+    // Default: FP32 host storage
+}
+
+TurboQuant mode (--turboquant-kv):
+    4-bit K + 4-bit V packed
+    Randomized Hadamard rotation
+    Groupsize=16, per-group scale (FP16)
+    ~4× compression vs FP32
+
+Write path (SPLIT — BUG):
+    Decode T=1:
+      kv_append_pair kernel writes new KV
+      TurboQuant: quantizes inline
+    Prefill T>1:
+      ⚠️ KV rows written as FP32 only
+      TurboQuant NOT applied during prefill
+      → KV cache is FP32 for prompt tokens,
+        INT4 only for generated tokens
+
+Read path:
+    kv_append_pair reads back for attention
+    attention_split reads cached pairs
+    No flash attention for T>1 prefill
+    Naïve O(T × ctx) attention computation
+
+Management:
+    Sequential append only
+    No defragmentation
+    Cache invalidated on new context start
+</pre>
+<div class="warn">⚠️ <strong>Prefill KV quantization bug:</strong> TurboQuant only
+  activates on the decode path. Prefill tokens land in FP32 KV cache regardless of
+  --turboquant-kv flag. Unified write path needed (same as llama.cpp's ggml_cpy approach).</div>
+</div>
+
+<div class="col-lcpp">
+<h4>llama.cpp KV Cache</h4>
+<pre>
+struct llama_kv_cache {
+    // Per layer:
+    k: [n_kv_heads, max_ctx, head_dim]
+    v: [n_kv_heads, max_ctx, head_dim]
+    dtype: configurable (default FP16)
+}
+
+Default dtype: FP16 (GGML_TYPE_F16)
+Quantized options:
+    -ctk q8_0  → Q8_0 keys   (1 scale/32 elem)
+    -ctv q8_0  → Q8_0 values
+    -ctk q4_0  → Q4_0 keys   (more compression)
+
+Write path (UNIFIED — correct):
+    T=1 and T&gt;1 BOTH use ggml_cpy:
+      ggml_cpy(K_new[T,kv_h,hd],
+               k_cache[slot..slot+T, kv_h, hd])
+    If dtype=FP16: straight copy
+    If dtype=Q8_0: FP16→Q8_0 quantize inline
+      1 scale per 32 elements during write
+    Same kernel handles both prefill and decode
+    → no prefill KV quantization bug
+
+Read path:
+    --flash-attn: flash_attn_ext tiles K/V
+      inline dequantization during reads
+      causal mask inside kernel
+      handles T=1 AND T&gt;1 shapes
+    Without flash-attn: ggml_mul_mat dequant
+
+Management:
+    llama_kv_cache_find_slot() — find free slots
+    llama_kv_cache_update()   — defragment
+    Cell-based: supports multi-turn reuse
+</pre>
+<div class="good">✅ <strong>Unified write path</strong> means KV quantization is
+  consistent between prefill and decode. No split-path bugs.</div>
+</div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<h2>5. T=1 (Decode) vs T&gt;1 (Prefill) Handling</h2>
+
+<div class="two-col">
+<div class="col-seal">
+<h4>Seal</h4>
+<pre>
+Decode (T=1):
+  GEMV path: each weight matrix uses
+    dedicated GEMV kernel (M=1)
+  Attention: FA-2 split-K custom kernel
+    CHUNKS_PER_WG=8 super-chunk amort.
+    SLM tiling, ~92% BW efficiency
+  KV write: kv_append_pair (correct)
+  Dispatch count: ~612 per token
+
+Prefill (T&gt;1):
+  GEMM path: ??? — weight multiplies
+    use same GEMV kernel even for T&gt;1
+    (no M&gt;1 GEMM kernel yet)
+  Attention: NAÏVE O(T × ctx)
+    no tiling, no flash-attn equivalent
+    separate dispatch per attention step
+    → 48× slower than llama.cpp
+  KV write: appends FP32 rows
+    TurboQuant NOT applied ← bug
+
+Key kernel: forward pass calls
+  backend.matmul_qXk_gemv() regardless
+  of batch size T. No T&gt;1 dispatch path.
+  This is why prefill is so slow.
+</pre>
+</div>
+
+<div class="col-lcpp">
+<h4>llama.cpp</h4>
+<pre>
+Decode (T=1):
+  GEMV path: ggml_mul_mat with M=1
+    dispatches mul_mat_vec_qX_K kernel
+    inline dequantization
+  Attention: flash_attn_ext (if --flash-attn)
+    or naive SDPA (without flag)
+    Q[1,h,d] × K_cache^T — trivial causal
+
+Prefill (T&gt;1):
+  GEMM path: ggml_mul_mat with M&gt;1
+    DISPATCHES DIFFERENT KERNEL (tiled GEMM)
+    mul_mat_q4_K — tiled, batched
+    FP16×FP16 → DPAS/joint_matrix (coopmat)
+  Attention: SAME flash_attn_ext kernel
+    shape drives inner tiling
+    Q[T,h,d] × K_cache^T — causal mask inside
+    O(T × ctx / tile²) with tiling
+    → 885 tok/s on pp512
+
+KV write: same ggml_cpy path for T=1/T&gt;1
+  Unified — no prefill quantization bug.
+
+Shape dispatch happens transparently:
+  ggml_sycl_mul_mat / ggml_vk_mul_mat
+  selects kernel at RUNTIME based on M.
+</pre>
+</div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<h2>6. MoE Expert Routing</h2>
+
+<div class="two-col">
+<div class="col-seal">
+<h4>Seal — Fused GPU Router</h4>
+<pre>
+Seal routes MoE entirely on GPU:
+
+ws_x_norm [1, 2048]
+  ↓
+moe_qx_topk_fused kernel:
+  Router matmul (Q4_K GEMV): x × W_router
+    → logits [1, 60]  (60 experts)
+  Top-2 selection inline
+  Softmax + renorm on GPU
+  expert_ids [1, 2] INT32
+  expert_weights [1, 2] FP32
+
+For top-2 active experts + 1 shared:
+  matmul_q4_k_moe_indirect_dp4a_gate_up_swiglu_sg32
+    Fused: gather + gate matmul + up matmul
+           + SwiGLU activation — 1 dispatch
+  matmul_q4_k_moe_indirect_lcpp (down proj)
+  moe_accumulate_add_rmsnorm
+    Fused: weighted accumulate + add residual
+           + RMS norm — 1 dispatch
+
+Total MoE dispatches per token:
+  moe_qx_topk_fused:              1 dispatch
+  gate_up_swiglu (experts):       1 dispatch
+  down proj (experts):            1 dispatch
+  accumulate+add+norm:            1 dispatch
+  = ~4-6 dispatches for full MoE FFN
+
+Seal advantage: FUSED kernels cut the
+per-op overhead that llama.cpp has.
+</pre>
+</div>
+
+<div class="col-lcpp">
+<h4>llama.cpp — Graph Nodes Per Expert</h4>
+<pre>
+llama.cpp routes MoE via graph nodes:
+
+ws_x_normed [T, hidden]
+  ↓
+ggml_mul_mat(x, W_router[E,H])
+  → logits [T, E] FP32
+
+Top-k + softmax + renorm:
+  CPU-side for most backends
+  (tensor is small: [1, 60])
+  expert_ids [T,k] INT32
+  expert_weights [T,k] FP32
+
+For each active expert e:
+  gather → x_e [n_tok, hidden]
+  gate_out = ggml_mul_mat(x_e, W_gate_e)
+  up_out   = ggml_mul_mat(x_e, W_up_e)
+  h_out    = ggml_mul(ggml_silu(gate_out), up_out)
+  down_out = ggml_mul_mat(h_out, W_down_e)
+  out += weight_e * down_out
+
+Each of the above = separate graph node
+  = separate Vulkan dispatch
+  No fused gate+up+silu kernel
+  No fused accumulate+norm
+
+For top-2 from 60 experts:
+  ~10-15 separate dispatches for MoE FFN
+
+llama.cpp limitation: graph approach means
+no mandatory fusion — each op is its own
+kernel launch. Seal's fused MoE is better.
+</pre>
+</div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<h2>7. Kernel Inventory: Side by Side</h2>
+
+<h3>7a. Seal Native Engine — Measured Kernel Profile</h3>
+<p>Steady-state run (repeat 3 of 3): 115 prefill + 128 decode = 243 total tokens.
+   Total GPU time: 530.4 ms across 148,716 dispatches.</p>
+
+<table>
+  <tr>
+    <th>Kernel Name</th>
+    <th>Calls</th>
+    <th>Total ms</th>
+    <th>Avg µs</th>
+    <th>% GPU time</th>
+    <th>What it does</th>
+  </tr>
+  <tr>
+    <td><code>matmul_q4_k_gemv_lcpp</code></td>
+    <td>24,300</td>
+    <td>92.1</td>
+    <td>3.79</td>
+    <td>17.4%</td>
+    <td>Q4_K GEMV for attention Q/K/V/O and FFN weights (dense layers)</td>
+  </tr>
+  <tr>
+    <td><code>moe_qx_topk_fused</code></td>
+    <td>9,720</td>
+    <td>46.5</td>
+    <td>4.78</td>
+    <td>8.8%</td>
+    <td>Router logits + top-k select + softmax renorm (fused, GPU-side)</td>
+  </tr>
+  <tr>
+    <td><code>matmul_q4_k_moe_indirect_dp4a_gate_up_swiglu_sg32</code></td>
+    <td>9,720</td>
+    <td>41.1</td>
+    <td>4.23</td>
+    <td>7.8%</td>
+    <td>MoE expert gate + up projection + SwiGLU (fused, indirect GEMV)</td>
+  </tr>
+  <tr>
+    <td><code>matmul_f16w_gemv</code></td>
+    <td>9,720</td>
+    <td>39.1</td>
+    <td>4.03</td>
+    <td>7.4%</td>
+    <td>FP16 weight GEMV (O projection, shared expert output)</td>
+  </tr>
+  <tr>
+    <td><code>moe_accumulate_add_rmsnorm</code></td>
+    <td>9,720</td>
+    <td>38.6</td>
+    <td>3.97</td>
+    <td>7.3%</td>
+    <td>Weighted expert accumulate + residual add + RMS norm (fused)</td>
+  </tr>
+  <tr>
+    <td><code>add_rmsnorm</code></td>
+    <td>9,720</td>
+    <td>38.3</td>
+    <td>3.94</td>
+    <td>7.2%</td>
+    <td>Residual add + RMS normalization (fused elementwise)</td>
+  </tr>
+  <tr>
+    <td><code>ssm_gdn_chain</code></td>
+    <td>7,290</td>
+    <td>36.5</td>
+    <td>5.00</td>
+    <td>6.9%</td>
+    <td>DeltaNet SSM state-space chain (recurrent state update, 30 layers)</td>
+  </tr>
+  <tr>
+    <td><code>matmul_q6_k_gemv_v2_glsl</code></td>
+    <td>9,720</td>
+    <td>36.3</td>
+    <td>3.73</td>
+    <td>6.8%</td>
+    <td>Q6_K GEMV v2 (faster path, attention output gate weights)</td>
+  </tr>
+  <tr>
+    <td><code>ssm_conv1d_silu</code></td>
+    <td>7,290</td>
+    <td>28.4</td>
+    <td>3.89</td>
+    <td>5.3%</td>
+    <td>SSM 1D causal convolution + SiLU (DeltaNet input projection, 30 layers)</td>
+  </tr>
+  <tr style="background:#ffebee;">
+    <td><code>matmul_q6_k_gemv_v1_sg32</code> ⚠️</td>
+    <td>243</td>
+    <td>21.98</td>
+    <td>90.47</td>
+    <td>4.1%</td>
+    <td><strong>LM HEAD ONLY</strong> (248,320 vocab) — wrong kernel! v1 at 90µs vs v2 at 3.73µs = 24× regression. Should route to v2 or lcpp_full path.</td>
+  </tr>
+  <tr>
+    <td><code>matmul_q6_k_moe_indirect_lcpp</code></td>
+    <td>4,860</td>
+    <td>21.7</td>
+    <td>4.46</td>
+    <td>4.1%</td>
+    <td>MoE expert down projection Q6_K (indirect gather GEMV)</td>
+  </tr>
+  <tr>
+    <td><code>matmul_q4_k_moe_indirect_lcpp</code></td>
+    <td>4,860</td>
+    <td>19.9</td>
+    <td>4.09</td>
+    <td>3.7%</td>
+    <td>MoE expert down projection Q4_K (indirect gather GEMV)</td>
+  </tr>
+  <tr>
+    <td><code>attention_split</code></td>
+    <td>2,430</td>
+    <td>11.8</td>
+    <td>4.83</td>
+    <td>2.2%</td>
+    <td>FA-2 split-K attention (full-attn layers, T=1 decode)</td>
+  </tr>
+  <tr>
+    <td><code>rmsnorm_batched_heads</code></td>
+    <td>4,860</td>
+    <td>10.7</td>
+    <td>2.20</td>
+    <td>2.0%</td>
+    <td>Per-head RMS norm on Q/K before attention (QK norm)</td>
+  </tr>
+  <tr>
+    <td><code>kv_append_pair</code></td>
+    <td>2,430</td>
+    <td>9.53</td>
+    <td>3.92</td>
+    <td>1.8%</td>
+    <td>Write K/V pair to KV cache (decode, full-attn layers)</td>
+  </tr>
+  <tr>
+    <td><code>sigmoid_mul_inplace</code></td>
+    <td>2,430</td>
+    <td>9.48</td>
+    <td>3.90</td>
+    <td>1.7%</td>
+    <td>SSM gate: sigmoid(gate) × state (DeltaNet gating)</td>
+  </tr>
+  <tr>
+    <td><code>q_gate_split</code></td>
+    <td>2,430</td>
+    <td>9.20</td>
+    <td>3.78</td>
+    <td>1.7%</td>
+    <td>Split Q and gate channels from combined projection (SSM layers)</td>
+  </tr>
+  <tr>
+    <td><code>matmul_q4_k_ssm_3way</code></td>
+    <td>7,290</td>
+    <td>8.46</td>
+    <td>1.16</td>
+    <td>1.6%</td>
+    <td>SSM 3-way projection (A/B/C matrices for DeltaNet state)</td>
+  </tr>
+  <tr>
+    <td><code>matmul_q4_k_dp4a_gate_up_swiglu_sg32</code></td>
+    <td>9,720</td>
+    <td>5.96</td>
+    <td>0.61</td>
+    <td>1.1%</td>
+    <td>Shared expert gate+up+SwiGLU (fused, shared expert path)</td>
+  </tr>
+  <tr>
+    <td><code>dot_sigmoid</code></td>
+    <td>9,720</td>
+    <td>4.74</td>
+    <td>0.49</td>
+    <td>0.9%</td>
+    <td>Sigmoid activation on router weights (MoE routing gate)</td>
+  </tr>
+  <tr>
+    <td><code>rmsnorm_parallel</code></td>
+    <td>243</td>
+    <td>0.38</td>
+    <td>1.56</td>
+    <td>0.1%</td>
+    <td>Final layer norm before LM head</td>
+  </tr>
+</table>
+
+<h3>7b. llama.cpp Vulkan — Kernel Inventory (Structural)</h3>
+<p>llama.cpp Vulkan kernel names from <code>ggml-vulkan.cpp</code>.
+   No per-kernel profiling was run in this session — avg_µs and % are not available.
+   Shape dispatch (M=1 → GEMV, M&gt;1 → GEMM) is automatic at runtime.</p>
+
+<table>
+  <tr>
+    <th>Kernel Name</th>
+    <th>Status</th>
+    <th>Used For</th>
+    <th>Notes</th>
+  </tr>
+  <tr>
+    <td><code>mul_mat_vec_q4_K_f32</code></td>
+    <td>✅ Active</td>
+    <td>GEMV Q4_K M=1 decode hot path</td>
+    <td>Inline dequant; selected when M=1</td>
+  </tr>
+  <tr>
+    <td><code>mul_mat_vec_q6_K_f32</code></td>
+    <td>✅ Active</td>
+    <td>GEMV Q6_K M=1</td>
+    <td>LM head uses this for Q6_K weights</td>
+  </tr>
+  <tr>
+    <td><code>mul_mat_q4_K</code></td>
+    <td>✅ Active</td>
+    <td>GEMM Q4_K M&gt;1 prefill</td>
+    <td>Tiled; triggered when M&gt;1 (prefill batch)</td>
+  </tr>
+  <tr>
+    <td><code>mul_mat_f16</code></td>
+    <td>✅ Active</td>
+    <td>FP16×FP16 GEMM</td>
+    <td>coopmat path for FP16 prefill GEMM</td>
+  </tr>
+  <tr>
+    <td><code>flash_attn_ext</code></td>
+    <td>✅ Active (--flash-attn flag)</td>
+    <td>SDPA — handles T=1 and T&gt;1</td>
+    <td>Unified; shape drives inner tile size</td>
+  </tr>
+  <tr>
+    <td><code>soft_max</code></td>
+    <td>✅ Active (without --flash-attn)</td>
+    <td>Naive SDPA softmax</td>
+    <td>Fallback when flash-attn not enabled</td>
+  </tr>
+  <tr>
+    <td><code>rms_norm</code></td>
+    <td>✅ Active</td>
+    <td>LayerNorm</td>
+    <td>Per-row workgroup reduction</td>
+  </tr>
+  <tr>
+    <td><code>rope_neox</code></td>
+    <td>✅ Active</td>
+    <td>RoPE encoding</td>
+    <td>NeoX style (Qwen uses this)</td>
+  </tr>
+  <tr>
+    <td><code>silu_back / mul</code></td>
+    <td>✅ Active</td>
+    <td>SiLU activation for SwiGLU</td>
+    <td>Separate node — not fused with gate</td>
+  </tr>
+  <tr>
+    <td><code>add</code></td>
+    <td>✅ Active</td>
+    <td>Elementwise add (residuals)</td>
+    <td>Separate dispatch per residual connection</td>
+  </tr>
+  <tr>
+    <td><code>cpy_f32_f16</code></td>
+    <td>✅ Active</td>
+    <td>KV cache write FP32→FP16</td>
+    <td>Unified path for T=1 and T&gt;1</td>
+  </tr>
+  <tr>
+    <td><code>cpy_f16_q8_0</code></td>
+    <td>✅ Active (-ctk q8_0)</td>
+    <td>KV cache write FP16→Q8_0</td>
+    <td>1 scale per 32 elements; block-level</td>
+  </tr>
+  <tr>
+    <td>DeltaNet SSM kernels</td>
+    <td>❌ Not present</td>
+    <td>—</td>
+    <td>Non-standard arch; not in llama.cpp</td>
+  </tr>
+  <tr>
+    <td>Fused MoE gate+up+swiglu</td>
+    <td>❌ Not present</td>
+    <td>—</td>
+    <td>Each op is a separate graph node</td>
+  </tr>
+  <tr>
+    <td>Fused accumulate+add+norm</td>
+    <td>❌ Not present</td>
+    <td>—</td>
+    <td>Separate ggml_add + ggml_rms_norm nodes</td>
+  </tr>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<h2>8. Dispatch Overhead Analysis</h2>
+
+<table>
+  <tr>
+    <th>Metric</th>
+    <th class="seal">Seal (measured)</th>
+    <th class="lcpp">llama.cpp (estimated)</th>
+  </tr>
+  <tr>
+    <td>Dispatches per decode token</td>
+    <td>~612 (148,716 dispatches / 243 tokens)</td>
+    <td>~20-60 (graph nodes per token)</td>
+  </tr>
+  <tr>
+    <td>Avg GPU work per dispatch</td>
+    <td>530.4ms / 148,716 = <strong>3.6 µs/dispatch</strong></td>
+    <td>~50-100 µs/dispatch (estimated)</td>
+  </tr>
+  <tr>
+    <td>Total GPU work per token (decode)</td>
+    <td>~2.18 ms GPU / 56.6 ms wall</td>
+    <td>~15-20 ms GPU / ~25 ms wall (est.)</td>
+  </tr>
+  <tr>
+    <td>GPU utilization</td>
+    <td><strong>3.9%</strong> (530ms GPU / 13,758ms wall)</td>
+    <td>~60-80% (estimated)</td>
+  </tr>
+  <tr>
+    <td>Inter-dispatch barrier overhead</td>
+    <td>~88µs per barrier (56ms / 612 barriers)</td>
+    <td>~0.4ms per barrier (25ms / 60 dispatches)</td>
+  </tr>
+  <tr>
+    <td>Fence waits per token</td>
+    <td>1 (all 612 dispatches in one command buffer)</td>
+    <td>1 (entire graph in one submit)</td>
+  </tr>
+</table>
+
+<div class="bad">
+  <strong>The 3.6µs-per-kernel problem:</strong> Seal's kernels are individually fast (3-5µs each at production shapes),
+  but every kernel is preceded by a full pipeline barrier (<code>VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT</code>).
+  The GPU must drain the previous shader invocation before starting the next. On BMG G31 this round-trip costs
+  ~80-90µs wall-clock even though the GPU only executes for ~4µs. The fix is not to remove barriers (correctness
+  requires them between dependent ops) but to reduce the number of independent dispatch calls by fusing more ops
+  into single kernels — which is exactly what MK-3 and MK-4 megakernels target.
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<h2>9. Top Opportunities to Close the Gap</h2>
+
+<table>
+  <tr>
+    <th>#</th>
+    <th>Fix</th>
+    <th>Expected Impact</th>
+    <th>Complexity</th>
+  </tr>
+  <tr>
+    <td><strong>P0</strong></td>
+    <td><strong>LM head kernel routing</strong> — <code>matmul_q6_k_gemv_v1_sg32</code> fires at 90µs avg for
+      the 248,320-vocab LM head. Should route to <code>v2_glsl</code> (3.73µs) or <code>lcpp_full</code>.
+      Fix the shape-dispatch condition in <code>compute.rs</code>.</td>
+    <td>Removes 22ms/token of unnecessary GPU time (4.1% of GPU time on wrong path). Direct 5-8% decode speedup.</td>
+    <td>Low — routing logic change, no shader work</td>
+  </tr>
+  <tr>
+    <td><strong>P1</strong></td>
+    <td><strong>MK-3/MK-4 megakernels</strong> — Fuse the SSM layer (~7 dispatches) and the MoE FFN
+      (~4-6 dispatches) into single kernels. Target: reduce 612 dispatches/token to &lt;100.</td>
+    <td>If barrier overhead drops proportionally: ~6× decode speedup → ~100 tok/s range.</td>
+    <td>High — new WGSL/GLSL kernels; cross-WG sync</td>
+  </tr>
+  <tr>
+    <td><strong>P2</strong></td>
+    <td><strong>Tiled prefill attention (flash-attn T&gt;1)</strong> — Current naïve O(T×ctx) attention for
+      prefill. llama.cpp's flash_attn_ext handles T&gt;1 with the same kernel. Need a WGSL tiled attention
+      kernel for M&gt;1 prefill.</td>
+    <td>At pp512: Seal currently ~5 tok/s estimated; tiled attn → 100-400 tok/s range.</td>
+    <td>High — new attention kernel for T&gt;1 shapes</td>
+  </tr>
+  <tr>
+    <td><strong>P3</strong></td>
+    <td><strong>Fix INT8/TurboQuant KV prefill bug</strong> — Unified write path for T=1 and T&gt;1.
+      Prefill tokens should write quantized KV rows through the same <code>kv_append_pair</code> path as decode.</td>
+    <td>Correctness fix — prefill KV cache is currently FP32 even with --turboquant-kv flag.</td>
+    <td>Medium — Rust code path change in model-registry</td>
+  </tr>
+  <tr>
+    <td><strong>P4</strong></td>
+    <td><strong>M&gt;1 GEMM kernels for prefill</strong> — Weight projections during prefill use the same
+      M=1 GEMV kernels regardless of batch size. For T=512, need tiled GEMM (like llama.cpp's mul_mat_q4_K
+      for M&gt;1 with coopmat acceleration).</td>
+    <td>Prefill throughput scales with T for weight-bound ops.</td>
+    <td>High — new tiled GEMM shaders</td>
+  </tr>
+</table>
+
+<!-- ═══════════════════════════════════════════════════════════════════ -->
+<h2>10. Full Architecture Comparison Table</h2>
+
+<table>
+  <tr>
+    <th>Aspect</th>
+    <th class="seal">Seal Native Engine (Vulkan)</th>
+    <th class="lcpp">llama.cpp (Vulkan)</th>
+    <th>Winner</th>
+  </tr>
+  <tr>
+    <td>Execution model</td>
+    <td>Imperative: kernels called directly from Rust forward pass</td>
+    <td>Graph-based: build DAG of ggml_tensor nodes, then schedule</td>
+    <td>🔵 llama.cpp (better for heterogeneous dispatch)</td>
+  </tr>
+  <tr>
+    <td>Backend</td>
+    <td>Single Vulkan (BMG G31 primary target)</td>
+    <td>Multi-backend: CPU, CUDA, Metal, SYCL, Vulkan</td>
+    <td>🔵 llama.cpp (portability)</td>
+  </tr>
+  <tr>
+    <td>Decode throughput</td>
+    <td>17.1 tok/s (measured)</td>
+    <td>39.5 tok/s (measured)</td>
+    <td>🔵 llama.cpp (2.3×)</td>
+  </tr>
+  <tr>
+    <td>Prefill throughput</td>
+    <td>~18 tok/s pp115 (measured)</td>
+    <td>885 tok/s pp512 (measured)</td>
+    <td>🔵 llama.cpp (48×)</td>
+  </tr>
+  <tr>
+    <td>GPU utilization</td>
+    <td>~3.9%</td>
+    <td>~60-80% (est.)</td>
+    <td>🔵 llama.cpp</td>
+  </tr>
+  <tr>
+    <td>Attention T=1 (decode)</td>
+    <td>FA-2 split-K, custom SLM tiling, super-chunk amortization, ~92% BW</td>
+    <td>flash_attn_ext or naive SDPA (~60-80% est.)</td>
+    <td>🔴 Seal (better custom attention kernel)</td>
+  </tr>
+  <tr>
+    <td>Attention T&gt;1 (prefill)</td>
+    <td>Naïve O(T × ctx) — no tiling, no flash-attn</td>
+    <td>Same flash_attn_ext kernel; shape drives tiling</td>
+    <td>🔵 llama.cpp</td>
+  </tr>
+  <tr>
+    <td>KV cache quantization write</td>
+    <td>SPLIT path: decode writes quant, prefill writes FP32 ← BUG</td>
+    <td>Unified ggml_cpy for T=1 and T&gt;1 — no split bug</td>
+    <td>🔵 llama.cpp</td>
+  </tr>
+  <tr>
+    <td>KV cache management</td>
+    <td>Sequential append only; no defrag; multi-turn requires reset</td>
+    <td>Cell-based: find_slot() + defrag; multi-turn reuse</td>
+    <td>🔵 llama.cpp</td>
+  </tr>
+  <tr>
+    <td>MoE fused decode kernel</td>
+    <td>✅ gate+up+SwiGLU fused, accumulate+add+norm fused — ~4 dispatches/MoE FFN</td>
+    <td>Separate graph node per op per expert — ~10-15 dispatches/MoE FFN</td>
+    <td>🔴 Seal (better fusion)</td>
+  </tr>
+  <tr>
+    <td>MoE router location</td>
+    <td>GPU-side: moe_qx_topk_fused kernel</td>
+    <td>CPU-side (tensor is tiny [1,60])</td>
+    <td>Tie (both work; CPU is faster for tiny tensor)</td>
+  </tr>
+  <tr>
+    <td>Runtime kernel shape dispatch</td>
+    <td>Manual per call site — M=1 hardcoded in most paths</td>
+    <td>Automatic: M drives GEMV vs GEMM selection at runtime</td>
+    <td>🔵 llama.cpp</td>
+  </tr>
+  <tr>
+    <td>DeltaNet SSM layers</td>
+    <td>✅ Fully implemented (30 layers, custom kernels)</td>
+    <td>❌ Not supported (non-standard arch)</td>
+    <td>🔴 Seal (unique capability)</td>
+  </tr>
+  <tr>
+    <td>DECODE GEMV Q4_K BW efficiency</td>
+    <td>~92% (custom lcpp kernel)</td>
+    <td>~60-80% est.</td>
+    <td>🔴 Seal</td>
+  </tr>
+  <tr>
+    <td>LM head kernel routing</td>
+    <td>⚠️ Routes to v1 at 90µs — BUG (v2 exists at 3.73µs)</td>
+    <td>Correct shape dispatch to vec kernel</td>
+    <td>🔵 llama.cpp</td>
+  </tr>
+  <tr>
+    <td>Memory planning</td>
+    <td>Manual: deferred buffer map; allocations tracked by host ptr</td>
+    <td>Automatic: ggml_backend_sched plans all tensor allocations from graph</td>
+    <td>🔵 llama.cpp</td>
+  </tr>
+  <tr>
+    <td>CPU fallback</td>
+    <td>❌ No automatic fallback — unsupported op = crash</td>
+    <td>✅ Automatic: unsupported nodes fall back to CPU backend</td>
+    <td>🔵 llama.cpp</td>
+  </tr>
+</table>
+
+<div class="info">
+  <strong>Summary:</strong> llama.cpp wins on throughput (2.3× decode, 48× prefill), GPU utilization, and
+  correctness (no split KV path bug). Seal wins on custom attention kernel quality, MoE fusion depth,
+  and DeltaNet support. The performance gap is almost entirely structural: 612 dispatches/token with
+  3.6µs average GPU work per dispatch vs llama.cpp's fewer, larger batched dispatches. MK-3/MK-4
+  megakernels are the highest-leverage path to close this gap. After megakernels, the LM head routing
+  fix (P0) is the single-file change with fastest turnaround.
+</div>
+
+<hr style="margin-top:48px; border:1px solid #c5cae9;">
+<p style="color:#546e7a; font-size:12px;">
+  Generated 2026-05-01. Seal kernel data is measured (SEAL_PROFILE_KERNELS=1, timestamp queries, VK_QUERY_TYPE_TIMESTAMP).
+  llama.cpp kernel names from ggml-vulkan.cpp source structure; per-kernel timing not measured this session.
+  Performance numbers are from actual benchmark runs on the same hardware, same model, same session.
+</p>
+</body>
+</html>

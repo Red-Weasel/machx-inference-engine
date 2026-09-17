@@ -1,0 +1,444 @@
+[ds4-bench] schema=1
+[ds4-bench] run.tool=ie-ds4-bench
+[ds4-bench] run.build=Sep  3 2026 06:09:23
+[ds4-bench] run.tag=2026-09-09-profile
+[ds4-bench] run.model_path=~/models/apetersson-DeepSeek-V4-Flash-Vision-Exp-Abliterated/Reference-Native-GGUF/DeepSeek-V4-Flash-Vision-Exp-Abliterated-NativePreserved-F16-F32-MXFP4.gguf
+[ds4-bench] run.mini_fixture=0
+[ds4-bench] run.max_seq=2048
+[ds4-bench] run.max_context=32768
+[ds4-bench] run.decode_steps=32
+[ds4-bench] run.decode_warmup=8
+[ds4-bench] run.prefetch=0
+[ds4-bench] run.kprofile=1
+[ds4-bench] run.kprofile_prefill=1
+[ds4-bench] run.pin_layers=0
+[ds4-bench] run.slots_per_layer_req=0
+[ds4-bench] run.min_stream_slots_req=0
+[ds4-bench] run.expert_cache_bytes_req=0
+[ds4-bench] model.tensors_bound=1371
+[ds4-bench] model.n_layers=43
+[ds4-bench] model.hidden=4096
+[ds4-bench] model.vocab=129280
+[ds4-bench] model.n_experts=256
+[ds4-bench] model.n_experts_used=6
+[ds4-bench] model.expert_ffn=2048
+[ds4-bench] model.sliding_window=128
+[ds4-bench] model.hash_layer_count=3
+[ds4-bench] model.n_cards=2
+[ds4-note] pp.<T> is prefill of T tokens from an EMPTY context, chunked at run.max_seq (pp.chunk_tokens). It is reported PER LENGTH on purpose: the local branch is bounded by sliding_window=128, the CSA (ratio 4) compressor emits its first entry at 4 tokens and the HCA (ratio 128) one at 128, and the CSA layers' top-k indexer only has a long compressed list to select from at long prompts. One prefill number would average three different regimes.
+[ds4-note] tg.<D> is decode from a context of D tokens. kv_state_bytes_e2 / _e4 are the live per-card cache state at that depth measured by Ds4LayerCache itself, quoted at 2 B/element (the reference/fp16 figure) and at 4 (what this fp32 engine allocates). kv_growing_bytes_e2 is the part that grows with context (the compressed entry arrays); kv_const_bytes_e2 is the remainder. None of these is a per-token constant multiplied out — they are read off the caches.
+[ds4-tp] card 0 of 2 -> GPU 0
+[ds4-tp] card 1 of 2 -> GPU 1
+[ds4] device 1: Intel(R) Arc(TM) Pro B70 Graphics (queue profiling ON)
+[ds4] compressed-entry cache width: values fp16, indexer keys fp32 (IE_DS4_KV16)
+[ds4] device 0: Intel(R) Arc(TM) Pro B70 Graphics (queue profiling ON)
+[ds4] compressed-entry cache width: values fp16, indexer keys fp32 (IE_DS4_KV16)
+[ds4] layer caches pre-sized: 0.318 GB at ctx 32768 across 1 slot(s) (never grown mid-decode; IE_DS4_PRESIZE=0 for lazy growth)
+[ds4] non-expert TP: card 1 of 2 holds query heads [32,64), output groups [4,8), shared-expert columns [1024,2048)
+[ds4] layer caches pre-sized: 0.318 GB at ctx 32768 across 1 slot(s) (never grown mid-decode; IE_DS4_PRESIZE=0 for lazy growth)
+[ds4] non-expert TP: card 0 of 2 holds query heads [0,32), output groups [0,4), shared-expert columns [0,1024)
+[ds4:c0] resident weights: layer 1/43  1.74 GB
+[ds4:c1] resident weights: layer 1/43  1.74 GB
+[ds4:c0] resident weights: layer 5/43  2.14 GB
+[ds4:c1] resident weights: layer 5/43  2.14 GB
+[ds4:c0] resident weights: layer 9/43  2.54 GB
+[ds4:c1] resident weights: layer 9/43  2.54 GB
+[ds4:c0] resident weights: layer 13/43  2.94 GB
+[ds4:c1] resident weights: layer 13/43  2.94 GB
+[ds4:c0] resident weights: layer 17/43  3.34 GB
+[ds4:c1] resident weights: layer 17/43  3.34 GB
+[ds4:c0] resident weights: layer 21/43  3.74 GB
+[ds4:c1] resident weights: layer 21/43  3.74 GB
+[ds4:c0] resident weights: layer 25/43  4.13 GB
+[ds4:c1] resident weights: layer 25/43  4.13 GB
+[ds4:c0] resident weights: layer 29/43  4.53 GB
+[ds4:c1] resident weights: layer 29/43  4.53 GB
+[ds4:c1] resident weights: layer 33/43  4.93 GB
+[ds4:c0] resident weights: layer 33/43  4.93 GB
+[ds4:c0] resident weights: layer 37/43  5.33 GB
+[ds4:c1] resident weights: layer 37/43  5.33 GB
+[ds4:c0] resident weights: layer 41/43  5.73 GB
+[ds4:c1] resident weights: layer 41/43  5.73 GB
+[ds4:c0] resident weights: layer 43/43  5.93 GB
+
+[ds4] always-resident set uploaded: 5.925 GB (packed residency saved 3.449 GB vs dequantising it all to fp16; that VRAM goes to the expert arena)
+[ds4:c1] resident weights: layer 43/43  5.93 GB
+
+[ds4] always-resident set uploaded: 5.925 GB (packed residency saved 3.449 GB vs dequantising it all to fp16; that VRAM goes to the expert arena)
+[ds4] workspaces: 2.141 GB (attention/indexer strips of 2048 of 2048 query rows; kv capacity 10433 = 2176 sliding + 8257 compressed)
+[ds4] workspaces: 2.141 GB (attention/indexer strips of 2048 of 2048 query rows; kv capacity 10433 = 2176 sliding + 8257 compressed)
+[ds4] VRAM plan: 34.242 GB total - 5.925 resident - 0.318 layer caches (ctx 32768) - 2.141 workspaces - 2.147 margin = 23.711 GB expert arena
+[ds4] VRAM plan: 34.242 GB total - 5.925 resident - 0.318 layer caches (ctx 32768) - 2.141 workspaces - 2.147 margin = 23.711 GB expert arena
+[ds4] pinned-host cap 198.242 GB derived live: MemTotal 267.38 GB, MemAvailable 231.66 GB (page cache 29.42 GB of it); available-33.42 = 198.242 GB, total-66.84 = 200.532 GB -> cap 198.242 GB (available bound)
+[ds4] pinned-host cap 198.242 GB derived live: MemTotal 267.38 GB, MemAvailable 231.66 GB (page cache 29.42 GB of it); available-33.42 = 198.242 GB, total-66.84 = 200.532 GB -> cap 198.242 GB (available bound)
+[ds4] expert-TP: card 0 of 2 holds intermediate columns/rows [0,1024) of every expert — 6.685 MB/slot vs 13.369 MB whole
+[ds4] residency: 81 slots/layer = 0 static (VRAM only, host copy never allocated) + 81 streaming; 23.283 GB VRAM experts; 256 of 256 experts/layer pinned = 73.585 GB host (this card; 147.170 GB over 2 cards, cap 198.242 GB)
+[ds4] expert-TP: card 1 of 2 holds intermediate columns/rows [1024,2048) of every expert — 6.685 MB/slot vs 13.369 MB whole
+[ds4] residency: 81 slots/layer = 0 static (VRAM only, host copy never allocated) + 81 streaming; 23.283 GB VRAM experts; 256 of 256 experts/layer pinned = 73.585 GB host (this card; 147.170 GB over 2 cards, cap 198.242 GB)
+[ds4] residency order: index order (default; no Ds4Options::expert_priority, no $DS4_EXPERT_PRIORITY_FILE)
+[ds4] residency order: index order (default; no Ds4Options::expert_priority, no $DS4_EXPERT_PRIORITY_FILE)
+[ds4] pinned host arena: 73.585 GB in 5 segments (largest 17.113 GB, cap 32.530 GB)
+[ds4] pinned host arena: 73.585 GB in 5 segments (largest 17.113 GB, cap 32.530 GB)
+[ds4] prefill fetch banks: 2 x 32 slots (0.428 GB (427819008 B)); prefill misses bypass the LRU
+[ds4] expert cache: 81 slots/layer, 23.711 GB VRAM (31.6% residency)
+[ds4] prefill fetch banks: 2 x 32 slots (0.428 GB (427819008 B)); prefill misses bypass the LRU
+[ds4] expert cache: 81 slots/layer, 23.711 GB VRAM (31.6% residency)
+[ds4-tp] P2P available between all 2 devices
+[ds4-tp] cross-card reduction: sliced host path at prefill sizes (IE_DS4_REDUCE_SLICED=0 for the memcpy form)
+[ds4-tp] expert pool: layer 1/43  3.42 GB packed across 2 cards  1.7 s  2012.3 MB/s
+[ds4-tp] expert pool: layer 2/43  6.85 GB packed across 2 cards  3.4 s  1992.5 MB/s
+[ds4-tp] expert pool: layer 3/43  10.27 GB packed across 2 cards  5.2 s  1978.6 MB/s
+[ds4-tp] expert pool: layer 4/43  13.69 GB packed across 2 cards  7.0 s  1942.2 MB/s
+[ds4-tp] expert pool: layer 5/43  17.11 GB packed across 2 cards  8.9 s  1929.3 MB/s
+[ds4-tp] expert pool: layer 6/43  20.54 GB packed across 2 cards  10.6 s  1943.1 MB/s
+[ds4-tp] expert pool: layer 7/43  23.96 GB packed across 2 cards  12.3 s  1942.1 MB/s
+[ds4-tp] expert pool: layer 8/43  27.38 GB packed across 2 cards  15.4 s  1776.7 MB/s
+[ds4-tp] expert pool: layer 9/43  30.80 GB packed across 2 cards  18.4 s  1675.9 MB/s
+[ds4-tp] expert pool: layer 10/43  34.23 GB packed across 2 cards  20.1 s  1698.8 MB/s
+[ds4-tp] expert pool: layer 11/43  37.65 GB packed across 2 cards  21.9 s  1716.6 MB/s
+[ds4-tp] expert pool: layer 12/43  41.07 GB packed across 2 cards  23.9 s  1720.7 MB/s
+[ds4-tp] expert pool: layer 13/43  44.49 GB packed across 2 cards  25.7 s  1730.6 MB/s
+[ds4-tp] expert pool: layer 14/43  47.92 GB packed across 2 cards  27.6 s  1733.2 MB/s
+[ds4-tp] expert pool: layer 15/43  51.34 GB packed across 2 cards  29.5 s  1739.8 MB/s
+[ds4-tp] expert pool: layer 16/43  54.76 GB packed across 2 cards  31.4 s  1743.8 MB/s
+[ds4-tp] expert pool: layer 17/43  58.18 GB packed across 2 cards  34.4 s  1690.0 MB/s
+[ds4-tp] expert pool: layer 18/43  61.61 GB packed across 2 cards  36.4 s  1693.8 MB/s
+[ds4-tp] expert pool: layer 19/43  65.03 GB packed across 2 cards  38.6 s  1686.2 MB/s
+[ds4-tp] expert pool: layer 20/43  68.45 GB packed across 2 cards  40.4 s  1696.1 MB/s
+[ds4-tp] expert pool: layer 21/43  71.87 GB packed across 2 cards  42.2 s  1702.3 MB/s
+[ds4-tp] expert pool: layer 22/43  75.30 GB packed across 2 cards  44.1 s  1706.2 MB/s
+[ds4-tp] expert pool: layer 23/43  78.72 GB packed across 2 cards  46.0 s  1713.1 MB/s
+[ds4-tp] expert pool: layer 24/43  82.14 GB packed across 2 cards  47.8 s  1720.2 MB/s
+[ds4-tp] expert pool: layer 25/43  85.56 GB packed across 2 cards  49.6 s  1725.3 MB/s
+[ds4-tp] expert pool: layer 26/43  88.99 GB packed across 2 cards  51.9 s  1715.3 MB/s
+[ds4-tp] expert pool: layer 27/43  92.41 GB packed across 2 cards  54.0 s  1711.7 MB/s
+[ds4-tp] expert pool: layer 28/43  95.83 GB packed across 2 cards  56.0 s  1710.0 MB/s
+[ds4-tp] expert pool: layer 29/43  99.25 GB packed across 2 cards  58.1 s  1709.5 MB/s
+[ds4-tp] expert pool: layer 30/43  102.68 GB packed across 2 cards  59.9 s  1715.1 MB/s
+[ds4-tp] expert pool: layer 31/43  106.10 GB packed across 2 cards  61.8 s  1718.0 MB/s
+[ds4-tp] expert pool: layer 32/43  109.52 GB packed across 2 cards  63.5 s  1724.2 MB/s
+[ds4-tp] expert pool: layer 33/43  112.94 GB packed across 2 cards  65.2 s  1731.5 MB/s
+[ds4-tp] expert pool: layer 34/43  116.37 GB packed across 2 cards  67.2 s  1731.8 MB/s
+[ds4-tp] expert pool: layer 35/43  119.79 GB packed across 2 cards  69.0 s  1735.8 MB/s
+[ds4-tp] expert pool: layer 36/43  123.21 GB packed across 2 cards  70.9 s  1737.3 MB/s
+[ds4-tp] expert pool: layer 37/43  126.63 GB packed across 2 cards  73.5 s  1722.4 MB/s
+[ds4-tp] expert pool: layer 38/43  130.06 GB packed across 2 cards  75.8 s  1716.0 MB/s
+[ds4-tp] expert pool: layer 39/43  133.48 GB packed across 2 cards  77.7 s  1718.2 MB/s
+[ds4-tp] expert pool: layer 40/43  136.90 GB packed across 2 cards  79.6 s  1719.8 MB/s
+[ds4-tp] expert pool: layer 41/43  140.32 GB packed across 2 cards  81.5 s  1722.3 MB/s
+[ds4-tp] expert pool: layer 42/43  143.75 GB packed across 2 cards  83.3 s  1725.5 MB/s
+[ds4-tp] expert pool: layer 43/43  147.17 GB packed across 2 cards  85.2 s  1726.4 MB/s
+[ds4-bench] load.seconds=125.54
+[ds4-bench] load.status=ok
+[ds4-bench] card.0.device=Intel(R) Arc(TM) Pro B70 Graphics
+[ds4-bench] card.0.resident_bytes=5925197788
+[ds4-bench] card.0.expert_cache_bytes=23710531584
+[ds4-bench] card.0.pinned_host_bytes=73584869376
+[ds4-bench] card.0.slots_per_layer=81
+[ds4-bench] card.0.static_slots=0
+[ds4-bench] card.0.stream_slots=81
+[ds4-bench] card.1.device=Intel(R) Arc(TM) Pro B70 Graphics
+[ds4-bench] card.1.resident_bytes=5925197788
+[ds4-bench] card.1.expert_cache_bytes=23710531584
+[ds4-bench] card.1.pinned_host_bytes=73584869376
+[ds4-bench] card.1.slots_per_layer=81
+[ds4-bench] card.1.static_slots=0
+[ds4-bench] card.1.stream_slots=81
+[ds4-bench] residency.vram_bytes_total=59271458744
+[ds4-bench] residency.pinned_host_bytes_total=147169738752
+[ds4-bench] residency.resident_saved_bytes=3448897536
+[ds4-bench] residency.pinned_experts_per_layer=256
+[ds4-bench] residency.layers_pinned=43
+[ds4-bench] residency.priority_origin=index
+[ds4-bench] residency.priority_source=-
+[ds4-bench] ttft.prompt_tokens=2048
+[ds4-bench] ttft.cold_ms=5191.012
+[ds4-bench] ttft.cold.prefill_ms=5190.898
+[ds4-bench] ttft.cold.sample_ms=0.115
+[ds4-bench] ttft.cold.first_token_id=416
+[ds4-bench] ttft.warm_ms=3753.467
+[ds4-bench] ttft.warm.prefill_ms=3753.352
+[ds4-bench] ttft.warm.sample_ms=0.115
+[ds4-bench] ttft.warm.first_token_id=416
+[ds4-note] ttft.cold includes SYCL JIT of every kernel; ttft.warm does not. Neither includes model load.
+[ds4-bench] pp.chunk_tokens=2048
+[ds4-bench] pp.4096.status=ok
+[ds4-bench] pp.4096.chunks=2
+[ds4-bench] pp.4096.ms=7821.548
+[ds4-bench] pp.4096.tok_s=523.682
+[ds4-bench] pp.4096.ms_per_tok=1.90956
+[ds4-bench] pp.4096.dma_bytes=142503837696
+[ds4-bench] pp.4096.dma_busy_ms=5460.122
+[ds4-bench] pp.4096.dma_busy_frac=0.6981
+[ds4-bench] pp.4096.cards=2
+[ds4-bench] pp.4096.dma_bytes_per_card=71251918848
+[ds4-bench] pp.4096.dma_busy_ms_per_card=2730.061
+[ds4-bench] pp.4096.dma_busy_frac_per_card=0.3490
+[ds4-bench] pp.4096.dma_GB_s_when_busy=26.099
+[ds4-bench] pp.4096.dma_MB_per_tok_per_card=17.395
+[ds4-bench] pp.4096.cache_hits=12794
+[ds4-bench] pp.4096.cache_misses=21318
+[ds4-bench] pp.4096.ftrace.wall_ms=4018.897
+[ds4-bench] pp.4096.ftrace.span_ms=3161.902
+[ds4-bench] pp.4096.ftrace.reduce_ms=803.685
+[ds4-bench] pp.4096.ftrace.prologue_ms=1.029
+[ds4-bench] pp.4096.ftrace.epilogue_ms=50.622
+[ds4-bench] pp.4096.ftrace.gap_ms=1.660
+[ds4-bench] pp.4096.ftrace.span_pre_ms=624.752
+[ds4-bench] pp.4096.ftrace.span_mid_ms=2379.830
+[ds4-bench] pp.4096.ftrace.span_post_ms=157.320
+[ds4-bench] pp.4096.ftrace.overlap_ms=3059.532
+[ds4-bench] pp.4096.ftrace.segments_overlapped=129
+[ds4-bench] pp.4096.ftrace.segments=129
+[ds4-bench] pp.4096.ftrace.sequential=0
+[ds4-bench] pp.4096.ftrace.card0.busy_ms=3076.133
+[ds4-bench] pp.4096.ftrace.card0.wait_router_ms=431.511
+[ds4-bench] pp.4096.ftrace.card0.wait_moe_ms=1886.836
+[ds4-bench] pp.4096.ftrace.card0.wait_post_ms=100.589
+[ds4-bench] pp.4096.ftrace.card0.wait_other_ms=0.755
+[ds4-bench] pp.4096.ftrace.card0.wait_total_ms=2419.692
+[ds4-bench] pp.4096.ftrace.card0.waits=378
+[ds4-bench] pp.4096.ftrace.card1.busy_ms=3145.301
+[ds4-bench] pp.4096.ftrace.card1.wait_router_ms=452.423
+[ds4-bench] pp.4096.ftrace.card1.wait_moe_ms=1879.831
+[ds4-bench] pp.4096.ftrace.card1.wait_post_ms=152.662
+[ds4-bench] pp.4096.ftrace.card1.wait_other_ms=0.744
+[ds4-bench] pp.4096.ftrace.card1.wait_total_ms=2485.660
+[ds4-bench] pp.4096.ftrace.card1.waits=377
+[ds4-bench] pp.4096.cache_hit_rate=0.3751
+[ds4-bench] pp.4096.cache_acquires=918
+[ds4-bench] pp.4096.acquire_ids_per_layer_per_card=396.65
+[ds4-bench] pp.4096.misses_per_layer_per_card=247.88
+[ds4-bench] pp.4096.prefetch_issued=0
+[ds4-bench] pp.4096.prefetch_hits=0
+[ds4-bench] pp.4096.kv_state_bytes_e2=33987584
+[ds4-bench] pp.4096.kv_state_bytes_e4=67975168
+[ds4-bench] pp.4096.kprof.wall_ms_SEQUENTIAL_CARDS=13196.690
+[ds4-bench] pp.4096.kprof.gpu_ms=11852.107
+[ds4-bench] pp.4096.kprof.dma_busy_ms=5244.581
+[ds4-bench] pp.4096.kprof.kernels=35
+[ds4-bench] pp.4096.kprof.kernel.ds4_gemm_mxfp4.ms=4176.0636
+[ds4-bench] pp.4096.kprof.kernel.ds4_gemm_mxfp4.calls=918
+[ds4-bench] pp.4096.kprof.kernel.ds4_gemm_mxfp4_xmx.ms=2200.1627
+[ds4-bench] pp.4096.kprof.kernel.ds4_gemm_mxfp4_xmx.calls=918
+[ds4-bench] pp.4096.kprof.kernel.ds4_indexer_score.ms=980.1358
+[ds4-bench] pp.4096.kprof.kernel.ds4_indexer_score.calls=84
+[ds4-bench] pp.4096.kprof.kernel.ds4_router_logits.ms=974.4200
+[ds4-bench] pp.4096.kprof.kernel.ds4_router_logits.calls=172
+[ds4-bench] pp.4096.kprof.kernel.ds4_hyper_connection.ms=576.5360
+[ds4-bench] pp.4096.kprof.kernel.ds4_hyper_connection.calls=344
+[ds4-bench] pp.4096.kprof.kernel.ds4_attention_xmx.ms=559.9063
+[ds4-bench] pp.4096.kprof.kernel.ds4_attention_xmx.calls=172
+[ds4-bench] pp.4096.kprof.kernel.ds4_hc_mix.ms=443.5582
+[ds4-bench] pp.4096.kprof.kernel.ds4_hc_mix.calls=344
+[ds4-bench] pp.4096.kprof.kernel.cast_f32_f16.ms=340.8949
+[ds4-bench] pp.4096.kprof.kernel.cast_f32_f16.calls=2958
+[ds4-bench] pp.4096.kprof.kernel.ds4_dense_f16@attn.ms=335.4185
+[ds4-bench] pp.4096.kprof.kernel.ds4_dense_f16@attn.calls=1352
+[ds4-bench] pp.4096.kprof.kernel.quant_q8_1.ms=177.3074
+[ds4-bench] pp.4096.kprof.kernel.quant_q8_1.calls=1090
+[ds4-bench] pp.4096.kprof.kernel.ds4_q8_soa_to_f16.ms=149.4392
+[ds4-bench] pp.4096.kprof.kernel.ds4_q8_soa_to_f16.calls=1788
+[ds4-bench] pp.4096.kprof.kernel.ds4_moe_gather.ms=113.4284
+[ds4-bench] pp.4096.kprof.kernel.ds4_moe_gather.calls=172
+[ds4-bench] pp.4096.kprof.kernel.ds4_unweighted_rms_norm.ms=111.2445
+[ds4-bench] pp.4096.kprof.kernel.ds4_unweighted_rms_norm.calls=172
+[ds4-bench] pp.4096.kprof.kernel.ds4_rope_apply.ms=104.7647
+[ds4-bench] pp.4096.kprof.kernel.ds4_rope_apply.calls=848
+[ds4-bench] pp.4096.kprof.kernel.ds4_grouped_f16@attn.ms=94.2129
+[ds4-bench] pp.4096.kprof.kernel.ds4_grouped_f16@attn.calls=172
+[ds4-bench] pp.4096.kprof.kernel.ds4_attention_xmx_prep.ms=92.0550
+[ds4-bench] pp.4096.kprof.kernel.ds4_attention_xmx_prep.calls=344
+[ds4-bench] pp.4096.kprof.kernel.ds4_dense_f16@shexp.ms=90.6073
+[ds4-bench] pp.4096.kprof.kernel.ds4_dense_f16@shexp.calls=516
+[ds4-bench] pp.4096.kprof.kernel.ds4_swiglu_clamped.ms=71.2920
+[ds4-bench] pp.4096.kprof.kernel.ds4_swiglu_clamped.calls=1090
+[ds4-bench] pp.4096.kprof.kernel.ds4_moe_scatter.ms=62.5879
+[ds4-bench] pp.4096.kprof.kernel.ds4_moe_scatter.calls=172
+[ds4-bench] pp.4096.kprof.kernel.ds4_indexer_topk.ms=56.5356
+[ds4-bench] pp.4096.kprof.kernel.ds4_indexer_topk.calls=84
+[ds4-bench] pp.4096.kprof.kernel.ds4_rms_norm.ms=46.5701
+[ds4-bench] pp.4096.kprof.kernel.ds4_rms_norm.calls=938
+[ds4-bench] pp.4096.kprof.kernel.ds4_add_f32.ms=38.3550
+[ds4-bench] pp.4096.kprof.kernel.ds4_add_f32.calls=172
+[ds4-bench] pp.4096.kprof.kernel.ds4_router_topk.ms=18.6454
+[ds4-bench] pp.4096.kprof.kernel.ds4_router_topk.calls=160
+[ds4-bench] pp.4096.kprof.kernel.ds4_concat_mask.ms=12.0421
+[ds4-bench] pp.4096.kprof.kernel.ds4_concat_mask.calls=164
+[ds4-bench] pp.4096.kprof.kernel.ds4_compress_pool.ms=10.6560
+[ds4-bench] pp.4096.kprof.kernel.ds4_compress_pool.calls=248
+[ds4-bench] pp.4096.kprof.kernel.ds4_sliding_causal_mask.ms=5.9959
+[ds4-bench] pp.4096.kprof.kernel.ds4_sliding_causal_mask.calls=172
+[ds4-bench] pp.4096.kprof.kernel.ds4_hyper_head.ms=2.0145
+[ds4-bench] pp.4096.kprof.kernel.ds4_hyper_head.calls=2
+[ds4-bench] pp.4096.kprof.kernel.ds4_dense_q8@lmhead.ms=1.9725
+[ds4-bench] pp.4096.kprof.kernel.ds4_dense_q8@lmhead.calls=2
+[ds4-bench] pp.4096.kprof.kernel.ds4_block_bias_topk_scatter.ms=1.8314
+[ds4-bench] pp.4096.kprof.kernel.ds4_block_bias_topk_scatter.calls=84
+[ds4-bench] pp.4096.kprof.kernel.ds4_expand_streams.ms=1.6069
+[ds4-bench] pp.4096.kprof.kernel.ds4_expand_streams.calls=4
+[ds4-bench] pp.4096.kprof.kernel.ds4_rope_cos_sin.ms=0.5278
+[ds4-bench] pp.4096.kprof.kernel.ds4_rope_cos_sin.calls=256
+[ds4-bench] pp.4096.kprof.kernel.ds4_block_bias_topk_fill.ms=0.4672
+[ds4-bench] pp.4096.kprof.kernel.ds4_block_bias_topk_fill.calls=84
+[ds4-bench] pp.4096.kprof.kernel.ds4_gather_embd.ms=0.4534
+[ds4-bench] pp.4096.kprof.kernel.ds4_gather_embd.calls=4
+[ds4-bench] pp.4096.kprof.kernel.ds4_router_hash.ms=0.2242
+[ds4-bench] pp.4096.kprof.kernel.ds4_router_hash.calls=12
+[ds4-bench] pp.4096.kprof.kernel.ds4_block_bias_dense.ms=0.1739
+[ds4-bench] pp.4096.kprof.kernel.ds4_block_bias_dense.calls=80
+[ds4-bench] pp.4096.kgroup.attention.ms=1714.006
+[ds4-bench] pp.4096.kgroup.attention.frac=0.1446
+[ds4-bench] pp.4096.kgroup.attention.calls=3800
+[ds4-bench] pp.4096.kgroup.dense_materialise.ms=149.439
+[ds4-bench] pp.4096.kgroup.dense_materialise.frac=0.0126
+[ds4-bench] pp.4096.kgroup.dense_materialise.calls=1788
+[ds4-bench] pp.4096.kgroup.hyper.ms=1022.109
+[ds4-bench] pp.4096.kgroup.hyper.frac=0.0862
+[ds4-bench] pp.4096.kgroup.hyper.calls=690
+[ds4-bench] pp.4096.kgroup.lm_head.ms=1.972
+[ds4-bench] pp.4096.kgroup.lm_head.frac=0.0002
+[ds4-bench] pp.4096.kgroup.lm_head.calls=2
+[ds4-bench] pp.4096.kgroup.moe_mixed.ms=71.292
+[ds4-bench] pp.4096.kgroup.moe_mixed.frac=0.0060
+[ds4-bench] pp.4096.kgroup.moe_mixed.calls=1090
+[ds4-bench] pp.4096.kgroup.moe_routed.ms=537.072
+[ds4-bench] pp.4096.kgroup.moe_routed.frac=0.0453
+[ds4-bench] pp.4096.kgroup.moe_routed.calls=4220
+[ds4-bench] pp.4096.kgroup.moe_shared.ms=90.607
+[ds4-bench] pp.4096.kgroup.moe_shared.frac=0.0076
+[ds4-bench] pp.4096.kgroup.moe_shared.calls=516
+[ds4-bench] pp.4096.kgroup.other.ms=8265.609
+[ds4-bench] pp.4096.kgroup.other.frac=0.6974
+[ds4-bench] pp.4096.kgroup.other.calls=3986
+[ds4-bench] pp.4096.kprof.host_ms_est=1344.583
+[ds4-note] pp.*.kprof.* comes from an EXTRA prefill run with the process-global kernel profiler on, which forces the TP cards to take turns. Its wall is therefore NOT the concurrent prefill wall reported as pp.*.ms; only the per-kernel and per-bucket GPU times and their shares are meant to be read.
+[ds4-bench] tg.4096.status=ok
+[ds4-bench] tg.4096.steps=32
+[ds4-bench] tg.4096.tok_s=23.1743
+[ds4-bench] tg.4096.ms_per_tok_mean=43.0497
+[ds4-bench] tg.4096.ms_per_tok_p50=42.8784
+[ds4-bench] tg.4096.ms_per_tok_p10=37.6488
+[ds4-bench] tg.4096.ms_per_tok_p90=49.2810
+[ds4-bench] tg.4096.ms_per_tok_min=32.4271
+[ds4-bench] tg.4096.ms_per_tok_max=51.6523
+[ds4-bench] tg.4096.ms_per_tok_stdev=4.7685
+[ds4-bench] tg.4096.burstiness_p90_over_p50=1.1493
+[ds4-bench] tg.4096.dma_bytes_per_tok=568614912.0
+[ds4-bench] tg.4096.dma_busy_ms_per_tok=21.8026
+[ds4-bench] tg.4096.dma_busy_frac=0.5053
+[ds4-bench] tg.4096.cache_hits=13790
+[ds4-bench] tg.4096.cache_misses=2722
+[ds4-bench] tg.4096.cache_hit_rate=0.8352
+[ds4-bench] tg.4096.cache_acquires=2752
+[ds4-bench] tg.4096.cache_unavailable=0
+[ds4-bench] tg.4096.prefetch_issued=0
+[ds4-bench] tg.4096.prefetch_hits=0
+[ds4-bench] tg.4096.kv_state_bytes_e2=35894784
+[ds4-bench] tg.4096.kv_state_bytes_e4=71789568
+[ds4-bench] tg.4096.kv_growing_bytes_e2=28449280
+[ds4-bench] tg.4096.kv_const_bytes_e2=7445504
+[ds4-bench] tg.4096.kv_allocated_bytes=1286417920
+[ds4-bench] tg.4096.context_length=4136
+[ds4-bench] tg.4096.kv_growth_bytes_per_ctx_tok_e2=6878.45
+[ds4-note] kprofile under TP: g_profiler is process-global and the cards run sequentially inside one forward, so attention / moe / hyper buckets are the SUM over cards, while lm_head is card 0 only (the head is mirrored and only card 0 computes it). Do not read a per-card share off these.
+[ds4-bench] tg.4096.kprof.wall_ms=71.7053
+[ds4-bench] tg.4096.kprof.gpu_ms=39.3542
+[ds4-bench] tg.4096.kprof.dma_busy_ms=20.5395
+[ds4-bench] tg.4096.kprof.kernels=32
+[ds4-bench] tg.4096.kprof.kernel.ds4_dense_q8@attn.ms=9.5255
+[ds4-bench] tg.4096.kprof.kernel.ds4_dense_q8@attn.calls=550
+[ds4-bench] tg.4096.kprof.kernel.ds4_gemm_mxfp4.ms=8.3747
+[ds4-bench] tg.4096.kprof.kernel.ds4_gemm_mxfp4.calls=172
+[ds4-bench] tg.4096.kprof.kernel.ds4_attention.ms=5.8172
+[ds4-bench] tg.4096.kprof.kernel.ds4_attention.calls=86
+[ds4-bench] tg.4096.kprof.kernel.ds4_grouped_q8@attn.ms=2.9063
+[ds4-bench] tg.4096.kprof.kernel.ds4_grouped_q8@attn.calls=86
+[ds4-bench] tg.4096.kprof.kernel.ds4_dense_q8@shexp.ms=2.5965
+[ds4-bench] tg.4096.kprof.kernel.ds4_dense_q8@shexp.calls=172
+[ds4-bench] tg.4096.kprof.kernel.ds4_router_logits.ms=1.9028
+[ds4-bench] tg.4096.kprof.kernel.ds4_router_logits.calls=86
+[ds4-bench] tg.4096.kprof.kernel.ds4_hc_tail_norm.ms=1.1070
+[ds4-bench] tg.4096.kprof.kernel.ds4_hc_tail_norm.calls=172
+[ds4-bench] tg.4096.kprof.kernel.ds4_dense_q8@lmhead.ms=0.9517
+[ds4-bench] tg.4096.kprof.kernel.ds4_dense_q8@lmhead.calls=1
+[ds4-bench] tg.4096.kprof.kernel.ds4_indexer_topk.ms=0.8804
+[ds4-bench] tg.4096.kprof.kernel.ds4_indexer_topk.calls=42
+[ds4-bench] tg.4096.kprof.kernel.ds4_hc_gemv.ms=0.8505
+[ds4-bench] tg.4096.kprof.kernel.ds4_hc_gemv.calls=172
+[ds4-bench] tg.4096.kprof.kernel.ds4_router_topk.ms=0.6350
+[ds4-bench] tg.4096.kprof.kernel.ds4_router_topk.calls=80
+[ds4-bench] tg.4096.kprof.kernel.ds4_indexer_score.ms=0.5132
+[ds4-bench] tg.4096.kprof.kernel.ds4_indexer_score.calls=42
+[ds4-bench] tg.4096.kprof.kernel.ds4_dense_f16@attn.ms=0.5102
+[ds4-bench] tg.4096.kprof.kernel.ds4_dense_f16@attn.calls=84
+[ds4-bench] tg.4096.kprof.kernel.ds4_hc_mix.ms=0.4662
+[ds4-bench] tg.4096.kprof.kernel.ds4_hc_mix.calls=172
+[ds4-bench] tg.4096.kprof.kernel.quant_q8_1.ms=0.3985
+[ds4-bench] tg.4096.kprof.kernel.quant_q8_1.calls=172
+[ds4-bench] tg.4096.kprof.kernel.ds4_rms_norm.ms=0.3469
+[ds4-bench] tg.4096.kprof.kernel.ds4_rms_norm.calls=173
+[ds4-bench] tg.4096.kprof.kernel.ds4_rope_apply.ms=0.2984
+[ds4-bench] tg.4096.kprof.kernel.ds4_rope_apply.calls=300
+[ds4-bench] tg.4096.kprof.kernel.ds4_moe_gather.ms=0.2002
+[ds4-bench] tg.4096.kprof.kernel.ds4_moe_gather.calls=86
+[ds4-bench] tg.4096.kprof.kernel.ds4_moe_scatter.ms=0.1929
+[ds4-bench] tg.4096.kprof.kernel.ds4_moe_scatter.calls=86
+[ds4-bench] tg.4096.kprof.kernel.ds4_swiglu_clamped_h.ms=0.1724
+[ds4-bench] tg.4096.kprof.kernel.ds4_swiglu_clamped_h.calls=86
+[ds4-bench] tg.4096.kprof.kernel.ds4_unweighted_rms_norm.ms=0.1236
+[ds4-bench] tg.4096.kprof.kernel.ds4_unweighted_rms_norm.calls=86
+[ds4-bench] tg.4096.kprof.kernel.ds4_hyper_head.ms=0.1004
+[ds4-bench] tg.4096.kprof.kernel.ds4_hyper_head.calls=1
+[ds4-bench] tg.4096.kprof.kernel.ds4_sliding_causal_mask.ms=0.0992
+[ds4-bench] tg.4096.kprof.kernel.ds4_sliding_causal_mask.calls=86
+[ds4-bench] tg.4096.kprof.kernel.ds4_swiglu_clamped.ms=0.0883
+[ds4-bench] tg.4096.kprof.kernel.ds4_swiglu_clamped.calls=86
+[ds4-bench] tg.4096.kprof.kernel.ds4_concat_mask.ms=0.0845
+[ds4-bench] tg.4096.kprof.kernel.ds4_concat_mask.calls=82
+[ds4-bench] tg.4096.kprof.kernel.ds4_add_f32.ms=0.0687
+[ds4-bench] tg.4096.kprof.kernel.ds4_add_f32.calls=86
+[ds4-bench] tg.4096.kprof.kernel.ds4_block_bias_topk_scatter.ms=0.0663
+[ds4-bench] tg.4096.kprof.kernel.ds4_block_bias_topk_scatter.calls=42
+[ds4-bench] tg.4096.kprof.kernel.ds4_block_bias_topk_fill.ms=0.0476
+[ds4-bench] tg.4096.kprof.kernel.ds4_block_bias_topk_fill.calls=42
+[ds4-bench] tg.4096.kprof.kernel.ds4_router_hash.ms=0.0173
+[ds4-bench] tg.4096.kprof.kernel.ds4_router_hash.calls=6
+[ds4-bench] tg.4096.kprof.kernel.ds4_rope_cos_sin.ms=0.0059
+[ds4-bench] tg.4096.kprof.kernel.ds4_rope_cos_sin.calls=4
+[ds4-bench] tg.4096.kprof.kernel.ds4_gather_embd.ms=0.0037
+[ds4-bench] tg.4096.kprof.kernel.ds4_gather_embd.calls=2
+[ds4-bench] tg.4096.kprof.kernel.ds4_expand_streams.ms=0.0022
+[ds4-bench] tg.4096.kprof.kernel.ds4_expand_streams.calls=2
+[ds4-bench] tg.4096.kgroup.attention.ms=20.8783
+[ds4-bench] tg.4096.kgroup.attention.frac=0.5305
+[ds4-bench] tg.4096.kgroup.attention.calls=1532
+[ds4-bench] tg.4096.kgroup.hyper.ms=2.5241
+[ds4-bench] tg.4096.kgroup.hyper.frac=0.0641
+[ds4-bench] tg.4096.kgroup.hyper.calls=517
+[ds4-bench] tg.4096.kgroup.lm_head.ms=0.9517
+[ds4-bench] tg.4096.kgroup.lm_head.frac=0.0242
+[ds4-bench] tg.4096.kgroup.lm_head.calls=1
+[ds4-bench] tg.4096.kgroup.moe_mixed.ms=0.2607
+[ds4-bench] tg.4096.kgroup.moe_mixed.frac=0.0066
+[ds4-bench] tg.4096.kgroup.moe_mixed.calls=172
+[ds4-bench] tg.4096.kgroup.moe_routed.ms=1.0508
+[ds4-bench] tg.4096.kgroup.moe_routed.frac=0.0267
+[ds4-bench] tg.4096.kgroup.moe_routed.calls=258
+[ds4-bench] tg.4096.kgroup.moe_shared.ms=2.5965
+[ds4-bench] tg.4096.kgroup.moe_shared.frac=0.0660
+[ds4-bench] tg.4096.kgroup.moe_shared.calls=172
+[ds4-bench] tg.4096.kgroup.other.ms=11.0922
+[ds4-bench] tg.4096.kgroup.other.frac=0.2819
+[ds4-bench] tg.4096.kgroup.other.calls=693
+[ds4-bench] tg.4096.overlap_est_frac=0.0000
+[ds4-bench] tg.4096.kprof.host_ms_est=32.3511
+[ds4-bench] tg.all.tok_s=23.1743
+[ds4-bench] tg.all.cache_hit_rate=0.8352
+[ds4-bench] tg.all.dma_mb_per_tok=568.6149
+[ds4-bench] tg.all.steps=32
+[ds4-bench] tp.reductions=4214
+[ds4-bench] tp.reduce_ms_total=6362.077
+[ds4-bench] tp.stage_bytes=134217728
+[ds4-note] tp.* are cumulative over the whole pass, not per token. The cards DO run concurrently now (DeepSeek4TpRuntime posts each layer segment to a per-card worker and joins at the reduction; deepseek4_residency_test 15h asserts the intervals intersect) EXCEPT while the kernel profiler is on, which forces them to take turns.
+[ds4-bench] run.status=ok

@@ -1,0 +1,16 @@
+# Keep the build context small + reproducible: send only sources, not the host
+# build tree, models, git history, or scratch.
+build/
+.git/
+.github/
+.claude/
+.remember/
+.pi-lens/
+models/
+.seal/
+*.gguf
+*.png
+*.o
+*.a
+*.so
+docs/superpowers/

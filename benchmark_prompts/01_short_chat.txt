@@ -1,0 +1,1 @@
+You are a concise technical assistant. Explain what a GPU inference engine does in plain English for a software developer who understands programming but not machine-learning runtimes. Keep the answer under 250 words.

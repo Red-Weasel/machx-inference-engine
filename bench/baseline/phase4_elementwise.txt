@@ -1,0 +1,9 @@
+Device: Intel(R) Graphics [0xe223]
+  residual_add 4096          OK
+  SiLU 1024 random           OK
+  SwiGLU 1024 random         OK
+  RMSNorm 1x8                OK
+  RoPE partial               OK
+  sigmoid_gate 1024 random   OK
+
+ALL PASS

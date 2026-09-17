@@ -1,0 +1,25 @@
+{
+  "date_utc": "2026-09-09T18:52:04.283966+00:00",
+  "workspace_head": "96771aa13a0b316142468d0414ac5e04e5f694a9",
+  "binary_sha256": "4737584ccccc4a3a25fad033a5c5d0f1ec5121c8275afc1523225dadc832c158",
+  "binary_original_mtime": "2026-09-03 06:09 local",
+  "binary_source_commit": "not independently attested; existing prebuilt executable",
+  "model_filename": "DeepSeek-V4-Flash-Vision-Exp-Abliterated-NativePreserved-F16-F32-MXFP4.gguf",
+  "model_bytes": 164697137152,
+  "model_publisher_sha256": "4b46c3b767c09ed707f2e89122e8a0ea9a92e0f714ffd5a5d3656c91f1cc69b4",
+  "model_hash_note": "copied from supplied SHA256SUMS; not independently rehashed",
+  "hardware": "2 x Intel Arc Pro B70 32 GiB; 249 GiB system RAM",
+  "kernel": "7.0.12-p2pwl",
+  "machine_condition": "No reboot; uptime about 4d22h; existing swap usage 4.7 GiB; 229 GiB MemAvailable before load; both GPUs 400 MHz idle; desktop apps present, no other inference process detected",
+  "protocol": "Deterministic synthetic token IDs, single stream, greedy decode; 128 decode steps/depth after 8 untimed steps; 2048-token prefill chunks; max context 32768. Full warmup process discarded; two timed repeat processes; separate profiling process. Model load excluded from throughput.",
+  "environment": {
+    "ONEAPI_DEVICE_SELECTOR": "level_zero:gpu",
+    "DS4_TP_GPUS": "0,1",
+    "DS4_RUN_REAL": "1",
+    "IE_DS4_RMS_EPS": "1e-20"
+  },
+  "guard": "single-flight lock; MemoryMax=220G; MemorySwapMax=0; 1200s timeout per process",
+  "intel_packages": "intel-level-zero-gpu \nintel-opencl-icd 26.22.38646.7-1~24.04~ppa1\nlibze-intel-gpu1 26.22.38646.7-1~24.04~ppa1\nlibze1 1.32.0-1~24.04~ppa1",
+  "mid_campaign_memory": "               total        used        free      shared  buff/cache   available\nMem:     267376091136 230156820480 11111133184  1204502528 29573943296 37219270656\nSwap:     8589930496  8589807616      122880\n",
+  "mid_campaign_note": "During run 2 load, system swap rose to about 8 GiB; MemAvailable remained about 34 GiB. Benchmark cgroup MemorySwapMax=0."
+}

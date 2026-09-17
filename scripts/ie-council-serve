@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+# ie-council-serve — expose a "council" of two chat endpoints as ONE
+# OpenAI-compatible endpoint, so any chat client (Hermes, etc.) can talk to
+# BOTH models at once in a normal conversation.
+#
+#   Point a client at this server's /v1 and every message you send is answered
+#   by both backends concurrently; you get one reply containing both answers
+#   (side-by-side) or a single synthesized answer (judge mode).
+#
+#   Backends (override via flags or env):
+#     A: crown    http://127.0.0.1:11501/v1   ($IE_COUNCIL_A)  [name@]url[#model]
+#     B: gpt-oss  http://127.0.0.1:11500/v1   ($IE_COUNCIL_B)
+#   Listen:       127.0.0.1:11502             (--port / $IE_COUNCIL_PORT)
+#   Mode:         side-by-side | judge        (--mode / $IE_COUNCIL_MODE)
+#   Judge:        A | B (who synthesizes)     (--judge / $IE_COUNCIL_JUDGE)
+#
+#   Then in another terminal:
+#     HERMES_INFERENCE_PROVIDER=custom CUSTOM_BASE_URL=http://127.0.0.1:11502/v1 \
+#     HERMES_INFERENCE_MODEL=council hermes --provider custom -m council
+#
+#   Standard library only. No GPU — the two backends do all the compute.
+
+import os, sys, json, time, argparse, urllib.request
+from concurrent.futures import ThreadPoolExecutor
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+def parse_ep(s, dflt_name, dflt_url):
+    name, url, model = dflt_name, dflt_url, None
+    if s:
+        head = s.split('@', 1)[0]
+        if '@' in s and '://' not in head:            # "name@url"
+            name, s = s.split('@', 1)
+        if '#' in s:                                   # "url#model"
+            s, model = s.rsplit('#', 1)
+        url = s or dflt_url
+    if not url.rstrip('/').endswith('/v1'):
+        url = url.rstrip('/') + '/v1'
+    return {'name': name, 'url': url.rstrip('/'), 'model': model}
+
+CFG = {
+    'A': parse_ep(os.environ.get('IE_COUNCIL_A'), 'crown',   'http://127.0.0.1:11501/v1'),
+    'B': parse_ep(os.environ.get('IE_COUNCIL_B'), 'gpt-oss', 'http://127.0.0.1:11500/v1'),
+    'mode': os.environ.get('IE_COUNCIL_MODE', 'side-by-side'),
+    'judge': os.environ.get('IE_COUNCIL_JUDGE', 'A'),
+    'timeout': float(os.environ.get('IE_COUNCIL_TIMEOUT', '180')),
+}
+
+def backend_chat(ep, messages, timeout, max_tokens, temperature):
+    body = {'model': ep['model'] or 'x', 'messages': messages,
+            'temperature': temperature, 'stream': False}
+    if max_tokens:
+        body['max_tokens'] = max_tokens
+    req = urllib.request.Request(
+        ep['url'] + '/chat/completions', data=json.dumps(body).encode(),
+        headers={'Content-Type': 'application/json'})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = json.load(r)
+        return (d['choices'][0]['message']['content'] or '').strip()
+    except Exception as e:
+        return f"_[{ep['name']} unavailable: {e}]_"
+
+def run_council(messages, max_tokens, temperature):
+    A, B = CFG['A'], CFG['B']
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fa = ex.submit(backend_chat, A, messages, CFG['timeout'], max_tokens, temperature)
+        fb = ex.submit(backend_chat, B, messages, CFG['timeout'], max_tokens, temperature)
+        a, b = fa.result(), fb.result()
+    if CFG['mode'] == 'judge':
+        j = A if CFG['judge'].upper() == 'A' else B
+        synth_msgs = [
+            {'role': 'system', 'content':
+                'You are the chair of a two-model council. Given the user request and two '
+                'draft answers, produce the single best combined answer. Merge the strengths, '
+                'drop errors, do not mention that drafts existed.'},
+            {'role': 'user', 'content':
+                f"User request:\n{_last_user(messages)}\n\n"
+                f"Draft from {A['name']}:\n{a}\n\nDraft from {B['name']}:\n{b}\n\n"
+                "Best combined answer:"}]
+        return backend_chat(j, synth_msgs, CFG['timeout'], max_tokens, temperature)
+    # side-by-side (default): show both, labeled
+    return f"**{A['name']}**\n\n{a}\n\n---\n\n**{B['name']}**\n\n{b}"
+
+def _last_user(messages):
+    for m in reversed(messages):
+        if m.get('role') == 'user':
+            return m.get('content', '')
+    return ''
+
+# ------------------------------------------------------------------ HTTP ------
+def _completion_obj(content, stream=False):
+    base = {'id': 'chatcmpl-council', 'created': int(time.time()), 'model': 'council'}
+    if stream:
+        base.update(object='chat.completion.chunk')
+    else:
+        base.update(object='chat.completion',
+                    choices=[{'index': 0, 'message': {'role': 'assistant', 'content': content},
+                              'finish_reason': 'stop'}],
+                    usage={'prompt_tokens': 0, 'completion_tokens': 0, 'total_tokens': 0})
+    return base
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
+    def log_message(self, *a): pass
+
+    def _send_json(self, obj, code=200):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path.rstrip('/').endswith('/models'):
+            self._send_json({'object': 'list', 'data': [
+                {'id': 'council', 'object': 'model', 'owned_by': 'ie-council',
+                 'created': int(time.time())}]})
+        else:
+            self._send_json({'status': 'ok', 'mode': CFG['mode'],
+                             'A': CFG['A']['name'], 'B': CFG['B']['name']})
+
+    def do_POST(self):
+        if not self.path.rstrip('/').endswith('/chat/completions'):
+            self._send_json({'error': 'not found'}, 404); return
+        try:
+            n = int(self.headers.get('Content-Length', 0))
+            req = json.loads(self.rfile.read(n) or b'{}')
+        except Exception as e:
+            self._send_json({'error': f'bad request: {e}'}, 400); return
+        messages = req.get('messages', [])
+        stream = bool(req.get('stream', False))
+        max_tokens = req.get('max_tokens')
+        temperature = req.get('temperature', 0.7)
+        try:
+            content = run_council(messages, max_tokens, temperature)
+        except Exception as e:
+            content = f"_[council error: {e}]_"
+        if stream:
+            self._stream(content)
+        else:
+            self._send_json(_completion_obj(content))
+
+    def _stream(self, content):
+        self.send_response(200)
+        self.send_header('Content-Type', 'text/event-stream')
+        self.send_header('Cache-Control', 'no-cache')
+        self.send_header('Connection', 'close')
+        self.end_headers()
+        def sse(obj):
+            self.wfile.write(b'data: ' + json.dumps(obj).encode() + b'\n\n')
+        first = _completion_obj('', stream=True)
+        first['choices'] = [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]
+        sse(first)
+        # emit in a few chunks so clients render progressively
+        step = 400
+        for i in range(0, len(content), step):
+            ch = _completion_obj('', stream=True)
+            ch['choices'] = [{'index': 0, 'delta': {'content': content[i:i+step]},
+                              'finish_reason': None}]
+            sse(ch)
+        last = _completion_obj('', stream=True)
+        last['choices'] = [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]
+        sse(last)
+        self.wfile.write(b'data: [DONE]\n\n')
+
+def main():
+    ap = argparse.ArgumentParser(description='Serve a two-model council as one OpenAI endpoint.')
+    ap.add_argument('--port', type=int, default=int(os.environ.get('IE_COUNCIL_PORT', '11502')))
+    ap.add_argument('--host', default=os.environ.get('IE_COUNCIL_HOST', '127.0.0.1'))
+    ap.add_argument('--mode', choices=['side-by-side', 'judge'], default=CFG['mode'])
+    ap.add_argument('--judge', choices=['A', 'B'], default=CFG['judge'])
+    ap.add_argument('--a'); ap.add_argument('--b')
+    args = ap.parse_args()
+    if args.a: CFG['A'] = parse_ep(args.a, 'crown', CFG['A']['url'])
+    if args.b: CFG['B'] = parse_ep(args.b, 'gpt-oss', CFG['B']['url'])
+    CFG['mode'], CFG['judge'] = args.mode, args.judge
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"ie-council-serve → http://{args.host}:{args.port}/v1  "
+          f"[{CFG['mode']}]  A={CFG['A']['name']}({CFG['A']['url']})  "
+          f"B={CFG['B']['name']}({CFG['B']['url']})", file=sys.stderr)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == '__main__':
+    main()

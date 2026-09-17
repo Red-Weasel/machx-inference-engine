@@ -1,0 +1,10 @@
+Device: Intel(R) Graphics [0xe223]
+Iters: 1000 (+20 warmup)
+
+GEMV-Q4_K bandwidth — gate is the FIRST shape (attn_q)
+  attn_q   2k×8k      K=2048  N=8192   W=   9.0 MiB  | 0.063 ms/iter  BW= 149.9 GB/s  (gate ≥ 365)
+  attn_out 4k×2k      K=4096  N=2048   W=   4.5 MiB  | 0.025 ms/iter  BW= 188.8 GB/s
+  ssm_out  4k×2k      K=4096  N=2048   W=   4.5 MiB  | 0.025 ms/iter  BW= 188.4 GB/s
+  qkv      2k×8k      K=2048  N=8192   W=   9.0 MiB  | 0.044 ms/iter  BW= 214.5 GB/s
+  big      4k×4k      K=4096  N=4096   W=   9.0 MiB  | 0.042 ms/iter  BW= 225.8 GB/s
+  4k×8k               K=4096  N=8192   W=  18.0 MiB  | 0.077 ms/iter  BW= 246.3 GB/s

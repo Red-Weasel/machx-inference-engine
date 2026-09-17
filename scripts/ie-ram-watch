@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# ie-ram-watch — sample memory every N s while a run is alive, so a long run's
+# low-water mark is a MEASUREMENT, not a glance at the wrong column.
+# The pin floor (IE_G5_PIN_FLOOR_GIB) is checked ONCE per layer BEFORE each pin;
+# consumption continues for the rest of the run, so the floor does not bound the
+# low-water mark (2026-08-28: floor 28 -> 12 GiB actual).
+# 2026-09-03 19:31: with 168 GiB pinned the steady state was ~18 GiB available,
+# not the ~81 the arithmetic predicts, and the ~57 GiB gap showed in NONE of
+# Anon/Unevictable/Cached — driver-side. The extra columns hunt for it.
+# usage: ie-ram-watch [interval_s] [outfile]
+set -u
+IV=${1:-15}; OUT=${2:-/dev/stdout}
+printf "%-9s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s\n" \
+  time avail free cache anon unevict shmem mapped pgtbl vmalloc percpu > "$OUT"
+lo=999999
+while pgrep -x 'ie-glm5next-run|ie-hyv4-run|ie-ds4-run' >/dev/null 2>&1 || pgrep -f 'tools/ie-' >/dev/null 2>&1; do
+    line=$(awk '
+        /^MemAvailable:/{a=$2} /^MemFree:/{f=$2} /^Cached:/{c=$2}
+        /^AnonPages:/{p=$2} /^Unevictable:/{u=$2} /^Shmem:/{s=$2}
+        /^Mapped:/{m=$2} /^PageTables:/{t=$2} /^VmallocUsed:/{v=$2} /^Percpu:/{pc=$2}
+        END{printf "%.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f %.1f",
+            a/1048576, f/1048576, c/1048576, p/1048576, u/1048576,
+            s/1048576, m/1048576, t/1048576, v/1048576, pc/1048576}' /proc/meminfo)
+    set -- $line
+    printf "%-9s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s\n" "$(date +%T)" "$@" >> "$OUT"
+    awk -v a="$1" -v l="$lo" 'BEGIN{exit !(a<l)}' && lo=$1
+    sleep "$IV"
+done
+echo "# low-water MemAvailable: ${lo} GiB" >> "$OUT"

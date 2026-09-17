@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# scripts/ie-host-tune — host-side knobs for latency-sensitive inference runs.
+# Needs root (sudo). Reversible; nothing persists across reboot.
+#
+#   ie-host-tune status          show current governor / EPP / GPU clock floors
+#   sudo ie-host-tune apply      governor=performance, EPP=performance,
+#                                B70 min_freq = max_freq (pin the GPU clock)
+#   sudo ie-host-tune revert     governor=powersave, EPP=balance_performance,
+#                                B70 min_freq = rpn_freq (driver default)
+#
+# Measured state on the dev rig 2026-09-10: governor powersave, EPP
+# balance_performance, B70 min 400 / max 2800 MHz. Effect on decode tok/s is
+# NOT yet measured — A/B it with ie-prompt-bench before and after `apply`.
+set -euo pipefail
+mode="${1:-status}"
+gpu_gts() { ls -d /sys/class/drm/card*/device/tile0/gt0 2>/dev/null; }
+is_b70() { grep -qi '0xe223' "$1/../../../device" 2>/dev/null || grep -qs 'e223' "$1/../../../device"; }
+status() {
+    echo "cpu governor: $(cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor)"
+    echo "cpu EPP     : $(cat /sys/devices/system/cpu/cpufreq/policy0/energy_performance_preference 2>/dev/null || echo n/a)"
+    for gt in $(gpu_gts); do
+        f=$gt/freq0
+        [ -f "$f/min_freq" ] || continue
+        echo "$(readlink -f $gt/../../.. | xargs basename) gt0: min $(cat $f/min_freq) max $(cat $f/max_freq) cur $(cat $f/cur_freq) act $(cat $f/act_freq 2>/dev/null || echo ?) rpn $(cat $f/rpn_freq 2>/dev/null || echo ?) rp0 $(cat $f/rp0_freq 2>/dev/null || echo ?)"
+    done
+}
+need_root() { [ "$(id -u)" = 0 ] || { echo "run with sudo" >&2; exit 2; }; }
+case "$mode" in
+    status) status ;;
+    apply)
+        need_root
+        for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
+            echo performance > "$c/scaling_governor"
+            [ -f "$c/energy_performance_preference" ] && echo performance > "$c/energy_performance_preference" || true
+        done
+        for gt in $(gpu_gts); do
+            f=$gt/freq0; [ -f "$f/min_freq" ] || continue
+            # only the discrete cards (rp0 >= 2000 MHz); leave the iGPU alone
+            if [ "$(cat $f/rp0_freq 2>/dev/null || echo 0)" -ge 2000 ]; then cat "$f/max_freq" > "$f/min_freq"; fi
+        done
+        status ;;
+    revert)
+        need_root
+        for c in /sys/devices/system/cpu/cpu[0-9]*/cpufreq; do
+            echo powersave > "$c/scaling_governor"
+            [ -f "$c/energy_performance_preference" ] && echo balance_performance > "$c/energy_performance_preference" || true
+        done
+        for gt in $(gpu_gts); do
+            f=$gt/freq0; [ -f "$f/min_freq" ] || continue
+            if [ "$(cat $f/rp0_freq 2>/dev/null || echo 0)" -ge 2000 ]; then cat "$f/rpn_freq" > "$f/min_freq"; fi
+        done
+        status ;;
+    *) echo "usage: ie-host-tune status|apply|revert" >&2; exit 2 ;;
+esac
