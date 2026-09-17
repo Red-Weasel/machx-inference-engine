@@ -1,0 +1,620 @@
+#!/usr/bin/env bash
+# hermes-engine — one command to run the local inference engine under Hermes Agent.
+#
+#   Pick a model, set context + GPUs, and it: starts SearXNG (if down), starts
+#   `ie serve` for the chosen GGUF, waits until it's ready, then launches the
+#   Hermes TUI pointed at it (web_search wired to SearXNG). On exit it stops the
+#   engine (frees the GPU); SearXNG is left running (lightweight, reusable).
+#
+#   Non-destructive: Hermes is pointed at the engine via ENV VARS ONLY
+#   (HERMES_INFERENCE_PROVIDER/CUSTOM_BASE_URL/HERMES_INFERENCE_MODEL/SEARXNG_URL
+#   + `--provider custom -m <id>`). Your ~/.hermes/config.yaml is never touched.
+#
+#   Usage:
+#     hermes-engine                          # interactive: pick model → LOAD SCREEN
+#     hermes-engine --model coder --ctx 32768 --gpus 1
+#     hermes-engine --list                   # just list discovered models
+#   The load screen shows every knob with its value (remembered per model in
+#   ~/.config/hermes-engine/models/); edit by number, Enter loads. Flags beat
+#   remembered settings; remembered settings beat defaults.
+#   Flags:
+#     --model <substr>   pick the model whose path matches <substr> (skip menu+screen)
+#     --configure        show the load screen even with --model
+#     --ctx <N>          context length          (default: 32768)
+#     --gpus <N|auto>    GPU count               (default: auto)
+#     --mode <M>         split | tp | single-q8  (27B dense; qwen3moe: split | tp)
+#     --spec             MTP speculative decode (greedy-only; pair with --temp 0)
+#     --parallel <N>     concurrent generations 1-4 (27B split: batched decode)
+#     --slot-ctx <N>     per-slot KV budget for batched decode (default auto)
+#     --temp <F>         server-default temperature for requests that omit it
+#     --port <N>         engine port             (default: a free port)
+#     --tui              use Hermes' modern TUI instead of the classic REPL
+#     --tp               legacy alias for --mode tp
+#     --no-search        don't start/require SearXNG
+#     --keep-engine      don't stop `ie serve` on exit
+#     --stop-search      also stop SearXNG on exit
+#     --rescan           walk ALL drives for GGUFs now (else the cached walk
+#                        refreshes in the background; finds show next launch)
+#     --pair <A> <B>     run TWO engines (model~A→card0, model~B→card1) as council
+#                        endpoints — no Hermes/SearXNG, freeze-safe, ctx 16384
+#     -h, --help
+set -uo pipefail
+
+# ----------------------------------------------------------------- config ----
+# Repo root: this script lives in <repo>/scripts, so derive it rather than
+# hardcoding a path. readlink -f first: invoked through a PATH symlink,
+# BASH_SOURCE is the symlink, so ../build/src/ie would name the wrong tree.
+# Override with IE_ROOT=/path/to/repo.
+IE_ROOT="${IE_ROOT:-$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)}"
+IE_BIN="$IE_ROOT/build/src/ie"
+ENV_SH="$IE_ROOT/scripts/env.sh"
+SEARXNG_DIR="${SEARXNG_DIR:-$HOME/searxng}"
+SEARXNG_PORT="${SEARXNG_PORT:-8888}"
+SEARXNG_URL="http://127.0.0.1:${SEARXNG_PORT}"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/hermes-engine"
+mkdir -p "$RUN_DIR"
+# FAST model roots, searched live on every launch: home dirs, any external-drive
+# `models/` folder (/media/<you>/<drive>/models or /mnt/<drive>/models), plus
+# IE_MODELS_DIRS (colon-separated extra dirs, e.g. IE_MODELS_DIRS=/data/gguf:/nas/llm).
+_ie_u="${USER:-$(id -un 2>/dev/null || echo user)}"
+MODELS_DIRS=("$HOME/models" "$HOME/.seal/models" /media/"$_ie_u"/*/models /mnt/*/models)
+if [ -n "${IE_MODELS_DIRS:-}" ]; then
+  IFS=':' read -r -a _ie_extra <<< "$IE_MODELS_DIRS"; MODELS_DIRS+=("${_ie_extra[@]}")
+fi
+
+# ALL-DRIVES index (cached): the WHOLE of every mounted drive (/media/<you>/*,
+# /mnt/*) is also walked for GGUFs, so models outside a `models/` folder
+# (LLM-Models/, ai-models-archive/, …) are found too. A cold multi-TB USB drive
+# takes MINUTES to walk (measured 1m36s + 2m35s on this box; <1s warm), so the
+# walk normally runs in the BACKGROUND against a cache — its finds appear on the
+# next launch. First run (no cache) and --rescan walk in the foreground.
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/hermes-engine"
+GGUF_CACHE="$CACHE_DIR/gguf-index"
+mkdir -p "$CACHE_DIR"
+drive_roots() { local m; for m in /media/"$_ie_u"/*/ /mnt/*/; do [ -d "$m" ] && printf '%s\n' "${m%/}"; done; return 0; }
+full_scan() {  # atomic cache rewrite so a reader never sees a half-written index
+  local tmp="$GGUF_CACHE.tmp.$$"
+  drive_roots | while read -r d; do find "$d" -type f -iname '*.gguf' 2>/dev/null; done > "$tmp" \
+    && mv -f "$tmp" "$GGUF_CACHE"
+}
+# (the walk itself is kicked off in the discovery section, after arg parsing)
+
+MODEL_ARG="" CTX="" GPUS="" PORT="" TUI=0 USE_SEARCH=1 KEEP_ENGINE=0 STOP_SEARCH=0 LIST_ONLY=0 TP_MODE=0
+PAIR_MODE=0 PAIR_A="" PAIR_B="" RESCAN=0
+# Load-screen settings (flags > remembered per-model conf > defaults).
+SPEC="" PARALLEL="" TEMP="" MODE="" PFCHUNK="" KVQ="" PCACHE="" REMEMBER="" CONFIGURE=0 SLOTCTX=
+CONF_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/hermes-engine/models"
+
+c() { printf '\033[%sm' "$1"; }; BOLD=$(c '1'); DIM=$(c '2'); GRN=$(c '32'); YLW=$(c '33'); RED=$(c '31'); CYN=$(c '36'); Z=$(c '0')
+say()  { printf '%s\n' "${CYN}▸${Z} $*" >&2; }
+warn() { printf '%s\n' "${YLW}⚠${Z} $*" >&2; }
+die()  { printf '%s\n' "${RED}✗${Z} $*" >&2; exit 1; }
+
+# Wait until an engine answers /v1/models. NO fixed deadline — a 150 GB model
+# on a USB drive legitimately loads for 15-25 min (a 300 s cap once killed such
+# a load at layer 17/43) — instead a PROGRESS watchdog: keep waiting while the
+# engine process is alive and its log keeps growing; only sustained silence
+# (default 600 s, override HERMES_ENGINE_STALL_SECS) counts as a stall.
+wait_engine_ready() {  # <pid> <url> <logfile> <label>   -> 0 ready, 1 dead/stalled
+  local pid="$1" url="$2" lg="$3" lbl="$4"
+  local stall="${HERMES_ENGINE_STALL_SECS:-600}" t0=$SECONDS last_sz=-1 last_chg=$SECONDS next_note=$((SECONDS+120)) sz
+  while :; do
+    kill -0 "$pid" 2>/dev/null || { warn "engine $lbl exited early:"; tail -n 25 "$lg" >&2; return 1; }
+    curl -s -o /dev/null --max-time 2 "$url" 2>/dev/null && return 0
+    sz="$(stat -c%s "$lg" 2>/dev/null || echo 0)"
+    if [ "$sz" != "$last_sz" ]; then last_sz="$sz"; last_chg=$SECONDS
+    elif [ $((SECONDS - last_chg)) -ge "$stall" ]; then
+      warn "engine $lbl: no log output for ${stall}s (waited $((SECONDS-t0))s total) — treating as stalled:"
+      tail -n 25 "$lg" >&2; return 1
+    fi
+    if [ "$SECONDS" -ge "$next_note" ]; then
+      say "still loading ($(( (SECONDS-t0) / 60 )) min)… ${DIM}$(tail -n 1 "$lg" 2>/dev/null | cut -c1-100)${Z}"
+      next_note=$((SECONDS+120))
+    fi
+    sleep 1
+  done
+}
+
+# ------------------------------------------------------------- arg parsing ---
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --model)  MODEL_ARG="${2:-}"; shift 2;;
+    --ctx)    CTX="${2:-}"; shift 2;;
+    --gpus)   GPUS="${2:-}"; shift 2;;
+    --port)   PORT="${2:-}"; shift 2;;
+    --tui)    TUI=1; shift;;
+    --tp)     TP_MODE=1; shift;;
+    --spec)      SPEC=on; shift;;
+    --parallel)  PARALLEL="${2:-}"; shift 2;;
+    --slot-ctx)  SLOTCTX="${2:-}"; shift 2;;
+    --temp)      TEMP="${2:-}"; shift 2;;
+    --mode)      MODE="${2:-}"; shift 2;;          # split | tp | single-q8 (27B dense)
+    --configure) CONFIGURE=1; shift;;              # force the load screen even with --model
+    --no-search)   USE_SEARCH=0; shift;;
+    --keep-engine) KEEP_ENGINE=1; shift;;
+    --stop-search) STOP_SEARCH=1; shift;;
+    --rescan)      RESCAN=1; shift;;
+    --pair)
+      [ $# -ge 3 ] || die "--pair needs two model substrings: --pair <A> <B>"
+      case "${2:-}" in --*|'') die "--pair: first substring looks like a flag/empty";; esac
+      case "${3:-}" in --*|'') die "--pair: second substring looks like a flag/empty";; esac
+      PAIR_MODE=1; PAIR_A="$2"; PAIR_B="$3"; shift 3;;
+    --list)   LIST_ONLY=1; shift;;
+    -h|--help) sed -n '2,33p' "$0" | sed 's/^# \{0,1\}//'; exit 0;;
+    *) die "unknown arg: $1 (try --help)";;
+  esac
+done
+
+[ -x "$IE_BIN" ] || die "engine binary not found/executable: $IE_BIN (build it first)"
+
+# ---------------------------------------------------------- arch heuristic ---
+# Best-effort label from the filename (the engine does the real detection at
+# load). Also tells us which arches currently have a >1-GPU path.
+arch_of() {
+  local n; n="$(basename "$1" | tr 'A-Z' 'a-z')"
+  case "$n" in
+    *gpt-oss*|*gptoss*)               echo "gpt-oss";;
+    *deepseek-v4*|*deepseek_v4*|*deepseekv4*|*deepseek4*) echo "deepseek4";;
+    *flash-next*|*flashnext*|*qwen4*) echo "qwen4exp";;
+    *qwen3next*|*qwen3-next*)         echo "qwen3next";;
+    *coder*30b*|*tongyi*|*qwen3-coder*|*deepresearch*) echo "qwen3moe";;
+    *35b-a3b*|*35b*a3b*|*agentworld*) echo "qwen35moe";;
+    *gemma-4*|*gemma4*)               echo "gemma4";;
+    *27b*)                            echo "qwen35dense";;
+    *phi-4*|*phi4*)                   echo "phi";;
+    *granite*)                        echo "granite";;
+    *codestral*|*mistral*)            echo "mistral";;
+    *llama-3*|*llama3*|*meta-llama*)  echo "llama3";;
+    *)                                echo "dense";;
+  esac
+}
+# Arches with a working multi-GPU (split/TP) path in the engine today.
+mgpu_ok() { case "$1" in gpt-oss|qwen35moe|qwen35dense|qwen3next|dense|llama3|granite|mistral|phi) return 0;; qwen3moe|deepseek4) return 0;; *) return 1;; esac; }
+
+# ------------------------------------------------------------- discovery -----
+if [ "$RESCAN" = 1 ] || [ ! -s "$GGUF_CACHE" ]; then
+  say "indexing all drives for GGUFs (a cold drive can take minutes)…"
+  full_scan
+else
+  ( full_scan >/dev/null 2>&1 & ) 2>/dev/null   # refresh the index for next launch
+fi
+
+# A SPLIT GGUF is `<name>-NNNNN-of-MMMMM.gguf`. Only shard 00001 carries the
+# metadata, and it is the ONLY one you can hand to the engine (its reader pulls
+# in the siblings itself) — but it is also by far the SMALLEST, so a plain
+# size-descending sort listed shards 2..M as if they were separate models and
+# buried the one usable file at the bottom. Every entry it offered for a split
+# model was unopenable.
+#
+# So: collapse each split set to ONE row — path = shard 00001, size = the sum of
+# every shard, label = the model name with the `-NNNNN-of-MMMMM.gguf` suffix
+# stripped — and sort on that summed size, which is what puts it where the user
+# expects. A split set with no shard 00001 present is DROPPED with a warning
+# rather than listed, because there is nothing that can be opened. Single-file
+# models take the else-branch and come through byte for byte as before.
+#
+# Candidates = the live fast-root walk MERGED with the cached all-drives index.
+# Cache entries whose file is gone (drive unmounted, model deleted) are dropped;
+# the same file reachable two ways (a ~/models symlink AND its real drive path)
+# is deduped on realpath, keeping the first-seen spelling — fast roots are
+# emitted first, so the familiar ~/models path wins the display.
+#
+# Rows are `size \t path \t display \t shard_count`, parallel arrays below.
+mapfile -t _GG_ROWS < <(
+  { for d in "${MODELS_DIRS[@]}"; do [ -d "$d" ] && find -L "$d" -type f -iname '*.gguf' 2>/dev/null; done
+    [ -s "$GGUF_CACHE" ] && cat "$GGUF_CACHE"; } \
+    | grep -viE 'mmproj|lora|mtp|draft' \
+    | while read -r f; do [ -f "$f" ] && printf '%s\t%s\n' "$(realpath -m "$f" 2>/dev/null || printf '%s' "$f")" "$f"; done \
+    | awk -F'\t' '!seen[$1]++ { print $2 }' \
+    | while read -r f; do printf '%s\t%s\n' "$(stat -Lc%s "$f" 2>/dev/null || echo 0)" "$f"; done \
+    | awk -F'\t' '
+        {
+          size = $1; path = $2; base = path; sub(/.*\//, "", base);
+          if (match(base, /-[0-9][0-9][0-9][0-9][0-9]-of-[0-9][0-9][0-9][0-9][0-9]\.gguf$/)) {
+            stem  = substr(base, 1, RSTART - 1);
+            shard = substr(base, RSTART + 1, 5) + 0;
+            dir   = substr(path, 1, length(path) - length(base));
+            key   = dir stem;
+            if (!(key in seen)) { seen[key] = 1; order[++n] = key; disp[key] = dir stem }
+            total[key] += size; nsh[key]++;
+            if (shard == 1) first[key] = path;
+          } else {
+            key = path;
+            if (!(key in seen)) { seen[key] = 1; order[++n] = key; disp[key] = path }
+            total[key] = size; nsh[key] = 1; first[key] = path;
+          }
+        }
+        END {
+          for (i = 1; i <= n; i++) {
+            k = order[i];
+            if (!(k in first)) {
+              printf "hermes-engine: skipping split model with no -00001- shard: %s\n", disp[k] > "/dev/stderr";
+              continue;
+            }
+            printf "%d\t%s\t%s\t%d\n", total[k], first[k], disp[k], nsh[k];
+          }
+        }' \
+    | sort -rn
+)
+GGUFS=(); GGUF_DISPLAY=(); GGUF_SIZES=(); GGUF_SHARDS=()
+for _r in "${_GG_ROWS[@]}"; do
+  GGUF_SIZES+=("${_r%%$'\t'*}");    _r="${_r#*$'\t'}"
+  GGUFS+=("${_r%%$'\t'*}");         _r="${_r#*$'\t'}"
+  GGUF_DISPLAY+=("${_r%%$'\t'*}");  GGUF_SHARDS+=("${_r##*$'\t'}")
+done
+[ "${#GGUFS[@]}" -gt 0 ] || die "no GGUF models found under: ${MODELS_DIRS[*]}"
+
+# Index of a path in GGUFS (-1 if absent) — lets callers that only carry a path
+# recover the COLLAPSED size instead of stat-ing shard 1 and seeing 5 MB.
+gguf_index() { local i p="$1"
+  for i in "${!GGUFS[@]}"; do [ "${GGUFS[$i]}" = "$p" ] && { printf '%s' "$i"; return; }; done
+  printf '%s' -1; }
+gguf_size() { local i; i="$(gguf_index "$1")"
+  if [ "$i" -ge 0 ]; then printf '%s' "${GGUF_SIZES[$i]}"; else stat -Lc%s "$1" 2>/dev/null || echo 0; fi; }
+
+human() { numfmt --to=iec --suffix=B "$1" 2>/dev/null || echo "$1"; }
+list_models() {
+  local i=0 shards
+  for i in "${!GGUFS[@]}"; do
+    shards=""; [ "${GGUF_SHARDS[$i]}" -gt 1 ] && shards=" ${DIM}(${GGUF_SHARDS[$i]} shards)${Z}"
+    printf "  ${BOLD}%2d${Z}  %-11s ${DIM}%7s${Z}  %s%s\n" "$((i+1))" "$(arch_of "${GGUF_DISPLAY[$i]}")" \
+      "$(human "${GGUF_SIZES[$i]}")" "${GGUF_DISPLAY[$i]/#$HOME\//~/}" "$shards" >&2
+  done
+}
+
+if [ "$LIST_ONLY" = 1 ]; then list_models; exit 0; fi
+
+# ------------------------------------------------------------- pair mode -----
+# `--pair A B`: run TWO single-card `ie serve` engines (one model per B70) as the
+# two endpoints for the council orchestrator (scripts/ie-council). No Hermes, no
+# SearXNG — just two OpenAI-compatible servers. FREEZE-SAFE by construction:
+#   * ONEAPI_DEVICE_SELECTOR=level_zero:0 / :1 makes each process see exactly ONE
+#     B70 (verified on this box: level_zero:0,1 = the two B70s, :2 = the iGPU) —
+#     so no iGPU-into-system-RAM trap and no two-models-on-one-card double-book.
+#   * NO --gpus flag: the auto-planner sees one visible card, resolves to 1 GPU,
+#     and KEEPS its VRAM fit-check (forcing --gpus 1 would skip that check).
+#   * refuses to start if an `ie` engine is already running, or if either model's
+#     raw weights are too big to leave KV headroom on one 32 GB card.
+#   * loads SEQUENTIALLY (A fully ready before B) so it never stages ~31 GB of
+#     weights through 32 GB of system RAM at once.
+#   * context capped (default 16384, hard max 32768) so weights+KV stay well
+#     under 32 GB per card.
+if [ "$PAIR_MODE" = 1 ]; then
+  _pair_resolve() {  # <substr> <outvar> — printf -v (not $()) so a `die` exits the script
+    local want f m=(); want="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+    for f in "${GGUFS[@]}"; do case "$(printf '%s' "$f" | tr 'A-Z' 'a-z')" in *"$want"*) m+=("$f");; esac; done
+    [ "${#m[@]}" -ge 1 ] || die "no model matches --pair substring '$1'"
+    printf -v "$2" '%s' "${m[0]}"          # GGUFS is size-desc → [0] = biggest match
+  }
+  _pair_resolve "$PAIR_A" GGUF_A
+  _pair_resolve "$PAIR_B" GGUF_B
+  [ "$GGUF_A" = "$GGUF_B" ] && die "both --pair substrings resolved to $(basename "$GGUF_A") — pick two different models"
+
+  PAIR_CTX="${CTX:-16384}"; [[ "$PAIR_CTX" =~ ^[0-9]+$ ]] || die "ctx must be a number, got '$PAIR_CTX'"
+  [ "$PAIR_CTX" -le 32768 ] || die "council ctx capped at 32768 for freeze-safety (got $PAIR_CTX)"
+
+  # occupancy: never stack a second model onto a card that already has one
+  if pgrep -x ie >/dev/null 2>&1 || pgrep -f "$IE_BIN" >/dev/null 2>&1; then
+    pgrep -af "$IE_BIN" 1>&2 2>/dev/null || true
+    die "an 'ie' engine is already running (above) — stop it first (frees the card), then re-run --pair"
+  fi
+  # require the two real B70s to be present (never fall back onto the iGPU)
+  if command -v xpu-smi >/dev/null 2>&1; then
+    _b70="$(xpu-smi discovery 2>/dev/null | grep -c 'Arc(TM) Pro B70')"
+    [ "${_b70:-0}" -ge 2 ] || die "xpu-smi sees ${_b70:-0} Arc Pro B70s (need 2) — refusing so we never touch the iGPU"
+  fi
+  # rough fit gate: raw weights must leave ≥6 GB for KV + workspace on a 32 GB card
+  # gguf_size (not stat) so a split model is judged on ALL its shards — stat-ing
+  # shard 00001 would see 5 MB and wave a 151 GB model onto one card.
+  _pair_fits() { local b; b="$(gguf_size "$1")"
+    [ "$b" -lt 26000000000 ] || die "$(basename "$1") is $(human "$b") — too big for a single-card council member (run it solo with --gpus 2)"; }
+  _pair_fits "$GGUF_A"; _pair_fits "$GGUF_B"
+
+  _free_port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()' 2>/dev/null; }
+  _port_busy() { ss -ltnH "sport = :$1" 2>/dev/null | grep -q .; }   # some server already listening?
+  P1="${PORT:-$(_free_port)}"; [ -n "$P1" ] || P1=11435
+  if _port_busy "$P1"; then warn "port $P1 is already in use (another server) — using a free port instead"; P1="$(_free_port)"; [ -n "$P1" ] || P1=11500; fi
+  P2="$(_free_port)"; [ -n "$P2" ] || P2=$((P1+1))
+  { [ "$P2" = "$P1" ] || _port_busy "$P2"; } && { P2="$(_free_port)"; [ -n "$P2" ] || P2=$((P1+2)); }
+
+  IE_PIDFILE_A="$RUN_DIR/ie-a.pid"; IE_LOG_A="$RUN_DIR/ie-serve-a.log"
+  IE_PIDFILE_B="$RUN_DIR/ie-b.pid"; IE_LOG_B="$RUN_DIR/ie-serve-b.log"
+  pair_cleanup() { [ "$KEEP_ENGINE" = 1 ] && return; local pf p
+    for pf in "$IE_PIDFILE_A" "$IE_PIDFILE_B"; do p="$(cat "$pf" 2>/dev/null || true)"
+      [ -n "$p" ] && kill "$p" 2>/dev/null && say "stopped engine (pid $p)"; done; }
+  trap pair_cleanup EXIT INT TERM
+
+  _pair_launch() {  # <gguf> <port> <card> <pidfile> <logfile>
+    local gg="$1" pt="$2" card="$3" pf="$4" lg="$5"; rm -f "$pf"
+    setsid bash -c '
+      PIDF="$1"; ENVSH="$2"; IE="$3"; GG="$4"; PT="$5"; CX="$6"; CARD="$7"
+      source "$ENVSH" >/dev/null 2>&1
+      export IE_FA2_VEC=1
+      export ONEAPI_DEVICE_SELECTOR="level_zero:$CARD"   # pin to ONE physical B70
+      export ZE_ENABLE_PCI_ID_DEVICE_ORDER=1             # deterministic ordinal↔BDF
+      "$IE" serve "$GG" --port "$PT" --ctx "$CX" &
+      echo $! > "$PIDF"; wait' \
+      _ "$pf" "$ENV_SH" "$IE_BIN" "$gg" "$pt" "$PAIR_CTX" "$card" >"$lg" 2>&1 &
+    local i; for i in $(seq 1 50); do [ -s "$pf" ] && break; sleep 0.1; done
+  }
+  _pair_ready() {  # <pidfile> <port> <logfile> <label>
+    local pf="$1" pt="$2" lg="$3" lbl="$4" pid
+    pid="$(cat "$pf" 2>/dev/null || true)"; [ -n "$pid" ] || { tail -n 25 "$lg" >&2; die "engine $lbl failed to launch"; }
+    wait_engine_ready "$pid" "http://127.0.0.1:$pt/v1/models" "$lg" "$lbl" || die "engine $lbl failed to start"
+  }
+
+  say "pair mode → two single-card engines (ctx $PAIR_CTX), sequential load:"
+  say "  card ${BOLD}0${Z} :${BOLD}$P1${Z}  $(basename "$GGUF_A")"
+  say "  card ${BOLD}1${Z} :${BOLD}$P2${Z}  $(basename "$GGUF_B")"
+  say "loading A on card 0 …"
+  _pair_launch "$GGUF_A" "$P1" 0 "$IE_PIDFILE_A" "$IE_LOG_A"
+  _pair_ready  "$IE_PIDFILE_A" "$P1" "$IE_LOG_A" "A(card0)"
+  say "engine A ${GRN}ready${Z} → http://127.0.0.1:$P1/v1"
+  say "loading B on card 1 …"
+  _pair_launch "$GGUF_B" "$P2" 1 "$IE_PIDFILE_B" "$IE_LOG_B"
+  _pair_ready  "$IE_PIDFILE_B" "$P2" "$IE_LOG_B" "B(card1)"
+  say "engine B ${GRN}ready${Z} → http://127.0.0.1:$P2/v1"
+  PID_A="$(cat "$IE_PIDFILE_A" 2>/dev/null || true)"; PID_B="$(cat "$IE_PIDFILE_B" 2>/dev/null || true)"
+  say "${GRN}both engines up.${Z} council command:"
+  say "  ${BOLD}scripts/ie-council 'your prompt' --a A@http://127.0.0.1:$P1/v1 --b B@http://127.0.0.1:$P2/v1${Z}"
+  say "Ctrl-C to stop both."
+  while kill -0 "$PID_A" 2>/dev/null && kill -0 "$PID_B" 2>/dev/null; do sleep 2; done
+  warn "an engine exited — stopping the pair"; exit 0
+fi
+
+# --------------------------------------------------------- select model ------
+GGUF=""
+if [ -n "$MODEL_ARG" ]; then
+  matches=(); for f in "${GGUFS[@]}"; do case "$(echo "$f" | tr 'A-Z' 'a-z')" in *"$(echo "$MODEL_ARG" | tr 'A-Z' 'a-z')"*) matches+=("$f");; esac; done
+  [ "${#matches[@]}" -ge 1 ] || die "no model matches '--model $MODEL_ARG'"
+  GGUF="${matches[0]}"
+  [ "${#matches[@]}" -gt 1 ] && warn "'$MODEL_ARG' matched ${#matches[@]}; using biggest: ${GGUF/#$HOME\//~/}"
+else
+  printf '%s\n' "${BOLD}Select a model:${Z}" >&2
+  list_models
+  printf '%s' "model # ${DIM}[1]${Z}: " >&2; read -r pick </dev/tty || true
+  pick="${pick:-1}"; [[ "$pick" =~ ^[0-9]+$ ]] && [ "$pick" -ge 1 ] && [ "$pick" -le "${#GGUFS[@]}" ] || die "invalid selection"
+  GGUF="${GGUFS[$((pick-1))]}"
+fi
+_gi="$(gguf_index "$GGUF")"
+GGUF_NAME="$([ "$_gi" -ge 0 ] && basename "${GGUF_DISPLAY[$_gi]}" || basename "$GGUF")"
+ARCH="$(arch_of "$GGUF_NAME")"
+say "model: ${BOLD}$GGUF_NAME${Z}  ${DIM}($ARCH$([ "$_gi" -ge 0 ] && [ "${GGUF_SHARDS[$_gi]}" -gt 1 ] && printf ', %s shards' "${GGUF_SHARDS[$_gi]}"))${Z}"
+
+# ------------------------------------------------- load screen + settings ----
+# Precedence: CLI flags > remembered per-model conf > defaults. The screen
+# shows every knob with its merged value; edit by number, Enter loads.
+CONF_FILE="$CONF_DIR/$(basename "$GGUF" .gguf).conf"
+# Legacy --tp → mode=tp BEFORE the conf load, so the flag beats a remembered
+# MODE (gate finding: it was applied after, and a conf silently won).
+[ "$TP_MODE" = 1 ] && [ -z "$MODE" ] && MODE=tp
+if [ -f "$CONF_FILE" ]; then
+  while IFS='=' read -r k v; do
+    case "$k" in
+      CTX)      [ -z "$CTX" ]      && CTX="$v";;
+      GPUS)     [ -z "$GPUS" ]     && GPUS="$v";;
+      MODE)     [ -z "$MODE" ]     && MODE="$v";;
+      SPEC)     [ -z "$SPEC" ]     && SPEC="$v";;
+      KVQ)      [ -z "$KVQ" ]      && KVQ="$v";;
+      PARALLEL) [ -z "$PARALLEL" ] && PARALLEL="$v";;
+      SLOTCTX)  [ -z "$SLOTCTX" ]  && SLOTCTX="$v";;
+      TEMP)     [ -z "$TEMP" ]     && TEMP="$v";;
+      PFCHUNK)  [ -z "$PFCHUNK" ]  && PFCHUNK="$v";;
+      PCACHE)   [ -z "$PCACHE" ]   && PCACHE="$v";;
+      PORT)     [ -z "$PORT" ]     && PORT="$v";;
+    esac
+  done < "$CONF_FILE"
+  say "remembered settings loaded: ${DIM}$CONF_FILE${Z}"
+fi
+# Defaults for anything still unset.
+CTX="${CTX:-32768}"; GPUS="${GPUS:-auto}"; SPEC="${SPEC:-off}"; KVQ="${KVQ:-f16}"
+PARALLEL="${PARALLEL:-1}"; TEMP="${TEMP:-default}"; PFCHUNK="${PFCHUNK:-auto}"; SLOTCTX="${SLOTCTX:-auto}"
+PCACHE="${PCACHE:-on}"; REMEMBER="${REMEMBER:-on}"
+if [ -z "$MODE" ]; then
+  case "$ARCH" in qwen35dense|qwen3moe) MODE=split;; *) MODE=-;; esac
+fi
+
+# Model-max context from GGUF metadata (best effort, header only).
+MODEL_MAX_CTX="$("$IE_BIN" preflight "$GGUF" 2>/dev/null | grep -oE 'context[_ ]length[: ]+[0-9]+' | grep -oE '[0-9]+' | head -1 || true)"
+
+settings_screen() {
+  local pick
+  while :; do
+    {
+      printf '%s\n' "──────────────────────────────────────────────────────"
+      printf '  %s  %s(%s%s)%s\n' "${BOLD}$GGUF_NAME${Z}" "$DIM" "$ARCH" \
+        "${MODEL_MAX_CTX:+, model max ctx $MODEL_MAX_CTX}" "$Z"
+      printf '%s\n' "──────────────────────────────────────────────────────"
+      printf '  %s1%s  Context length     %s\n' "$BOLD" "$Z" "$CTX"
+      printf '  %s2%s  GPUs               %s\n' "$BOLD" "$Z" "$GPUS"
+      printf '  %s3%s  Multi-GPU mode     %s%s\n' "$BOLD" "$Z" "$MODE" \
+        "$([ "$MODE" = - ] && printf ' %s(n/a for %s)%s' "$DIM" "$ARCH" "$Z")"
+      printf '  %s4%s  Speculative decode %s%s\n' "$BOLD" "$Z" "$SPEC" \
+        "$([ "$SPEC" = on ] && [ "$TEMP" != 0 ] && printf ' %s(greedy-only: engages when temp=0)%s' "$YLW" "$Z")"
+      printf '  %s5%s  KV cache quant     %s\n' "$BOLD" "$Z" "$KVQ"
+      printf '  %s6%s  Parallel requests  %s\n' "$BOLD" "$Z" "$PARALLEL"
+      printf '  %s6b%s Slot ctx (batch)   %s %s(per-slot KV budget when parallel>1; auto=min(ctx,65536))%s\n' "$BOLD" "$Z" "$SLOTCTX" "$DIM" "$Z"
+      printf '  %s7%s  Temperature        %s %s(server default when request omits it)%s\n' "$BOLD" "$Z" "$TEMP" "$DIM" "$Z"
+      printf '  %s8%s  Prefill chunk      %s\n' "$BOLD" "$Z" "$PFCHUNK"
+      printf '  %s9%s  Prompt cache       %s\n' "$BOLD" "$Z" "$PCACHE"
+      printf '  %s10%s Port               %s\n' "$BOLD" "$Z" "${PORT:-auto}"
+      printf '  %sR%s  Remember for this model   [%s]\n' "$BOLD" "$Z" "$REMEMBER"
+      printf '%s\n' "──────────────────────────────────────────────────────"
+      printf '%s' "edit # (Enter = load): "
+    } >&2
+    read -r pick </dev/tty || return 0
+    case "$pick" in
+      '') return 0;;
+      1)  printf 'context length [%s]: ' "$CTX" >&2; read -r v </dev/tty || true
+          [ -n "${v:-}" ] && CTX="$v";;
+      2)  printf 'GPUs (1, 2, auto) [%s]: ' "$GPUS" >&2; read -r v </dev/tty || true
+          [ -n "${v:-}" ] && GPUS="$v";;
+      3)  case "$ARCH" in
+            qwen35dense) printf 'mode (split | tp | single-q8) [%s]: ' "$MODE" >&2;;
+            qwen3moe)    printf 'mode (split | tp) [%s]: ' "$MODE" >&2;;
+            *) warn "mode is fixed for arch '$ARCH'"; continue;;
+          esac
+          read -r v </dev/tty || true; [ -n "${v:-}" ] && MODE="$v";;
+      4)  [ "$SPEC" = on ] && SPEC=off || SPEC=on;;
+      5)  [ "$KVQ" = f16 ] && KVQ=int8 || KVQ=f16;;
+      6)  printf 'parallel requests (1-4) [%s]: ' "$PARALLEL" >&2; read -r v </dev/tty || true
+          [ -n "${v:-}" ] && PARALLEL="$v";;
+      6b) printf 'slot ctx (number or auto) [%s]: ' "$SLOTCTX" >&2; read -r v </dev/tty || true
+          [ -n "${v:-}" ] && SLOTCTX="$v";;
+      7)  printf 'temperature (number, 0 = greedy, "default" = engine 0.7) [%s]: ' "$TEMP" >&2
+          read -r v </dev/tty || true; [ -n "${v:-}" ] && TEMP="$v";;
+      8)  printf 'prefill chunk (number or auto) [%s]: ' "$PFCHUNK" >&2; read -r v </dev/tty || true
+          [ -n "${v:-}" ] && PFCHUNK="$v";;
+      9)  [ "$PCACHE" = on ] && PCACHE=off || PCACHE=on;;
+      10) printf 'port (number or auto) [%s]: ' "${PORT:-auto}" >&2; read -r v </dev/tty || true
+          [ -n "${v:-}" ] && { [ "$v" = auto ] && PORT="" || PORT="$v"; };;
+      [Rr]) [ "$REMEMBER" = on ] && REMEMBER=off || REMEMBER=on;;
+      *) warn "no such setting: $pick";;
+    esac
+  done
+}
+if [ "$CONFIGURE" = 1 ] || [ -z "$MODEL_ARG" ]; then settings_screen; fi
+
+# ---- validate + resolve the merged settings ----------------------------------
+[[ "$CTX" =~ ^[0-9]+$ ]] || die "ctx must be a number, got '$CTX'"
+[[ "$PARALLEL" =~ ^[1-4]$ ]] || die "parallel must be 1..4, got '$PARALLEL'"
+case "$MODE" in split|tp|single-q8|-) ;; *) die "mode must be split, tp, or single-q8 (got '$MODE')";; esac
+case "$SLOTCTX" in auto) ;; *) [[ "$SLOTCTX" =~ ^[0-9]+$ ]] || die "slot-ctx must be a number or 'auto', got '$SLOTCTX'";; esac
+case "$TEMP" in default) ;; *) [[ "$TEMP" =~ ^[0-9]*\.?[0-9]+$ ]] || die "temp must be a number or 'default', got '$TEMP'";; esac
+case "$MODE" in
+  tp)        GPUS=2;;
+  single-q8) GPUS=1;;
+esac
+if [ "$GPUS" != "auto" ]; then
+  [[ "$GPUS" =~ ^[0-9]+$ ]] || die "gpus must be a number or 'auto', got '$GPUS'"
+  if [ "$GPUS" -gt 1 ] && ! mgpu_ok "$ARCH"; then
+    warn "arch '$ARCH' has no multi-GPU path in the engine yet — the engine will use 1 card."
+  fi
+fi
+GPUS_FLAG=(); [ "$GPUS" != "auto" ] && GPUS_FLAG=(--gpus "$GPUS")
+EXTRA_FLAGS=()
+[ "$SPEC" = on ]        && EXTRA_FLAGS+=(--spec)
+[ "$KVQ" = int8 ]       && EXTRA_FLAGS+=(--int8-kv)
+[ "$PARALLEL" != 1 ]    && EXTRA_FLAGS+=(--parallel "$PARALLEL")
+# Bounded prompt cache for agent serving: at long --ctx the cache's default
+# worst case (12 entries x full-depth snapshots) overcommits VRAM — the engine
+# now REFUSES such configs at load (2026-08-26 crash lesson). Default the caps
+# to fit; explicit env from the user wins.
+if [ "$PARALLEL" != 1 ]; then
+  [ -z "${IE_PROMPT_CACHE_MAX_PREFIX:-}" ] && ENGINE_ENV+=(IE_PROMPT_CACHE_MAX_PREFIX="${SLOTCTX/auto/24576}")
+  [ -z "${IE_PROMPT_CACHE_MAX_ENTRIES:-}" ] && ENGINE_ENV+=(IE_PROMPT_CACHE_MAX_ENTRIES=4)
+fi
+# Model-spec sampling defaults (generation_config.json) for requests that omit
+# fields — Qwen3.8-27B ships temp 1.0 / top_k 20 / top_p 0.95; serving it at
+# the library defaults (0.7/40) is off-spec (2026-08-26 Ω post-mortem).
+if [ "$ARCH" = qwen35dense ] && [ "$TEMP" = default ]; then
+  ENGINE_ENV+=(IE_SERVE_TEMP=1.0 IE_SERVE_TOP_K=20 IE_SERVE_TOP_P=0.95)
+fi
+[ "$SLOTCTX" != auto ]  && EXTRA_FLAGS+=(--slot-ctx "$SLOTCTX")
+[ "$TEMP" != default ]  && EXTRA_FLAGS+=(--temp "$TEMP")
+[ "$PFCHUNK" != auto ]  && EXTRA_FLAGS+=(--prefill-chunk "$PFCHUNK")
+ENGINE_ENV=()
+[ "$PCACHE" = off ] && ENGINE_ENV+=(IE_NO_PROMPT_CACHE=1)
+case "$MODE" in
+  tp)        case "$ARCH" in
+               qwen35dense) ENGINE_ENV+=(IE_QWEN35_TP=1);;
+               qwen3moe)    ENGINE_ENV+=(IE_QWEN3MOE_TP=1);;
+             esac;;
+  single-q8) ENGINE_ENV+=(IE_QWEN35_Q8=1);;
+esac
+if [ "$PARALLEL" != 1 ] && [ "$KVQ" = int8 ]; then
+  die "parallel > 1 does not support int8 KV yet (pick one)"
+fi
+# Remember (per model) — written before launch so a crash still keeps it.
+if [ "$REMEMBER" = on ]; then
+  mkdir -p "$CONF_DIR"
+  {
+    echo "CTX=$CTX"; echo "GPUS=$GPUS"; echo "MODE=$MODE"; echo "SPEC=$SPEC"
+    echo "KVQ=$KVQ"; echo "PARALLEL=$PARALLEL"; echo "SLOTCTX=$SLOTCTX"; echo "TEMP=$TEMP"
+    echo "PFCHUNK=$PFCHUNK"; echo "PCACHE=$PCACHE"; echo "PORT=${PORT:-}"
+  } > "$CONF_FILE"
+  say "settings remembered: ${DIM}$CONF_FILE${Z}"
+fi
+
+# --------------------------------------------------------- free port ---------
+if [ -z "$PORT" ]; then
+  PORT="$(python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()' 2>/dev/null || echo 8080)"
+fi
+
+# ---------------------------------------------------------- teardown ---------
+IE_PID="" SX_STARTED=0
+pid_on_port() { ss -ltnpH 2>/dev/null | grep -F ":$1 " | grep -oP 'pid=\K[0-9]+' | head -1; }
+cleanup() {
+  if [ "$KEEP_ENGINE" = 0 ] && [ -n "${IE_PID:-}" ]; then
+    kill "$IE_PID" 2>/dev/null && say "stopped engine (pid $IE_PID)"
+  fi
+  if [ "$STOP_SEARCH" = 1 ] && [ "$SX_STARTED" = 1 ]; then
+    local p; p="$(pid_on_port "$SEARXNG_PORT")"
+    [ -n "$p" ] && kill "$p" 2>/dev/null && say "stopped SearXNG"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+# ---------------------------------------------------------- SearXNG ----------
+searxng_up() { curl -s -o /dev/null --max-time 2 "$SEARXNG_URL/healthz" 2>/dev/null || curl -s -o /dev/null --max-time 2 "$SEARXNG_URL/" 2>/dev/null; }
+if [ "$USE_SEARCH" = 1 ]; then
+  if searxng_up; then say "SearXNG already up at $SEARXNG_URL"
+  elif [ -x "$SEARXNG_DIR/manage" ]; then
+    say "starting SearXNG…"
+    ( cd "$SEARXNG_DIR" && GRANIAN_INTERFACE=wsgi GRANIAN_HOST="127.0.0.1" GRANIAN_PORT="$SEARXNG_PORT" \
+        setsid ./manage pyenv.cmd granian searx.webapp:app >"$RUN_DIR/searxng.log" 2>&1 & echo $! >"$RUN_DIR/searxng.pid" )
+    SX_STARTED=1
+    for _ in $(seq 1 30); do searxng_up && break; sleep 0.5; done
+    if searxng_up; then say "SearXNG ${GRN}ready${Z}"; else warn "SearXNG didn't come up (see $RUN_DIR/searxng.log); continuing without it"; USE_SEARCH=0; fi
+  else warn "no SearXNG at $SEARXNG_DIR; continuing without web search"; USE_SEARCH=0; fi
+fi
+
+# ---------------------------------------------------------- engine -----------
+# DeepSeek-V4: hand the engine the measured expert-residency ranking when one
+# exists — static VRAM slots then hold the actually-hot experts (decode hit rate
+# 0.72 -> 0.85, ~+24% decode, measured 2026-08-08 vs index-order residency).
+if [ "$ARCH" = deepseek4 ] && [ -z "${DS4_EXPERT_PRIORITY_FILE:-}" ]; then
+  _ds4_rank="$(ls -t "$(dirname "$GGUF")"/../expert_rank_*.txt "$(dirname "$GGUF")"/expert_rank_*.txt 2>/dev/null | head -1)"
+  [ -n "$_ds4_rank" ] && { export DS4_EXPERT_PRIORITY_FILE="$_ds4_rank"; say "expert priority: ${DIM}$_ds4_rank${Z}"; }
+fi
+[ "$MODE" = tp ] && say "tensor-parallel ${GRN}on${Z} ($ARCH)"
+say "starting engine on port ${BOLD}$PORT${Z}  (ctx $CTX, gpus $GPUS, mode $MODE, spec $SPEC, parallel $PARALLEL, temp $TEMP)…"
+IE_LOG="$RUN_DIR/ie-serve.log"; IE_PIDFILE="$RUN_DIR/ie.pid"; rm -f "$IE_PIDFILE"
+# setsid → the engine runs in its own session so a Ctrl-C inside Hermes doesn't
+# reach it. The wrapper records the REAL `ie` pid to a file (using `exec` would
+# hide it behind the short-lived setsid), so readiness + teardown track it.
+# ENGINE_ENV (mode/prompt-cache env) + EXTRA_FLAGS (spec/parallel/temp/…) come
+# from the load screen / remembered conf / CLI flags resolved above.
+env ${ENGINE_ENV[@]+"${ENGINE_ENV[@]}"} setsid bash -c '
+  PIDF="$1"; ENVSH="$2"; IE="$3"; GG="$4"; PT="$5"; CX="$6"; shift 6
+  source "$ENVSH" >/dev/null 2>&1; export IE_FA2_VEC=1
+  "$IE" serve "$GG" --port "$PT" --ctx "$CX" "$@" &
+  echo $! > "$PIDF"; wait' \
+  _ "$IE_PIDFILE" "$ENV_SH" "$IE_BIN" "$GGUF" "$PORT" "$CTX" "${GPUS_FLAG[@]}" \
+  ${EXTRA_FLAGS[@]+"${EXTRA_FLAGS[@]}"} >"$IE_LOG" 2>&1 &
+for _ in $(seq 1 50); do [ -s "$IE_PIDFILE" ] && break; sleep 0.1; done
+IE_PID="$(cat "$IE_PIDFILE" 2>/dev/null || true)"
+[ -n "$IE_PID" ] || { tail -n 20 "$IE_LOG" >&2; die "engine failed to launch"; }
+
+BASE_URL="http://127.0.0.1:${PORT}/v1"
+_gb="$(( $(gguf_size "$GGUF") / 1000000000 ))"
+[ "$_gb" -ge 40 ] && say "${_gb} GB model — first load from a USB/SATA drive can take 15-25 min; waiting as long as it makes progress"
+wait_engine_ready "$IE_PID" "$BASE_URL/models" "$IE_LOG" "" || die "engine failed to start"
+say "engine ${GRN}ready${Z} at $BASE_URL"
+say "📊 live tok/s per turn — run in ANOTHER terminal: ${BOLD}tail -f $IE_LOG | grep --line-buffered '\\[gen\\]'${Z}"
+
+# what model id does the engine report? (fed to Hermes as -m)
+MODEL_ID="$(curl -s --max-time 5 "$BASE_URL/models" 2>/dev/null \
+  | python3 -c 'import sys,json;d=json.load(sys.stdin);print((d.get("data") or [{}])[0].get("id",""))' 2>/dev/null || true)"
+[ -n "$MODEL_ID" ] || MODEL_ID="$(basename "$GGUF" .gguf)"
+
+# ---------------------------------------------------------- Hermes -----------
+HERMES_BIN="$(command -v hermes || echo "$HOME/.local/bin/hermes")"
+[ -x "$HERMES_BIN" ] || die "hermes not found on PATH"
+say "launching Hermes → ${BOLD}$MODEL_ID${Z}${DIM} (web_search: $([ "$USE_SEARCH" = 1 ] && echo "$SEARXNG_URL" || echo off))${Z}"
+export HERMES_INFERENCE_PROVIDER=custom
+export CUSTOM_BASE_URL="$BASE_URL"
+export HERMES_INFERENCE_MODEL="$MODEL_ID"
+[ "$USE_SEARCH" = 1 ] && export SEARXNG_URL="$SEARXNG_URL"
+HERMES_FLAGS=(--provider custom -m "$MODEL_ID"); [ "$TUI" = 1 ] && HERMES_FLAGS+=(--tui)
+"$HERMES_BIN" "${HERMES_FLAGS[@]}"

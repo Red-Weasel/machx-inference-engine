@@ -1,0 +1,128 @@
+{
+  "stable_counters_per_run": 18,
+  "throughput": [
+    {
+      "phase": "pp",
+      "tokens": 128,
+      "baseline": [
+        141.222,
+        141.235,
+        141.746
+      ],
+      "candidate": [
+        141.81,
+        141.336,
+        142.847
+      ],
+      "baseline_median": 141.235,
+      "candidate_median": 141.81,
+      "delta_percent": 0.40712288030586574
+    },
+    {
+      "phase": "pp",
+      "tokens": 512,
+      "baseline": [
+        277.118,
+        280.979,
+        280.034
+      ],
+      "candidate": [
+        284.117,
+        276.672,
+        284.009
+      ],
+      "baseline_median": 280.034,
+      "candidate_median": 284.009,
+      "delta_percent": 1.419470492868724
+    },
+    {
+      "phase": "pp",
+      "tokens": 4096,
+      "baseline": [
+        516.236,
+        513.95,
+        513.594
+      ],
+      "candidate": [
+        526.905,
+        539.514,
+        537.162
+      ],
+      "baseline_median": 513.95,
+      "candidate_median": 537.162,
+      "delta_percent": 4.516392645198941
+    },
+    {
+      "phase": "pp",
+      "tokens": 16384,
+      "baseline": [
+        479.686,
+        478.058,
+        478.09
+      ],
+      "candidate": [
+        504.851,
+        503.027,
+        504.088
+      ],
+      "baseline_median": 478.09,
+      "candidate_median": 504.088,
+      "delta_percent": 5.437888263716051
+    },
+    {
+      "phase": "tg",
+      "tokens": 128,
+      "baseline": [
+        33.4917,
+        33.4985,
+        33.5761
+      ],
+      "candidate": [
+        33.5687,
+        33.5378,
+        33.5831
+      ],
+      "baseline_median": 33.4985,
+      "candidate_median": 33.5687,
+      "delta_percent": 0.20956162216219099
+    },
+    {
+      "phase": "tg",
+      "tokens": 4096,
+      "baseline": [
+        27.8753,
+        27.9397,
+        27.912
+      ],
+      "candidate": [
+        27.918,
+        27.9117,
+        27.9508
+      ],
+      "baseline_median": 27.912,
+      "candidate_median": 27.918,
+      "delta_percent": 0.021496130696485594
+    }
+  ],
+  "expert_profile_ms": {
+    "baseline": 4166.8301,
+    "candidate": 3110.9356,
+    "speedup": 1.339413808501854
+  },
+  "quality": {
+    "baseline-quality": {
+      "ppl.scored": "511",
+      "ppl.nonfinite": "0",
+      "ppl.avg_nll": "1.699666",
+      "ppl.perplexity": "5.4721"
+    },
+    "candidate-quality": {
+      "ppl.scored": "511",
+      "ppl.nonfinite": "0",
+      "ppl.avg_nll": "1.699666",
+      "ppl.perplexity": "5.4721"
+    }
+  },
+  "quality_dumps_byte_equal": true,
+  "quality_dump_sha256": "8907d19d5927703a93a6522f62ba30569d2c5571ac12f715981af535f21deaf1"
+}

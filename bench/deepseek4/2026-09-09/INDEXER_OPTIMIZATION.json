@@ -1,0 +1,128 @@
+{
+  "stable_counters_per_run": 18,
+  "throughput": [
+    {
+      "phase": "pp",
+      "tokens": 128,
+      "baseline": [
+        140.747,
+        142.548,
+        141.825
+      ],
+      "candidate": [
+        142.524,
+        142.306,
+        143.014
+      ],
+      "baseline_median": 141.825,
+      "candidate_median": 142.524,
+      "delta_percent": 0.492860920148086
+    },
+    {
+      "phase": "pp",
+      "tokens": 512,
+      "baseline": [
+        279.731,
+        282.105,
+        291.221
+      ],
+      "candidate": [
+        286.242,
+        284.2,
+        276.843
+      ],
+      "baseline_median": 282.105,
+      "candidate_median": 284.2,
+      "delta_percent": 0.7426312897679921
+    },
+    {
+      "phase": "pp",
+      "tokens": 4096,
+      "baseline": [
+        536.894,
+        542.342,
+        533.839
+      ],
+      "candidate": [
+        544.468,
+        547.221,
+        548.561
+      ],
+      "baseline_median": 536.894,
+      "candidate_median": 547.221,
+      "delta_percent": 1.9234709272221373
+    },
+    {
+      "phase": "pp",
+      "tokens": 16384,
+      "baseline": [
+        503.516,
+        504.169,
+        502.802
+      ],
+      "candidate": [
+        520.361,
+        522.573,
+        527.925
+      ],
+      "baseline_median": 503.516,
+      "candidate_median": 522.573,
+      "delta_percent": 3.78478538914353
+    },
+    {
+      "phase": "tg",
+      "tokens": 128,
+      "baseline": [
+        32.9511,
+        33.1551,
+        33.2934
+      ],
+      "candidate": [
+        33.0831,
+        33.3986,
+        33.6747
+      ],
+      "baseline_median": 33.1551,
+      "candidate_median": 33.3986,
+      "delta_percent": 0.7344269810677817
+    },
+    {
+      "phase": "tg",
+      "tokens": 4096,
+      "baseline": [
+        27.6177,
+        27.7459,
+        27.5818
+      ],
+      "candidate": [
+        27.5254,
+        27.7944,
+        28.0831
+      ],
+      "baseline_median": 27.6177,
+      "candidate_median": 27.7944,
+      "delta_percent": 0.6398070802420275
+    }
+  ],
+  "indexer_profile_ms": {
+    "baseline": 979.9243,
+    "candidate": 682.9433,
+    "speedup": 1.4348545479544201
+  },
+  "quality": {
+    "baseline-quality": {
+      "ppl.scored": "511",
+      "ppl.nonfinite": "0",
+      "ppl.avg_nll": "1.699666",
+      "ppl.perplexity": "5.4721"
+    },
+    "candidate-quality": {
+      "ppl.scored": "511",
+      "ppl.nonfinite": "0",
+      "ppl.avg_nll": "1.699666",
+      "ppl.perplexity": "5.4721"
+    }
+  },
+  "quality_dumps_byte_equal": true,
+  "quality_dump_sha256": "8907d19d5927703a93a6522f62ba30569d2c5571ac12f715981af535f21deaf1"
+}

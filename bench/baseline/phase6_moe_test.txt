@@ -1,0 +1,8 @@
+Device: Intel(R) Graphics [0xe223]
+  Loaded MoE tensors for layer 0 (E=256, H=2048, I=512, K=8)
+  CPU reference: top-8 = [25,28,51,65,124,194,199,222]  (5.5 ms)
+  router top-8 indices match                       OK  GPU=[25,28,51,65,124,194,199,222] ref=[25,28,51,65,124,194,199,222]
+  router top-8 weights match                       OK  max_abs=0.00005
+  MoE block forward y vs CPU ref (gate ≤ 1e-2 abs) OK  max_abs=0.00001 max_rel=0.00265 worst@1269 (ref=-0.0287761 got=-0.0287628)  GPU=2.1 ms / CPU=5.5 ms
+
+ALL PASS

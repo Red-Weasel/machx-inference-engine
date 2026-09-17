@@ -1,0 +1,1 @@
+Write a C++17 function that parses a simple command-line argument list for an inference benchmark. It should support --model, --ctx, --tokens, --temperature, --seed, --prompt-file, and --json-output. Include validation, helpful error messages, and a small usage string. Do not use external libraries.

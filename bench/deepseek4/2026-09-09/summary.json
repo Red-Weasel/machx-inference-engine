@@ -1,0 +1,91 @@
+{
+  "rows": [
+    {
+      "metric": "pp",
+      "tokens": 128,
+      "run_1": 141.122,
+      "run_2": 141.189,
+      "median": 141.15550000000002,
+      "minimum": 141.122,
+      "maximum": 141.189
+    },
+    {
+      "metric": "pp",
+      "tokens": 4096,
+      "run_1": 478.105,
+      "run_2": 493.209,
+      "median": 485.65700000000004,
+      "minimum": 478.105,
+      "maximum": 493.209
+    },
+    {
+      "metric": "pp",
+      "tokens": 16384,
+      "run_1": 464.961,
+      "run_2": 466.136,
+      "median": 465.5485,
+      "minimum": 464.961,
+      "maximum": 466.136
+    },
+    {
+      "metric": "tg",
+      "tokens": 128,
+      "run_1": 33.3969,
+      "run_2": 33.5017,
+      "median": 33.4493,
+      "minimum": 33.3969,
+      "maximum": 33.5017
+    },
+    {
+      "metric": "tg",
+      "tokens": 4096,
+      "run_1": 27.7598,
+      "run_2": 27.7178,
+      "median": 27.738799999999998,
+      "minimum": 27.7178,
+      "maximum": 27.7598
+    },
+    {
+      "metric": "tg",
+      "tokens": 16384,
+      "run_1": 29.993,
+      "run_2": 29.954,
+      "median": 29.9735,
+      "minimum": 29.954,
+      "maximum": 29.993
+    }
+  ],
+  "profile_buckets": {
+    "pp.4096.kgroup.attention.ms": 1714.006,
+    "pp.4096.kgroup.attention.frac": 0.1446,
+    "pp.4096.kgroup.dense_materialise.ms": 149.439,
+    "pp.4096.kgroup.dense_materialise.frac": 0.0126,
+    "pp.4096.kgroup.hyper.ms": 1022.109,
+    "pp.4096.kgroup.hyper.frac": 0.0862,
+    "pp.4096.kgroup.lm_head.ms": 1.972,
+    "pp.4096.kgroup.lm_head.frac": 0.0002,
+    "pp.4096.kgroup.moe_mixed.ms": 71.292,
+    "pp.4096.kgroup.moe_mixed.frac": 0.006,
+    "pp.4096.kgroup.moe_routed.ms": 537.072,
+    "pp.4096.kgroup.moe_routed.frac": 0.0453,
+    "pp.4096.kgroup.moe_shared.ms": 90.607,
+    "pp.4096.kgroup.moe_shared.frac": 0.0076,
+    "pp.4096.kgroup.other.ms": 8265.609,
+    "pp.4096.kgroup.other.frac": 0.6974,
+    "tg.4096.kgroup.attention.ms": 20.8783,
+    "tg.4096.kgroup.attention.frac": 0.5305,
+    "tg.4096.kgroup.hyper.ms": 2.5241,
+    "tg.4096.kgroup.hyper.frac": 0.0641,
+    "tg.4096.kgroup.lm_head.ms": 0.9517,
+    "tg.4096.kgroup.lm_head.frac": 0.0242,
+    "tg.4096.kgroup.moe_mixed.ms": 0.2607,
+    "tg.4096.kgroup.moe_mixed.frac": 0.0066,
+    "tg.4096.kgroup.moe_routed.ms": 1.0508,
+    "tg.4096.kgroup.moe_routed.frac": 0.0267,
+    "tg.4096.kgroup.moe_shared.ms": 2.5965,
+    "tg.4096.kgroup.moe_shared.frac": 0.066,
+    "tg.4096.kgroup.other.ms": 11.0922,
+    "tg.4096.kgroup.other.frac": 0.2819
+  },
+  "notes": "Warmup excluded. Two timed repeat processes. Profile pass excluded from throughput."
+}

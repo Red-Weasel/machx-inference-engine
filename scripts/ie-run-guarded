@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# ie-run-guarded — run one engine binary with (a) a single-flight lock so two
+# engine processes can never stack pinned host arenas, and (b) a hard memory
+# cap so runaway allocation gets OOM-killed instead of livelocking the box
+# (2026-08-27 freeze: pinned malloc_host banks + model mmap exhausted 249 GB;
+# journald's "Under memory pressure" was the machine's last words).
+#
+# usage: ie-run-guarded [--mem 200G] [--timeout 1800] <binary> [args...]
+set -u
+MEM=200G
+TMO=1800
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --mem)     MEM="$2"; shift 2 ;;
+        --timeout) TMO="$2"; shift 2 ;;
+        *) break ;;
+    esac
+done
+[[ $# -ge 1 ]] || { echo "usage: ie-run-guarded [--mem 200G] [--timeout SECS] <binary> [args...]" >&2; exit 2; }
+
+LOCK=/tmp/ie-gpu.lock
+exec 9>"$LOCK"
+if ! flock -w 5 9; then
+    echo "ie-run-guarded: another engine process holds $LOCK (pid $(cat "$LOCK" 2>/dev/null)); refusing to stack" >&2
+    exit 3
+fi
+echo $$ >&9
+
+if command -v systemd-run >/dev/null 2>&1; then
+    exec systemd-run --user --scope -q \
+        -p MemoryMax="$MEM" -p MemorySwapMax=0 \
+        timeout --signal=TERM --kill-after=20 "$TMO" "$@"
+else
+    exec timeout --signal=TERM --kill-after=20 "$TMO" "$@"
+fi

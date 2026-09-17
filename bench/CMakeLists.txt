@@ -1,0 +1,30 @@
+add_executable(bench_gemm_fp16 bench_gemm_fp16.cpp)
+target_link_libraries(bench_gemm_fp16 PRIVATE ie_sycl_flags)
+
+add_executable(bench_dequant bench_dequant.cpp)
+target_link_libraries(bench_dequant PRIVATE ie_core ie_sycl_flags)
+
+add_executable(bench_gemv_q4k bench_gemv_q4k.cpp)
+target_link_libraries(bench_gemv_q4k PRIVATE ie_core ie_sycl_flags)
+
+add_executable(bench_gemm_slm bench_gemm_slm.cpp)
+target_link_libraries(bench_gemm_slm PRIVATE ie_core ie_sycl_flags)
+
+add_executable(bench_attention bench_attention.cpp)
+target_link_libraries(bench_attention PRIVATE ie_core ie_sycl_flags)
+
+add_executable(ds41_attn_decode_probe ds41_attn_decode_probe.cpp)
+target_link_libraries(ds41_attn_decode_probe PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ds41_attn_decode_probe PROPERTIES OUTPUT_NAME "ds41-attn-decode-probe")
+
+add_executable(ds41_fp8_gemv_bench ds41_fp8_gemv_bench.cpp)
+target_link_libraries(ds41_fp8_gemv_bench PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ds41_fp8_gemv_bench PROPERTIES OUTPUT_NAME "ds41-fp8-gemv-bench")
+
+add_executable(ds41_topk_split_check ds41_topk_split_check.cpp)
+target_link_libraries(ds41_topk_split_check PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ds41_topk_split_check PROPERTIES OUTPUT_NAME "ds41-topk-split-check")
+
+add_executable(ds41_mxfp4_gemm_bench ds41_mxfp4_gemm_bench.cpp)
+target_link_libraries(ds41_mxfp4_gemm_bench PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ds41_mxfp4_gemm_bench PROPERTIES OUTPUT_NAME "ds41-mxfp4-gemm-bench")

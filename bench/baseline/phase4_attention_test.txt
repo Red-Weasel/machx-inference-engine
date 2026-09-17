@@ -1,0 +1,11 @@
+Device: Intel(R) Graphics [0xe223]
+
+  KvCache append round-trip                    OK
+  constant-V → output equals const           OK
+  causal mask: future garbage ignored          OK
+  GQA mapping (group invariance, group split)  OK
+  vs scalar ref T=1                            OK  max_abs=0.0001206 max_rel=0.0004229 worst@51 (exp=-0.351686 got=-0.351807)
+  vs scalar ref T=16                           OK  max_abs=0.0001939 max_rel=0.09091  worst@1189 (exp=0.257619 got=0.257812)
+  vs scalar ref T=256                          OK  max_abs=0.0002021 max_rel=0.04765  worst@776 (exp=-0.417522 got=-0.417725)
+
+ALL PASS

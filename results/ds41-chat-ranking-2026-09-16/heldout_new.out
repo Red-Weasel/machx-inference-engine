@@ -1,0 +1,7 @@
+heldout  0: ttft 2.2s decode 300 tok in 24.7s = 12.15 tok/s cached 17724 finish length err None
+heldout  1: ttft 1.2s decode 300 tok in 24.8s = 12.10 tok/s cached 17724 finish length err None
+heldout  2: ttft 1.2s decode 300 tok in 23.1s = 12.99 tok/s cached 17724 finish length err None
+heldout  3: ttft 1.2s decode 151 tok in 18.7s = 8.07 tok/s cached 17724 finish stop err None
+heldout  4: ttft 1.3s decode 300 tok in 35.5s = 8.45 tok/s cached 17724 finish length err None
+heldout  5: ttft 1.3s decode 232 tok in 19.7s = 11.78 tok/s cached 17724 finish tool_calls err None
+heldout TOTAL: 1583 tokens in 146.5s = 10.81 tok/s

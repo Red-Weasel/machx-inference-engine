@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+# ie-council — ask a "council" of two already-running chat endpoints one prompt.
+#
+#   A thin client over two OpenAI-compatible /v1/chat/completions servers.
+#   It does NOT start any server and does NOT touch the GPU — you launch the
+#   engines yourself (e.g. `ie serve <gguf> --port 11435`) and this just talks
+#   to them. Standard library only (no pip).
+#
+#   Modes:
+#     side-by-side  (default)  query BOTH concurrently, print each answer.
+#     judge                    get both answers, then have ONE model synthesize
+#                              the single best combined answer (both drafts shown).
+#     debate                   one round: show each model the OTHER's answer and
+#                              let it revise; print both revisions.
+#
+#   Endpoints default to two local servers and are overridable via flags or env:
+#     A: model "crown"   http://127.0.0.1:11435/v1   ($IE_COUNCIL_A)
+#     B: model "gpt-oss" http://127.0.0.1:11436/v1   ($IE_COUNCIL_B)
+#
+#   Usage:
+#     ie-council "Explain the CAP theorem in 3 bullets"
+#     echo "Refactor this loop for clarity" | ie-council --mode judge
+#     ie-council --mode debate --temperature 0.4 "Is Rust worth it for a CLI?"
+#     ie-council --a http://host:8001/v1 --a-model my-model "hello"
+#
+# Endpoint spec (--a / --b, or $IE_COUNCIL_A / $IE_COUNCIL_B) is a base URL with
+# an optional "name@" prefix and optional "#model" suffix, e.g.
+#     crown@http://127.0.0.1:11435/v1#crown
+# Bare URLs are fine; name/model then come from --a-name/--a-model (or defaults).
+
+import argparse
+import concurrent.futures
+import json
+import os
+import sys
+import time
+import urllib.error
+import urllib.request
+
+# -----------------------------------------------------------------------------
+# ANSI (light touch; auto-disabled when not a TTY or when NO_COLOR is set)
+# -----------------------------------------------------------------------------
+def _supports_color():
+    if os.environ.get("NO_COLOR"):
+        return False
+    if os.environ.get("IE_COUNCIL_NO_COLOR"):
+        return False
+    return sys.stdout.isatty()
+
+_COLOR = _supports_color()
+
+
+def _c(code, text):
+    if not _COLOR:
+        return text
+    return "\033[%sm%s\033[0m" % (code, text)
+
+
+def bold(t):
+    return _c("1", t)
+
+
+def dim(t):
+    return _c("2", t)
+
+
+def cyan(t):
+    return _c("36", t)
+
+
+def green(t):
+    return _c("32", t)
+
+
+def yellow(t):
+    return _c("33", t)
+
+
+def red(t):
+    return _c("31", t)
+
+
+# A stable color per slot so A/B are visually distinguishable.
+_SLOT_COLOR = {"A": cyan, "B": green}
+
+
+def header(slot, name, extra=""):
+    tag = "%s · %s" % (slot, name)
+    color = _SLOT_COLOR.get(slot, bold)
+    label = color(bold("┤ %s ├" % tag))
+    suffix = " " + dim(extra) if extra else ""
+    fill = max(4, 58 - len(tag) - len(extra))
+    return "%s %s%s" % (label, dim("─" * fill), suffix)
+
+
+# -----------------------------------------------------------------------------
+# Endpoint parsing / config
+# -----------------------------------------------------------------------------
+class Endpoint:
+    def __init__(self, slot, base_url, name, model):
+        self.slot = slot
+        self.base_url = base_url.rstrip("/")
+        self.name = name
+        self.model = model
+
+    @property
+    def url(self):
+        return self.base_url + "/chat/completions"
+
+    def __repr__(self):
+        return "Endpoint(%s, %s, name=%s, model=%s)" % (
+            self.slot, self.base_url, self.name, self.model)
+
+
+def parse_endpoint(slot, spec, default_url, default_name, default_model,
+                   cli_url, cli_name, cli_model):
+    """Resolve an endpoint from (in priority order) explicit CLI url, then the
+    combined spec string (env or --a/--b), then defaults. Supports the compact
+    form  name@http://host/v1#model ."""
+    name = default_name
+    model = default_model
+    base = default_url
+
+    raw = cli_url if cli_url else spec
+    if raw:
+        s = raw.strip()
+        if "@" in s and "://" in s and s.index("@") < s.index("://"):
+            name, s = s.split("@", 1)
+        if "#" in s:
+            s, model = s.rsplit("#", 1)
+        base = s
+
+    # Explicit per-field CLI overrides win last.
+    if cli_name:
+        name = cli_name
+    if cli_model:
+        model = cli_model
+
+    return Endpoint(slot, base, name.strip(), model.strip())
+
+
+# -----------------------------------------------------------------------------
+# HTTP: OpenAI-compatible chat completion (non-streaming)
+# -----------------------------------------------------------------------------
+class EndpointError(Exception):
+    pass
+
+
+def chat(ep, messages, *, timeout, max_tokens, temperature):
+    """POST one chat completion. Returns (text, elapsed_seconds).
+    Raises EndpointError with a human-readable reason on any failure."""
+    payload = {
+        "model": ep.model,
+        "messages": messages,
+        "temperature": temperature,
+        "stream": False,
+    }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+
+    data = json.dumps(payload).encode("utf-8")
+    headers = {"Content-Type": "application/json"}
+    api_key = os.environ.get("IE_COUNCIL_API_KEY") or os.environ.get("OPENAI_API_KEY")
+    if api_key:
+        headers["Authorization"] = "Bearer " + api_key
+
+    req = urllib.request.Request(ep.url, data=data, headers=headers, method="POST")
+    t0 = time.time()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            body = resp.read()
+    except urllib.error.HTTPError as e:
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:500]
+        except Exception:
+            pass
+        raise EndpointError("HTTP %s from %s%s" % (
+            e.code, ep.url, (" — " + detail) if detail else ""))
+    except urllib.error.URLError as e:
+        raise EndpointError("cannot reach %s (%s)" % (ep.url, e.reason))
+    except (TimeoutError, OSError) as e:
+        raise EndpointError("network error talking to %s (%s)" % (ep.url, e))
+    elapsed = time.time() - t0
+
+    try:
+        obj = json.loads(body)
+    except json.JSONDecodeError:
+        raise EndpointError("non-JSON response from %s: %s" % (
+            ep.url, body[:200].decode("utf-8", "replace")))
+
+    # OpenAI-compatible: choices[0].message.content
+    try:
+        choice = obj["choices"][0]
+        msg = choice.get("message") or {}
+        text = msg.get("content")
+        if text is None:
+            # Some servers use the legacy "text" field.
+            text = choice.get("text")
+        if text is None:
+            raise KeyError("content")
+    except (KeyError, IndexError, TypeError):
+        raise EndpointError("unexpected response shape from %s: %s" % (
+            ep.url, json.dumps(obj)[:300]))
+
+    return text.strip(), elapsed
+
+
+# A parallel-safe wrapper that never raises: returns a result dict.
+def try_chat(ep, messages, **kw):
+    res = {"slot": ep.slot, "name": ep.name, "ok": False,
+           "text": None, "elapsed": None, "error": None}
+    try:
+        text, elapsed = chat(ep, messages, **kw)
+        res["ok"] = True
+        res["text"] = text
+        res["elapsed"] = elapsed
+    except EndpointError as e:
+        res["error"] = str(e)
+    except Exception as e:  # last-resort guard so one dead endpoint never kills the run
+        res["error"] = "%s: %s" % (type(e).__name__, e)
+    return res
+
+
+def run_both(endpoints, messages_for, **kw):
+    """Query all endpoints concurrently. messages_for(ep) -> messages list.
+    Returns results in the same slot order as `endpoints`."""
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(endpoints)) as pool:
+        futs = {pool.submit(try_chat, ep, messages_for(ep), **kw): ep
+                for ep in endpoints}
+        for fut in concurrent.futures.as_completed(futs):
+            ep = futs[fut]
+            results[ep.slot] = fut.result()
+    return [results[ep.slot] for ep in endpoints]
+
+
+# -----------------------------------------------------------------------------
+# Output helpers
+# -----------------------------------------------------------------------------
+def print_result(res, *, extra=""):
+    slot = res["slot"]
+    name = res["name"]
+    if res["ok"]:
+        meta = "%.1fs" % res["elapsed"]
+        if extra:
+            meta += " · " + extra
+        print(header(slot, name, meta))
+        print()
+        print(res["text"])
+        print()
+    else:
+        print(header(slot, name, "UNAVAILABLE"))
+        print()
+        print(red("  ✗ " + res["error"]))
+        print()
+
+
+def any_ok(results):
+    return any(r["ok"] for r in results)
+
+
+def ok_results(results):
+    return [r for r in results if r["ok"]]
+
+
+# -----------------------------------------------------------------------------
+# Modes
+# -----------------------------------------------------------------------------
+def system_msg(text):
+    return {"role": "system", "content": text}
+
+
+def user_msg(text):
+    return {"role": "user", "content": text}
+
+
+def base_messages(system, prompt):
+    msgs = []
+    if system:
+        msgs.append(system_msg(system))
+    msgs.append(user_msg(prompt))
+    return msgs
+
+
+def mode_side_by_side(endpoints, prompt, system, kw):
+    print(dim("Council · side-by-side · %d models" % len(endpoints)))
+    print()
+    results = run_both(endpoints, lambda ep: base_messages(system, prompt), **kw)
+    for res in results:
+        print_result(res)
+    return 0 if any_ok(results) else 2
+
+
+def mode_judge(endpoints, prompt, system, kw, judge_slot):
+    print(dim("Council · judge · drafts from %d models → synthesis by %s" % (
+        len(endpoints), judge_slot)))
+    print()
+
+    # 1) collect drafts concurrently
+    results = run_both(endpoints, lambda ep: base_messages(system, prompt), **kw)
+    print(bold("Drafts"))
+    print()
+    for res in results:
+        print_result(res)
+
+    good = ok_results(results)
+    if not good:
+        print(red("All endpoints failed; nothing to synthesize."))
+        return 2
+
+    judge_ep = next((ep for ep in endpoints if ep.slot == judge_slot), None)
+    if judge_ep is None:
+        judge_ep = endpoints[0]
+
+    # If the judge endpoint itself is down, fall back to another live one.
+    live_slots = {r["slot"] for r in good}
+    if judge_ep.slot not in live_slots:
+        fallback = next(ep for ep in endpoints if ep.slot in live_slots)
+        print(yellow("Judge %s (%s) is down; synthesizing with %s (%s) instead." % (
+            judge_ep.slot, judge_ep.name, fallback.slot, fallback.name)))
+        print()
+        judge_ep = fallback
+
+    # 2) build the synthesis prompt from the live drafts
+    parts = ["Original question:", prompt, ""]
+    parts.append("You are the presiding judge of a council of AI models. Below are "
+                 "independent draft answers from council members. Synthesize the "
+                 "single best answer: merge the correct and useful parts, resolve "
+                 "any contradictions, drop errors, and do not mention that drafts "
+                 "existed. Reply only with the final answer.")
+    parts.append("")
+    for r in good:
+        parts.append("--- Draft from %s ---" % r["name"])
+        parts.append(r["text"])
+        parts.append("")
+    synth_prompt = "\n".join(parts)
+
+    synth_sys = system or "You are a careful, impartial judge who writes the best possible final answer."
+    synth = try_chat(judge_ep, base_messages(synth_sys, synth_prompt), **kw)
+
+    print(bold("Synthesis"))
+    print()
+    print_result(synth, extra="judge")
+    if not synth["ok"]:
+        return 2
+    return 0
+
+
+def mode_debate(endpoints, prompt, system, kw):
+    if len(endpoints) != 2:
+        print(red("debate mode requires exactly 2 endpoints."))
+        return 2
+
+    print(dim("Council · debate · one revision round between %s and %s" % (
+        endpoints[0].name, endpoints[1].name)))
+    print()
+
+    # Round 1: independent answers
+    print(bold("Round 1 · opening answers"))
+    print()
+    r1 = run_both(endpoints, lambda ep: base_messages(system, prompt), **kw)
+    for res in r1:
+        print_result(res)
+
+    by_slot = {res["slot"]: res for res in r1}
+    a, b = endpoints[0], endpoints[1]
+
+    # Round 2: each model sees the OTHER's answer and may revise.
+    def revise_messages(me, other_res, other_name):
+        instr = (
+            "Here is the original question, followed by another AI model's answer. "
+            "Critically consider it: adopt anything it got right that you missed, "
+            "and correct anything you think it got wrong. Then produce your own "
+            "improved, standalone answer. Do not address the other model directly; "
+            "just give your best final answer.\n\n"
+            "Original question:\n%s\n\n"
+            "--- %s's answer ---\n%s"
+        )
+        if other_res["ok"]:
+            other_text = other_res["text"]
+        else:
+            other_text = "(this model was unavailable — no answer to consider)"
+        return base_messages(system, instr % (prompt, other_name, other_text))
+
+    print(bold("Round 2 · revised after seeing the other's answer"))
+    print()
+
+    tasks = [
+        (a, revise_messages(a, by_slot[b.slot], b.name)),
+        (b, revise_messages(b, by_slot[a.slot], a.name)),
+    ]
+    results = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        futs = {pool.submit(try_chat, ep, msgs, **kw): ep for ep, msgs in tasks}
+        for fut in concurrent.futures.as_completed(futs):
+            ep = futs[fut]
+            results[ep.slot] = fut.result()
+    r2 = [results[a.slot], results[b.slot]]
+    for res in r2:
+        print_result(res, extra="revised")
+
+    return 0 if any_ok(r2) else 2
+
+
+# -----------------------------------------------------------------------------
+# CLI
+# -----------------------------------------------------------------------------
+def read_prompt(args):
+    if args.prompt:
+        return " ".join(args.prompt).strip()
+    if not sys.stdin.isatty():
+        data = sys.stdin.read().strip()
+        if data:
+            return data
+    return ""
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="ie-council",
+        description="Ask a council of two running OpenAI-compatible chat endpoints "
+                    "one prompt (side-by-side, judge, or debate). Does not start a "
+                    "server or touch the GPU.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "examples:\n"
+            "  ie-council \"Explain the CAP theorem in 3 bullets\"\n"
+            "  echo \"Refactor this loop\" | ie-council --mode judge\n"
+            "  ie-council --mode debate --temperature 0.4 \"Is Rust worth it?\"\n"
+        ),
+    )
+    p.add_argument("prompt", nargs="*", help="prompt text (or pipe it via stdin)")
+    p.add_argument("--mode", choices=["side-by-side", "judge", "debate"],
+                   default="side-by-side", help="council mode (default: side-by-side)")
+
+    # Endpoint A
+    p.add_argument("--a", metavar="SPEC",
+                   default=os.environ.get("IE_COUNCIL_A", ""),
+                   help="endpoint A spec: [name@]base_url[#model] "
+                        "(env IE_COUNCIL_A; default crown@http://127.0.0.1:11435/v1#crown)")
+    p.add_argument("--a-name", default="", help="override display name for A")
+    p.add_argument("--a-model", default="", help="override model id sent to A")
+    # Endpoint B
+    p.add_argument("--b", metavar="SPEC",
+                   default=os.environ.get("IE_COUNCIL_B", ""),
+                   help="endpoint B spec: [name@]base_url[#model] "
+                        "(env IE_COUNCIL_B; default gpt-oss@http://127.0.0.1:11436/v1#gpt-oss)")
+    p.add_argument("--b-name", default="", help="override display name for B")
+    p.add_argument("--b-model", default="", help="override model id sent to B")
+
+    p.add_argument("--judge", choices=["A", "B"], default="A",
+                   help="which endpoint synthesizes in judge mode (default: A)")
+
+    p.add_argument("--system", default=os.environ.get("IE_COUNCIL_SYSTEM", ""),
+                   help="optional system prompt sent to every member")
+    p.add_argument("--timeout", type=float, default=120.0,
+                   help="per-request timeout in seconds (default: 120)")
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="max_tokens per response (default: server default)")
+    p.add_argument("--temperature", type=float, default=0.7,
+                   help="sampling temperature (default: 0.7)")
+    return p
+
+
+def main(argv):
+    args = build_parser().parse_args(argv)
+
+    prompt = read_prompt(args)
+    if not prompt:
+        print(red("No prompt given. Pass it as an argument or pipe it via stdin."),
+              file=sys.stderr)
+        print(dim("Try: ie-council \"your question\"   (or)   echo q | ie-council"),
+              file=sys.stderr)
+        return 1
+
+    ep_a = parse_endpoint(
+        "A", args.a,
+        default_url="http://127.0.0.1:11435/v1",
+        default_name="crown", default_model="crown",
+        cli_url="", cli_name=args.a_name, cli_model=args.a_model)
+    ep_b = parse_endpoint(
+        "B", args.b,
+        default_url="http://127.0.0.1:11436/v1",
+        default_name="gpt-oss", default_model="gpt-oss",
+        cli_url="", cli_name=args.b_name, cli_model=args.b_model)
+    endpoints = [ep_a, ep_b]
+
+    kw = dict(timeout=args.timeout, max_tokens=args.max_tokens,
+              temperature=args.temperature)
+
+    # Small banner so it's clear where answers are coming from.
+    print(dim("A → %s (%s)   B → %s (%s)" % (
+        ep_a.name, ep_a.base_url, ep_b.name, ep_b.base_url)))
+    print()
+
+    try:
+        if args.mode == "side-by-side":
+            return mode_side_by_side(endpoints, prompt, args.system, kw)
+        if args.mode == "judge":
+            return mode_judge(endpoints, prompt, args.system, kw, args.judge)
+        if args.mode == "debate":
+            return mode_debate(endpoints, prompt, args.system, kw)
+    except KeyboardInterrupt:
+        print(file=sys.stderr)
+        print(yellow("Interrupted."), file=sys.stderr)
+        return 130
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

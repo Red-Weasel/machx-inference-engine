@@ -1,0 +1,7 @@
+Device: Intel(R) Graphics [0xe223]
+  blk.0.attn_gate.weight                         K=2048 N=4096  max_abs=0.0002  max_rel=0.00050105 worst@3456 (exp=0.00111524 got=0.0011158)  OK
+  blk.3.attn_q.weight                            K=2048 N=8192  max_abs=0.0002  max_rel=0.00052885 worst@6386 (exp=0.00196179 got=0.00196075)  OK
+  blk.3.attn_output.weight                       K=4096 N=2048  max_abs=0.0008  max_rel=0.00051783 worst@1500 (exp=0.00799975 got=0.00799561)  OK
+  blk.0.ssm_out.weight                           K=4096 N=2048  max_abs=0.0004  max_rel=0.00047565 worst@1019 (exp=0.509523 got=0.509766)  OK
+
+ALL PASS

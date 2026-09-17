@@ -1,0 +1,1 @@
+A benchmark produces the following decode speeds across five prompts: 27.4, 29.1, 30.6, 26.8, and 28.7 tokens per second. Calculate the mean, median, min, max, and percent spread from min to max. Then explain which statistic should be used as the headline number and why.

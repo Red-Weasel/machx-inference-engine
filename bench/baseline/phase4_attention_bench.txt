@@ -1,0 +1,9 @@
+Device: Intel(R) Graphics [0xe223]
+Naive full_attention at Qwen3.6 dims (n_q=16, n_kv=2, d_head=256)
+
+  prefill T=1, ctx=0         T=1    start_pos=0      | 0.013 ms/iter  ~1.3 GFLOPS
+  prefill T=16, ctx=0        T=16   start_pos=0      | 0.026 ms/iter  ~85.4 GFLOPS
+  prefill T=256, ctx=0       T=256  start_pos=0      | 0.399 ms/iter  ~1350.8 GFLOPS
+  prefill T=1024, ctx=0      T=1024 start_pos=0      | 7.322 ms/iter  ~1174.3 GFLOPS
+  decode @ ctx=4k            T=1    start_pos=4096   | 3.549 ms/iter  ~18.9 GFLOPS
+  decode @ ctx=32k           T=1    start_pos=32768  | 29.204 ms/iter  ~18.4 GFLOPS

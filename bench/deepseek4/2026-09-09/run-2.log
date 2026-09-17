@@ -1,0 +1,410 @@
+[ds4-bench] schema=1
+[ds4-bench] run.tool=ie-ds4-bench
+[ds4-bench] run.build=Sep  3 2026 06:09:23
+[ds4-bench] run.tag=2026-09-09-run-2
+[ds4-bench] run.model_path=~/models/apetersson-DeepSeek-V4-Flash-Vision-Exp-Abliterated/Reference-Native-GGUF/DeepSeek-V4-Flash-Vision-Exp-Abliterated-NativePreserved-F16-F32-MXFP4.gguf
+[ds4-bench] run.mini_fixture=0
+[ds4-bench] run.max_seq=2048
+[ds4-bench] run.max_context=32768
+[ds4-bench] run.decode_steps=128
+[ds4-bench] run.decode_warmup=8
+[ds4-bench] run.prefetch=0
+[ds4-bench] run.kprofile=0
+[ds4-bench] run.kprofile_prefill=0
+[ds4-bench] run.pin_layers=0
+[ds4-bench] run.slots_per_layer_req=0
+[ds4-bench] run.min_stream_slots_req=0
+[ds4-bench] run.expert_cache_bytes_req=0
+[ds4-bench] model.tensors_bound=1371
+[ds4-bench] model.n_layers=43
+[ds4-bench] model.hidden=4096
+[ds4-bench] model.vocab=129280
+[ds4-bench] model.n_experts=256
+[ds4-bench] model.n_experts_used=6
+[ds4-bench] model.expert_ffn=2048
+[ds4-bench] model.sliding_window=128
+[ds4-bench] model.hash_layer_count=3
+[ds4-bench] model.n_cards=2
+[ds4-note] pp.<T> is prefill of T tokens from an EMPTY context, chunked at run.max_seq (pp.chunk_tokens). It is reported PER LENGTH on purpose: the local branch is bounded by sliding_window=128, the CSA (ratio 4) compressor emits its first entry at 4 tokens and the HCA (ratio 128) one at 128, and the CSA layers' top-k indexer only has a long compressed list to select from at long prompts. One prefill number would average three different regimes.
+[ds4-note] tg.<D> is decode from a context of D tokens. kv_state_bytes_e2 / _e4 are the live per-card cache state at that depth measured by Ds4LayerCache itself, quoted at 2 B/element (the reference/fp16 figure) and at 4 (what this fp32 engine allocates). kv_growing_bytes_e2 is the part that grows with context (the compressed entry arrays); kv_const_bytes_e2 is the remainder. None of these is a per-token constant multiplied out — they are read off the caches.
+[ds4-tp] card 0 of 2 -> GPU 0
+[ds4-tp] card 1 of 2 -> GPU 1
+[ds4] device 0: Intel(R) Arc(TM) Pro B70 Graphics (queue profiling OFF — set IE_QUEUE_PROFILING=1 for --kprofile)
+[ds4] device 1: Intel(R) Arc(TM) Pro B70 Graphics (queue profiling OFF — set IE_QUEUE_PROFILING=1 for --kprofile)
+[ds4] compressed-entry cache width: values fp16, indexer keys fp32 (IE_DS4_KV16)
+[ds4] compressed-entry cache width: values fp16, indexer keys fp32 (IE_DS4_KV16)
+[ds4] layer caches pre-sized: 0.318 GB at ctx 32768 across 1 slot(s) (never grown mid-decode; IE_DS4_PRESIZE=0 for lazy growth)
+[ds4] non-expert TP: card 1 of 2 holds query heads [32,64), output groups [4,8), shared-expert columns [1024,2048)
+[ds4] layer caches pre-sized: 0.318 GB at ctx 32768 across 1 slot(s) (never grown mid-decode; IE_DS4_PRESIZE=0 for lazy growth)
+[ds4] non-expert TP: card 0 of 2 holds query heads [0,32), output groups [0,4), shared-expert columns [0,1024)
+[ds4:c1] resident weights: layer 1/43  1.74 GB
+[ds4:c0] resident weights: layer 1/43  1.74 GB
+[ds4:c1] resident weights: layer 5/43  2.14 GB
+[ds4:c0] resident weights: layer 5/43  2.14 GB
+[ds4:c1] resident weights: layer 9/43  2.54 GB
+[ds4:c0] resident weights: layer 9/43  2.54 GB
+[ds4:c0] resident weights: layer 13/43  2.94 GB
+[ds4:c1] resident weights: layer 13/43  2.94 GB
+[ds4:c0] resident weights: layer 17/43  3.34 GB
+[ds4:c1] resident weights: layer 17/43  3.34 GB
+[ds4:c0] resident weights: layer 21/43  3.74 GB
+[ds4:c1] resident weights: layer 21/43  3.74 GB
+[ds4:c1] resident weights: layer 25/43  4.13 GB
+[ds4:c0] resident weights: layer 25/43  4.13 GB
+[ds4:c1] resident weights: layer 29/43  4.53 GB
+[ds4:c0] resident weights: layer 29/43  4.53 GB
+[ds4:c0] resident weights: layer 33/43  4.93 GB
+[ds4:c1] resident weights: layer 33/43  4.93 GB
+[ds4:c0] resident weights: layer 37/43  5.33 GB
+[ds4:c1] resident weights: layer 37/43  5.33 GB
+[ds4:c1] resident weights: layer 41/43  5.73 GB
+[ds4:c0] resident weights: layer 41/43  5.73 GB
+[ds4:c0] resident weights: layer 43/43  5.93 GB
+
+[ds4] always-resident set uploaded: 5.925 GB (packed residency saved 3.449 GB vs dequantising it all to fp16; that VRAM goes to the expert arena)
+[ds4:c1] resident weights: layer 43/43  5.93 GB
+
+[ds4] always-resident set uploaded: 5.925 GB (packed residency saved 3.449 GB vs dequantising it all to fp16; that VRAM goes to the expert arena)
+[ds4] workspaces: 2.141 GB (attention/indexer strips of 2048 of 2048 query rows; kv capacity 10433 = 2176 sliding + 8257 compressed)
+[ds4] workspaces: 2.141 GB (attention/indexer strips of 2048 of 2048 query rows; kv capacity 10433 = 2176 sliding + 8257 compressed)
+[ds4] VRAM plan: 34.242 GB total - 5.925 resident - 0.318 layer caches (ctx 32768) - 2.141 workspaces - 2.147 margin = 23.711 GB expert arena
+[ds4] VRAM plan: 34.242 GB total - 5.925 resident - 0.318 layer caches (ctx 32768) - 2.141 workspaces - 2.147 margin = 23.711 GB expert arena
+[ds4] pinned-host cap 198.838 GB derived live: MemTotal 267.38 GB, MemAvailable 232.26 GB (page cache 26.54 GB of it); available-33.42 = 198.838 GB, total-66.84 = 200.532 GB -> cap 198.838 GB (available bound)
+[ds4] pinned-host cap 198.838 GB derived live: MemTotal 267.38 GB, MemAvailable 232.26 GB (page cache 26.54 GB of it); available-33.42 = 198.838 GB, total-66.84 = 200.532 GB -> cap 198.838 GB (available bound)
+[ds4] expert-TP: card 0 of 2 holds intermediate columns/rows [0,1024) of every expert — 6.685 MB/slot vs 13.369 MB whole
+[ds4] residency: 81 slots/layer = 0 static (VRAM only, host copy never allocated) + 81 streaming; 23.283 GB VRAM experts; 256 of 256 experts/layer pinned = 73.585 GB host (this card; 147.170 GB over 2 cards, cap 198.838 GB)
+[ds4] expert-TP: card 1 of 2 holds intermediate columns/rows [1024,2048) of every expert — 6.685 MB/slot vs 13.369 MB whole
+[ds4] residency: 81 slots/layer = 0 static (VRAM only, host copy never allocated) + 81 streaming; 23.283 GB VRAM experts; 256 of 256 experts/layer pinned = 73.585 GB host (this card; 147.170 GB over 2 cards, cap 198.838 GB)
+[ds4] residency order: index order (default; no Ds4Options::expert_priority, no $DS4_EXPERT_PRIORITY_FILE)
+[ds4] residency order: index order (default; no Ds4Options::expert_priority, no $DS4_EXPERT_PRIORITY_FILE)
+[ds4] pinned host arena: 73.585 GB in 5 segments (largest 17.113 GB, cap 32.530 GB)
+[ds4] pinned host arena: 73.585 GB in 5 segments (largest 17.113 GB, cap 32.530 GB)
+[ds4] prefill fetch banks: 2 x 32 slots (0.428 GB (427819008 B)); prefill misses bypass the LRU
+[ds4] prefill fetch banks: 2 x 32 slots (0.428 GB (427819008 B)); prefill misses bypass the LRU
+[ds4] expert cache: 81 slots/layer, 23.711 GB VRAM (31.6% residency)
+[ds4] expert cache: 81 slots/layer, 23.711 GB VRAM (31.6% residency)
+[ds4-tp] P2P available between all 2 devices
+[ds4-tp] cross-card reduction: sliced host path at prefill sizes (IE_DS4_REDUCE_SLICED=0 for the memcpy form)
+[ds4-tp] expert pool: layer 1/43  3.42 GB packed across 2 cards  1.7 s  2051.2 MB/s
+[ds4-tp] expert pool: layer 2/43  6.85 GB packed across 2 cards  3.4 s  2017.8 MB/s
+[ds4-tp] expert pool: layer 3/43  10.27 GB packed across 2 cards  5.2 s  1980.4 MB/s
+[ds4-tp] expert pool: layer 4/43  13.69 GB packed across 2 cards  7.0 s  1957.1 MB/s
+[ds4-tp] expert pool: layer 5/43  17.11 GB packed across 2 cards  8.8 s  1950.5 MB/s
+[ds4-tp] expert pool: layer 6/43  20.54 GB packed across 2 cards  10.5 s  1953.0 MB/s
+[ds4-tp] expert pool: layer 7/43  23.96 GB packed across 2 cards  12.2 s  1963.8 MB/s
+[ds4-tp] expert pool: layer 8/43  27.38 GB packed across 2 cards  15.3 s  1788.0 MB/s
+[ds4-tp] expert pool: layer 9/43  30.80 GB packed across 2 cards  18.6 s  1658.3 MB/s
+[ds4-tp] expert pool: layer 10/43  34.23 GB packed across 2 cards  20.3 s  1687.2 MB/s
+[ds4-tp] expert pool: layer 11/43  37.65 GB packed across 2 cards  22.1 s  1706.2 MB/s
+[ds4-tp] expert pool: layer 12/43  41.07 GB packed across 2 cards  23.9 s  1716.0 MB/s
+[ds4-tp] expert pool: layer 13/43  44.49 GB packed across 2 cards  25.7 s  1733.5 MB/s
+[ds4-tp] expert pool: layer 14/43  47.92 GB packed across 2 cards  27.8 s  1723.4 MB/s
+[ds4-tp] expert pool: layer 15/43  51.34 GB packed across 2 cards  29.6 s  1732.8 MB/s
+[ds4-tp] expert pool: layer 16/43  54.76 GB packed across 2 cards  31.8 s  1723.8 MB/s
+[ds4-tp] expert pool: layer 17/43  58.18 GB packed across 2 cards  34.1 s  1704.7 MB/s
+[ds4-tp] expert pool: layer 18/43  61.61 GB packed across 2 cards  36.2 s  1700.4 MB/s
+[ds4-tp] expert pool: layer 19/43  65.03 GB packed across 2 cards  38.4 s  1692.4 MB/s
+[ds4-tp] expert pool: layer 20/43  68.45 GB packed across 2 cards  40.1 s  1704.9 MB/s
+[ds4-tp] expert pool: layer 21/43  71.87 GB packed across 2 cards  41.8 s  1717.6 MB/s
+[ds4-tp] expert pool: layer 22/43  75.30 GB packed across 2 cards  43.7 s  1723.8 MB/s
+[ds4-tp] expert pool: layer 23/43  78.72 GB packed across 2 cards  45.4 s  1732.4 MB/s
+[ds4-tp] expert pool: layer 24/43  82.14 GB packed across 2 cards  47.2 s  1739.5 MB/s
+[ds4-tp] expert pool: layer 25/43  85.56 GB packed across 2 cards  49.2 s  1739.2 MB/s
+[ds4-tp] expert pool: layer 26/43  88.99 GB packed across 2 cards  51.5 s  1728.9 MB/s
+[ds4-tp] expert pool: layer 27/43  92.41 GB packed across 2 cards  53.7 s  1721.5 MB/s
+[ds4-tp] expert pool: layer 28/43  95.83 GB packed across 2 cards  55.8 s  1716.7 MB/s
+[ds4-tp] expert pool: layer 29/43  99.25 GB packed across 2 cards  57.6 s  1724.4 MB/s
+[ds4-tp] expert pool: layer 30/43  102.68 GB packed across 2 cards  59.3 s  1732.3 MB/s
+[ds4-tp] expert pool: layer 31/43  106.10 GB packed across 2 cards  61.2 s  1733.5 MB/s
+[ds4-tp] expert pool: layer 32/43  109.52 GB packed across 2 cards  63.0 s  1737.7 MB/s
+[ds4-tp] expert pool: layer 33/43  112.94 GB packed across 2 cards  64.9 s  1740.7 MB/s
+[ds4-tp] expert pool: layer 34/43  116.37 GB packed across 2 cards  66.8 s  1741.7 MB/s
+[ds4-tp] expert pool: layer 35/43  119.79 GB packed across 2 cards  69.0 s  1736.3 MB/s
+[ds4-tp] expert pool: layer 36/43  123.21 GB packed across 2 cards  71.0 s  1736.5 MB/s
+[ds4-tp] expert pool: layer 37/43  126.63 GB packed across 2 cards  73.1 s  1732.4 MB/s
+[ds4-tp] expert pool: layer 38/43  130.06 GB packed across 2 cards  75.2 s  1728.4 MB/s
+[ds4-tp] expert pool: layer 39/43  133.48 GB packed across 2 cards  77.1 s  1731.1 MB/s
+[ds4-tp] expert pool: layer 40/43  136.90 GB packed across 2 cards  79.3 s  1726.0 MB/s
+[ds4-tp] expert pool: layer 41/43  140.32 GB packed across 2 cards  81.2 s  1727.2 MB/s
+[ds4-tp] expert pool: layer 42/43  143.75 GB packed across 2 cards  83.1 s  1729.5 MB/s
+[ds4-tp] expert pool: layer 43/43  147.17 GB packed across 2 cards  85.4 s  1722.4 MB/s
+[ds4-bench] load.seconds=125.15
+[ds4-bench] load.status=ok
+[ds4-bench] card.0.device=Intel(R) Arc(TM) Pro B70 Graphics
+[ds4-bench] card.0.resident_bytes=5925197788
+[ds4-bench] card.0.expert_cache_bytes=23710531584
+[ds4-bench] card.0.pinned_host_bytes=73584869376
+[ds4-bench] card.0.slots_per_layer=81
+[ds4-bench] card.0.static_slots=0
+[ds4-bench] card.0.stream_slots=81
+[ds4-bench] card.1.device=Intel(R) Arc(TM) Pro B70 Graphics
+[ds4-bench] card.1.resident_bytes=5925197788
+[ds4-bench] card.1.expert_cache_bytes=23710531584
+[ds4-bench] card.1.pinned_host_bytes=73584869376
+[ds4-bench] card.1.slots_per_layer=81
+[ds4-bench] card.1.static_slots=0
+[ds4-bench] card.1.stream_slots=81
+[ds4-bench] residency.vram_bytes_total=59271458744
+[ds4-bench] residency.pinned_host_bytes_total=147169738752
+[ds4-bench] residency.resident_saved_bytes=3448897536
+[ds4-bench] residency.pinned_experts_per_layer=256
+[ds4-bench] residency.layers_pinned=43
+[ds4-bench] residency.priority_origin=index
+[ds4-bench] residency.priority_source=-
+[ds4-bench] ttft.prompt_tokens=128
+[ds4-bench] ttft.cold_ms=2111.566
+[ds4-bench] ttft.cold.prefill_ms=2111.455
+[ds4-bench] ttft.cold.sample_ms=0.111
+[ds4-bench] ttft.cold.first_token_id=2808
+[ds4-bench] ttft.warm_ms=744.730
+[ds4-bench] ttft.warm.prefill_ms=744.618
+[ds4-bench] ttft.warm.sample_ms=0.112
+[ds4-bench] ttft.warm.first_token_id=2808
+[ds4-note] ttft.cold includes SYCL JIT of every kernel; ttft.warm does not. Neither includes model load.
+[ds4-bench] pp.chunk_tokens=2048
+[ds4-bench] pp.128.status=ok
+[ds4-bench] pp.128.chunks=1
+[ds4-bench] pp.128.ms=906.588
+[ds4-bench] pp.128.tok_s=141.189
+[ds4-bench] pp.128.ms_per_tok=7.08272
+[ds4-bench] pp.128.dma_bytes=36792434688
+[ds4-bench] pp.128.dma_busy_ms=0.000
+[ds4-bench] pp.128.dma_busy_frac=0.0000
+[ds4-bench] pp.128.cards=2
+[ds4-bench] pp.128.dma_bytes_per_card=18396217344
+[ds4-bench] pp.128.dma_busy_ms_per_card=0.000
+[ds4-bench] pp.128.dma_busy_frac_per_card=0.0000
+[ds4-bench] pp.128.dma_GB_s_when_busy=0.000
+[ds4-bench] pp.128.dma_MB_per_tok_per_card=143.720
+[ds4-bench] pp.128.cache_hits=4994
+[ds4-bench] pp.128.cache_misses=5504
+[ds4-bench] pp.128.ftrace.wall_ms=906.586
+[ds4-bench] pp.128.ftrace.span_ms=845.063
+[ds4-bench] pp.128.ftrace.reduce_ms=59.015
+[ds4-bench] pp.128.ftrace.prologue_ms=0.142
+[ds4-bench] pp.128.ftrace.epilogue_ms=1.966
+[ds4-bench] pp.128.ftrace.gap_ms=0.400
+[ds4-bench] pp.128.ftrace.span_pre_ms=41.882
+[ds4-bench] pp.128.ftrace.span_mid_ms=787.202
+[ds4-bench] pp.128.ftrace.span_post_ms=15.979
+[ds4-bench] pp.128.ftrace.overlap_ms=815.253
+[ds4-bench] pp.128.ftrace.segments_overlapped=129
+[ds4-bench] pp.128.ftrace.segments=129
+[ds4-bench] pp.128.ftrace.sequential=0
+[ds4-bench] pp.128.ftrace.card0.busy_ms=843.614
+[ds4-bench] pp.128.ftrace.card0.wait_router_ms=23.087
+[ds4-bench] pp.128.ftrace.card0.wait_moe_ms=749.159
+[ds4-bench] pp.128.ftrace.card0.wait_post_ms=14.711
+[ds4-bench] pp.128.ftrace.card0.wait_other_ms=0.068
+[ds4-bench] pp.128.ftrace.card0.wait_total_ms=787.025
+[ds4-bench] pp.128.ftrace.card0.waits=299
+[ds4-bench] pp.128.ftrace.card1.busy_ms=816.702
+[ds4-bench] pp.128.ftrace.card1.wait_router_ms=22.449
+[ds4-bench] pp.128.ftrace.card1.wait_moe_ms=721.819
+[ds4-bench] pp.128.ftrace.card1.wait_post_ms=15.016
+[ds4-bench] pp.128.ftrace.card1.wait_other_ms=0.067
+[ds4-bench] pp.128.ftrace.card1.wait_total_ms=759.351
+[ds4-bench] pp.128.ftrace.card1.waits=298
+[ds4-bench] pp.128.cache_hit_rate=0.4757
+[ds4-bench] pp.128.cache_acquires=296
+[ds4-bench] pp.128.acquire_ids_per_layer_per_card=122.07
+[ds4-bench] pp.128.misses_per_layer_per_card=64.00
+[ds4-bench] pp.128.prefetch_issued=0
+[ds4-bench] pp.128.prefetch_hits=0
+[ds4-bench] pp.128.kv_state_bytes_e2=6687744
+[ds4-bench] pp.128.kv_state_bytes_e4=13375488
+[ds4-bench] pp.4096.status=ok
+[ds4-bench] pp.4096.chunks=2
+[ds4-bench] pp.4096.ms=8304.791
+[ds4-bench] pp.4096.tok_s=493.209
+[ds4-bench] pp.4096.ms_per_tok=2.02754
+[ds4-bench] pp.4096.dma_bytes=140043878400
+[ds4-bench] pp.4096.dma_busy_ms=0.000
+[ds4-bench] pp.4096.dma_busy_frac=0.0000
+[ds4-bench] pp.4096.cards=2
+[ds4-bench] pp.4096.dma_bytes_per_card=70021939200
+[ds4-bench] pp.4096.dma_busy_ms_per_card=0.000
+[ds4-bench] pp.4096.dma_busy_frac_per_card=0.0000
+[ds4-bench] pp.4096.dma_GB_s_when_busy=0.000
+[ds4-bench] pp.4096.dma_MB_per_tok_per_card=17.095
+[ds4-bench] pp.4096.cache_hits=13162
+[ds4-bench] pp.4096.cache_misses=20950
+[ds4-bench] pp.4096.ftrace.wall_ms=4014.320
+[ds4-bench] pp.4096.ftrace.span_ms=3218.121
+[ds4-bench] pp.4096.ftrace.reduce_ms=790.271
+[ds4-bench] pp.4096.ftrace.prologue_ms=0.642
+[ds4-bench] pp.4096.ftrace.epilogue_ms=3.569
+[ds4-bench] pp.4096.ftrace.gap_ms=1.717
+[ds4-bench] pp.4096.ftrace.span_pre_ms=637.986
+[ds4-bench] pp.4096.ftrace.span_mid_ms=2425.739
+[ds4-bench] pp.4096.ftrace.span_post_ms=154.396
+[ds4-bench] pp.4096.ftrace.overlap_ms=3115.503
+[ds4-bench] pp.4096.ftrace.segments_overlapped=129
+[ds4-bench] pp.4096.ftrace.segments=129
+[ds4-bench] pp.4096.ftrace.sequential=0
+[ds4-bench] pp.4096.ftrace.card0.busy_ms=3131.138
+[ds4-bench] pp.4096.ftrace.card0.wait_router_ms=427.304
+[ds4-bench] pp.4096.ftrace.card0.wait_moe_ms=1946.537
+[ds4-bench] pp.4096.ftrace.card0.wait_post_ms=100.448
+[ds4-bench] pp.4096.ftrace.card0.wait_other_ms=0.624
+[ds4-bench] pp.4096.ftrace.card0.wait_total_ms=2474.914
+[ds4-bench] pp.4096.ftrace.card0.waits=374
+[ds4-bench] pp.4096.ftrace.card1.busy_ms=3202.485
+[ds4-bench] pp.4096.ftrace.card1.wait_router_ms=447.890
+[ds4-bench] pp.4096.ftrace.card1.wait_moe_ms=1941.322
+[ds4-bench] pp.4096.ftrace.card1.wait_post_ms=148.704
+[ds4-bench] pp.4096.ftrace.card1.wait_other_ms=0.628
+[ds4-bench] pp.4096.ftrace.card1.wait_total_ms=2538.544
+[ds4-bench] pp.4096.ftrace.card1.waits=373
+[ds4-bench] pp.4096.cache_hit_rate=0.3858
+[ds4-bench] pp.4096.cache_acquires=908
+[ds4-bench] pp.4096.acquire_ids_per_layer_per_card=396.65
+[ds4-bench] pp.4096.misses_per_layer_per_card=243.60
+[ds4-bench] pp.4096.prefetch_issued=0
+[ds4-bench] pp.4096.prefetch_hits=0
+[ds4-bench] pp.4096.kv_state_bytes_e2=33987584
+[ds4-bench] pp.4096.kv_state_bytes_e4=67975168
+[ds4-bench] pp.16384.status=ok
+[ds4-bench] pp.16384.chunks=8
+[ds4-bench] pp.16384.ms=35148.576
+[ds4-bench] pp.16384.tok_s=466.136
+[ds4-bench] pp.16384.ms_per_tok=2.14530
+[ds4-bench] pp.16384.dma_bytes=543450464256
+[ds4-bench] pp.16384.dma_busy_ms=0.000
+[ds4-bench] pp.16384.dma_busy_frac=0.0000
+[ds4-bench] pp.16384.cards=2
+[ds4-bench] pp.16384.dma_bytes_per_card=271725232128
+[ds4-bench] pp.16384.dma_busy_ms_per_card=0.000
+[ds4-bench] pp.16384.dma_busy_frac_per_card=0.0000
+[ds4-bench] pp.16384.dma_GB_s_when_busy=0.000
+[ds4-bench] pp.16384.dma_MB_per_tok_per_card=16.585
+[ds4-bench] pp.16384.cache_hits=52128
+[ds4-bench] pp.16384.cache_misses=81298
+[ds4-bench] pp.16384.ftrace.wall_ms=4985.577
+[ds4-bench] pp.16384.ftrace.span_ms=3928.193
+[ds4-bench] pp.16384.ftrace.reduce_ms=1050.718
+[ds4-bench] pp.16384.ftrace.prologue_ms=0.918
+[ds4-bench] pp.16384.ftrace.epilogue_ms=3.722
+[ds4-bench] pp.16384.ftrace.gap_ms=2.026
+[ds4-bench] pp.16384.ftrace.span_pre_ms=1329.025
+[ds4-bench] pp.16384.ftrace.span_mid_ms=2446.804
+[ds4-bench] pp.16384.ftrace.span_post_ms=152.364
+[ds4-bench] pp.16384.ftrace.overlap_ms=3808.292
+[ds4-bench] pp.16384.ftrace.segments_overlapped=129
+[ds4-bench] pp.16384.ftrace.segments=129
+[ds4-bench] pp.16384.ftrace.sequential=0
+[ds4-bench] pp.16384.ftrace.card0.busy_ms=3811.807
+[ds4-bench] pp.16384.ftrace.card0.wait_router_ms=426.397
+[ds4-bench] pp.16384.ftrace.card0.wait_moe_ms=1955.308
+[ds4-bench] pp.16384.ftrace.card0.wait_post_ms=92.182
+[ds4-bench] pp.16384.ftrace.card0.wait_other_ms=0.582
+[ds4-bench] pp.16384.ftrace.card0.wait_total_ms=2474.469
+[ds4-bench] pp.16384.ftrace.card0.waits=374
+[ds4-bench] pp.16384.ftrace.card1.busy_ms=3924.678
+[ds4-bench] pp.16384.ftrace.card1.wait_router_ms=451.411
+[ds4-bench] pp.16384.ftrace.card1.wait_moe_ms=1963.775
+[ds4-bench] pp.16384.ftrace.card1.wait_post_ms=150.116
+[ds4-bench] pp.16384.ftrace.card1.wait_other_ms=0.631
+[ds4-bench] pp.16384.ftrace.card1.wait_total_ms=2565.933
+[ds4-bench] pp.16384.ftrace.card1.waits=373
+[ds4-bench] pp.16384.cache_hit_rate=0.3907
+[ds4-bench] pp.16384.cache_acquires=3534
+[ds4-bench] pp.16384.acquire_ids_per_layer_per_card=1551.47
+[ds4-bench] pp.16384.misses_per_layer_per_card=945.33
+[ds4-bench] pp.16384.prefetch_issued=0
+[ds4-bench] pp.16384.prefetch_hits=0
+[ds4-bench] pp.16384.kv_state_bytes_e2=118529024
+[ds4-bench] pp.16384.kv_state_bytes_e4=237058048
+[ds4-bench] tg.128.status=ok
+[ds4-bench] tg.128.steps=128
+[ds4-bench] tg.128.tok_s=33.5017
+[ds4-bench] tg.128.ms_per_tok_mean=29.7479
+[ds4-bench] tg.128.ms_per_tok_p50=28.9249
+[ds4-bench] tg.128.ms_per_tok_p10=25.4806
+[ds4-bench] tg.128.ms_per_tok_p90=34.8169
+[ds4-bench] tg.128.ms_per_tok_min=24.4186
+[ds4-bench] tg.128.ms_per_tok_max=40.9492
+[ds4-bench] tg.128.ms_per_tok_stdev=3.6649
+[ds4-bench] tg.128.burstiness_p90_over_p50=1.2037
+[ds4-bench] tg.128.dma_bytes_per_tok=244094976.0
+[ds4-bench] tg.128.dma_busy_ms_per_tok=0.0000
+[ds4-bench] tg.128.dma_busy_frac=0.0000
+[ds4-bench] tg.128.cache_hits=61374
+[ds4-bench] tg.128.cache_misses=4674
+[ds4-bench] tg.128.cache_hit_rate=0.9292
+[ds4-bench] tg.128.cache_acquires=11008
+[ds4-bench] tg.128.cache_unavailable=0
+[ds4-bench] tg.128.prefetch_issued=0
+[ds4-bench] tg.128.prefetch_hits=0
+[ds4-bench] tg.128.kv_state_bytes_e2=7949824
+[ds4-bench] tg.128.kv_state_bytes_e4=15899648
+[ds4-bench] tg.128.kv_growing_bytes_e2=1815040
+[ds4-bench] tg.128.kv_const_bytes_e2=6134784
+[ds4-bench] tg.128.kv_allocated_bytes=1286417920
+[ds4-bench] tg.128.context_length=264
+[ds4-bench] tg.128.kv_growth_bytes_per_ctx_tok_e2=6875.15
+[ds4-bench] tg.4096.status=ok
+[ds4-bench] tg.4096.steps=128
+[ds4-bench] tg.4096.tok_s=27.7178
+[ds4-bench] tg.4096.ms_per_tok_mean=35.9762
+[ds4-bench] tg.4096.ms_per_tok_p50=35.6397
+[ds4-bench] tg.4096.ms_per_tok_p10=31.7152
+[ds4-bench] tg.4096.ms_per_tok_p90=40.8365
+[ds4-bench] tg.4096.ms_per_tok_min=27.4964
+[ds4-bench] tg.4096.ms_per_tok_max=44.2070
+[ds4-bench] tg.4096.ms_per_tok_stdev=3.3622
+[ds4-bench] tg.4096.burstiness_p90_over_p50=1.1458
+[ds4-bench] tg.4096.dma_bytes_per_tok=475865088.0
+[ds4-bench] tg.4096.dma_busy_ms_per_tok=0.0000
+[ds4-bench] tg.4096.dma_busy_frac=0.0000
+[ds4-bench] tg.4096.cache_hits=56936
+[ds4-bench] tg.4096.cache_misses=9112
+[ds4-bench] tg.4096.cache_hit_rate=0.8620
+[ds4-bench] tg.4096.cache_acquires=11008
+[ds4-bench] tg.4096.cache_unavailable=0
+[ds4-bench] tg.4096.prefetch_issued=0
+[ds4-bench] tg.4096.prefetch_hits=0
+[ds4-bench] tg.4096.kv_state_bytes_e2=35249664
+[ds4-bench] tg.4096.kv_state_bytes_e4=70499328
+[ds4-bench] tg.4096.kv_growing_bytes_e2=29114880
+[ds4-bench] tg.4096.kv_const_bytes_e2=6134784
+[ds4-bench] tg.4096.kv_allocated_bytes=1286417920
+[ds4-bench] tg.4096.context_length=4232
+[ds4-bench] tg.4096.kv_growth_bytes_per_ctx_tok_e2=6879.70
+[ds4-bench] tg.16384.status=ok
+[ds4-bench] tg.16384.steps=128
+[ds4-bench] tg.16384.tok_s=29.9540
+[ds4-bench] tg.16384.ms_per_tok_mean=33.2832
+[ds4-bench] tg.16384.ms_per_tok_p50=32.3078
+[ds4-bench] tg.16384.ms_per_tok_p10=29.4237
+[ds4-bench] tg.16384.ms_per_tok_p90=38.2940
+[ds4-bench] tg.16384.ms_per_tok_min=28.1583
+[ds4-bench] tg.16384.ms_per_tok_max=45.7178
+[ds4-bench] tg.16384.ms_per_tok_stdev=3.6861
+[ds4-bench] tg.16384.burstiness_p90_over_p50=1.1853
+[ds4-bench] tg.16384.dma_bytes_per_tok=234276864.0
+[ds4-bench] tg.16384.dma_busy_ms_per_tok=0.0000
+[ds4-bench] tg.16384.dma_busy_frac=0.0000
+[ds4-bench] tg.16384.cache_hits=61562
+[ds4-bench] tg.16384.cache_misses=4486
+[ds4-bench] tg.16384.cache_hit_rate=0.9321
+[ds4-bench] tg.16384.cache_acquires=11008
+[ds4-bench] tg.16384.cache_unavailable=0
+[ds4-bench] tg.16384.prefetch_issued=0
+[ds4-bench] tg.16384.prefetch_hits=0
+[ds4-bench] tg.16384.kv_state_bytes_e2=119791104
+[ds4-bench] tg.16384.kv_state_bytes_e4=239582208
+[ds4-bench] tg.16384.kv_growing_bytes_e2=113656320
+[ds4-bench] tg.16384.kv_const_bytes_e2=6134784
+[ds4-bench] tg.16384.kv_allocated_bytes=1286417920
+[ds4-bench] tg.16384.context_length=16520
+[ds4-bench] tg.16384.kv_growth_bytes_per_ctx_tok_e2=6879.92
+[ds4-bench] tg.all.tok_s=30.2079
+[ds4-bench] tg.all.cache_hit_rate=0.9078
+[ds4-bench] tg.all.dma_mb_per_tok=318.0790
+[ds4-bench] tg.all.steps=384
+[ds4-bench] tp.reductions=37152
+[ds4-bench] tp.reduce_ms_total=20880.367
+[ds4-bench] tp.stage_bytes=134217728
+[ds4-note] tp.* are cumulative over the whole pass, not per token. The cards DO run concurrently now (DeepSeek4TpRuntime posts each layer segment to a per-card worker and joins at the reduction; deepseek4_residency_test 15h asserts the intervals intersect) EXCEPT while the kernel profiler is on, which forces them to take turns.
+[ds4-bench] run.status=ok

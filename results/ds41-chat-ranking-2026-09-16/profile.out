@@ -1,0 +1,15 @@
+profile  0: ttft 2.7s decode 300 tok in 39.1s = 7.67 tok/s cached 17724 finish length err None
+profile  1: ttft 1.8s decode 300 tok in 34.2s = 8.77 tok/s cached 17724 finish length err None
+profile  2: ttft 1.7s decode 146 tok in 21.3s = 6.85 tok/s cached 17724 finish stop err None
+profile  3: ttft 1.8s decode 300 tok in 36.7s = 8.17 tok/s cached 17724 finish length err None
+profile  4: ttft 1.7s decode 300 tok in 57.4s = 5.23 tok/s cached 17724 finish length err None
+profile  5: ttft 1.7s decode 300 tok in 40.5s = 7.41 tok/s cached 17724 finish length err None
+profile  6: ttft 2.1s decode 300 tok in 45.7s = 6.56 tok/s cached 17724 finish length err None
+profile  7: ttft 1.6s decode 300 tok in 44.3s = 6.77 tok/s cached 17724 finish length err None
+profile  8: ttft 1.8s decode 300 tok in 29.2s = 10.27 tok/s cached 17724 finish length err None
+profile  9: ttft 1.8s decode 300 tok in 32.4s = 9.26 tok/s cached 17724 finish length err None
+profile 10: ttft 2.1s decode 212 tok in 23.4s = 9.06 tok/s cached 17724 finish stop err None
+profile 11: ttft 1.6s decode 300 tok in 38.8s = 7.73 tok/s cached 17724 finish length err None
+profile 12: ttft 1.8s decode 300 tok in 38.8s = 7.73 tok/s cached 17724 finish length err None
+profile 13: ttft 1.9s decode 155 tok in 21.6s = 7.18 tok/s cached 17724 finish tool_calls err None
+profile TOTAL: 3813 tokens in 503.4s = 7.57 tok/s
