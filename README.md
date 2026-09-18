@@ -29,6 +29,9 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 Everything runs behind one OpenAI-compatible server (`ie serve`) with tool calls, and the
 [Dream Agent Harness](https://github.com/Red-Weasel/Dream-Agent-Harness) drives it as a local agent.
 
+![DeepSeek-V4.1-Flash running locally in the Dream Agent Harness, served by Mach X on two Arc Pro B70 cards](docs/images/dream-deepseek-v41.png)
+<sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
+
 ---
 
 ## Highlights
@@ -406,12 +409,4 @@ Per-model design and measurement notes are in **[docs/](docs)**.
 
 Free to use, modify, and ship (including commercially). Apache-2.0's patent grant + retaliation clause protects you and downstream users.
 
-## Support
-
-If Mach X saved you time — or you just want to see more fast inference land on Intel Arc — you can support the work:
-
-[![Ko-fi](https://img.shields.io/badge/Support%20on-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/redweasel)
-
-☕ **[ko-fi.com/redweasel](https://ko-fi.com/redweasel)**
-
-**All donations go straight back into the project.** Requests and suggestions are welcome — [open an issue](https://github.com/Red-Weasel/machx-inference-engine/issues).
+Requests and suggestions are welcome — [open an issue](https://github.com/Red-Weasel/machx-inference-engine/issues).
