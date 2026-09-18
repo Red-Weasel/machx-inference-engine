@@ -253,6 +253,9 @@ public:
     // at pp2048 the full [T, vocab] fp32 block is 1 GiB of VRAM and a 1 GiB copy to the host, and
     // generation needs one row. Off by default so the goldens' full-logits comparisons still work.
     void set_logits_last_only(bool on) { logits_last_only_ = on; }
+    // Phase 58: admit 2..kDs41MaxDecodeRows-row decode steps (a speculative verify) without IE_DS41_DECODE_MULTI --
+    // the prompt-lookup loop turns it on for itself; the multi-row path is gated (docs/deepseek41/55-56)
+    void set_multi_row_decode(bool on) { multi_rows_ = on; }
     // Decoder SWA Bounded Replay (docs/deepseek41/27; the report's §2.2/§3.2.2), ON by default as
     // deployed: at a prefill longer than the window, the decoder half (layers n_layers/2..) runs
     // over the last `window_size` prompt tokens only, after its first layer's compressor has
@@ -272,6 +275,16 @@ public:
     // on only when a drafter consumes it (the generator sets it with a drafter attached; the drafter tests set it)
     void set_capture_main_hidden(bool on) { capture_main_hidden_ = on; }
     const std::vector<int32_t>& all_ids() const { return all_ids_; }        // the sequence the caches hold (gate P3 finding 3)
+    // Vision (Phase 56, docs/deepseek41/95). An image position carries a NEGATIVE id, unique per image and slot: the
+    // prefix cache's match, the engram's dead-token rule, the image router bias and the splice all read it off the id.
+    // Its stream row comes from a span given here, not from the embedding table: rows [n, hidden] f32 for the absolute
+    // positions [pos0, pos0 + n). Spans live until clear_vision(); a position already in the caches needs none.
+    void set_vision_span(uint32_t pos0, std::vector<float> rows);
+    // An image position no span covers asks the provider: `row` [hidden] for absolute position `pos`, "" on success.
+    // The engine encodes an image on its first row, so an image the prefix cache already holds is never encoded.
+    using VisionProvider = std::function<std::string(uint32_t pos, const float*& row)>;
+    void set_vision_provider(VisionProvider p) { vis_provider_ = std::move(p); }
+    void clear_vision() { vis_spans_.clear(); vis_provider_ = nullptr; }
     // the last forward's time outside the layer loop: host prep (engram hashes + table gathers +
     // embed) and the tail (collapse, norm, head, logits to the host), ms
     double prep_ms() const { return prep_ms_; }
@@ -366,8 +379,12 @@ private:
     bool                      noring_diag_ = false;
     uint32_t                  snap_pos0_ = 0, snap_T_ = 0; bool snap_valid_ = false;   // P3: the last multi-row step's snapshot
     bool                      logits_last_only_ = false;
+    bool                      multi_rows_ = false;
     bool                      bounded_replay_ = true;
     std::vector<int32_t>      all_ids_;           // the sequence so far (engram look-back)
+    struct VisSpan { uint32_t pos0 = 0, n = 0; std::vector<float> rows; };
+    std::vector<VisSpan>      vis_spans_;         // image rows for positions whose id is negative
+    VisionProvider            vis_provider_;
     bool capture_main_hidden_ = false;
     std::vector<std::vector<int64_t>> last_hashes_;
     std::vector<std::vector<uint64_t>> profile_;   // [layer][expert] selection counts

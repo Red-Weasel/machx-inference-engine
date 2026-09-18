@@ -35,7 +35,8 @@ struct Ds41EngramTables {
     std::string load(const std::string& dir);
 };
 
-// NgramHashState.forward for a prefill from position 0 with no image spans:
+// NgramHashState.forward for a prefill from position 0. An image position (token_mask False in the reference, cached
+// as DEAD) is a NEGATIVE id here: no n-gram spans it.
 //   out[t * n_hash_cols + j] for t in [0, L), j in [0, 24), for engram layer `layer_index`
 //   (an index into `layer_ids`, NOT a model layer id).
 // Integer arithmetic; must match the reference exactly.

@@ -78,7 +78,7 @@ std::string server_capabilities_json(const std::string& model_path) {
                       {"thinking_description",reasoning.thinking_description}}},
         {"features",{{"prompt_cache",cache},{"speculative",spec},{"int8_kv",kv8},
                      {"context_shift",false},
-                     {"vision",arch==ModelArch::kDeepSeek4 || arch==ModelArch::kQwen4Exp}}},
+                     {"vision",arch==ModelArch::kDeepSeek4 || arch==ModelArch::kQwen4Exp || arch==ModelArch::kDeepSeek41}}},
         {"defaults",{{"temperature",0.7},{"top_k",40},{"top_p",0.95},{"min_p",0.0},
                      {"repeat_penalty",1.0},{"repeat_last_n",64},{"presence_penalty",0.0},
                      {"frequency_penalty",0.0},{"seed",0},{"max_tokens",16384},

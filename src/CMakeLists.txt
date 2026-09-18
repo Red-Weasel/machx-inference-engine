@@ -97,6 +97,7 @@ add_library(ie_core
   model/qwen4_vision.cpp
   model/qwen4_image.cpp
   model/ds4_vision.cpp
+  model/ds41_vision.cpp
   model/glm5next.cpp
   model/hyv4.cpp
   model/qwen35moe_split.cpp
@@ -145,6 +146,13 @@ set_source_files_properties(ops/cpu_moe_mxfp4.cpp PROPERTIES
 # without this the pragmas are silently ignored and every fill runs on one thread.
 set_source_files_properties(model/deepseek41_experts.cpp PROPERTIES
   COMPILE_OPTIONS "-fopenmp")
+# The vision tower's transient mode converts ~0.5 B BF16 weights into pinned f16 once (docs/deepseek41/94).
+set_source_files_properties(model/ds4_vision.cpp PROPERTIES
+  COMPILE_OPTIONS "-fopenmp")
+# The V4.1 image plan must round exactly as Python does: icpx's default fast model turns x / 14 into x * (1 / 14),
+# and floor(1134 / 14) came out 80 (docs/deepseek41/94).
+set_source_files_properties(model/ds41_vision.cpp PROPERTIES
+  COMPILE_OPTIONS "-fp-model=precise")
 set_source_files_properties(model/deepseek41_engram.cpp PROPERTIES
   COMPILE_OPTIONS "-fopenmp")
 target_link_options(ie_core PUBLIC -fopenmp)

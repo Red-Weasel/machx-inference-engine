@@ -211,11 +211,18 @@ void pil_resize(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh
 
 std::string ds4_load_image_mem(const void* bytes, size_t nbytes, std::vector<float>& px,
                                uint32_t& H, uint32_t& W, Ds4VisGeom& geom) {
+    return ds4_load_image_planned(bytes, nbytes, [](uint32_t w, uint32_t h) { return ds4_vis_plan(w, h); }, px, H, W, geom);
+}
+
+std::string ds4_load_image_planned(const void* bytes, size_t nbytes,
+                                   const std::function<Ds4VisGeom(uint32_t, uint32_t)>& plan,
+                                   std::vector<float>& px, uint32_t& H, uint32_t& W, Ds4VisGeom& geom) {
     int sw = 0, sh = 0, comp = 0;
     uint8_t* rgb = stbi_load_from_memory(static_cast<const stbi_uc*>(bytes), int(nbytes),
                                          &sw, &sh, &comp, 3);
-    if (!rgb) return std::string("ds4 vision: image decode failed: ") + stbi_failure_reason();
-    geom = ds4_vis_plan(uint32_t(sw), uint32_t(sh));
+    if (!rgb) return std::string("vision: image decode failed: ") + stbi_failure_reason();
+    geom = plan(uint32_t(sw), uint32_t(sh));
+    if (!geom.best_w || !geom.best_h) { stbi_image_free(rgb); return "vision: the image plan is empty"; }
     const int bw = int(geom.best_w), bh = int(geom.best_h);
     std::vector<uint8_t> canvas(size_t(bw) * bh * 3, 127);
     if (geom.plain) {
@@ -272,15 +279,26 @@ std::string ds4_load_image(const std::string& path, std::vector<float>& px,
 // ===========================================================================
 // Weights + GPU state
 // ===========================================================================
+using Ds4vFind = std::function<const SafeTensorInfo*(const std::string&)>;
+
+// One device buffer of a tower: a weight (src set; in_d != 0 -> f16 Bt [in_d, out_d], else f32 [out_d]) or scratch.
+struct Ds4vSlot { void** pp; size_t bytes; const SafeTensorInfo* src; uint32_t out_d, in_d; size_t off; };
+
 struct Ds4Vision::Impl {
     ~Impl() {
         if (!alloc) return;
         sycl::queue& q = alloc->queue();
         for (void* p : {static_cast<void*>(h_px), static_cast<void*>(h_cs), static_cast<void*>(h_sn),
-                        static_cast<void*>(h_out)})
+                        static_cast<void*>(h_out), hw})
             if (p) sycl::free(p, q);
     }
     SafetensorsReader st;
+    Ds4VisionOptions opt;
+    Ds4vFind find;
+    // transient mode: the converted weights (pinned), and every device buffer's offset in the one encode block
+    void* hw = nullptr; size_t hw_bytes = 0, block_bytes = 0;
+    std::vector<Ds4vSlot> slots;
+    void collect_slots();
     bool open = false;
     std::vector<float> ctrl[4];                    // start, pad, newline, end [4096] f32
 
@@ -328,11 +346,11 @@ inline float bf16_at(const uint8_t* p, size_t i) {
     return f;
 }
 
-std::string want(const SafetensorsReader& st, const std::string& name, std::vector<int64_t> shape,
+std::string want(const Ds4vFind& find, const std::string& name, std::vector<int64_t> shape,
                  const SafeTensorInfo*& out) {
-    out = st.find(name);
-    if (!out) return name + ": not found in sidecar";
-    if (out->dtype_str != "BF16") return name + ": expected BF16, sidecar has " + out->dtype_str;
+    out = find(name);
+    if (!out) return name + ": not found";
+    if (out->dtype_str != "BF16") return name + ": expected BF16, found " + out->dtype_str;
     if (out->shape != shape) {
         std::string s = name + ": unexpected shape [";
         for (auto d : out->shape) s += std::to_string(d) + ",";
@@ -560,12 +578,12 @@ sycl::event ds4v_attn_gather(sycl::queue& q, const sycl::half* qkv, sycl::half* 
 }
 
 // P[t, k] = softmax_k(scale * S[t, k]) over k < N, 0 for k >= N; one WG per row.
-sycl::event ds4v_softmax_rows(sycl::queue& q, const float* S, sycl::half* P, uint32_t N, uint32_t Nc,
-                              float scale) {
+sycl::event ds4v_softmax_rows(sycl::queue& q, const float* S, sycl::half* P, uint32_t rows, uint32_t N, uint32_t Nc,
+                              float scale, float pscale) {
     constexpr uint32_t WG = 256;
     return q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> red(WG, h);
-        h.parallel_for(sycl::nd_range<1>(size_t(N) * WG, WG), [=](sycl::nd_item<1> it) {
+        h.parallel_for(sycl::nd_range<1>(size_t(rows) * WG, WG), [=](sycl::nd_item<1> it) {
             const uint32_t row = uint32_t(it.get_group(0)), l = uint32_t(it.get_local_id(0));
             const float* s = S + size_t(row) * Nc;
             sycl::half* p = P + size_t(row) * Nc;
@@ -587,7 +605,7 @@ sycl::event ds4v_softmax_rows(sycl::queue& q, const float* S, sycl::half* P, uin
                 if (l < st) red[l] += red[l + st];
                 it.barrier(sycl::access::fence_space::local_space);
             }
-            const float inv = 1.f / red[0];
+            const float inv = pscale / red[0];
             for (uint32_t k = l; k < Nc; k += WG)
                 p[k] = k < N ? sycl::half(sycl::native::exp(s[k] * scale - mx) * inv) : sycl::half(0.f);
         });
@@ -595,11 +613,11 @@ sycl::event ds4v_softmax_rows(sycl::queue& q, const float* S, sycl::half* P, uin
 }
 
 // att[t, head*64 + d] = f16(O[t, d])
-sycl::event ds4v_attn_scatter(sycl::queue& q, const float* O, sycl::half* att, uint32_t N, uint32_t head) {
+sycl::event ds4v_attn_scatter(sycl::queue& q, const float* O, sycl::half* att, uint32_t N, uint32_t head, float mul) {
     constexpr uint32_t HD = kDs4VisHeadDim, D = kDs4VisDim;
     return q.parallel_for(sycl::range<1>(size_t(N) * HD), [=](sycl::id<1> id) {
         const uint32_t i = uint32_t(id), t = i / HD, d = i % HD;
-        att[size_t(t) * D + head * HD + d] = sycl::half(O[i]);
+        att[size_t(t) * D + head * HD + d] = sycl::half(O[i] * mul);      // mul == 1 leaves the value bit for bit
     });
 }
 
@@ -633,63 +651,87 @@ Ds4Vision::Ds4Vision() : impl_(std::make_unique<Impl>()) {}
 Ds4Vision::~Ds4Vision() = default;
 bool Ds4Vision::loaded() const { return impl_->open; }
 
+namespace {
+// shape-check everything an upload will read, while a failure is still a load error; fill the control rows
+std::string ds4v_check(const Ds4vFind& find, const Ds4VisionOptions& o, std::vector<float> ctrl[4]) {
+    const char* names[4] = {"image_start", "image_pad", "image_newline", "image_end"};
+    for (int k = 0; k < 4; ++k) {
+        if (k == 1 && !o.pad_row) continue;
+        const SafeTensorInfo* t;
+        if (auto e = want(find, names[k], {int64_t(o.out_dim)}, t); !e.empty()) return e;
+        ctrl[k].resize(o.out_dim);
+        for (uint32_t i = 0; i < o.out_dim; ++i) ctrl[k][i] = bf16_at(t->data, i);
+    }
+    const SafeTensorInfo* t;
+    std::string e;
+    const int64_t D = kDs4VisDim, Fd = kDs4VisFfn, O = o.out_dim;
+    if (e = want(find, "vision.patch_embed.proj.weight", {D, 3 * 14 * 14}, t); !e.empty()) return e;
+    if (e = want(find, "vision.patch_embed.proj.bias", {D}, t); !e.empty()) return e;
+    if (e = want(find, "vision.norm.weight", {D}, t); !e.empty()) return e;
+    if (e = want(find, "aligner.w1.weight", {O, D * 9}, t); !e.empty()) return e;
+    if (e = want(find, "aligner.w1.bias", {O}, t); !e.empty()) return e;
+    if (e = want(find, "aligner.w2.weight", {O, O}, t); !e.empty()) return e;
+    if (e = want(find, "aligner.w2.bias", {O}, t); !e.empty()) return e;
+    for (uint32_t L = 0; L < kDs4VisDepth; ++L) {
+        const std::string p = "vision.blocks." + std::to_string(L) + ".";
+        if (e = want(find, p + "norm1.weight", {D}, t); !e.empty()) return e;
+        if (e = want(find, p + "norm2.weight", {D}, t); !e.empty()) return e;
+        if (e = want(find, p + "attn.wqkv.weight", {3 * D, D}, t); !e.empty()) return e;
+        if (e = want(find, p + "attn.wqkv.bias", {3 * D}, t); !e.empty()) return e;
+        if (e = want(find, p + "attn.wo.weight", {D, D}, t); !e.empty()) return e;
+        if (e = want(find, p + "attn.wo.bias", {D}, t); !e.empty()) return e;
+        if (e = want(find, p + "mlp.w1.weight", {2 * Fd, D}, t); !e.empty()) return e;
+        if (e = want(find, p + "mlp.w2.weight", {D, Fd}, t); !e.empty()) return e;
+    }
+    return {};
+}
+}  // namespace
+
 std::string Ds4Vision::load(const std::string& path) {
     Impl& I = *impl_;
     if (auto e = I.st.open(path); !e.empty()) return "ds4 vision: " + e;
     if (I.st.tensors().size() != 267)
         return "ds4 vision: sidecar has " + std::to_string(I.st.tensors().size()) + " tensors, expected 267";
-    const char* names[4] = {"image_start", "image_pad", "image_newline", "image_end"};
-    for (int k = 0; k < 4; ++k) {
-        const SafeTensorInfo* t;
-        if (auto e = want(I.st, names[k], {int64_t(kDs4VisOut)}, t); !e.empty()) return "ds4 vision: " + e;
-        I.ctrl[k].resize(kDs4VisOut);
-        for (uint32_t i = 0; i < kDs4VisOut; ++i) I.ctrl[k][i] = bf16_at(t->data, i);
-    }
-    // shape-check everything the upload will read, now, while a failure is a load error
-    const SafeTensorInfo* t;
-    std::string e;
-    const int64_t D = kDs4VisDim, Fd = kDs4VisFfn, O = kDs4VisOut;
-    if (e = want(I.st, "vision.patch_embed.proj.weight", {D, 3 * 14 * 14}, t); !e.empty()) return "ds4 vision: " + e;
-    if (e = want(I.st, "vision.patch_embed.proj.bias", {D}, t); !e.empty()) return "ds4 vision: " + e;
-    if (e = want(I.st, "vision.norm.weight", {D}, t); !e.empty()) return "ds4 vision: " + e;
-    if (e = want(I.st, "aligner.w1.weight", {O, D * 9}, t); !e.empty()) return "ds4 vision: " + e;
-    if (e = want(I.st, "aligner.w1.bias", {O}, t); !e.empty()) return "ds4 vision: " + e;
-    if (e = want(I.st, "aligner.w2.weight", {O, O}, t); !e.empty()) return "ds4 vision: " + e;
-    if (e = want(I.st, "aligner.w2.bias", {O}, t); !e.empty()) return "ds4 vision: " + e;
-    for (uint32_t L = 0; L < kDs4VisDepth; ++L) {
-        const std::string p = "vision.blocks." + std::to_string(L) + ".";
-        if (e = want(I.st, p + "norm1.weight", {D}, t); !e.empty()) return "ds4 vision: " + e;
-        if (e = want(I.st, p + "norm2.weight", {D}, t); !e.empty()) return "ds4 vision: " + e;
-        if (e = want(I.st, p + "attn.wqkv.weight", {3 * D, D}, t); !e.empty()) return "ds4 vision: " + e;
-        if (e = want(I.st, p + "attn.wqkv.bias", {3 * D}, t); !e.empty()) return "ds4 vision: " + e;
-        if (e = want(I.st, p + "attn.wo.weight", {D, D}, t); !e.empty()) return "ds4 vision: " + e;
-        if (e = want(I.st, p + "attn.wo.bias", {D}, t); !e.empty()) return "ds4 vision: " + e;
-        if (e = want(I.st, p + "mlp.w1.weight", {2 * Fd, D}, t); !e.empty()) return "ds4 vision: " + e;
-        if (e = want(I.st, p + "mlp.w2.weight", {D, Fd}, t); !e.empty()) return "ds4 vision: " + e;
-    }
+    I.opt = Ds4VisionOptions{};
+    I.opt.max_patches = kMaxPatches; I.opt.max_blocks = kMaxBlocks;
+    I.find = [&I](const std::string& n) { return I.st.find(n); };
+    if (auto e = ds4v_check(I.find, I.opt, I.ctrl); !e.empty()) return "ds4 vision: " + e;
     I.open = true;
     return {};
 }
+
+std::string Ds4Vision::load_from(Ds4vFind find, const Ds4VisionOptions& opt) {
+    Impl& I = *impl_;
+    if (I.open) return "ds4 vision: already loaded";
+    if (!opt.out_dim || !opt.max_patches || !opt.max_blocks) return "ds4 vision: empty options";
+    I.opt = opt; I.find = std::move(find);
+    if (auto e = ds4v_check(I.find, I.opt, I.ctrl); !e.empty()) return "ds4 vision: " + e;
+    I.open = true;
+    return {};
+}
+
+uint32_t Ds4Vision::out_dim() const { return impl_->opt.out_dim; }
 
 std::string Ds4Vision::assemble_rows(const std::vector<float>& aligned, const std::vector<int32_t>& types,
                                      const std::vector<int32_t>& perm, std::vector<float>& rows) const {
     const Impl& I = *impl_;
     if (!I.open) return "ds4 vision: not loaded";
-    const size_t n_img = aligned.size() / kDs4VisOut;
-    rows.assign(types.size() * kDs4VisOut, 0.f);
+    const uint32_t OD = I.opt.out_dim;
+    const size_t n_img = aligned.size() / OD;
+    rows.assign(types.size() * OD, 0.f);
     size_t k = 0;
     for (size_t i = 0; i < types.size(); ++i) {
-        float* dst = &rows[i * kDs4VisOut];
+        float* dst = &rows[i * OD];
         switch (types[i]) {
-            case kDs4VisStart:   std::memcpy(dst, I.ctrl[0].data(), kDs4VisOut * 4); break;
-            case kDs4VisPad:     std::memcpy(dst, I.ctrl[1].data(), kDs4VisOut * 4); break;
-            case kDs4VisNewline: std::memcpy(dst, I.ctrl[2].data(), kDs4VisOut * 4); break;
-            case kDs4VisEnd:     std::memcpy(dst, I.ctrl[3].data(), kDs4VisOut * 4); break;
+            case kDs4VisStart:   std::memcpy(dst, I.ctrl[0].data(), OD * 4); break;
+            case kDs4VisPad:     std::memcpy(dst, I.ctrl[1].data(), OD * 4); break;
+            case kDs4VisNewline: std::memcpy(dst, I.ctrl[2].data(), OD * 4); break;
+            case kDs4VisEnd:     std::memcpy(dst, I.ctrl[3].data(), OD * 4); break;
             case kDs4VisImage: {
                 if (k >= perm.size()) return "ds4 vision: more IMAGE rows than perm entries";
                 const int32_t src = perm[k++];
                 if (src < 0 || size_t(src) >= n_img) return "ds4 vision: perm index out of range";
-                std::memcpy(dst, &aligned[size_t(src) * kDs4VisOut], kDs4VisOut * 4);
+                std::memcpy(dst, &aligned[size_t(src) * OD], OD * 4);
                 break;
             }
             default: return "ds4 vision: bad row type " + std::to_string(types[i]);
@@ -716,9 +758,10 @@ uint64_t Ds4Vision::device_bytes() {
 std::string Ds4Vision::upload(DeviceAllocator& alloc) {
     Impl& I = *impl_;
     if (!I.open) return "ds4 vision: not loaded";
+    if (I.opt.transient) return stage_host(alloc);
     if (I.alloc) return I.alloc == &alloc ? std::string{} : "ds4 vision: allocator changed between calls";
     const uint32_t PD = 3 * kDs4VisPatch * kDs4VisPatch;
-    const uint32_t D = kDs4VisDim, Fd = kDs4VisFfn, O = kDs4VisOut, UF = D * 9;
+    const uint32_t D = kDs4VisDim, Fd = kDs4VisFfn, O = I.opt.out_dim, UF = D * 9;
     sycl::queue& q = alloc.queue();
     static const bool trace = std::getenv("IE_DS4_VIS_TRACE") != nullptr;
     const auto t_start = std::chrono::steady_clock::now();
@@ -731,7 +774,7 @@ std::string Ds4Vision::upload(DeviceAllocator& alloc) {
     {
         I.alloc = &alloc;
         Stage st(q, size_t(UF) * O * 2);   // aligner.w1 is the largest upload
-        auto T = [&](const std::string& n) { return I.st.find(n); };
+        auto T = [&](const std::string& n) { return I.find(n); };
         bool ok = true;
         I.patch   = ds4v_upload_bt(alloc, st, *T("vision.patch_embed.proj.weight"), D, PD);  ok &= I.patch != nullptr;
         I.patch_b = ds4v_upload_f32(alloc, st, *T("vision.patch_embed.proj.bias"));          ok &= I.patch_b != nullptr;
@@ -754,12 +797,11 @@ std::string Ds4Vision::upload(DeviceAllocator& alloc) {
         I.a2   = ds4v_upload_bt(alloc, st, *T("aligner.w2.weight"), O, O);              ok &= I.a2 != nullptr;
         I.a2_b = ds4v_upload_f32(alloc, st, *T("aligner.w2.bias"));                     ok &= I.a2_b != nullptr;
         if (!ok) return "ds4 vision: device/pinned allocation failed during weight upload";
-        I.st.close();
+        if (!I.st.tensors().empty()) I.st.close();
         mark("upload");
     }
     {   // scratch, once, for the largest block the token budget allows
-        const uint32_t Mp = kMaxPatches, Bp = kMaxBlocks, NB = Bp;
-        (void)NB;
+        const uint32_t Mp = I.opt.max_patches, Bp = I.opt.max_blocks;
         if (I.cap_n < Mp) {
         auto am = [&](size_t bytes) { return alloc.malloc(bytes); };
         I.px  = static_cast<sycl::half*>(am(size_t(Mp) * PD * 2));
@@ -787,8 +829,9 @@ std::string Ds4Vision::upload(DeviceAllocator& alloc) {
             I.qh = static_cast<sycl::half*>(alloc.malloc(size_t(Mp) * kDs4VisHeadDim * 2));
             I.kT = static_cast<sycl::half*>(alloc.malloc(size_t(kDs4VisHeadDim) * Nc * 2));
             I.vh = static_cast<sycl::half*>(alloc.malloc(size_t(Nc) * kDs4VisHeadDim * 2));
-            I.S  = static_cast<float*>(alloc.malloc(size_t(Mp) * Nc * 4));
-            I.P  = static_cast<sycl::half*>(alloc.malloc(size_t(Mp) * Nc * 2));
+            const uint32_t Tq = I.opt.attn_tile ? std::min(I.opt.attn_tile, Mp) : Mp;   // query rows per GEMM
+            I.S  = static_cast<float*>(alloc.malloc(size_t(Tq) * Nc * 4));
+            I.P  = static_cast<sycl::half*>(alloc.malloc(size_t(Tq) * Nc * 2));
             I.O  = static_cast<float*>(alloc.malloc(size_t(Mp) * kDs4VisHeadDim * 4));
             if (!I.qh || !I.kT || !I.vh || !I.S || !I.P || !I.O) return "ds4 vision: attention scratch allocation failed";
             I.cap_nc = Nc;
@@ -818,7 +861,7 @@ std::string Ds4Vision::encode_gpu(DeviceAllocator& alloc, const float* img, uint
     const uint32_t bh = (n_h + kDs4VisDown - 1) / kDs4VisDown, bw = (n_w + kDs4VisDown - 1) / kDs4VisDown;
     const uint32_t NB = bh * bw;
     const uint32_t PD = 3 * p * p;              // 588
-    const uint32_t D = kDs4VisDim, Fd = kDs4VisFfn, O = kDs4VisOut, UF = D * 9;
+    const uint32_t D = kDs4VisDim, Fd = kDs4VisFfn, O = I.opt.out_dim, UF = D * 9;
     sycl::queue& q = alloc.queue();
     // IE_DS4_VIS_TRACE=1: wait after every stage and print elapsed time (hang
     // localisation; serialises the queue, never on by default).
@@ -833,6 +876,23 @@ std::string Ds4Vision::encode_gpu(DeviceAllocator& alloc, const float* img, uint
 
     if (std::string e = upload(alloc); !e.empty()) return e;
     if (I.alloc != &alloc) return "ds4 vision: allocator changed between calls";
+    // transient: weights + scratch in ONE device block that lives for this call (freed after the queue drains)
+    struct Lease {
+        sycl::queue& q; Impl& I; void* p = nullptr;
+        ~Lease() {
+            if (!p) return;
+            try { q.wait(); } catch (...) {}
+            sycl::free(p, q);
+            for (auto& sl : I.slots) *sl.pp = nullptr;
+        }
+    } lease{q, I};
+    if (I.opt.transient) {
+        lease.p = sycl::malloc_device(I.block_bytes, q);
+        if (!lease.p) return "ds4 vision: no device memory for the " + std::to_string(I.block_bytes >> 20) + " MiB encode block";
+        for (auto& sl : I.slots) *sl.pp = static_cast<uint8_t*>(lease.p) + sl.off;
+        q.memcpy(lease.p, I.hw, I.hw_bytes);
+        mark("weights-h2d");
+    }
     const uint32_t Mp = round8(N), Bp = round8(NB);
     if (Mp > I.cap_n || Bp > I.cap_b)
         return "ds4 vision: image of " + std::to_string(N) + " patches / " + std::to_string(NB) +
@@ -884,12 +944,18 @@ std::string Ds4Vision::encode_gpu(DeviceAllocator& alloc, const float* img, uint
             ds4v_attn_full(q, I.qkv, I.att, N);
         } else {
             const uint32_t Nc = (N + 127u) & ~127u;
+            const uint32_t Tq = I.opt.attn_tile ? std::min(I.opt.attn_tile, N) : N;   // softmax is per query row: tiling rows is exact
+            static const char* ps_env = std::getenv("IE_DS4_VIS_PSCALE");                 // A/B lever
+            const float pscale = ps_env ? float(std::atof(ps_env)) : I.opt.prob_scale;
             for (uint32_t hd = 0; hd < kDs4VisHeads; ++hd) {
                 ds4v_attn_gather(q, I.qkv, I.qh, I.kT, I.vh, N, Nc, hd);
-                gemm_fp16(q, I.qh, I.kT, I.S, N, Nc, kDs4VisHeadDim);
-                ds4v_softmax_rows(q, I.S, I.P, N, Nc, attn_scale);
-                gemm_fp16(q, I.P, I.vh, I.O, N, kDs4VisHeadDim, Nc);
-                ds4v_attn_scatter(q, I.O, I.att, N, hd);
+                for (uint32_t r0 = 0; r0 < N; r0 += Tq) {
+                    const uint32_t n = std::min(Tq, N - r0);
+                    gemm_fp16(q, I.qh + size_t(r0) * kDs4VisHeadDim, I.kT, I.S, n, Nc, kDs4VisHeadDim);
+                    ds4v_softmax_rows(q, I.S, I.P, n, N, Nc, attn_scale, pscale);
+                    gemm_fp16(q, I.P, I.vh, I.O, n, kDs4VisHeadDim, Nc);
+                    ds4v_attn_scatter(q, I.O, I.att + size_t(r0) * kDs4VisDim, n, hd, 1.0f / pscale);
+                }
             }
         }
         if (m0) mark("b0 attn");
@@ -915,6 +981,90 @@ std::string Ds4Vision::encode_gpu(DeviceAllocator& alloc, const float* img, uint
     q.memcpy(I.h_out, I.Ca, aligned.size() * 4).wait();
     std::memcpy(aligned.data(), I.h_out, aligned.size() * 4);
     mark("aligner");
+    return {};
+}
+
+// Every device buffer of the tower in one fixed order (weights first), with its offset in the encode block.
+void Ds4Vision::Impl::collect_slots() {
+    slots.clear();
+    const uint32_t PD = 3 * kDs4VisPatch * kDs4VisPatch, D = kDs4VisDim, Fd = kDs4VisFfn, O = opt.out_dim, UF = D * 9;
+    auto W2 = [&](sycl::half*& ptr, const std::string& n, uint32_t out_d, uint32_t in_d) {
+        slots.push_back({reinterpret_cast<void**>(&ptr), size_t(out_d) * in_d * 2, find(n), out_d, in_d, 0});
+    };
+    auto W1 = [&](float*& ptr, const std::string& n, uint32_t len) {
+        slots.push_back({reinterpret_cast<void**>(&ptr), size_t(len) * 4, find(n), len, 0, 0});
+    };
+    W2(patch, "vision.patch_embed.proj.weight", D, PD);  W1(patch_b, "vision.patch_embed.proj.bias", D);
+    blk.resize(kDs4VisDepth);
+    for (uint32_t L = 0; L < kDs4VisDepth; ++L) {
+        const std::string pre = "vision.blocks." + std::to_string(L) + ".";
+        auto& b = blk[L];
+        W1(b.n1, pre + "norm1.weight", D);             W1(b.n2, pre + "norm2.weight", D);
+        W2(b.qkv, pre + "attn.wqkv.weight", 3 * D, D); W1(b.qkv_b, pre + "attn.wqkv.bias", 3 * D);
+        W2(b.wo, pre + "attn.wo.weight", D, D);        W1(b.wo_b, pre + "attn.wo.bias", D);
+        W2(b.w1, pre + "mlp.w1.weight", 2 * Fd, D);    W2(b.w2, pre + "mlp.w2.weight", D, Fd);
+    }
+    W1(norm, "vision.norm.weight", D);
+    W2(a1, "aligner.w1.weight", O, UF);  W1(a1_b, "aligner.w1.bias", O);
+    W2(a2, "aligner.w2.weight", O, O);   W1(a2_b, "aligner.w2.bias", O);
+    const size_t n_weights = slots.size();
+    const size_t Mp = opt.max_patches, Bp = opt.max_blocks, Nc = (Mp + 127u) & ~size_t(127);
+    const size_t Tq = opt.attn_tile ? std::min<size_t>(opt.attn_tile, Mp) : Mp, HD = kDs4VisHeadDim;
+    auto S = [&](auto*& ptr, size_t bytes) { slots.push_back({reinterpret_cast<void**>(&ptr), bytes, nullptr, 0, 0, 0}); };
+    S(px, Mp * PD * 2);  S(res, Mp * D * 4);  S(xh, Mp * D * 2);  S(C, Mp * 2 * Fd * 4);  S(qkv, Mp * 3 * D * 2);
+    S(att, Mp * D * 2);  S(ffn, Mp * Fd * 2);  S(cs, Mp * kDs4VisRot * 4);  S(sn, Mp * kDs4VisRot * 4);
+    S(qh, Mp * HD * 2);  S(kT, HD * Nc * 2);  S(vh, Nc * HD * 2);  S(this->S, Tq * Nc * 4);  S(P, Tq * Nc * 2);  S(this->O, Mp * HD * 4);
+    S(unf, Bp * UF * 2);  S(ah, Bp * O * 2);  S(Ca, Bp * O * 4);
+    size_t off = 0;
+    for (size_t i = 0; i < slots.size(); ++i) {
+        slots[i].off = off;
+        off += (slots[i].bytes + 4095) & ~size_t(4095);
+        if (i + 1 == n_weights) hw_bytes = off;
+    }
+    block_bytes = off;
+}
+
+uint64_t Ds4Vision::encode_bytes() const {
+    Impl& I = *impl_;
+    if (!I.open) return 0;
+    if (!I.opt.transient) return device_bytes();
+    if (I.slots.empty()) I.collect_slots();
+    return I.block_bytes;
+}
+
+std::string Ds4Vision::stage_host(DeviceAllocator& alloc) {
+    Impl& I = *impl_;
+    if (!I.open) return "ds4 vision: not loaded";
+    if (!I.opt.transient) return "ds4 vision: stage_host is the transient mode's";
+    if (I.alloc) return I.alloc == &alloc ? std::string{} : "ds4 vision: allocator changed between calls";
+    sycl::queue& q = alloc.queue();
+    I.collect_slots();
+    for (auto& sl : I.slots) *sl.pp = nullptr;
+    const size_t Mp = I.opt.max_patches, Bp = I.opt.max_blocks, PD = 3 * kDs4VisPatch * kDs4VisPatch;
+    I.hw    = sycl::malloc_host(I.hw_bytes, q);
+    I.h_px  = sycl::malloc_host<sycl::half>(Mp * PD, q);
+    I.h_cs  = sycl::malloc_host<float>(Mp * kDs4VisRot, q);
+    I.h_sn  = sycl::malloc_host<float>(Mp * kDs4VisRot, q);
+    I.h_out = sycl::malloc_host<float>(Bp * I.opt.out_dim, q);
+    I.alloc = &alloc;                                   // the destructor frees the pinned buffers through it
+    if (!I.hw || !I.h_px || !I.h_cs || !I.h_sn || !I.h_out) return "ds4 vision: pinned host allocation failed";
+    auto* base = static_cast<uint8_t*>(I.hw);
+    for (const auto& sl : I.slots) {
+        if (!sl.src) break;                             // weights come first
+        const uint8_t* src = sl.src->data;
+        if (sl.in_d) {                                  // BF16 [out, in] -> f16 Bt [in, out]
+            auto* bt = reinterpret_cast<sycl::half*>(base + sl.off);
+            const uint32_t out_d = sl.out_d, in_d = sl.in_d;
+            #pragma omp parallel for schedule(static)
+            for (uint32_t o = 0; o < out_d; ++o)
+                for (uint32_t k = 0; k < in_d; ++k)
+                    bt[size_t(k) * out_d + o] = sycl::half(bf16_at(src, size_t(o) * in_d + k));
+        } else {
+            auto* f = reinterpret_cast<float*>(base + sl.off);
+            for (uint32_t i = 0; i < sl.out_d; ++i) f[i] = bf16_at(src, i);
+        }
+    }
+    I.cap_n = uint32_t(Mp); I.cap_b = uint32_t(Bp); I.cap_nc = uint32_t((Mp + 127u) & ~size_t(127));
     return {};
 }
 

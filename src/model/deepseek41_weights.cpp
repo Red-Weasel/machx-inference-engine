@@ -78,6 +78,7 @@ std::string Ds41DenseCache::upload_layer(sycl::queue& q, const DeepSeek41Model& 
     d.a_fn = u.f32(Lw.hc_attn_fn); d.a_bs = u.f32(Lw.hc_attn_base); d.a_sc = u.f32(Lw.hc_attn_scale);
     d.f_fn = u.f32(Lw.hc_ffn_fn);  d.f_bs = u.f32(Lw.hc_ffn_base);  d.f_sc = u.f32(Lw.hc_ffn_scale);
     d.g_w = u.bf16_32(Lw.gate_w);  d.g_b = u.f32(Lw.gate_bias);
+    if (Lw.gate_bias_vl.w) d.g_b_vl = u.f32(Lw.gate_bias_vl);
     if (k.is_kv_source) {
         d.comp_wkv = u.bf16_16(Lw.comp_wkv); d.n_c = u.bf16_32(Lw.comp_norm);
         if (k.has_compressor_gate) d.comp_wgate = u.bf16_16(Lw.comp_wgate);

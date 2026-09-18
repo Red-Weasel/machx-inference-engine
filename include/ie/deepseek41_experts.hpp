@@ -210,12 +210,16 @@ private:
     // 1.2 / (1.2 + 2.75) experts per ms, measured); IE_DS41_CPU_CORES (default 8-19, the E-cores).
     struct CpuMiss {
         bool on = false; float qstar = 0.30f; std::vector<int> cores; int nthreads = 0;
+        // Phase 59 (docs/deepseek41/98): the leg also serves 2..kMaxRows-row decode steps (a speculative verify); its
+        // own PCIe share, because a CPU expert costs per ROW routed to it and a transfer per expert
+        static constexpr uint32_t kMaxRows = 8; float qstar_multi = 0.20f;   // swept 0.10-0.65 on 8-row verifies: 0.20 best (docs/98)
         std::thread th; std::mutex mu; std::condition_variable cv; bool stop = false, pending = false, done = true;
         const Ds4SlotLayout* lay = nullptr; float limit = 0.f;
-        std::vector<std::pair<const void*, uint32_t>> work;   // (arena slot, its packed row)
-        std::vector<float> x, scratch, out;                   // host: the activation, EF*2, H
+        struct Item { const void* slot; uint32_t row, tok; };
+        std::vector<Item> work;                               // (arena slot, its packed row, that row's token)
+        std::vector<float> x, scratch, out;                   // host: the activations [kMaxRows, H], EF*2, H
         double work_ms = 0;                                   // the last request's compute time
-        sycl::half* h_rows = nullptr;                         // pinned host: the rows, [top_k, H] fp16, in work order
+        sycl::half* h_rows = nullptr;                         // pinned host: the rows, [kMaxRows * top_k, H] fp16, in work order
     };
     CpuMiss cpu_;
     std::string cpu_cores_override_;
