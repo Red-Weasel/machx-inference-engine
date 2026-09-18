@@ -7,8 +7,10 @@
 #include "ie/deepseek41_engram.hpp"
 #include <cstdio>
 
+#include "ie/allocator.hpp"
 #include "ie/deepseek41_dspark.hpp"
 #include "ie/deepseek41_forward.hpp"
+#include "ie/ds41_vision.hpp"
 #include "ie/tokenizer.hpp"
 
 #include <memory>
@@ -26,6 +28,14 @@ struct Ds41Bundle {
     Ds41Drafter                                 drafter;   // DSpark P4 (docs/deepseek41/58): built under IE_DS41_SPEC=1
     // Phase 48 (docs/deepseek41/88): IE_DS41_PROFILE_OUT -- the DECODE routing of every request served, summed per
     // (layer, expert) and rewritten as a residency ranking after each request, so a client's own traffic can be profiled
+    // Phase 57 (docs/deepseek41/96): the checkpoint's vision tower, transient on card 0 (its device block lives only
+    // while an image is encoded). `vis_error` says why image requests are refused when it is not ready.
+    DeviceAllocator                             vis_alloc;
+    Ds4Vision                                   vis;
+    bool                                        vis_ready = false;
+    std::string                                 vis_error = "the vision tower is not loaded";
+    // Phase 58-59 (docs/deepseek41/97-98): prompt-lookup speculation for served requests, ON unless IE_DS41_LOOKUP=0
+    bool                                        lookup = true;
     std::string                                 profile_out;
     std::vector<std::vector<uint64_t>>          profile_acc;
     uint64_t                                    profile_steps = 0;

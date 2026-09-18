@@ -40,6 +40,7 @@ struct Ds41LayerDense {
     float *n_c = nullptr, *n_ik = nullptr, *engram_qk = nullptr;         // q_weight * k_weight, [hc, dim]
     float *a_fn = nullptr, *a_bs = nullptr, *a_sc = nullptr, *f_fn = nullptr, *f_bs = nullptr, *f_sc = nullptr;
     float *g_w = nullptr, *g_b = nullptr;                                // router weight [E, dim] fp32, bias [E]
+    float *g_b_vl = nullptr;                                             // the bias image-span tokens route by [E]
     uint64_t bytes = 0;                                                  // device bytes this layer holds
     std::vector<void*> owned;                                            // everything to free
 };

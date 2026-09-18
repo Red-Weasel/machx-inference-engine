@@ -523,6 +523,14 @@ target_link_libraries(ie_ds41_resident_test PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_ds41_resident_test PROPERTIES OUTPUT_NAME "ie-ds41-resident-test")
 
 # DeepSeek-V4.1-Flash Phase 9: decode on the resident runtime vs the reference's generate loop (docs/deepseek41/19, 24).
+add_executable(ie_ds41_lookup_test ds41_lookup_test.cpp)
+target_link_libraries(ie_ds41_lookup_test PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_ds41_lookup_test PROPERTIES OUTPUT_NAME "ie-ds41-lookup-test")
+
+add_executable(ie_ds41_vision_test ds41_vision_test.cpp)
+target_link_libraries(ie_ds41_vision_test PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_ds41_vision_test PROPERTIES OUTPUT_NAME "ie-ds41-vision-test")
+
 add_executable(ie_ds41_decode_test ds41_decode_test.cpp)
 target_link_libraries(ie_ds41_decode_test PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_ds41_decode_test PROPERTIES OUTPUT_NAME "ie-ds41-decode-test")

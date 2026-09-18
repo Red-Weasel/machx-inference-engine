@@ -47,6 +47,10 @@ struct Ds41GenStats {
     struct SpecConf { uint8_t pos, accepted; float conf; };
     std::vector<SpecConf> spec_conf;                       // one record per judged draft (the confidence head, measured)
     double spec_draft_ms = 0, spec_verify_ms = 0, spec_rollback_ms = 0;
+    // Phase 58 (docs/deepseek41/97): prompt-lookup speculation -- passes that verified a copied draft, their rows and
+    // accepted drafts, and the one-row steps between them
+    uint32_t lookup_passes = 0, lookup_rows = 0, lookup_accepted = 0, lookup_plain = 0;
+    double   lookup_verify_ms = 0, lookup_plain_ms = 0;
     // Phase 50: the forward's per-layer stages summed over every plain decode step (set_accumulate_stages)
     struct StageAcc { uint32_t steps = 0; double att = 0, fpre = 0, moe = 0, grp = 0, join = 0, mmg = 0, tail = 0, shd = 0, lay = 0, cpu_ms = 0, cpu_w = 0, bp = 0, bm = 0, sta = 0, pin = 0, mmx = 0, sh = 0, cpu = 0, wall = 0, prep = 0, head = 0, sample = 0, emit = 0, mm_fill = 0, mm_pack = 0, mm_read = 0, mm_perm = 0, spawn = 0, mprep = 0; } stages;
 };
@@ -82,6 +86,8 @@ public:
     void set_spec_conf(float th) { spec_conf_ = th; }
     void set_warmup_mark(uint32_t n) { warm_mark_ = n; }
     void set_accumulate_stages(bool on) { acc_stages_ = on; }   // Phase 50: needs IE_DS41_STAGES=1 for the stage timers to be valid
+    // Phase 58: prompt-lookup speculation for this generator: -1 = the IE_DS41_LOOKUP environment (the default), 0 off, 1 on
+    void set_lookup(int on) { lookup_ = on; }
 private:
     Ds41Forward& fwd_;
     const Tokenizer& tok_;
@@ -89,6 +95,7 @@ private:
     bool                profile_decode_only_ = false;
     uint32_t spec_k_ = 0, warm_mark_ = 0; float spec_conf_ = -1e30f;
     bool acc_stages_ = false;
+    int  lookup_ = -1;
 };
 
 }  // namespace ie

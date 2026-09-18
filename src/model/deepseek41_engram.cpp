@@ -60,7 +60,9 @@ void ds41_engram_hash(const Ds41EngramTables& tb, const int32_t* ids, uint32_t L
         int64_t prod[8];  // max_ngram_size <= 8
         bool blocked = false;
         for (uint32_t s = 0; s < S; ++s) {
-            blocked = blocked || (t < s);
+            // a negative id is an image position: DEAD in the reference's cache, it ends the look-back (and its own
+            // row's hash is never used: the engram gate is shut there)
+            blocked = blocked || (t < s) || ids[t - s] < 0;
             const int64_t tok = blocked ? tb.pad_id : int64_t(tb.token_map[size_t(ids[t - s])]);
             prod[s] = tok * mult[s];
         }

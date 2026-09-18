@@ -2,8 +2,9 @@
 // docs/deepseek41/31): the same opaque-bundle pattern as V4's Ds4Bundle. A model DIRECTORY
 // (safetensors + config.json + tokenizer.json) loads here and never touches the GGUF path;
 // chat() renders the V4.1 prompt format and runs Ds41Generator on the resident two-card
-// runtime. Native V4.1 tools are encoded and parsed; images are refused. One request at a
-// time (EngineOptions::parallel is 1 for this arch; the server's gate serialises).
+// runtime. Native V4.1 tools are encoded and parsed; images go through the checkpoint's own
+// vision tower (Phase 57, docs/deepseek41/96). One request at a time (EngineOptions::parallel
+// is 1 for this arch; the server's gate serialises).
 #include "ie/engine.hpp"
 
 #include "ie/ds41_engine.hpp"
@@ -44,6 +45,22 @@ std::string Engine::ds41_load(const std::string& dir) {
     }
     if (devs.empty()) return "deepseek41: no Arc GPU";
     for (const auto& d : devs) { b->queues.push_back(std::make_unique<sycl::queue>(sycl::context(d), d, sycl::property_list{sycl::property::queue::in_order{}})); b->qs.push_back(b->queues.back().get()); }
+    // Phase 57: the vision tower, staged in pinned host memory BEFORE the runtime sizes its pinned expert pool (the
+    // live rule then sees it). Nothing of it stays on a card: encode_gpu() leases its block per image. IE_DS41_VISION=0
+    // leaves it out; a failure here is reported on every image request instead of failing the load.
+    if (const char* v = std::getenv("IE_DS41_VISION"); v && std::string(v) == "0") b->vis_error = "vision is disabled (IE_DS41_VISION=0)";
+    else if (!b->model.config().vision_n_layers) b->vis_error = "this checkpoint has no vision tower";
+    else {
+        const auto tv = std::chrono::steady_clock::now();
+        std::string e = b->vis_alloc.init_with(b->qs[0]->get_context(), b->qs[0]->get_device());
+        if (e.empty()) e = b->vis.load_from([m = &b->model](const std::string& n) { return m->store().find(n); }, ds41_vision_options(b->model.config().dim));
+        if (e.empty()) e = b->vis.stage_host(b->vis_alloc);
+        if (e.empty()) {
+            b->vis_ready = true; b->vis_error.clear();
+            std::fprintf(stderr, "[deepseek41] vision tower staged in pinned host memory in %.0f ms; %.0f MiB on card 0 while an image encodes, nothing between\n",
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tv).count(), double(b->vis.encode_bytes()) / 1048576.0);
+        } else { b->vis_error = e; std::fprintf(stderr, "[deepseek41] vision tower NOT available: %s\n", e.c_str()); }
+    }
     std::vector<std::vector<uint32_t>> ranking;
     // Phase 48 (docs/deepseek41/88): IE_DS41_RANKING names the residency ranking; otherwise a decode-phase chat ranking
     // beside the model (ie_ranking_decode_chat.txt) when present, else the held-out prefill profile
@@ -105,6 +122,9 @@ std::string Engine::ds41_load(const std::string& dir) {
     std::fprintf(stderr, "[deepseek41] resident in %.0f s on %zu card(s), capacity %u tokens\n", s, devs.size(), opts_.max_ctx);
     arch_ = ModelArch::kDeepSeek41;
     opts_.parallel = 1;
+    if (const char* lv = std::getenv("IE_DS41_LOOKUP"); lv && std::string(lv) == "0") b->lookup = false;
+    std::fprintf(stderr, "[deepseek41] prompt-lookup speculation %s (a copy of >= 12 context tokens verified up to 8 rows at a time; IE_DS41_LOOKUP=0 turns it off)\n",
+                 b->lookup ? "ON" : "off");
     if (const char* po = std::getenv("IE_DS41_PROFILE_OUT"); po && *po) {
         b->profile_out = po;
         std::fprintf(stderr, "[deepseek41] profiling decode routing into %s (rewritten after every request)\n", po);
@@ -121,6 +141,7 @@ GenerateResult ds41_run_ids(Ds41Bundle& b, const std::vector<int32_t>& ids, cons
     p.repeat_penalty = sp.repeat_penalty; p.repeat_window = sp.repeat_window; p.seed = sp.seed;
     const uint32_t max_new = sp.max_tokens == 0 || ids.size() + sp.max_tokens > b.fwd.capacity() ? (uint32_t(ids.size()) < b.fwd.capacity() ? b.fwd.capacity() - uint32_t(ids.size()) : 0) : sp.max_tokens;
     Ds41Generator gen(b.fwd, b.tok); if (b.drafter.ready()) gen.set_drafter(&b.drafter, b.qs.back());
+    gen.set_lookup(b.lookup ? 1 : 0);
     if (!b.profile_out.empty()) gen.set_profile_decode_only(true);   // the forward's counts are this request's decode steps at the end
     std::vector<int32_t> out; Ds41GenStats st; std::string text;
     const std::string e = gen.run(ids, max_new, p, {}, [&](std::string_view piece) { text.append(piece); return on_token ? on_token(piece) : true; }, out, st);
@@ -160,20 +181,108 @@ GenerateResult ds41_run_ids(Ds41Bundle& b, const std::vector<int32_t>& ids, cons
 }
 }  // namespace
 
+namespace {
+constexpr std::string_view kDs41ImagePlaceholder = "<｜deepseek_image｜>";
+
+// One image of a request: where its span sits, and its rows once something asks for one.
+struct Ds41RequestImage {
+    const std::string* bytes = nullptr;          // the image file as the request carried it
+    Ds4VisGeom geom; uint32_t pos0 = 0, n = 0; uint64_t hash = 0;
+    std::vector<float> rows;
+};
+
+// The id of an image position: negative, and a function of the image's bytes and the slot -- two images never share a
+// prefix in the prompt cache, the same image at the same place always does.
+int32_t ds41_image_id(uint64_t image_hash, uint32_t slot) {
+    uint64_t x = image_hash + 0x9E3779B97F4A7C15ull * (uint64_t(slot) + 1);
+    x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 27; x *= 0x94D049BB133111EBull; x ^= x >> 31;
+    return -1 - int32_t(x >> 33);
+}
+
+// The turn's text with one placeholder per image: where the parser's markers sit, else in front (as the V4 path does).
+std::string ds41_place_images(std::string text, size_t n_images) {
+    size_t markers = 0;
+    for (size_t p = text.find(kChatImageMarker); p != std::string::npos; p = text.find(kChatImageMarker, p + kChatImageMarker.size())) ++markers;
+    if (markers == n_images) {
+        for (size_t p = text.find(kChatImageMarker); p != std::string::npos; p = text.find(kChatImageMarker, p + kDs41ImagePlaceholder.size()))
+            text.replace(p, kChatImageMarker.size(), kDs41ImagePlaceholder);
+        return text;
+    }
+    for (size_t p = text.find(kChatImageMarker); p != std::string::npos; p = text.find(kChatImageMarker)) text.erase(p, kChatImageMarker.size());
+    std::string front;
+    for (size_t i = 0; i < n_images; ++i) front += kDs41ImagePlaceholder;
+    return front + text;
+}
+}  // namespace
+
 GenerateResult Engine::ds41_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
                                  bool enable_thinking, std::string_view tools_json, std::string_view reasoning_effort) {
     GenerateResult r;
     std::vector<Ds41ChatMessage> msgs;
+    std::vector<Ds41RequestImage> images;
     for (const auto& t : turns) {
-        if (!t.images.empty()) { r.finish_reason = "error: deepseek41 image input is not supported yet"; return r; }
-        msgs.push_back({t.role, t.content_without_tool_calls.value_or(t.content), t.reasoning_content.value_or(""), false, !t.tool_calls_json.empty(), t.tool_calls_json, t.tool_call_id, ""});
+        std::string content = t.content_without_tool_calls.value_or(t.content);
+        if (!t.images.empty()) {
+            if (!ds41_->vis_ready) { r.finish_reason = "error: deepseek41 image input: " + ds41_->vis_error; return r; }
+            if (ds41_->drafter.ready()) { r.finish_reason = "error: deepseek41 image input is not supported with speculation (IE_DS41_SPEC=1)"; return r; }
+            content = ds41_place_images(std::move(content), t.images.size());
+            for (const auto& bytes : t.images) {
+                Ds41RequestImage im; im.bytes = &bytes;
+                uint32_t w = 0, h = 0;
+                if (auto e = ds41_image_size(bytes.data(), bytes.size(), w, h); !e.empty()) { r.finish_reason = "error: " + e; return r; }
+                im.geom = ds41_vis_plan(w, h);
+                im.n = ds41_vis_tokens(im.geom.n_llm_h, im.geom.n_llm_w);
+                im.hash = 0xCBF29CE484222325ull;
+                for (char c : bytes) { im.hash ^= uint8_t(c); im.hash *= 0x100000001B3ull; }
+                images.push_back(std::move(im));
+            }
+        }
+        msgs.push_back({t.role, std::move(content), t.reasoning_content.value_or(""), false, !t.tool_calls_json.empty(), t.tool_calls_json, t.tool_call_id, ""});
     }
     Ds41PromptOptions po; po.thinking = enable_thinking; po.has_tools = !tools_json.empty(); po.tools_json = std::string(tools_json); std::string err;
     if (!reasoning_effort.empty()) { po.reasoning_effort = ds41_reasoning_effort_of(std::string(reasoning_effort), err); if (!err.empty()) { r.finish_reason = "error: " + err; return r; } }
     const std::string prompt = ds41_encode_messages(msgs, po, err);
     if (!err.empty()) { r.finish_reason = "error: " + err; return r; }
-    const auto ids = ds41_->tok.encode(prompt, /*allow_special=*/true);
-    return ds41_run_ids(*ds41_, ids, sp, on_token, enable_thinking, /*chat=*/true);
+    auto ids = ds41_->tok.encode(prompt, /*allow_special=*/true);
+    if (images.empty()) return ds41_run_ids(*ds41_, ids, sp, on_token, enable_thinking, /*chat=*/true);
+
+    // every placeholder becomes its image's span: START, (IMAGE x w, NEW_LINE) x h, END -- all image positions
+    const int32_t ph = int32_t(ds41_->model.config().image_token_id);
+    std::vector<int32_t> full; full.reserve(ids.size() + images.size() * kDs41VisMaxTok);
+    size_t k = 0;
+    for (int32_t id : ids) {
+        if (id != ph) { full.push_back(id); continue; }
+        if (k >= images.size()) { r.finish_reason = "error: the prompt holds more image placeholders than images"; return r; }
+        Ds41RequestImage& im = images[k++];
+        im.pos0 = uint32_t(full.size());
+        for (uint32_t s = 0; s < im.n; ++s) full.push_back(ds41_image_id(im.hash, s));
+    }
+    if (k != images.size()) { r.finish_reason = "error: the prompt holds fewer image placeholders than images"; return r; }
+
+    Ds41Bundle& b = *ds41_;
+    b.fwd.set_vision_provider([&b, &images](uint32_t pos, const float*& row) -> std::string {
+        const uint32_t H = b.model.config().dim;
+        for (auto& im : images) {
+            if (pos < im.pos0 || pos - im.pos0 >= im.n) continue;
+            if (im.rows.empty()) {                                   // first row asked of this image: decode, encode, lay out
+                const auto t0 = std::chrono::steady_clock::now();
+                std::vector<float> px, aligned; uint32_t ph_ = 0, pw_ = 0; Ds4VisGeom g;
+                if (auto e = ds41_load_image_mem(im.bytes->data(), im.bytes->size(), px, ph_, pw_, g); !e.empty()) return e;
+                if (auto e = b.vis.encode_gpu(b.vis_alloc, px.data(), ph_, pw_, aligned); !e.empty()) return e;
+                std::vector<int32_t> types, perm; ds41_vis_types(g.n_llm_h, g.n_llm_w, types, perm);
+                if (types.size() != im.n) return "the image plan changed between the size probe and the decode";
+                if (auto e = b.vis.assemble_rows(aligned, types, perm, im.rows); !e.empty()) return e;
+                std::fprintf(stderr, "[deepseek41] vision: image at %u, %ux%u patches -> %u tokens, encoded in %.0f ms\n", im.pos0, g.n_vit_h, g.n_vit_w, im.n,
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            }
+            row = im.rows.data() + size_t(pos - im.pos0) * H;
+            return {};
+        }
+        return "position " + std::to_string(pos) + " is outside every image of this request";
+    });
+    GenerateResult res = ds41_run_ids(b, full, sp, on_token, enable_thinking, /*chat=*/true);
+    b.fwd.clear_vision();                                             // the provider captures this frame's locals
+    return res;
 }
 
 GenerateResult Engine::ds41_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token) {

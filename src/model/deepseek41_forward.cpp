@@ -417,6 +417,11 @@ std::string Ds41Forward::write_profile(const std::string& path, const std::strin
     return ds4_expert_priority_write_layers(path, orders, counts, {note, "total selections " + std::to_string(total)});
 }
 
+void Ds41Forward::set_vision_span(uint32_t pos0, std::vector<float> rows) {
+    VisSpan sp; sp.pos0 = pos0; sp.n = uint32_t(rows.size() / m_->config().dim); sp.rows = std::move(rows);
+    vis_spans_.push_back(std::move(sp));
+}
+
 std::string Ds41Forward::forward(const int32_t* ids, uint32_t T, uint32_t pos0, std::vector<float>& logits_out,
                                  const Probe& probe, const std::vector<std::vector<int32_t>>* expected,
                                  const std::vector<std::vector<float>>* expected_w, bool force_routing,
@@ -473,7 +478,7 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
         // one 2,048-token forward (any request carrying Dream's tool schemas) was refused at its second chunk.
         // IE_DS41_CONT=0 is the kill switch.
         static const bool cont_on = [] { const char* v = std::getenv("IE_DS41_CONT"); return !(v && *v && std::string(v) == "0"); }();
-        if (T != 1 && !(multi && T >= 2 && T <= kDs41MaxDecodeRows) && !(cont_on && T > kDs41MaxDecodeRows)) return "forward: at pos0 > 0 only single-token steps are admitted (T == 1; up to " + std::to_string(kDs41MaxDecodeRows) + " with IE_DS41_DECODE_MULTI=1)";
+        if (T != 1 && !((multi || multi_rows_) && T >= 2 && T <= kDs41MaxDecodeRows) && !(cont_on && T > kDs41MaxDecodeRows)) return "forward: at pos0 > 0 only single-token steps are admitted (T == 1; up to " + std::to_string(kDs41MaxDecodeRows) + " with IE_DS41_DECODE_MULTI=1)";
         if (!stage && pos0 != n_pos_) return "forward: step at pos0 " + std::to_string(pos0) + " but the state holds " + std::to_string(n_pos_) + " positions";   // forward_pipelined checks the whole chunk list up front
     }
     if (pos0 + T > cap_pos_) return "forward: position " + std::to_string(pos0 + T) + " exceeds the state's capacity " + std::to_string(cap_pos_) + " (max_tokens)";
@@ -553,12 +558,31 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
     std::vector<float> hh(first_stage ? size_t(T) * FLAT : 0);
     if (first_stage) {
         const auto* EW = reinterpret_cast<const uint16_t*>(m.embed.w->data);
-        for (uint32_t t = 0; t < T; ++t)
+        for (uint32_t t = 0; t < T; ++t) {
+            const float* vrow = nullptr;                       // an image position: the tower's row, not the table's
+            if (ids[t] < 0) {
+                const uint32_t p = pos0 + t;
+                for (const auto& sp : vis_spans_) if (p >= sp.pos0 && p - sp.pos0 < sp.n) { vrow = sp.rows.data() + size_t(p - sp.pos0) * H; break; }
+                if (!vrow && vis_provider_) { if (std::string ve = vis_provider_(p, vrow); !ve.empty()) return "forward: vision: " + ve; }
+                if (!vrow) return "forward: position " + std::to_string(p) + " is an image position and no vision span covers it";
+            }
             for (uint32_t d = 0; d < H; ++d) {
-                const float v = bf16f(EW[size_t(ids[t]) * H + d]);
+                const float v = vrow ? vrow[d] : bf16f(EW[size_t(ids[t]) * H + d]);
                 for (uint32_t cpy = 0; cpy < HC; ++cpy) hh[(size_t(t) * HC + cpy) * H + d] = v;
             }
+        }
     }
+    // image rows among the last `n` rows of this call, as (local row, count) runs: the engram passes them through
+    // untouched and the router selects by the image bias there (model.py: engram_mask, Gate.bias_vl)
+    auto image_runs = [&](uint32_t n) {
+        std::vector<std::pair<uint32_t, uint32_t>> runs;
+        for (uint32_t t = T - n; t < T; ++t) {
+            if (ids[t] >= 0) continue;
+            if (!runs.empty() && runs.back().first + runs.back().second == t - (T - n)) ++runs.back().second;
+            else runs.push_back({t - (T - n), 1});
+        }
+        return runs;
+    };
     std::vector<float> hpm(size_t(T) * HC, 0.f);
     for (uint32_t t = 0; t < T; ++t) hpm[size_t(t) * HC] = 1.f;
     std::vector<float> h_imp_ckv, h_imp_ik;                      // the current source's caches, at a card boundary
@@ -877,6 +901,9 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
             float* dqk = resident_ ? card.cache.layer(L)->engram_qk : (float*)keep(f32(qk.size()));
             if (!resident_) q.memcpy(dqk, qk.data(), qk.size() * 4).wait();
             ds41_engram_gate(q, h, keyc, valc, dqk, h_next, egate, Tl, H, HC, c.norm_eps).wait();
+            for (const auto& [r0, rn] : image_runs(Tl))        // token_mask False shuts the gate: the row passes through
+                q.memcpy(h_next + size_t(r0) * FLAT, h + size_t(r0) * FLAT, size_t(rn) * FLAT * 4);
+            q.wait();
             std::swap(h, h_next);
             stats_[L].engram_ms = ms_from(te);
             if (probe) probe("engram", L, h, size_t(Tl) * FLAT, q);
@@ -1232,6 +1259,20 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
 
         W(ds4_router_topk(q, xfn, g_w, g_b, r_logits, r_w, r_i, Tl, H, E, TK, c.route_scale));   // the readback below waits
         q.memcpy(h_idx.data(), r_i, size_t(Tl) * TK * 4); q.memcpy(h_w.data(), r_w, size_t(Tl) * TK * 4).wait();   // Tl rows: the rest of h_idx is stale
+        if (const auto runs = image_runs(Tl); !runs.empty()) {
+            // image-span tokens select by their own bias (training's noaux_tc_for_vl); the weights stay the unbiased
+            // scores'. Second pass with that bias, its rows taken at the image positions, device and host kept equal.
+            if (!Lw.gate_bias_vl.w) return "forward: the prompt holds image positions and layer " + std::to_string(L) + " has no ffn.gate.bias_vl";
+            float* g_bv = (rd && rd->g_b_vl) ? rd->g_b_vl : (float*)keep(f32_up(Lw.gate_bias_vl));
+            W(ds4_router_topk(q, xfn, g_w, g_bv, r_logits, r_w, r_i, Tl, H, E, TK, c.route_scale));
+            std::vector<int32_t> vi(size_t(Tl) * TK); std::vector<float> vw(size_t(Tl) * TK);
+            q.memcpy(vi.data(), r_i, vi.size() * 4); q.memcpy(vw.data(), r_w, vw.size() * 4).wait();
+            for (const auto& [r0, rn] : runs) {
+                std::copy(vi.begin() + size_t(r0) * TK, vi.begin() + size_t(r0 + rn) * TK, h_idx.begin() + size_t(r0) * TK);
+                std::copy(vw.begin() + size_t(r0) * TK, vw.begin() + size_t(r0 + rn) * TK, h_w.begin() + size_t(r0) * TK);
+            }
+            q.memcpy(r_i, h_idx.data(), size_t(Tl) * TK * 4); q.memcpy(r_w, h_w.data(), size_t(Tl) * TK * 4).wait();
+        }
         stats_[L].ffn_pre_ms = ms_from(tf);
         if (expected && L < expected->size()) {
             uint32_t diff = 0;

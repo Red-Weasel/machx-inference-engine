@@ -18,6 +18,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -25,6 +26,7 @@
 namespace ie {
 
 class DeviceAllocator;
+struct SafeTensorInfo;
 
 inline constexpr uint32_t kDs4VisPatch   = 14;
 inline constexpr uint32_t kDs4VisDim     = 1024;
@@ -65,10 +67,38 @@ uint32_t ds4_vis_grid_tokens(uint32_t n_llm_h, uint32_t n_llm_w);
 void ds4_vis_build_block(uint32_t n_llm_h, uint32_t n_llm_w, uint32_t start_pos,
                          std::vector<int32_t>& types, std::vector<int32_t>& perm);
 
+// The tower's runtime shape. The defaults are the V4 Vision-Exp sidecar; DeepSeek-V4.1 runs the SAME tower
+// (32 x 1024, 2-D RoPE, SwiGLU 2816, 3x3 aligner) into a 5120-wide LM with a 1,024-token image budget and no
+// pad row (include/ie/ds41_vision.hpp).
+struct Ds4VisionOptions {
+    uint32_t out_dim     = kDs4VisOut;   // LM hidden the aligner projects to
+    uint32_t max_patches = 3584;         // scratch caps (kMaxPatches / kMaxBlocks for the sidecar)
+    uint32_t max_blocks  = 400;
+    bool     pad_row     = true;         // the sidecar carries `image_pad`
+    uint32_t attn_tile   = 0;            // query rows per attention GEMM; 0 = every row in one GEMM
+    // The attention probabilities are an f16 GEMM input. Past a few thousand keys most of them sit below f16's
+    // normal range (6.1e-5) and lose their low bits; stored as p * prob_scale they keep them (the row sum is then
+    // prob_scale, and the scatter divides it back out). 1 = the sidecar's original arithmetic, bit for bit.
+    float    prob_scale  = 1.0f;
+    // transient: the converted weights live in pinned host memory and the device copy (weights + scratch, one
+    // block) exists only inside encode_gpu(). For a language model whose cards are full at steady state: the
+    // encode runs before the prompt's prefill, in the VRAM that prefill is about to use.
+    bool     transient   = false;
+};
+
 class Ds4Vision {
 public:
     Ds4Vision();
     ~Ds4Vision();
+
+    // The tower's tensors from any source (a checkpoint's own shards): `find` returns the BF16 tensor of that
+    // name or null, and must stay valid until the weights are uploaded (persistent) or staged (transient).
+    std::string load_from(std::function<const SafeTensorInfo*(const std::string&)> find, const Ds4VisionOptions& opt);
+    // transient only: convert the weights into pinned host memory now (else the first encode_gpu() does it).
+    std::string stage_host(DeviceAllocator& alloc);
+    uint32_t out_dim() const;
+    // device bytes this instance holds while it encodes (weights + scratch), by its own options
+    uint64_t encode_bytes() const;
 
     // Opens the safetensors sidecar (kept mapped until the first upload).
     std::string load(const std::string& sidecar_path);
@@ -106,6 +136,10 @@ std::string ds4_load_image_mem(const void* bytes, size_t nbytes, std::vector<flo
                                uint32_t& H, uint32_t& W, Ds4VisGeom& geom);
 std::string ds4_load_image(const std::string& path, std::vector<float>& px,
                            uint32_t& H, uint32_t& W, Ds4VisGeom& geom);
+// The same decode + PIL-exact resize/pad + normalise, on a canvas planned by `plan(src_w, src_h)`.
+std::string ds4_load_image_planned(const void* bytes, size_t nbytes,
+                                   const std::function<Ds4VisGeom(uint32_t, uint32_t)>& plan,
+                                   std::vector<float>& px, uint32_t& H, uint32_t& W, Ds4VisGeom& geom);
 
 // Test seam (tests/unit/ds4_vision_gpu_test --probe): the encoder's own
 // elementwise kernel, callable on caller-supplied buffers.

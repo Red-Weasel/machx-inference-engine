@@ -13,25 +13,29 @@ Intel Arc is a genuinely capable AI GPU that inference tooling has mostly ignore
 
 ---
 
-## ⚡ Headline: gpt-oss-20b, head-to-head vs llama.cpp
+## ⚡ What people run on it
 
-Same GGUF, same GPU (1× Arc Pro B70), llama.cpp on its *fastest* config (FlashAttention on):
+The five models this engine is tuned for, each on **two Arc Pro B70 cards** (64 GB VRAM) with host RAM holding the
+experts that do not fit. Dates, workloads and methods are in [Benchmarks](#benchmarks).
 
-| context | **Mach X** prefill | llama.cpp | speedup | **Mach X** decode | llama.cpp | speedup |
-|---|---|---|---|---|---|---|
-| 512  | **1795** t/s | 927 | **1.94×** | **58.3** t/s | 50.3 | **1.16×** |
-| 2K   | **4147** t/s | 927 | **4.47×** | **57.4** t/s | 49.9 | **1.15×** |
-| 4K   | **3428** t/s | 896 | **3.83×** | **55.6** t/s | 49.4 | **1.13×** |
+| model | weights | prefill | decode | also |
+|---|---|---:|---:|---|
+| **DeepSeek-V4.1-Flash** | 475 GB safetensors (FP8 dense, MXFP4 experts), 256 GB RAM | **304** tok/s at 2K, **319** at 32K–223K | **12.8** tok/s chat, **14.0** in agent loops | native vision, tool calls, 223K context, 1–2 s follow-up turns from the prompt cache |
+| **DeepSeek-V4-Flash** | 155 GB GGUF (MXFP4 experts, Q8_0 dense) | **571** tok/s at 4K | **26.1** tok/s at 4K, **32.7** short | tool calls, prompt cache |
+| **GLM-5.3-Flash** | UD-Q4_K_XL GGUF, host-resident experts | **156** tok/s at 16K | **14.5** tok/s at 16K | MTP draft, two-GPU pipelined prefill |
+| **Qwen3.8-Flash** (Flash-Next) | 104 GB UD-Q4_K_XL GGUF | **467** tok/s pipelined | **35.0** tok/s chat, **41.8** code (lossless speculative) | native vision |
+| **Qwen3.8-27B** | Q8_0 GGUF | **945** tok/s at 2K | **24.5** tok/s (tensor-parallel + speculative) | prompt cache (layer-split) |
 
-**Wins both axes at every context length, and stays flat as context grows.** Clean-box, reproducible (`ie-bench` vs `llama-bench`).
+Everything runs behind one OpenAI-compatible server (`ie serve`) with tool calls, and the
+[Dream Agent Harness](https://github.com/Red-Weasel/Dream-Agent-Harness) drives it as a local agent.
 
 ---
 
 ## Highlights
 
-- 🐋 **DeepSeek-V4.1-Flash on two B70s** — the 475 GB safetensors checkpoint with host-resident experts: 223K-token context verified, native tool calls through `ie serve`, and a prompt cache that answers follow-up chat turns in ~1–2 s. See [the V4.1 numbers](#deepseek-v41-flash).
+- 🐋 **DeepSeek-V4.1-Flash on two B70s** — the 475 GB safetensors checkpoint with host-resident experts: 223K-token context verified, native tool calls and **image input** through `ie serve`, a prompt cache that answers follow-up turns in ~1–2 s, and prompt-lookup speculation that decodes agent tool loops **1.47× faster**. See [the V4.1 numbers](#deepseek-v41-flash).
 - 🏛 **Dense, MoE and hybrid models** — GLM-5.3-Flash, DeepSeek-V4.1-Flash, DeepSeek-V4-Flash, Qwen3.8-Flash-Next, Qwen3.6, Qwen3 / Coder / Tongyi, Qwen3-Next, Gemma-4, gpt-oss, and Llama-compatible dense models. GLM-5.2 and Tencent Hy4-preview have experimental standalone runners. See [architecture coverage](#supported-architectures) for entry points and status.
-- 👁 **Native vision** — Qwen3.8-Flash-Next and experimental DeepSeek-V4-Flash-Vision-Exp, including image inputs through the OpenAI-compatible API. DeepSeek vision requires its native vision sidecar weights.
+- 👁 **Native vision** — DeepSeek-V4.1-Flash (the checkpoint's own vision tower, no extra files), Qwen3.8-Flash-Next and experimental DeepSeek-V4-Flash-Vision-Exp, including image inputs through the OpenAI-compatible API. DeepSeek-V4 vision requires its native vision sidecar weights.
 - 🥇 **Beats llama.cpp on Arc** — on prefill *and* decode across the models below.
 - 🧠 **Runs the big ones** — gpt-oss-**120b** (117B) and Qwen3-Next-**80B** on 2× B70 via tensor-parallel; **~2.5× faster than LM Studio** on 120b.
 - 🔀 **Multi-GPU built in** — `ie serve --gpus 2` (tensor-parallel + layer-split), no P2P required.
@@ -49,11 +53,11 @@ the benchmarked models. Prebuilt container images may lag these source updates.
 
 | Family / GGUF architecture | Models | Entry point and coverage |
 |---|---|---|
-| **GLM-5.3-Flash** · `glm5next` | UD-Q4_K_XL GGUF | `ie-glm5next-run`; sparse MLA + KDA, host-resident MoE, two-GPU pipelined prefill and MTP draft; kernel and full-model validation in [PERFORMANCE.md](PERFORMANCE.md) |
-| **DeepSeek-V4.1** · safetensors directory (`deepseek_v41`) | Flash (FP8 dense, MXFP4 experts) | `ie serve <model dir>` and `ie-ds41-run`; two-card pipeline, CSA/engram/hyper-connections, three expert tiers (VRAM, pinned host RAM, NVMe), chunked long-context prefill, native DSML tool calls, prefix cache (memory + disk); needs ~256 GB of system RAM |
+| **GLM-5.3-Flash** · `glm5next` | UD-Q4_K_XL GGUF | `ie serve` and `ie-glm5next-run`; sparse MLA + KDA, host-resident MoE, two-GPU pipelined prefill and MTP draft; kernel and full-model validation in [PERFORMANCE.md](PERFORMANCE.md) |
+| **DeepSeek-V4.1** · safetensors directory (`deepseek_v41`) | Flash (FP8 dense, MXFP4 experts) | `ie serve <model dir>` and `ie-ds41-run`; two-card pipeline, CSA/engram/hyper-connections, three expert tiers (VRAM, pinned host RAM, NVMe), chunked long-context prefill, native DSML tool calls, native vision, prefix cache (memory + disk), prompt-lookup speculation; needs ~256 GB of system RAM |
 | **DeepSeek-V4** · `deepseek4` | Flash (ggml-org MXFP4, Q8_0 dense), Flash-Vision-Exp | `ie serve`; streaming expert caches, long-context sparse attention, prompt caching and structured tool calls; experimental native vision requires sidecar weights |
 | **Qwen3.8-Flash-Next** · `qwen4exp` | Qwen4 preview | `ie serve`; DeltaNet + sparse QSA, hyper-connections, PLE embeddings, streamed MoE and native vision |
-| **Qwen3.5 / Qwen3.6 hybrid** · `qwen35`, `qwen35moe` | 27B dense, 35B-A3B MoE | `ie serve`; gated-DeltaNet + full attention, dense or MoE feed-forward paths |
+| **Qwen3.5 / Qwen3.6 / Qwen3.8 hybrid** · `qwen35`, `qwen35moe` | 27B dense (incl. Qwen3.8-27B), 35B-A3B MoE | `ie serve`; gated-DeltaNet + full attention, dense or MoE feed-forward paths |
 | **Qwen3 MoE** · `qwen3moe` | Coder-30B-A3B, Tongyi-30B | `ie serve`; QK-normalized attention and routed MoE |
 | **Qwen3-Next** · `qwen3next` | 80B-A3B | `ie serve`; DeltaNet + full attention and 512-expert MoE |
 | **gpt-oss** · `gpt-oss` | 20b, 120b (MXFP4) | `ie serve`; attention sinks, sliding-window attention, Harmony chat and tool calls |
@@ -72,6 +76,25 @@ to native GGUF. Import format support does not add an unsupported architecture.
 ---
 
 ## Latest Intel Arc kernel updates
+
+**September 18, 2026 — DeepSeek-V4.1-Flash sees images, and agent loops decode 1.47× faster.**
+
+- **Native vision from the checkpoint's own tower** (32-block ViT + aligner, 926 MB of weights already in the
+  shards): images go in as OpenAI `image_url` parts, including a tool's screenshot. The tower's rows match DeepSeek's
+  reference implementation at rel-L2 0.1–0.6 % (the model's own bf16 run is at 5 %), bit-identical run to run. The
+  encoder borrows 1.5 GB of VRAM only while an image encodes (0.2 s for 640×480, 2.9 s at the 1,024-token budget),
+  and a follow-up turn about the same image is served from the prompt cache without re-encoding it.
+  [Tower](docs/deepseek41/94_PHASE55_VISION_TOWER_2026-09-18.md), [in the forward](docs/deepseek41/95_PHASE56_IMAGE_POSITIONS_IN_THE_FORWARD_2026-09-18.md),
+  [serving and a 42-step agent soak](docs/deepseek41/96_PHASE57_IMAGES_IN_SERVE_AND_THE_AGENT_SOAK_2026-09-18.md).
+- **Prompt-lookup speculation.** Agents spend much of their output copying text they have already seen (a todo list
+  rewritten with one change, a file written back, a quoted string). When at least 12 context tokens match, the engine
+  drafts the next 7 from that earlier occurrence and verifies all of them in one forward; prose is never drafted. The
+  first A/B gave only 1.04×: an 8-row verify sent 17 GB of experts over PCIe, because the CPU expert path served
+  one-row steps only. With that path extended to multi-row steps the verify drops 780 → 488 ms, and 42 recorded
+  agent requests (18–34K context, replayed byte-identically, A-B-A) decode at **106 → 71.6 ms/token (9.4 → 14.0
+  tok/s, 1.47×)**, outputs bit-identical to plain decoding with the CPU split off. On by default in `ie serve`
+  (`IE_DS41_LOOKUP=0` turns it off). [Lookup speculation](docs/deepseek41/97_PHASE58_PROMPT_LOOKUP_SPECULATION_2026-09-18.md),
+  [multi-row CPU expert path](docs/deepseek41/98_PHASE59_MULTI_ROW_CPU_EXPERT_LEG_2026-09-18.md).
 
 **September 16–17, 2026 — DeepSeek-V4.1-Flash: faster long prompts, tool calls in the server, a prompt cache.**
 
@@ -145,6 +168,16 @@ results, rejected experiments, test coverage and reproduction commands.
 
 📊 **[Interactive charts →](https://red-weasel.github.io/machx-inference-engine/benchmarks.html)** · all measured on **Arc Pro B70** hardware; gpt-oss rows are clean-box head-to-head with identical GGUFs.
 
+**gpt-oss-20b, head-to-head vs llama.cpp** — same GGUF, same GPU (1× Arc Pro B70), llama.cpp on its *fastest* config (FlashAttention on):
+
+| context | **Mach X** prefill | llama.cpp | speedup | **Mach X** decode | llama.cpp | speedup |
+|---|---|---|---|---|---|---|
+| 512  | **1795** t/s | 927 | **1.94×** | **58.3** t/s | 50.3 | **1.16×** |
+| 2K   | **4147** t/s | 927 | **4.47×** | **57.4** t/s | 49.9 | **1.15×** |
+| 4K   | **3428** t/s | 896 | **3.83×** | **55.6** t/s | 49.4 | **1.13×** |
+
+Wins both axes at every context length, and stays flat as context grows. Clean-box, reproducible (`ie-bench` vs `llama-bench`).
+
 **gpt-oss-120b** (117B, MXFP4) — 2× B70, tensor-parallel:
 | metric | Mach X | LM Studio (same 2 cards) |
 |---|---|---|
@@ -202,6 +235,8 @@ system RAM (≈197 GB pinned expert arena, at least 30 GiB left free), measured 
 | 24,193 tokens, held-out real document | **344** | 10.4 (120 tokens) |
 | 223,237 tokens, held-out real document, needle at 50 % retrieved | **319** (700 s) | 4.7 (300 tokens) |
 | Dream-style chat: 17.7K-token system prompt + 90 tool schemas, `ie serve`, 6 held-out prompts | first turn **281**; follow-ups served from the prefix cache (1.1–2.3 s to first token) | **12.8** (range 10.5–15.5) |
+| agent loop: 42 recorded tool-calling requests with screenshots, 18–34K context, `ie serve` (September 18) | follow-ups from the prefix cache | **14.0** with prompt-lookup speculation (9.4 without) |
+| image input: 640×480 / 1920×1080 screenshot (206 / 968 image tokens) | vision encode **0.2 s / 2.9 s** | — |
 
 Perplexity 1.887 on 16,384 wikitext-2 test tokens (exact path). Decode at long context is bound by expert
 residency (VRAM and host RAM against the checkpoint), not kernels. Design and measurement notes:
