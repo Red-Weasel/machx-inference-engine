@@ -48,7 +48,8 @@ std::string chat_chunk_sse_tool_calls_json(const std::string& model, const std::
 // stream (caller then sends "data: [DONE]\n\n").
 std::string chat_chunk_sse(const std::string& model, const std::string& id,
                            int64_t created, std::string_view delta,
-                           const std::string& finish_reason);
+                           const std::string& finish_reason,
+                           const std::string& truncated_tool_call = {});
 
 // Streaming tool_calls delta: parses the accumulated generation's <tool_call>
 // text into structured OpenAI tool_calls. Returns "" if no valid call is

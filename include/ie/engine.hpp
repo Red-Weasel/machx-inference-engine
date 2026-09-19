@@ -180,6 +180,8 @@ struct GenerateResult {
     uint32_t    cached_tokens     = 0; // prompt tokens served from the prefix cache
     uint32_t    completion_tokens = 0;
     std::string finish_reason;        // "stop" | "length" | "abort"
+    // deepseek41: a "length" reply cut off inside a tool call -- that call's name (docs/deepseek41/100).
+    std::string truncated_tool_call;
     double      prefill_ms        = 0; // wall time of the prefill phase
     double      decode_ms         = 0; // wall time of the decode loop
 };

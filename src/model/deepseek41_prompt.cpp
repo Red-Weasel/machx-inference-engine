@@ -286,6 +286,16 @@ std::string ds41_visible_content(std::string_view text) {
     return std::string(text);
 }
 
+std::string ds41_cut_tool_name(std::string_view text) {
+    const auto at=text.find(dsml);
+    if(at==std::string_view::npos) return {};
+    static const std::regex invoke(R"TAG(<｜DSML｜ invoke name="([^"]+)")TAG");
+    const std::string tail(text.substr(at));
+    std::string name="unknown";                          // the LAST invoke is the one the cut landed in
+    for(auto it=std::sregex_iterator(tail.begin(),tail.end(),invoke); it!=std::sregex_iterator(); ++it) name=(*it)[1].str();
+    return name;
+}
+
 Ds41Completion ds41_parse_completion(std::string_view text, bool thinking) {
     Ds41Completion out;
     try {

@@ -10,6 +10,9 @@
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <malloc.h>
 #include <memory>
 #include <thread>
 #include <mutex>
@@ -28,6 +31,19 @@ static void on_stop_signal(int sig) {
     if (g_signal.exchange(sig) != 0) _exit(128 + sig);
 }
 
+// After every generation, hand the heap's free pages back to the OS. A request's transient buffers (prefill chunks,
+// image rows, bounce copies) are freed into glibc's per-thread arenas, which otherwise keep them: live, a day of
+// Dream image traffic grew ie serve by ~30 GB of freed-but-held heap until the machine ran out of RAM
+// (docs/deepseek41/99). IE_MALLOC_TRIM=0 turns it off.
+static double g_trim_ms = 0.0;   // the last trim's cost, for IE_MEM_REPORT
+static void release_free_heap() {
+    static const bool off = [] { const char* v = std::getenv("IE_MALLOC_TRIM"); return v && v[0] == '0'; }();
+    if (off) return;
+    const auto t0 = std::chrono::steady_clock::now();
+    malloc_trim(0);
+    g_trim_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+}
+
 // Per-request throughput to the engine's terminal (stderr). Free: token counts
 // already tracked, timing is phase-boundary clock reads (see Engine::generate).
 static void log_gen_speed(const GenerateResult& r) {
@@ -36,6 +52,21 @@ static void log_gen_speed(const GenerateResult& r) {
     std::fprintf(stderr,
         "[gen] prefill %u tok (%u cached) / %.0f ms = %.0f tok/s  |  decode %u tok / %.0f ms = %.1f tok/s\n",
         r.prompt_tokens, r.cached_tokens, r.prefill_ms, pf, r.completion_tokens, r.decode_ms, dc);
+    // IE_MEM_REPORT=1: the process's anonymous RSS and glibc's heap (all arenas) after every request -- tells a
+    // leak (in-use climbs) from arena fragmentation (free-in-arenas climbs) (docs/deepseek41/99)
+    static const bool mem_report = std::getenv("IE_MEM_REPORT") != nullptr;
+    if (mem_report) {
+        long anon_kb = -1;
+        if (FILE* f = std::fopen("/proc/self/status", "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof line, f))
+                if (!std::strncmp(line, "RssAnon:", 8)) { anon_kb = std::atol(line + 8); break; }
+            std::fclose(f);
+        }
+        const struct mallinfo2 mi = mallinfo2();
+        std::fprintf(stderr, "[mem] RssAnon %ld MiB | malloc heap %zu MiB: in use %zu, free in arenas %zu; mmapped %zu MiB | trim %.1f ms\n",
+                     anon_kb / 1024, mi.arena >> 20, mi.uordblks >> 20, mi.fordblks >> 20, mi.hblkhd >> 20, g_trim_ms);
+    }
     std::fflush(stderr);
 }
 
@@ -188,6 +219,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                     return true;
                 },
                 cr.enable_thinking, cr.tools_json, cr.reasoning_effort);
+            release_free_heap();
             if (stopped_ns) {
                 r.finish_reason = "stop";
                 r.tool_calls_json.clear();
@@ -378,6 +410,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                         flush_to(acc.size() > hold ? acc.size() - hold : 0);
                         return sink_alive;
                     }, cr.enable_thinking, cr.tools_json, cr.reasoning_effort);
+                release_free_heap();
                 if (r.finish_reason == "context_length_exceeded") {
                     std::string ev =
                         "data: {\"error\":{\"message\":\"context_length_exceeded: prompt "
@@ -426,7 +459,8 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                     } else if (ds41) flush_to(content_start + r.text.size());
                     else flush_to(acc.size());
                 }
-                auto fin = oai::chat_chunk_sse(model_id, id, created, "", fin_reason);
+                auto fin = oai::chat_chunk_sse(model_id, id, created, "", fin_reason,
+                                               fin_reason == "length" ? r.truncated_tool_call : std::string{});
                 sink.write(fin.data(), fin.size());
                 // Real token usage so streaming clients get live context % + tok/s
                 // (without this the client accounts zeros).
