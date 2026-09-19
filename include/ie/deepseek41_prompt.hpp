@@ -41,5 +41,8 @@ struct Ds41Completion {
 Ds41Completion ds41_parse_completion(std::string_view text, bool thinking);
 // Hide DSML (including a partial marker) from incomplete replies.
 std::string ds41_visible_content(std::string_view text);
+// A reply cut off inside a tool call: the call's name ("unknown" before the name was written), "" when the reply
+// holds no DSML block. The call itself is never parsed or run.
+std::string ds41_cut_tool_name(std::string_view text);
 
 }  // namespace ie

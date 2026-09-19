@@ -176,6 +176,7 @@ GenerateResult ds41_run_ids(Ds41Bundle& b, const std::vector<int32_t>& ids, cons
         if (const auto at = text.find("</think>"); at != std::string::npos) { r.reasoning_content = text.substr(0, at); r.text = text.substr(at + 8); }
         else { r.reasoning_content = text; }                    // the budget ended inside the reasoning
     } else r.text = text;
+    if (chat && r.finish_reason == "length") r.truncated_tool_call = ds41_cut_tool_name(r.text);
     if (chat) r.text = ds41_visible_content(r.text);
     return r;
 }

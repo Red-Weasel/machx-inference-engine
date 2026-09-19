@@ -519,8 +519,9 @@ std::string chat_completion_json(const std::string& model,
     } else {
         msg["content"] = r.text;
     }
-    j["choices"] = json::array({{
-        {"index", 0}, {"message", msg}, {"finish_reason", finish}}});
+    json choice = {{"index", 0}, {"message", msg}, {"finish_reason", finish}};
+    if (!r.truncated_tool_call.empty()) choice["truncated_tool_call"] = {{"name", r.truncated_tool_call}};
+    j["choices"] = json::array({choice});
     j["usage"] = {{"prompt_tokens", r.prompt_tokens},
                   {"completion_tokens", r.completion_tokens},
                   {"total_tokens", r.prompt_tokens + r.completion_tokens},
@@ -571,13 +572,15 @@ std::string chat_chunk_sse_tool_calls_json(const std::string& model, const std::
 
 std::string chat_chunk_sse(const std::string& model, const std::string& id,
                            int64_t created, std::string_view delta,
-                           const std::string& finish_reason) {
+                           const std::string& finish_reason,
+                           const std::string& truncated_tool_call) {
     json j = base(model, id, created, "chat.completion.chunk");
     json d = json::object();
     if (!delta.empty()) d["content"] = std::string(delta);
-    j["choices"] = json::array({{
-        {"index", 0}, {"delta", d},
-        {"finish_reason", finish_reason.empty() ? json() : json(finish_reason)}}});
+    json choice = {{"index", 0}, {"delta", d},
+        {"finish_reason", finish_reason.empty() ? json() : json(finish_reason)}};
+    if (!truncated_tool_call.empty()) choice["truncated_tool_call"] = {{"name", truncated_tool_call}};
+    j["choices"] = json::array({choice});
     return "data: " + j.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
 }
 

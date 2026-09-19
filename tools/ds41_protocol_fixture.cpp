@@ -31,7 +31,8 @@ int main() {
             } else sse="data: "+ie::oai::error_json(p.error)+"\n\n";
             sse+="data: [DONE]\n\n";
             result={{"sse",sse},{"response",J::parse(ie::oai::chat_completion_json("DeepSeek-V4.1-Flash",generated,"fixture",0))},{"content",p.content},{"reasoning_content",p.reasoning_content},{"error",p.error},{"tool_calls",p.tool_calls_json.empty()?J::array():J::parse(p.tool_calls_json)}};
-        } else if(c.contains("partial")) result={{"content",ie::ds41_visible_content(c["partial"].get<std::string>())}};
+        } else if(c.contains("partial")) result={{"content",ie::ds41_visible_content(c["partial"].get<std::string>())},
+                                                 {"cut_tool",ie::ds41_cut_tool_name(c["partial"].get<std::string>())}};
         else {
             std::vector<ie::Ds41ChatMessage> msgs;
             for(const auto& m:c["messages"]) {
