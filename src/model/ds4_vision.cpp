@@ -297,6 +297,7 @@ struct Ds4Vision::Impl {
     Ds4vFind find;
     // transient mode: the converted weights (pinned), and every device buffer's offset in the one encode block
     void* hw = nullptr; size_t hw_bytes = 0, block_bytes = 0;
+    uint64_t hw_hash = 0;          // sampled hash of the staged weights, checked before every encode
     std::vector<Ds4vSlot> slots;
     void collect_slots();
     bool open = false;
@@ -851,6 +852,23 @@ std::string Ds4Vision::upload(DeviceAllocator& alloc) {
     return {};
 }
 
+namespace {
+// A cheap fingerprint of the pinned tower weights: 4 MiB sampled across the buffer. A
+// full hash of 1.5 GiB would cost ~0.4 s per image; this costs ~2 ms and still catches
+// anything that overwrites a region (docs/deepseek41/101).
+uint64_t ds4v_sample_hash(const void* p, size_t bytes) {
+    const auto* b = static_cast<const uint8_t*>(p);
+    const size_t chunk = 4096, want = 4u << 20;
+    const size_t chunks = bytes / chunk, take = std::min(chunks, want / chunk);
+    if (!chunks) return 0;
+    const size_t stride = std::max<size_t>(1, chunks / std::max<size_t>(1, take));
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (size_t c = 0; c < chunks; c += stride)
+        for (size_t i = 0; i < chunk; i += 64) { h ^= b[c * chunk + i]; h *= 0x100000001B3ull; }
+    return h;
+}
+}  // namespace
+
 std::string Ds4Vision::encode_gpu(DeviceAllocator& alloc, const float* img, uint32_t H, uint32_t W,
                                   std::vector<float>& aligned) {
     Impl& I = *impl_;
@@ -890,6 +908,14 @@ std::string Ds4Vision::encode_gpu(DeviceAllocator& alloc, const float* img, uint
         lease.p = sycl::malloc_device(I.block_bytes, q);
         if (!lease.p) return "ds4 vision: no device memory for the " + std::to_string(I.block_bytes >> 20) + " MiB encode block";
         for (auto& sl : I.slots) *sl.pp = static_cast<uint8_t*>(lease.p) + sl.off;
+        // The staged weights live for the whole process. If anything has overwritten them,
+        // every image after it would encode to nonsense -- and the model then answers with
+        // one token repeated (seen live 2026-09-19). Check, say so, and restage.
+        if (I.hw_hash && ds4v_sample_hash(I.hw, I.hw_bytes) != I.hw_hash) {
+            std::fprintf(stderr, "[ds4-vis] the staged tower weights changed since they were loaded — restaging "
+                                 "(an image encoded with them would be nonsense)\n");
+            if (std::string e = restage_host(); !e.empty()) return "ds4 vision: restage after corruption: " + e;
+        }
         q.memcpy(lease.p, I.hw, I.hw_bytes);
         mark("weights-h2d");
     }
@@ -1048,6 +1074,13 @@ std::string Ds4Vision::stage_host(DeviceAllocator& alloc) {
     I.h_out = sycl::malloc_host<float>(Bp * I.opt.out_dim, q);
     I.alloc = &alloc;                                   // the destructor frees the pinned buffers through it
     if (!I.hw || !I.h_px || !I.h_cs || !I.h_sn || !I.h_out) return "ds4 vision: pinned host allocation failed";
+    fill_host();
+    I.cap_n = uint32_t(Mp); I.cap_b = uint32_t(Bp); I.cap_nc = uint32_t((Mp + 127u) & ~size_t(127));
+    return {};
+}
+
+void Ds4Vision::fill_host() {
+    Impl& I = *impl_;
     auto* base = static_cast<uint8_t*>(I.hw);
     for (const auto& sl : I.slots) {
         if (!sl.src) break;                             // weights come first
@@ -1064,7 +1097,13 @@ std::string Ds4Vision::stage_host(DeviceAllocator& alloc) {
             for (uint32_t i = 0; i < sl.out_d; ++i) f[i] = bf16_at(src, i);
         }
     }
-    I.cap_n = uint32_t(Mp); I.cap_b = uint32_t(Bp); I.cap_nc = uint32_t((Mp + 127u) & ~size_t(127));
+    I.hw_hash = ds4v_sample_hash(I.hw, I.hw_bytes);
+}
+
+std::string Ds4Vision::restage_host() {
+    Impl& I = *impl_;
+    if (!I.hw || !I.open) return "the tower is not staged";
+    fill_host();
     return {};
 }
 

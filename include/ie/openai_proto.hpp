@@ -13,6 +13,9 @@ struct ChatRequest {
     SamplingParams sampling;
     bool stream = false;
     bool enable_thinking = false;  // Qwen reasoning trace; opt-in per request
+    bool stream_tool_preview = false;  // opt-in: stream the text of a forming tool call
+                                       // as delta.tool_call_preview, so a client can show
+                                       // the code being written. Off = byte-identical stream.
     std::string reasoning_effort;  // empty keeps the selected model's default
     std::string model;        // echoed back, not used for routing in v1
     std::string tools_json;   // raw OpenAI `tools` array (dumped); empty = none
@@ -37,6 +40,12 @@ std::string chat_completion_json(const std::string& model,
 // One SSE data frame carrying a `reasoning_content` delta (deepseek4 thinking).
 std::string chat_chunk_sse_reasoning(const std::string& model, const std::string& id,
                                      int64_t created, std::string_view delta);
+// One SSE data frame carrying the raw text of a tool call while it is still
+// being written (delta.tool_call_preview). Display only: the same bytes come
+// back at the end as structured tool_calls, and a client that ignores the
+// field sees exactly the stream it saw before.
+std::string chat_chunk_sse_tool_preview(const std::string& model, const std::string& id,
+                                        int64_t created, std::string_view delta);
 // One SSE data frame carrying structured tool_calls from an engine-parsed
 // OpenAI-format array (GenerateResult::tool_calls_json); "" when the array is
 // empty or unparseable.

@@ -183,6 +183,10 @@ struct GenerateResult {
     // deepseek41: a "length" reply cut off inside a tool call -- that call's name (docs/deepseek41/100).
     std::string truncated_tool_call;
     double      prefill_ms        = 0; // wall time of the prefill phase
+    // deepseek41: what the prefill time was spent on. Without this the "tok/s" above
+    // counts cached tokens as if they had been run and hides a fixed per-turn cost.
+    double      restore_ms        = 0; // of prefill_ms: restoring the cached prefix
+    std::string cache_source;          // "live" | "checkpoint" | "host slot" | "none" | "" (cache off)
     double      decode_ms         = 0; // wall time of the decode loop
 };
 

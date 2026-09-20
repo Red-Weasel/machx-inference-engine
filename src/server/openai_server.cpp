@@ -13,6 +13,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <malloc.h>
+#include <filesystem>
 #include <memory>
 #include <thread>
 #include <mutex>
@@ -35,6 +36,26 @@ static void on_stop_signal(int sig) {
 // image rows, bounce copies) are freed into glibc's per-thread arenas, which otherwise keep them: live, a day of
 // Dream image traffic grew ie serve by ~30 GB of freed-but-held heap until the machine ran out of RAM
 // (docs/deepseek41/99). IE_MALLOC_TRIM=0 turns it off.
+// A generation the engine stopped as repetition is a bug report: keep the request that
+// produced it (bounded, newest wins) so it can be replayed exactly (docs/deepseek41/101).
+static void keep_repeating_request(const std::string& body) {
+    const char* home = std::getenv("HOME");
+    if (!home) return;
+    std::error_code ec;
+    const std::filesystem::path dir = std::filesystem::path(home) / ".cache" / "machx-ie" / "repetition";
+    std::filesystem::create_directories(dir, ec);
+    size_t have = 0;
+    for (const auto& e : std::filesystem::directory_iterator(dir, ec)) { (void)e; ++have; }
+    if (have >= 20) return;
+    const auto now = std::chrono::system_clock::now().time_since_epoch();
+    const auto path = dir / (std::to_string(std::chrono::duration_cast<std::chrono::seconds>(now).count()) + ".json");
+    if (FILE* f = std::fopen(path.c_str(), "wb")) {
+        std::fwrite(body.data(), 1, body.size(), f);
+        std::fclose(f);
+        std::fprintf(stderr, "[req] the reply repeated itself and was stopped; the request is in %s\n", path.c_str());
+    }
+}
+
 static double g_trim_ms = 0.0;   // the last trim's cost, for IE_MEM_REPORT
 static void release_free_heap() {
     static const bool off = [] { const char* v = std::getenv("IE_MALLOC_TRIM"); return v && v[0] == '0'; }();
@@ -47,11 +68,23 @@ static void release_free_heap() {
 // Per-request throughput to the engine's terminal (stderr). Free: token counts
 // already tracked, timing is phase-boundary clock reads (see Engine::generate).
 static void log_gen_speed(const GenerateResult& r) {
-    const double pf = r.prefill_ms > 0 ? r.prompt_tokens * 1000.0 / r.prefill_ms : 0.0;
+    // Rate the prefill on the tokens it actually ran. Counting the cached ones as if
+    // they had been prefilled reads as thousands of tok/s and hides both the real rate
+    // and the fixed per-turn cost (docs/deepseek41/102).
+    const uint32_t run = r.prompt_tokens - std::min(r.cached_tokens, r.prompt_tokens);
+    const double ran_ms = std::max(0.0, r.prefill_ms - r.restore_ms);
+    const double pf = ran_ms > 0 ? run * 1000.0 / ran_ms : 0.0;
     const double dc = r.decode_ms  > 0 ? r.completion_tokens * 1000.0 / r.decode_ms : 0.0;
+    char split[192];
+    if (r.cached_tokens)
+        std::snprintf(split, sizeof split, " [restore %.0f ms from %s, %u new in %.0f ms = %.0f tok/s]",
+                      r.restore_ms, r.cache_source.empty() ? "cache" : r.cache_source.c_str(),
+                      run, ran_ms, pf);
+    else
+        std::snprintf(split, sizeof split, " = %.0f tok/s", pf);
     std::fprintf(stderr,
-        "[gen] prefill %u tok (%u cached) / %.0f ms = %.0f tok/s  |  decode %u tok / %.0f ms = %.1f tok/s\n",
-        r.prompt_tokens, r.cached_tokens, r.prefill_ms, pf, r.completion_tokens, r.decode_ms, dc);
+        "[gen] prefill %u tok (%u cached) / %.0f ms%s  |  decode %u tok / %.0f ms = %.1f tok/s\n",
+        r.prompt_tokens, r.cached_tokens, r.prefill_ms, split, r.completion_tokens, r.decode_ms, dc);
     // IE_MEM_REPORT=1: the process's anonymous RSS and glibc's heap (all arenas) after every request -- tells a
     // leak (in-use climbs) from arena fragmentation (free-in-arenas climbs) (docs/deepseek41/99)
     static const bool mem_report = std::getenv("IE_MEM_REPORT") != nullptr;
@@ -220,6 +253,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 },
                 cr.enable_thinking, cr.tools_json, cr.reasoning_effort);
             release_free_heap();
+            if (r.finish_reason == "repetition") keep_repeating_request(req.body);
             if (stopped_ns) {
                 r.finish_reason = "stop";
                 r.tool_calls_json.clear();
@@ -280,8 +314,9 @@ int run_openai_server(Engine& eng, const std::string& model_id,
         if (fault.faulted()) { unavailable(res); return; }
         if (!adm.acquire())  { refuse(res); return; }
         auto adm_rel = std::make_shared<AdmRelease>(&adm);
+        const std::string raw_body = req.body;   // kept for a repetition capture
         res.set_chunked_content_provider("text/event-stream",
-            [&eng, &adm, &fault, adm_rel, cr, id, created, model_id]
+            [&eng, &adm, &fault, adm_rel, cr, id, created, model_id, raw_body]
             (size_t, httplib::DataSink& sink) {
               // Phase L: a forward that throws mid-stream (the non-stream path
               // already catches) must end the stream with an error frame, not
@@ -355,6 +390,20 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                         else sink_alive = false;   // client gone — stop generating
                     }
                 };
+                // Opt-in (`stream_tool_preview`): while a tool call is being written,
+                // send its raw text as delta.tool_call_preview so the client can show
+                // the code appearing. It is display only -- the same bytes arrive at
+                // the end as structured tool_calls -- and it never touches content.
+                size_t tool_streamed = 0;
+                auto flush_tool_preview_to = [&](size_t upto) {
+                    upto = utf8_safe(acc, upto);
+                    if (upto > tool_streamed) {
+                        auto f = oai::chat_chunk_sse_tool_preview(model_id, id, created,
+                            std::string_view(acc).substr(tool_streamed, upto - tool_streamed));
+                        if (sink.write(f.data(), f.size())) tool_streamed = upto;
+                        else sink_alive = false;
+                    }
+                };
                 auto flush_reason_to = [&](size_t upto) {
                     upto = utf8_safe(acc, upto);
                     if (upto > reason_streamed) {
@@ -389,7 +438,10 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                             content_start = p + THINK_CLOSE.size();
                             streamed      = content_start;
                         }
-                        if (in_tool) return true;                 // buffering the call
+                        if (in_tool) {                            // buffering the call
+                            if (cr.stream_tool_preview) flush_tool_preview_to(acc.size());
+                            return sink_alive;
+                        }
                         size_t tc = acc.find(OPEN, content_start);
                         if (ds4 || ds41) {
                             const size_t td = acc.find(DSML_OPEN, content_start);
@@ -405,12 +457,15 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                             size_t cut = tc;
                             if (ds41 && in_dsml)
                                 for (int k = 0; k < 2 && cut > std::max(content_start, streamed) && acc[cut - 1] == '\n'; ++k) --cut;
-                            flush_to(cut); in_tool = true; return sink_alive;
+                            flush_to(cut); in_tool = true; tool_streamed = cut;
+                            if (cr.stream_tool_preview && sink_alive) flush_tool_preview_to(acc.size());
+                            return sink_alive;
                         }
                         flush_to(acc.size() > hold ? acc.size() - hold : 0);
                         return sink_alive;
                     }, cr.enable_thinking, cr.tools_json, cr.reasoning_effort);
                 release_free_heap();
+                if (r.finish_reason == "repetition") keep_repeating_request(raw_body);
                 if (r.finish_reason == "context_length_exceeded") {
                     std::string ev =
                         "data: {\"error\":{\"message\":\"context_length_exceeded: prompt "

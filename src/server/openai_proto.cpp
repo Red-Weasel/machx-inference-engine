@@ -134,6 +134,7 @@ static ChatRequest parse_chat_request_impl(const std::string& body, ChatRequest 
     out.model = j.value("model", "default");
     out.stream = j.value("stream", false);
     out.enable_thinking = j.value("enable_thinking", out.enable_thinking);
+    out.stream_tool_preview = j.value("stream_tool_preview", out.stream_tool_preview);
     if(j.contains("reasoning_effort") && !j["reasoning_effort"].is_null()) {
         if(!j["reasoning_effort"].is_string())throw std::runtime_error("reasoning_effort must be a string");
         out.reasoning_effort=j["reasoning_effort"].get<std::string>();
@@ -548,6 +549,15 @@ std::string chat_chunk_sse_reasoning(const std::string& model, const std::string
     json j = base(model, id, created, "chat.completion.chunk");
     json d = json::object();
     d["reasoning_content"] = std::string(delta);
+    j["choices"] = json::array({{{"index", 0}, {"delta", d}, {"finish_reason", json()}}});
+    return "data: " + j.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+}
+
+std::string chat_chunk_sse_tool_preview(const std::string& model, const std::string& id,
+                                        int64_t created, std::string_view delta) {
+    json j = base(model, id, created, "chat.completion.chunk");
+    json d = json::object();
+    d["tool_call_preview"] = std::string(delta);
     j["choices"] = json::array({{{"index", 0}, {"delta", d}, {"finish_reason", json()}}});
     return "data: " + j.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
 }

@@ -161,8 +161,10 @@ GenerateResult ds41_run_ids(Ds41Bundle& b, const std::vector<int32_t>& ids, cons
                 std::to_string(b.profile_steps) + " generated tokens", "total selections " + std::to_string(total)}); !pe.empty())
             std::fprintf(stderr, "[deepseek41] profile write: %s\n", pe.c_str());
     }
-    r.prompt_tokens = st.n_prompt; r.completion_tokens = st.n_gen; r.cached_tokens = st.n_cached; r.prefill_ms = st.prefill_s * 1000.0; r.decode_ms = st.decode_s * 1000.0;
-    r.finish_reason = st.stop_reason == "eos" || st.stop_reason == "stop" ? "stop" : st.stop_reason == "callback" ? "abort" : "length";
+    r.prompt_tokens = st.n_prompt; r.completion_tokens = st.n_gen; r.cached_tokens = st.n_cached; r.prefill_ms = st.prefill_s * 1000.0; r.decode_ms = st.decode_s * 1000.0; r.restore_ms = st.restore_s * 1000.0; r.cache_source = st.cache_source;
+    r.finish_reason = st.stop_reason == "eos" || st.stop_reason == "stop" ? "stop"
+                      : st.stop_reason == "callback" ? "abort"
+                      : st.stop_reason == "repetition" ? "repetition" : "length";
     if (chat && r.finish_reason == "stop") {
         auto parsed = ds41_parse_completion(text + "<｜end▁of▁sentence｜>", split_thinking);
         r.text = std::move(parsed.content);

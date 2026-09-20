@@ -96,6 +96,9 @@ public:
     std::string load_from(std::function<const SafeTensorInfo*(const std::string&)> find, const Ds4VisionOptions& opt);
     // transient only: convert the weights into pinned host memory now (else the first encode_gpu() does it).
     std::string stage_host(DeviceAllocator& alloc);
+    // Convert the weights into the pinned buffer again: every encode checks a sampled hash of it first, because
+    // staged weights that something else overwrote encode every later image to nonsense (docs/deepseek41/101).
+    std::string restage_host();
     uint32_t out_dim() const;
     // device bytes this instance holds while it encodes (weights + scratch), by its own options
     uint64_t encode_bytes() const;
@@ -126,6 +129,7 @@ public:
                               const std::vector<int32_t>& perm, std::vector<float>& rows) const;
 
 private:
+    void fill_host();
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };

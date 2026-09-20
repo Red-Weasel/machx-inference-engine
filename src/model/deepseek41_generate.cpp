@@ -121,6 +121,21 @@ struct Ds41Emitter {
     Ds41Emitter(const Tokenizer& t, const std::vector<std::string>& s, const std::function<bool(std::string_view)>& cb,
                 std::vector<int32_t>& o, std::vector<int32_t>& r, Ds41GenStats& stats)
         : tok(t), stops(s), on_piece(cb), out_ids(o), recent(r), st(stats) { for (const auto& x : stops) longest_stop = std::max(longest_stop, x.size()); }
+    // A reply that has become one short pattern repeated is finished, whatever it says next: live
+    // (2026-09-19) a corrupted image encode made the model emit one word 11,584 times, 14 minutes of
+    // decoding. 1,024 tokens in, every 64th, the last 512 are checked for a period of at most 16.
+    bool repeating() const {
+        constexpr uint32_t kMin = 1024, kWindow = 512, kMaxPeriod = 16;
+        if (st.n_gen < kMin || st.n_gen % 64) return false;
+        const size_t n = out_ids.size();
+        if (n < size_t(kWindow) + kMaxPeriod) return false;
+        for (uint32_t p = 1; p <= kMaxPeriod; ++p) {
+            bool same = true;
+            for (size_t i = n - kWindow; i < n && same; ++i) same = out_ids[i] == out_ids[i - p];
+            if (same) return true;
+        }
+        return false;
+    }
     bool push(int32_t id) {                                       // false: the run ended (st.stop_reason set)
         if (id == tok.eos_token_id()) { st.stop_reason = "eos"; return false; }
         out_ids.push_back(id); recent.push_back(id); ++st.n_gen;
@@ -128,6 +143,7 @@ struct Ds41Emitter {
         // warm_n describe the run from the mark onwards -- the cold steps after the prefill excluded.
         if (warm_mark && st.n_gen == warm_mark) warm_t0 = std::chrono::steady_clock::now();
         else if (warm_mark && st.n_gen > warm_mark) { st.warm_decode_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0).count(); st.warm_n = st.n_gen - warm_mark; }
+        if (repeating()) { st.stop_reason = "repetition"; return false; }
         pending += tok.decode(std::span<const int32_t>(&id, 1), /*skip_special=*/false);
         const size_t n = utf8_complete_prefix(pending);
         if (n) {
@@ -168,7 +184,9 @@ std::string Ds41Generator::run(const std::vector<int32_t>& prompt_ids, uint32_t 
     // rest is run. Off under speculation (the drafter's rings are not checkpointed).
     uint32_t reused = 0;
     if (!spec && fwd_.prefix_cache()) {
+        const auto tr = std::chrono::steady_clock::now();
         if (auto e = fwd_.prefix_prepare(prompt_ids, reused, &st.cache_source); !e.empty()) { st.stop_reason = "error"; return "prefix cache: " + e; }
+        st.restore_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - tr).count();
         st.n_cached = reused;
     }
     const uint32_t Te = T & ~1u;                                   // the even prefix
