@@ -213,13 +213,22 @@ private:
         // Phase 59 (docs/deepseek41/98): the leg also serves 2..kMaxRows-row decode steps (a speculative verify); its
         // own PCIe share, because a CPU expert costs per ROW routed to it and a transfer per expert
         static constexpr uint32_t kMaxRows = 8; float qstar_multi = 0.20f;   // swept 0.10-0.65 on 8-row verifies: 0.20 best (docs/98)
+        // A prompt chunk of up to `cont_rows` rows (a continuation -- a tool result, a user turn -- or a prefill chunk) takes
+        // the leg too: a 26-row continuation moved 1,832 pinned experts (32.6 GB) over PCIe for ~2.5 rows each. It is split
+        // by cost -- the experts with the most rows go over PCIe until the transfers' time covers the CPU's remaining rows,
+        // at the rate ratio qstar_cont (at one row per expert the split IS q*; swept 0.15-0.40, 0.30 best). Continuation
+        // prefill -22..-45 %, a 10k fresh prompt -17 %; 16k-token wikitext PPL +0.00055 +/- 0.00066 nats (t = 0.83).
+        // ON by default (owner decision 2026-09-21); IE_DS41_CPU_CONT_ROWS=0 turns it off, IE_DS41_QSTAR_CONT the ratio.
+        uint32_t cont_rows = 2048; float qstar_cont = 0.30f; bool f32 = false;   // f32: this request also writes h_rows32
+        uint32_t max_rows() const { return std::max(kMaxRows, cont_rows); }
         std::thread th; std::mutex mu; std::condition_variable cv; bool stop = false, pending = false, done = true;
         const Ds4SlotLayout* lay = nullptr; float limit = 0.f;
         struct Item { const void* slot; uint32_t row, tok; };
         std::vector<Item> work;                               // (arena slot, its packed row, that row's token)
-        std::vector<float> x, scratch, out;                   // host: the activations [kMaxRows, H], EF*2, H
+        std::vector<float> x, scratch, out;                   // host: the activations [max_rows, H]; per row of a run, EF*2 and H
         double work_ms = 0;                                   // the last request's compute time
-        sycl::half* h_rows = nullptr;                         // pinned host: the rows, [kMaxRows * top_k, H] fp16, in work order
+        sycl::half* h_rows = nullptr;                         // pinned host: the rows, [max_rows * top_k, H] fp16, in work order
+        float* h_rows32 = nullptr;                            // the same rows fp32 for a continuation chunk: the XMX route lands fp32
     };
     CpuMiss cpu_;
     std::string cpu_cores_override_;

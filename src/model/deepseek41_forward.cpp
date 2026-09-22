@@ -22,6 +22,7 @@
 #include <cmath>
 #include <cstring>
 #include <omp.h>
+#include <sys/mman.h>
 #include <thread>
 #include <limits>
 #include <numeric>
@@ -244,6 +245,17 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
             }
         });
     }
+    // The engram tables are read one random 256-byte row per (token, column) (ds41_engram_gather), but the tiers' init
+    // above advised the whole store MADV_NORMAL for the dense path -- and under it every row's fault read around a 128 KB
+    // window: ~12.5 GB of NVMe reads per 2,048-token chunk, 2.2-2.5 s of the first card's host prep, which made card 0
+    // the pipeline's slow stage (busy 29 s vs 16 s at 10k tokens). Back to MADV_RANDOM for these ranges: one page a row.
+    for (const uint32_t Le : tables.layer_ids)
+        for (const SafeTensorInfo* t : {m.layers()[Le].engram_embed.w, m.layers()[Le].engram_embed.s}) {
+            if (!t || !t->data || !t->nbytes) continue;
+            const uintptr_t a0 = reinterpret_cast<uintptr_t>(t->data) & ~uintptr_t(4095);
+            const uintptr_t a1 = (reinterpret_cast<uintptr_t>(t->data) + t->nbytes + 4095) & ~uintptr_t(4095);
+            if (madvise(reinterpret_cast<void*>(a0), a1 - a0, MADV_RANDOM) != 0) return "init_resident: madvise(MADV_RANDOM) on the engram table " + t->name + " failed";
+        }
     g_ds4_attn_split_fixed64 = true;   // DSpark P2: the T-row step's attention combine is the one-row step's (bit-identical)
     if (ep_) std::fprintf(stderr, "[ds41 forward] expert parallel %s on %u cards\n", ep_ == 2 ? "CONTROL ARM (the machinery, no parallelism)" : "ON (parity share of every layer's experts per card)", n_cards);
     resident_ = true;

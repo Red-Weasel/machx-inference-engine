@@ -65,6 +65,23 @@ static void release_free_heap() {
     g_trim_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
 
+// #54 (2026-09-22 02:28): a lost device cannot be recovered in-process. The orderly teardown spun on
+// one core for good while the GT reset-looped, holding 29 GiB of VRAM and the pinned RAM, and the
+// supervisor kept polling an unhealthy server. Once the latch trips, log it and leave: the reply that hit
+// the fault has already been written, and the driver reclaims the VM when the process is gone.
+// IE_EXIT_ON_DEVICE_LOST=0 keeps the old behaviour (stay up, answer 503).
+static void exit_on_device_loss(const ie::DeviceFaultLatch& fault) {
+    if (!fault.faulted()) return;
+    if (const char* v = std::getenv("IE_EXIT_ON_DEVICE_LOST"); v && *v && std::string(v) == "0") return;
+    static std::once_flag once;
+    std::call_once(once, [&fault] {
+        std::fprintf(stderr, "[ie] device lost (%s): exiting in 2 s so the supervisor can relaunch "
+                             "(IE_EXIT_ON_DEVICE_LOST=0 keeps the process up)\n", fault.reason().c_str());
+        std::fflush(stderr);
+        std::thread([] { std::this_thread::sleep_for(std::chrono::seconds(2)); std::fflush(stderr); std::_Exit(75); }).detach();
+    });
+}
+
 // Per-request throughput to the engine's terminal (stderr). Free: token counts
 // already tracked, timing is phase-boundary clock reads (see Engine::generate).
 static void log_gen_speed(const GenerateResult& r) {
@@ -82,9 +99,20 @@ static void log_gen_speed(const GenerateResult& r) {
                       run, ran_ms, pf);
     else
         std::snprintf(split, sizeof split, " = %.0f tok/s", pf);
+    // Early vs late within ONE reply. A per-request average cannot tell decode that
+    // degrades as the KV grows from a process that has simply become slower
+    // (docs/deepseek41/102); this can.
+    char pace[96] = "";
+    if (r.early_decode_n && r.completion_tokens > r.early_decode_n + 50 && r.early_decode_ms > 0) {
+        const double early = r.early_decode_n * 1000.0 / r.early_decode_ms;
+        const double rest_ms = r.decode_ms - r.early_decode_ms;
+        if (rest_ms > 0)
+            std::snprintf(pace, sizeof pace, " (first %u at %.1f, rest at %.1f)", r.early_decode_n, early,
+                          (r.completion_tokens - r.early_decode_n) * 1000.0 / rest_ms);
+    }
     std::fprintf(stderr,
-        "[gen] prefill %u tok (%u cached) / %.0f ms%s  |  decode %u tok / %.0f ms = %.1f tok/s\n",
-        r.prompt_tokens, r.cached_tokens, r.prefill_ms, split, r.completion_tokens, r.decode_ms, dc);
+        "[gen] prefill %u tok (%u cached) / %.0f ms%s  |  decode %u tok / %.0f ms = %.1f tok/s%s\n",
+        r.prompt_tokens, r.cached_tokens, r.prefill_ms, split, r.completion_tokens, r.decode_ms, dc, pace);
     // IE_MEM_REPORT=1: the process's anonymous RSS and glibc's heap (all arenas) after every request -- tells a
     // leak (in-use climbs) from arena fragmentation (free-in-arenas climbs) (docs/deepseek41/99)
     static const bool mem_report = std::getenv("IE_MEM_REPORT") != nullptr;
@@ -287,6 +315,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
             }
             if (r.finish_reason.starts_with("error:")) {
                 fault.observe(r.finish_reason);   // latch a lost device → /health 503
+                exit_on_device_loss(fault);
                 res.status = fault.faulted() ? 503 : 500;
                 res.set_content(oai::error_json(r.finish_reason), "application/json");
                 return;
@@ -297,6 +326,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
             } catch (const std::exception& e) {
                 std::fprintf(stderr, "[chat] forward EXCEPTION: %s\n", e.what());
                 fault.observe(e.what());
+                exit_on_device_loss(fault);
                 res.status = fault.faulted() ? 503 : 500;
                 res.set_content(oai::error_json(std::string("forward: ") + e.what()),
                                 "application/json");
@@ -476,6 +506,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 }
                 if (r.finish_reason.starts_with("error:")) {
                     fault.observe(r.finish_reason);   // latch a lost device → /health 503
+                    exit_on_device_loss(fault);
                     const std::string ev = "data: " + oai::error_json(r.finish_reason)
                         + "\n\ndata: [DONE]\n\n";
                     sink.write(ev.data(), ev.size());
@@ -529,6 +560,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
               } catch (const std::exception& e) {
                 std::fprintf(stderr, "[chat] stream forward EXCEPTION: %s\n", e.what());
                 fault.observe(e.what());
+                exit_on_device_loss(fault);
                 std::string ev = "data: " + oai::error_json(std::string("forward: ") + e.what())
                                  + "\n\ndata: [DONE]\n\n";
                 sink.write(ev.data(), ev.size());

@@ -118,6 +118,7 @@ struct Ds41Emitter {
     size_t longest_stop = 0;
     uint32_t warm_mark = 0;                                       // P5: the committed token the steady-state window starts at
     std::chrono::steady_clock::time_point warm_t0{};
+    std::chrono::steady_clock::time_point decode_t0{};            // set at the first committed token
     Ds41Emitter(const Tokenizer& t, const std::vector<std::string>& s, const std::function<bool(std::string_view)>& cb,
                 std::vector<int32_t>& o, std::vector<int32_t>& r, Ds41GenStats& stats)
         : tok(t), stops(s), on_piece(cb), out_ids(o), recent(r), st(stats) { for (const auto& x : stops) longest_stop = std::max(longest_stop, x.size()); }
@@ -139,6 +140,12 @@ struct Ds41Emitter {
     bool push(int32_t id) {                                       // false: the run ended (st.stop_reason set)
         if (id == tok.eos_token_id()) { st.stop_reason = "eos"; return false; }
         out_ids.push_back(id); recent.push_back(id); ++st.n_gen;
+        // Early-window rate, for the decode-variance question.
+        if (st.n_gen == 1) decode_t0 = std::chrono::steady_clock::now();
+        else if (st.n_gen == 100) {
+            st.early_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - decode_t0).count();
+            st.early_n = 100;
+        }
         // P5 (docs/deepseek41/59): the window opens at the mark and closes at every later token, so warm_decode_s /
         // warm_n describe the run from the mark onwards -- the cold steps after the prefill excluded.
         if (warm_mark && st.n_gen == warm_mark) warm_t0 = std::chrono::steady_clock::now();

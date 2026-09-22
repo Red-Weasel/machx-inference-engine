@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
+#include <malloc.h>
 #include <string>
 #include <vector>
 
@@ -107,6 +108,13 @@ std::string find_ie_pull(const char* argv0) {
 int main(int argc, char** argv) {
     if (argc < 2) { std::fputs(USAGE, stderr); return 2; }
     const std::string cmd = argv[1];
+
+    // ie serve: pin glibc's mmap threshold at 256 KiB. Left dynamic it climbs to the largest
+    // block freed so far, after which every request's big host buffers come from the heap and
+    // their freed space stays resident: DS4.1 100-token requests grew RssAnon 42-54 MiB each
+    // (free-in-arenas +38-40), with the pin 16-18 (+1-3); prefill and decode unchanged.
+    // An explicit GLIBC_TUNABLES wins.
+    if (cmd == "serve" && !std::getenv("GLIBC_TUNABLES")) mallopt(M_MMAP_THRESHOLD, 256 * 1024);
 
     if (cmd == "capabilities") {
         if (argc > 3) { std::fputs("usage: ie capabilities [model.gguf]\n", stderr); return 2; }

@@ -31,4 +31,11 @@ void cpu_gemv_mxfp4_f32(const float* x, const uint8_t* qs, const uint8_t* e, flo
 void cpu_expert_mxfp4(const void* slot, const Ds4SlotLayout& lay, const float* x, float* scratch,
                       float* out, float swiglu_limit, int nthreads);
 
+// R <= kCpuExpertRows rows through ONE expert: row r's out[r * H] is bit-identical to cpu_expert_mxfp4 on xs[r] (the
+// same block order, FMAs and final sum per row), but each weight block is read and decoded once for all R rows
+// instead of once per row -- the per-row cost was the ~19 MB weight read. `scratch` holds R * 2 * EF floats.
+constexpr uint32_t kCpuExpertRows = 8;
+void cpu_expert_mxfp4_rows(const void* slot, const Ds4SlotLayout& lay, const float* const* xs, uint32_t R,
+                           float* scratch, float* out, float swiglu_limit, int nthreads);
+
 }  // namespace ie

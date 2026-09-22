@@ -32,6 +32,11 @@ struct Ds41SampleParams {
 struct Ds41GenStats {
     double   prefill_s = 0, decode_s = 0;
     double   restore_s = 0;         // of prefill_s: restoring the cached prefix
+    // Of decode_s: the time the FIRST 100 committed tokens took. Comparing that rate
+    // with the rest of the same reply separates "decode slows as the KV grows" from
+    // "this process got slower" -- a per-request average cannot (docs/deepseek41/102).
+    double   early_s = 0;
+    uint32_t early_n = 0;
     uint32_t n_prompt = 0, n_gen = 0;
     uint32_t n_cached = 0;          // Phase 46: prompt tokens served from the prefix cache (not run)
     std::string cache_source;       // "live" | "checkpoint" | "host slot" | "none" (empty: the cache is off)

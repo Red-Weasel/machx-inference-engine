@@ -74,6 +74,26 @@ int main() {
         char buf[64]; std::snprintf(buf, sizeof buf, "rel %.2e over %u outputs", r, H);
         check(r < 1e-4, "cpu_expert_mxfp4 == scalar gate/up/silu-clamp/down within 1e-4", buf);
     }
+
+    // 4. the multi-row expert: every row bit-identical to the one-row expert on that row, for R = 1..kCpuExpertRows
+    {
+        const uint32_t H = 5120, EF = 2304, RM = ie::kCpuExpertRows;
+        ie::Ds4SlotLayout lay; if (auto er = ie::ds41_slot_layout(H, EF, lay); !er.empty()) { std::printf("[FAIL] layout: %s\n", er.c_str()); return 1; }
+        std::vector<uint8_t> slot(lay.bytes);
+        for (auto& b : slot) b = uint8_t(rng() & 0xFF);
+        for (const auto* m : {&lay.gate, &lay.up, &lay.down}) for (uint64_t i = 0; i < m->len1; ++i) slot[m->off1 + i] = uint8_t(120 + (rng() % 12));
+        std::vector<float> xs(size_t(RM) * H); for (auto& v : xs) v = float(int(rng() % 2001) - 1000) / 1000.f;
+        std::vector<float> one(size_t(RM) * H), scratch1(2 * EF);
+        for (uint32_t r = 0; r < RM; ++r) ie::cpu_expert_mxfp4(slot.data(), lay, xs.data() + size_t(r) * H, scratch1.data(), one.data() + size_t(r) * H, 10.f, 8);
+        bool all = true;
+        for (uint32_t R = 1; R <= RM; ++R) {
+            const float* xp[ie::kCpuExpertRows]; for (uint32_t r = 0; r < R; ++r) xp[r] = xs.data() + size_t(RM - R + r) * H;   // rows RM-R .. RM-1
+            std::vector<float> scratch(size_t(R) * 2 * EF), out(size_t(R) * H);
+            ie::cpu_expert_mxfp4_rows(slot.data(), lay, xp, R, scratch.data(), out.data(), 10.f, 8);
+            all &= std::memcmp(out.data(), one.data() + size_t(RM - R) * H, size_t(R) * H * 4) == 0;
+        }
+        check(all, "cpu_expert_mxfp4_rows == cpu_expert_mxfp4 per row, bit for bit, R = 1..8");
+    }
     std::printf("%s\n", g_fail ? "cpu_moe_mxfp4_test: FAILURE(S)" : "cpu_moe_mxfp4_test: all OK");
     return g_fail ? 1 : 0;
 }

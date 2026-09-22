@@ -1214,6 +1214,12 @@ private:
     std::vector<uint64_t>      slot_seq_;   // [n_layers * slots] 0 = never streamed
     uint64_t                   seq_ = 0;    // enqueue counter on the transfer queue
     std::vector<sycl::event>   pending_;    // profiling events not yet drained
+    bool                       xq_prof_ = false;   // the transfer queue profiles (IE_QUEUE_PROFILING)
+    // A fill's event. Every one is kept for collect_dma_time() only when the transfer queue profiles; otherwise only
+    // the latest is needed (speculate()'s "anything outstanding" check). A caller that never collects -- the V4.1
+    // tier -- grew pending_ by one event per miss for the life of the process: ~2.5 KB of runtime state each,
+    // +6.3 MiB per 100-token served reply (+17 MiB with the CPU leg off, all misses over PCIe).
+    void note_fill(const sycl::event& e) { if (!xq_prof_) pending_.clear(); pending_.push_back(e); }
     uint32_t                   n_layers_ = 0, n_experts_ = 0, slots_ = 0, static_ = 0;
     uint64_t                   device_bytes_ = 0;
     Stats                      st_{};

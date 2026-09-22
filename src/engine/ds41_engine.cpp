@@ -19,6 +19,7 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <omp.h>
 #include <string>
 #include <vector>
 
@@ -90,6 +91,9 @@ std::string Engine::ds41_load(const std::string& dir) {
     else if (!ef && std::ifstream(dir + "/ie_experts_tail.ieslot").good()) setenv("IE_DS41_EXPERT_FILE", (dir + "/ie_experts_tail.ieslot").c_str(), 0);
     Ds41Forward::ResidentOptions ro; ro.max_tokens = opts_.max_ctx;
     ro.head_fp8 = true;   // Phase 54 (founder decision, docs/deepseek41/93); IE_DS41_HEAD_FP8=0 restores the BF16 head
+    // IE_DS41_VRAM_RESERVE_GIB: the per-card headroom kept free after the dense set (default 6 GiB, ResidentOptions);
+    // the A/B knob for the static-expert budget -- the same name ds41_resident_test reads.
+    if (const char* r = std::getenv("IE_DS41_VRAM_RESERVE_GIB"); r && *r) ro.vram_reserve = uint64_t(std::max(0.0, std::atof(r)) * 1073741824.0);
     if (auto e = b->fwd.init_resident(b->qs, b->model, b->tables, ranking, ro); !e.empty()) return "deepseek41 resident: " + e;
     b->fwd.set_logits_last_only(true);
     // Phase 46 (docs/deepseek41/86): the prefix cache, on unless the load disables it (--no-prompt-cache /
@@ -127,7 +131,23 @@ std::string Engine::ds41_load(const std::string& dir) {
                  b->lookup ? "ON" : "off");
     if (const char* po = std::getenv("IE_DS41_PROFILE_OUT"); po && *po) {
         b->profile_out = po;
-        std::fprintf(stderr, "[deepseek41] profiling decode routing into %s (rewritten after every request)\n", po);
+        // The raw counts persist beside the ranking (<file>.counts) and are resumed here, so a profile accumulates over
+        // restarts -- days of a user's own sessions (docs/89: the best ranking is one profiled on THEIR traffic), not
+        // one process's.
+        const auto& c = b->model.config();
+        b->profile_acc.assign(c.n_layers, std::vector<uint64_t>(c.n_routed_experts, 0));
+        const std::string cp = b->profile_out + ".counts";
+        if (std::ifstream f(cp); f) {
+            std::string magic; uint32_t nl = 0, ne = 0; uint64_t steps = 0;
+            f >> magic >> nl >> ne >> steps;
+            if (magic == "ie-ds41-profile-counts-v1" && nl == c.n_layers && ne == c.n_routed_experts) {
+                for (auto& row : b->profile_acc) for (auto& v : row) f >> v;
+                if (f) b->profile_steps = steps;
+                else { b->profile_acc.assign(c.n_layers, std::vector<uint64_t>(c.n_routed_experts, 0)); std::fprintf(stderr, "[deepseek41] %s is truncated: starting the profile over\n", cp.c_str()); }
+            } else std::fprintf(stderr, "[deepseek41] %s is not this model's profile (%u x %u): starting over\n", cp.c_str(), nl, ne);
+        }
+        std::fprintf(stderr, "[deepseek41] profiling decode routing into %s, counts in %s (resumed at %llu generated tokens)\n",
+                     po, cp.c_str(), (unsigned long long)b->profile_steps);
     }
     ds41_ = std::move(b);
     return {};
@@ -136,6 +156,10 @@ std::string Engine::ds41_load(const std::string& dir) {
 namespace {
 GenerateResult ds41_run_ids(Ds41Bundle& b, const std::vector<int32_t>& ids, const SamplingParams& sp, const TokenCallback& on_token, bool split_thinking, bool chat = false) {
     GenerateResult r;
+    // Block time 0 on THIS thread, as the tier's init sets it on the loading thread: ie serve runs a request on an
+    // HTTP pool thread, and that thread's team (the engram gather, every token) spun 200 ms after each region --
+    // 19 workers at 40-100 % CPU through decode, beside the CPU miss path's cores (docs/deepseek41/35 step 3).
+    kmp_set_blocktime(0);
     if (chat) r.tool_calls_json = "[]"; // authoritative native parser, including no calls
     Ds41SampleParams p; p.temperature = sp.temperature; p.top_k = sp.top_k; p.top_p = sp.top_p; p.min_p = sp.min_p;
     p.repeat_penalty = sp.repeat_penalty; p.repeat_window = sp.repeat_window; p.seed = sp.seed;
@@ -160,8 +184,16 @@ GenerateResult ds41_run_ids(Ds41Bundle& b, const std::vector<int32_t>& ids, cons
         if (auto pe = ds4_expert_priority_write_layers(b.profile_out, orders, {}, {"V4.1 DECODE-PHASE profile from served requests (IE_DS41_PROFILE_OUT): " +
                 std::to_string(b.profile_steps) + " generated tokens", "total selections " + std::to_string(total)}); !pe.empty())
             std::fprintf(stderr, "[deepseek41] profile write: %s\n", pe.c_str());
+        {   // the counts, for the next process to resume from -- written then renamed, so a crash leaves the old file
+            const std::string cp = b.profile_out + ".counts", tmp = cp + ".tmp";
+            std::ofstream f(tmp);
+            f << "ie-ds41-profile-counts-v1 " << b.profile_acc.size() << ' ' << (b.profile_acc.empty() ? 0 : b.profile_acc[0].size()) << ' ' << b.profile_steps << '\n';
+            for (const auto& row : b.profile_acc) { for (size_t x = 0; x < row.size(); ++x) f << (x ? " " : "") << row[x]; f << '\n'; }
+            f.close();
+            if (!f || std::rename(tmp.c_str(), cp.c_str()) != 0) std::fprintf(stderr, "[deepseek41] profile counts: could not write %s\n", cp.c_str());
+        }
     }
-    r.prompt_tokens = st.n_prompt; r.completion_tokens = st.n_gen; r.cached_tokens = st.n_cached; r.prefill_ms = st.prefill_s * 1000.0; r.decode_ms = st.decode_s * 1000.0; r.restore_ms = st.restore_s * 1000.0; r.cache_source = st.cache_source;
+    r.prompt_tokens = st.n_prompt; r.completion_tokens = st.n_gen; r.cached_tokens = st.n_cached; r.prefill_ms = st.prefill_s * 1000.0; r.decode_ms = st.decode_s * 1000.0; r.restore_ms = st.restore_s * 1000.0; r.cache_source = st.cache_source; r.early_decode_ms = st.early_s * 1000.0; r.early_decode_n = st.early_n;
     r.finish_reason = st.stop_reason == "eos" || st.stop_reason == "stop" ? "stop"
                       : st.stop_reason == "callback" ? "abort"
                       : st.stop_reason == "repetition" ? "repetition" : "length";

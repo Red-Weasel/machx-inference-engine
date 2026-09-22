@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>   // getenv/atof for IE_DS41_CACHE_KEEP_FREE_GIB
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -73,6 +74,16 @@ std::string Ds41Forward::set_prefix_cache(bool on, const PrefixCacheOptions& o) 
     const uint64_t WIN = c.window_size, HD = c.head_dim;
     std::unique_lock<std::mutex> lk(pc_mu_);
     pc_opt_ = o;
+    // The headroom this guard insists on before it will keep a conversation's state
+    // in a host slot. 24 GiB is deliberately generous -- a forward with pinned banks
+    // needs room, and an OOM is worse than a slow turn. But when the server's own
+    // memory grows the guard starts refusing EVERY slot (live 2026-09-21: MemAvailable
+    // sat at ~17-20 GiB, every 0.4-0.6 GiB slot was refused, and each resume or
+    // post-compaction turn then re-prefilled tens of thousands of tokens: 178 s, 104 s,
+    // 77 s). Tunable so that trade can be made without a rebuild.
+    if (const char* v = std::getenv("IE_DS41_CACHE_KEEP_FREE_GIB"))
+        if (const double g = std::atof(v); g >= 0.0)
+            pc_opt_.keep_free = uint64_t(g * 1073741824.0);
     pc_pool_.assign(cards_.size(), {}); pc_off_.assign(cards_.size(), std::vector<uint64_t>(c.n_layers, 0));
     pc_block_.assign(cards_.size(), 0); pc_bounce_.assign(cards_.size(), nullptr);
     for (size_t ci = 0; ci < cards_.size(); ++ci) {
@@ -204,8 +215,13 @@ std::string Ds41Forward::pc_save_live_to_slot(bool& saved) {
         pc_slot_bytes_ -= it->bytes; pc_slots_.erase(it);
     }
     if (ds41pc_mem_available() < pc_opt_.keep_free + bytes) {
-        std::fprintf(stderr, "[ds41 prefix cache] not keeping a %.2f GiB host slot: MemAvailable would fall under %.0f GiB\n",
-                     double(bytes) / 1073741824.0, double(pc_opt_.keep_free) / 1073741824.0);
+        // Say what the refusal COSTS, not just that it happened: without the slot this
+        // conversation re-prefills from the disk entry on its next resume.
+        std::fprintf(stderr, "[ds41 prefix cache] not keeping a %.2f GiB host slot: MemAvailable %.1f GiB would fall "
+                             "under %.0f GiB — this conversation will re-prefill when it resumes "
+                             "(IE_DS41_CACHE_KEEP_FREE_GIB lowers the bar)\n",
+                     double(bytes) / 1073741824.0, double(ds41pc_mem_available()) / 1073741824.0,
+                     double(pc_opt_.keep_free) / 1073741824.0);
         return {};
     }
     PcSlot s; s.ids.assign(all_ids_.begin(), all_ids_.begin() + n_pos_);

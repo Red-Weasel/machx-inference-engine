@@ -1497,6 +1497,7 @@ std::string Ds4ExpertCache::init(sycl::queue& compute, const Ds4HostArena& arena
                                                        sycl::property::queue::enable_profiling()}
                                  : sycl::property_list{sycl::property::queue::in_order()});
     xq_ = &xq_store_.back();
+    xq_prof_ = qprof;
     return {};
 }
 
@@ -1647,7 +1648,7 @@ sycl::event Ds4ExpertCache::acquire_prefill(uint32_t L, const int32_t* ids, uint
                 const sycl::event fe = xq_->memcpy(dev_[L] + uint64_t(found) * sb, src, size_t(sb));
                 slot_ev_[uint64_t(L) * slots_ + found]  = fe;
                 slot_seq_[uint64_t(L) * slots_ + found] = ++seq_;
-                pending_.push_back(fe);
+                note_fill(fe);
                 ++st_.misses;
                 st_.bytes_fetched += sb;
                 out_slots[k] = found;
@@ -1658,7 +1659,7 @@ sycl::event Ds4ExpertCache::acquire_prefill(uint32_t L, const int32_t* ids, uint
         if (j >= bank_slots_) { out_slots[k] = kDs4NoSlot; ++st_.unavailable; continue; }
         uint8_t* dst = bank_[bank] + uint64_t(j) * bank_stride_;
         const sycl::event fe = xq_->memcpy(dst, src, size_t(sb));
-        pending_.push_back(fe);
+        note_fill(fe);
         ++st_.misses;
         st_.bytes_fetched += sb;
         out_slots[k] = kDs4BankSlotBase + bank * bank_slots_ + j;
@@ -1754,7 +1755,7 @@ sycl::event Ds4ExpertCache::acquire_impl(uint32_t L, const int32_t* ids, uint32_
         const sycl::event fe = xq_->memcpy(dev_[L] + uint64_t(v) * sb, src, size_t(sb));
         slot_ev_[uint64_t(L) * slots_ + v]  = fe;
         slot_seq_[uint64_t(L) * slots_ + v] = ++seq_;
-        pending_.push_back(fe);
+        note_fill(fe);
         ++st_.misses;
         st_.bytes_fetched += sb;
         observe(v);
@@ -1800,7 +1801,7 @@ uint32_t Ds4ExpertCache::speculate(uint32_t L, const int32_t* ids, uint32_t n) {
         // HITS this slot before the copy lands returns an event that covers it.
         slot_ev_[uint64_t(L) * slots_ + v]  = fe;
         slot_seq_[uint64_t(L) * slots_ + v] = ++seq_;
-        pending_.push_back(fe);
+        note_fill(fe);
         ++issued;
         ++st_.spec_issued;
         st_.spec_bytes += sb;

@@ -63,4 +63,4 @@ Raw local evidence and reproducible build/campaign scripts are in
 `results/deepseek4-indexer-opt-2026-09-09/`. Each run records its command,
 selected environment, executable SHA-256, exit code and elapsed time.
 [Machine-readable measurements](INDEXER_OPTIMIZATION.json) and
-[implementation and experiment report](../../../docs/deepseek4/76_INDEXER_OPTIMIZATION_2026-09-09.md).
+the implementation and experiment report (internal engineering note 76, 2026-09-09; not part of the public docs).

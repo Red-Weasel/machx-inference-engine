@@ -234,6 +234,7 @@ Ds41ExpertTier::~Ds41ExpertTier() { mm_reader_stop(); cpu_stop(); }
 void Ds41ExpertTier::free_storage(sycl::queue& q) {
     mm_reader_stop();
     cpu_stop(); if (cpu_.h_rows) { sycl::free(cpu_.h_rows, q); cpu_.h_rows = nullptr; }
+    if (cpu_.h_rows32) { sycl::free(cpu_.h_rows32, q); cpu_.h_rows32 = nullptr; }
     if (bws_.max_tokens) ds4_expert_batch_ws_free(q, bws_);
     for (void** p : {reinterpret_cast<void**>(&h_row_tok_), reinterpret_cast<void**>(&h_tk2p_), reinterpret_cast<void**>(&h_w_pk_), reinterpret_cast<void**>(&h_w_pk2_)}) if (*p) { sycl::free(*p, q); *p = nullptr; }
     for (auto* sp : mm_stage_) if (sp) {
@@ -403,6 +404,8 @@ void Ds41ExpertTier::cpu_start(sycl::queue& q) {
     if (share_) cpu_.qstar = 0.60f;                         // under expert parallel (a parity share): the sweep's optimum (docs/52); 0.30 for a whole tier
     if (const char* qs = std::getenv("IE_DS41_QSTAR")) cpu_.qstar = std::max(0.f, std::min(1.f, float(std::atof(qs))));
     if (const char* qs = std::getenv("IE_DS41_QSTAR_MULTI")) cpu_.qstar_multi = std::max(0.f, std::min(1.f, float(std::atof(qs))));
+    if (const char* v = std::getenv("IE_DS41_CPU_CONT_ROWS")) cpu_.cont_rows = uint32_t(std::max(0, std::min(2048, std::atoi(v))));
+    if (const char* qs = std::getenv("IE_DS41_QSTAR_CONT")) cpu_.qstar_cont = std::max(0.f, std::min(1.f, float(std::atof(qs))));
     std::string cores = !cpu_cores_override_.empty() ? cpu_cores_override_ : std::getenv("IE_DS41_CPU_CORES") ? std::getenv("IE_DS41_CPU_CORES") : "8-19";
     cpu_.cores.clear();
     for (size_t i = 0; i < cores.size();) {                // "8-19,0,1" -> the core list
@@ -413,8 +416,10 @@ void Ds41ExpertTier::cpu_start(sycl::queue& q) {
         i = j + 1;
     }
     cpu_.nthreads = int(cpu_.cores.size());
-    cpu_.lay = &lay_; cpu_.x.assign(size_t(CpuMiss::kMaxRows) * H_, 0.f); cpu_.scratch.assign(size_t(2) * EF_, 0.f); cpu_.out.assign(H_, 0.f);
-    cpu_.h_rows = sycl::malloc_host<sycl::half>(size_t(CpuMiss::kMaxRows) * TK_ * H_, q);
+    cpu_.lay = &lay_; cpu_.x.assign(size_t(cpu_.max_rows()) * H_, 0.f); cpu_.scratch.assign(size_t(kCpuExpertRows) * 2 * EF_, 0.f); cpu_.out.assign(size_t(kCpuExpertRows) * H_, 0.f);
+    cpu_.h_rows = sycl::malloc_host<sycl::half>(size_t(cpu_.max_rows()) * TK_ * H_, q);
+    if (cpu_.cont_rows > CpuMiss::kMaxRows) cpu_.h_rows32 = sycl::malloc_host<float>(size_t(cpu_.cont_rows) * TK_ * H_, q);
+    if (cpu_.cont_rows > CpuMiss::kMaxRows && !cpu_.h_rows32) cpu_.cont_rows = 0;   // no fp32 staging: continuations keep the GPU route
     cpu_.stop = false; cpu_.pending = false; cpu_.done = true;
     // the reader threads (this thread's OpenMP team) keep off the worker's cores: pinned to the rest
     {
@@ -429,6 +434,7 @@ void Ds41ExpertTier::cpu_start(sycl::queue& q) {
     }
     cpu_.th = std::thread([this] { cpu_run(); });
     std::fprintf(stderr, "[ds41 tier] CPU miss path ON: q* %.2f (PCIe share of the pinned misses), %d threads on cores %s\n", cpu_.qstar, cpu_.nthreads, cores.c_str());
+    if (cpu_.cont_rows > CpuMiss::kMaxRows) std::fprintf(stderr, "[ds41 tier] ... and continuation chunks up to %u rows, split by cost at q* %.2f\n", cpu_.cont_rows, cpu_.qstar_cont);
 }
 
 void Ds41ExpertTier::mm_reader_post(int which, std::function<void()> job) {
@@ -488,10 +494,24 @@ void Ds41ExpertTier::cpu_run() {
         cpu_.pending = false; lk.unlock();
         const auto tw = std::chrono::steady_clock::now();
         size_t i_row = 0;
-        for (const auto& it : cpu_.work) {
-            cpu_expert_mxfp4(it.slot, *cpu_.lay, cpu_.x.data() + size_t(it.tok) * H_, cpu_.scratch.data(), cpu_.out.data(), cpu_.limit, cpu_.nthreads);
-            sycl::half* dst = cpu_.h_rows + i_row * H_; for (uint32_t i = 0; i < H_; ++i) dst[i] = sycl::half(cpu_.out[i]);   // the row, as the GPU stores its own (fp16)
-            ++i_row;
+        for (size_t i = 0; i < cpu_.work.size();) {
+            // the run of rows on one expert (the leg lists an expert's rows together): its weights are read once for the
+            // run (cpu_expert_mxfp4_rows, bit-identical per row); a lone row keeps the one-row kernel
+            size_t j = i + 1;
+            while (j < cpu_.work.size() && j - i < kCpuExpertRows && cpu_.work[j].slot == cpu_.work[i].slot) ++j;
+            const uint32_t R = uint32_t(j - i);
+            if (R == 1) cpu_expert_mxfp4(cpu_.work[i].slot, *cpu_.lay, cpu_.x.data() + size_t(cpu_.work[i].tok) * H_, cpu_.scratch.data(), cpu_.out.data(), cpu_.limit, cpu_.nthreads);
+            else {
+                const float* xs[kCpuExpertRows];
+                for (uint32_t r = 0; r < R; ++r) xs[r] = cpu_.x.data() + size_t(cpu_.work[i + r].tok) * H_;
+                cpu_expert_mxfp4_rows(cpu_.work[i].slot, *cpu_.lay, xs, R, cpu_.scratch.data(), cpu_.out.data(), cpu_.limit, cpu_.nthreads);
+            }
+            for (uint32_t r = 0; r < R; ++r, ++i_row) {
+                const float* o = cpu_.out.data() + size_t(r) * H_;
+                sycl::half* dst = cpu_.h_rows + i_row * H_; for (uint32_t k = 0; k < H_; ++k) dst[k] = sycl::half(o[k]);   // the row, as the GPU stores its own (fp16)
+                if (cpu_.f32) std::copy_n(o, H_, cpu_.h_rows32 + i_row * H_);                                               // and fp32, for the XMX route
+            }
+            i = j;
         }
         cpu_.work_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
         lk.lock(); cpu_.done = true; lk.unlock(); cpu_.cv.notify_all();
@@ -554,13 +574,22 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
     if (alien && !ep_import_) { std::copy_n(bws_.pk.weights_packed.data(), TK, h_w_pk2_); q.memcpy(bws_.w_pk, h_w_pk2_, TK * 4); }
     // ---- the decode miss path: a share of the pinned MISSES goes to the CPU worker, concurrently
     bool cpu_leg = false; std::chrono::steady_clock::time_point tc{};
-    if (cpu_.on && T <= CpuMiss::kMaxRows) {   // Phase 20 (docs/49): in both modes -- the CPU rows land in the packed workspace like the GPU's
+    if (cpu_.on && T <= cpu_.max_rows()) {   // Phase 20 (docs/49): in both modes -- the CPU rows land in the packed workspace like the GPU's
         std::vector<uint32_t> miss;
         for (uint32_t e : occ) if (tier_[l][e] == 1 && !cache_.is_resident(l, e)) miss.push_back(e);
         // Phase 59 (docs/98): a multi-row step sends the experts with the MOST rows over PCIe (a transfer costs the same
         // per expert, the CPU per row) and keeps the rest; one row keeps the Phase 20 order and share exactly
         if (T > 1) std::stable_sort(miss.begin(), miss.end(), [&](uint32_t a, uint32_t b) { return off[a + 1] - off[a] > off[b + 1] - off[b]; });
-        const uint32_t n_pcie = uint32_t(std::lround((T > 1 ? cpu_.qstar_multi : cpu_.qstar) * double(miss.size())));
+        uint32_t n_pcie = uint32_t(std::lround((T > 1 ? cpu_.qstar_multi : cpu_.qstar) * double(miss.size())));
+        if (T > CpuMiss::kMaxRows) {   // a continuation chunk: the fewest transfers whose time covers the CPU's remaining rows
+            const double w = double(cpu_.qstar_cont) / std::max(1e-6, 1.0 - double(cpu_.qstar_cont));   // a row's CPU time, in transfers
+            auto rows_of = [&](uint32_t e) { return uint64_t(off[e + 1] - off[e]); };
+            uint64_t rest = 0; for (uint32_t e : miss) rest += rows_of(e);
+            uint32_t k = 0;
+            while (k < miss.size() && double(k) < double(rest) * w) rest -= rows_of(miss[k++]);
+            if (k > 0 && double(rest + rows_of(miss[k - 1])) * w < double(k)) --k;   // one transfer fewer is the lower maximum
+            n_pcie = k;
+        }
         if (miss.size() > n_pcie) {
             cpu_.work.clear();
             for (size_t i = n_pcie; i < miss.size(); ++i) {
@@ -571,6 +600,7 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
             }
             cpu_.limit = swiglu_limit;
             q.memcpy(cpu_.x.data(), x, size_t(T) * H * 4).wait();      // the activations, host side
+            cpu_.f32 = T > CpuMiss::kMaxRows;
             { std::lock_guard<std::mutex> lk(cpu_.mu); cpu_.pending = true; cpu_.done = false; }
             cpu_.cv.notify_all();
             cpu_leg = true; tc = std::chrono::steady_clock::now();
@@ -594,7 +624,7 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
         // P-cores; at prefill the readers are the work, so they are spawned with every core allowed (T = 1 keeps
         // the partition: the CPU leg's team owns the E-cores then)
         cpu_set_t saved_aff; bool relax = false;
-        if (cpu_.on && T > CpuMiss::kMaxRows && sched_getaffinity(0, sizeof saved_aff, &saved_aff) == 0) {   // a decode step (<= kMaxRows rows) keeps the partition: the CPU leg's team owns the E-cores
+        if (cpu_.on && !cpu_leg && T > CpuMiss::kMaxRows && sched_getaffinity(0, sizeof saved_aff, &saved_aff) == 0) {   // a continuation with the leg keeps it too   // a decode step (<= kMaxRows rows) keeps the partition: the CPU leg's team owns the E-cores
             cpu_set_t all; CPU_ZERO(&all); const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
             for (long c = 0; c < ncpu && c < CPU_SETSIZE; ++c) CPU_SET(int(c), &all);
             relax = sched_setaffinity(0, sizeof all, &all) == 0;
@@ -812,8 +842,12 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
     if (cpu_leg) {   // Phase 20: the CPU experts' rows land in their packed positions before the export wait / the scatter
         { std::unique_lock<std::mutex> lk(cpu_.mu); cpu_.cv.wait(lk, [&] { return cpu_.done; }); }
         st_.ms_cpu = ms_since(tc); st_.ms_cpu_work = cpu_.work_ms;
-        for (size_t i = 0; i < cpu_.work.size(); ++i)
-            q.memcpy(static_cast<sycl::half*>(bws_.yp) + uint64_t(cpu_.work[i].row) * H, cpu_.h_rows + i * H, size_t(H) * 2);
+        for (size_t i = 0; i < cpu_.work.size();) {          // one copy per run of consecutive packed rows (an expert's rows at least)
+            size_t j = i + 1; while (j < cpu_.work.size() && cpu_.work[j].row == cpu_.work[j - 1].row + 1) ++j;
+            if (xmx) q.memcpy(bws_.y_f32 + uint64_t(cpu_.work[i].row) * H, cpu_.h_rows32 + i * H, (j - i) * H * 4);   // the XMX scatter reads y_f32
+            else q.memcpy(static_cast<sycl::half*>(bws_.yp) + uint64_t(cpu_.work[i].row) * H, cpu_.h_rows + i * H, (j - i) * H * 2);
+            i = j;
+        }
     }
     if (ep_export_) { q.wait(); }                                                         // the rows are the product; no scatter
     else {

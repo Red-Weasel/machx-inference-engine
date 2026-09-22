@@ -186,6 +186,8 @@ struct GenerateResult {
     // deepseek41: what the prefill time was spent on. Without this the "tok/s" above
     // counts cached tokens as if they had been run and hides a fixed per-turn cost.
     double      restore_ms        = 0; // of prefill_ms: restoring the cached prefix
+    double      early_decode_ms   = 0; // of decode_ms: the first `early_decode_n` tokens
+    uint32_t    early_decode_n    = 0;
     std::string cache_source;          // "live" | "checkpoint" | "host slot" | "none" | "" (cache off)
     double      decode_ms         = 0; // wall time of the decode loop
 };

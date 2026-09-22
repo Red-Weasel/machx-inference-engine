@@ -112,6 +112,24 @@ int main(int argc, char** argv) {
         }
         std::printf("threads %2d: %6.2f ms per expert = %5.2f experts/ms = %5.1f GB/s of slot bytes (best of %u rounds over %u experts)\n", nt, best / n_exp, n_exp / best, n_exp * lay.bytes / (best / 1000.0) / 1e9, rounds, n_exp);
     }
+    // IE_DS41_BENCH_ROWS=R: R rows per expert through cpu_expert_mxfp4_rows (the weights read once for all R), the
+    // continuation leg's cost model input -- what a row costs beyond the expert's first
+    if (const char* rv = std::getenv("IE_DS41_BENCH_ROWS")) {
+        const uint32_t R = std::max(1u, std::min(ie::kCpuExpertRows, uint32_t(std::atoi(rv))));
+        std::vector<float> xr(size_t(R) * H); for (auto& v : xr) v = float(int(rng() % 2001) - 1000) / 1000.f;
+        const float* xs[ie::kCpuExpertRows]; for (uint32_t r = 0; r < R; ++r) xs[r] = xr.data() + size_t(r) * H;
+        std::vector<float> scr(size_t(R) * 2 * EF), outr(size_t(R) * H);
+        for (int nt : teams) {
+            ie::cpu_expert_mxfp4_rows(slots[0], lay, xs, R, scr.data(), outr.data(), c.swiglu_limit, nt);   // warm the team
+            double best = 1e9;
+            for (uint32_t rd = 0; rd < 3; ++rd) {
+                const auto t0 = std::chrono::steady_clock::now();
+                for (uint32_t e = 0; e < n_exp; ++e) ie::cpu_expert_mxfp4_rows(slots[e], lay, xs, R, scr.data(), outr.data(), c.swiglu_limit, nt);
+                best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            }
+            std::printf("threads %2d, %u rows per expert: %6.2f ms per expert = %5.2f ms per row\n", nt, R, best / n_exp, best / n_exp / R);
+        }
+    }
 
     // one expert against the GPU's own M = 1 path on the same slot bytes (the tier's ds4_gemm path
     // with Q8 activations, so the bar is the quantisation of x, ~1e-2; the CPU keeps x fp32)
