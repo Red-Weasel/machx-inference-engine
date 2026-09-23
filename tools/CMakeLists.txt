@@ -656,3 +656,7 @@ set_target_properties(ie_mimo26_attn_bench PROPERTIES OUTPUT_NAME "ie-mimo26-att
 add_executable(ie_mimo26_reuse mimo26_reuse.cpp)
 target_link_libraries(ie_mimo26_reuse PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_mimo26_reuse PROPERTIES OUTPUT_NAME "ie-mimo26-reuse")
+# MiMo-V2.6 P5 gate (d): the DFlash drafter on dumped context features vs tools/mimo26/dflash_accept.py
+add_executable(ie_mimo26_dflash_check mimo26_dflash_check.cpp)
+target_link_libraries(ie_mimo26_dflash_check PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_mimo26_dflash_check PROPERTIES OUTPUT_NAME "ie-mimo26-dflash-check")

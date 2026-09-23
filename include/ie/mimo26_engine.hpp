@@ -4,6 +4,7 @@
 // Engine's destructor can destroy the unique_ptr. One request at a time (EngineOptions::parallel is 1 for this arch).
 #pragma once
 #include "ie/mimo26.hpp"
+#include "ie/mimo26_dflash.hpp"
 #include "ie/mimo26_forward.hpp"
 #include "ie/tokenizer.hpp"
 
@@ -26,9 +27,13 @@ struct Mimo26Bundle {
     std::vector<int32_t>                      eos;         // stop ids (generation_config.json eos_token_id)
     bool                                      prefix_reuse = true;
     bool                                      lookup = false;   // prompt-lookup speculation (ie serve: on; IE_MIMO26_LOOKUP=0)
+    std::unique_ptr<Mimo26DFlash>             dflash;           // the checkpoint's DFlash drafter (IE_MIMO26_DFLASH=K), null = off
+    uint32_t                                  dflash_k = 0;     // drafts per pass
+    float                                     dflash_minp = 0.7f;   // drafts cut at the first one below this drafter probability
     // Drain before the frees: an aborted generation can leave kernels in flight.
     ~Mimo26Bundle() {
         for (auto& q : queues) if (q) { try { q->wait_and_throw(); } catch (const sycl::exception& e) { std::fprintf(stderr, "[mimo26] teardown drain: %s\n", e.what()); } }
+        if (dflash) dflash->free_all();
         fwd.free_all();
     }
 };

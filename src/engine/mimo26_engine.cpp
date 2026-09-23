@@ -283,14 +283,37 @@ std::string Engine::mimo26_load(const std::string& dir) {
             return "mimo_v2 ranking: " + e;
         std::fprintf(stderr, "[mimo26] residency ranking: %s\n", rank_path.c_str());
     } else std::fprintf(stderr, "[mimo26] no residency ranking: index-order expert placement (slower)\n");
+    // P5: the DFlash drafter (dflash/ in the checkpoint) on the last card, allocated BEFORE the forward so the auto static
+    // tier sizes around it. ON when the checkpoint ships one (A-B-A vs lookup alone: -19 % per token on the held-out
+    // prompts; greedy near-ties can resolve differently, as with lookup); IE_MIMO26_DFLASH=K drafts K (1..7), 0 = off
+    const bool has_dflash = std::ifstream(dir + "/dflash/config.json").good();
+    b->dflash_k = has_dflash ? 7u : 0u;
+    if (const char* v = std::getenv("IE_MIMO26_DFLASH"); v && *v) b->dflash_k = uint32_t(std::atoi(v));
+    if (const char* v = std::getenv("IE_MIMO26_DFLASH_MINP"); v && *v) b->dflash_minp = float(std::atof(v));
+    if (!b->dflash_k) std::fprintf(stderr, "[mimo26] DFlash drafter off (%s)\n", has_dflash ? "IE_MIMO26_DFLASH=0" : "no dflash/ in the checkpoint");
+    if (b->dflash_k) {
+        b->dflash = std::make_unique<Mimo26DFlash>();
+        if (auto e = b->dflash->load(dir); !e.empty()) return "mimo_v2 " + e;
+        if (auto e = b->dflash->init(*b->qs.back(), b->model.embed.w->data, b->model.config().vocab_size, b->dflash->config().window); !e.empty())
+            return "mimo_v2 " + e;
+        b->dflash_k = std::min(b->dflash_k, b->dflash->config().block - 1);
+    }
     if (auto e = b->fwd.init(b->qs, b->model, mo); !e.empty()) return "mimo_v2 forward: " + e;
+    if (b->dflash) {
+        b->dflash->set_head(b->fwd.head_weights());
+        if (auto e = b->fwd.set_feature_layers(b->dflash->config().target_layers, b->dflash->config().window); !e.empty()) return "mimo_v2 " + e;
+        std::fprintf(stderr, "[mimo26] DFlash drafter ON: up to %u drafts per pass, cut below p %.2f, %.2f GB on the last card (IE_MIMO26_DFLASH=0 turns it off)\n",
+                     b->dflash_k, b->dflash_minp, b->dflash->vram_bytes() / 1e9);
+    }
     if (const char* v = std::getenv("IE_MIMO26_PROMPT_CACHE"); !opts_.prompt_cache || (v && std::string(v) == "0")) b->prefix_reuse = false;
     // prompt-lookup speculation (P4: held-out Dream turns -13 % per token, 76 % of drafts accepted; greedy near-ties can
     // resolve differently from one-row decoding -- 1 of 7 distinct held-out outputs identical over 256 tokens, every
-    // divergence a near-tie, gate P4-1); IE_MIMO26_LOOKUP=0 turns it off
-    b->lookup = true;
-    if (const char* v = std::getenv("IE_MIMO26_LOOKUP"); v && std::string(v) == "0") b->lookup = false;
-    std::fprintf(stderr, "[mimo26] prompt-lookup speculation %s (a copy of >= 12 context tokens verified up to %u rows at a time; IE_MIMO26_LOOKUP=0 turns it off)\n",
+    // divergence a near-tie, gate P4-1). With the DFlash drafter on it defaults OFF: the drafter alone decodes the held-out
+    // prompts 7 % faster than lookup-first and ties it on verbatim copies (P5 gate finding 2, results/mimo26/p5 df4);
+    // IE_MIMO26_LOOKUP=1 forces it on (a copy then takes priority over the drafter), =0 off
+    b->lookup = !b->dflash;
+    if (const char* v = std::getenv("IE_MIMO26_LOOKUP"); v && *v) b->lookup = std::string(v) != "0";
+    std::fprintf(stderr, "[mimo26] prompt-lookup speculation %s (a copy of >= 12 context tokens verified up to %u rows at a time; IE_MIMO26_LOOKUP=1 on, =0 off)\n",
                  b->lookup ? "ON" : "off", Mimo26Forward::kDecodeRows);
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::string res = "{\"arch\":\"mimo_v2\",\"cards\":" + std::to_string(devs.size()) + ",\"capacity\":" + std::to_string(opts_.max_ctx) +
@@ -337,6 +360,11 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
     b.fwd.rewind(L);
     b.live.resize(L);
     if (L == 0) b.fwd.reset();
+    if (b.dflash) { if (L == 0) b.dflash->reset(); else b.dflash->rewind(L); }
+    // the drafter's context follows every forward: the call's exported rows [p0, p0 + n) (a verify adds only its kept rows)
+    auto add_ctx = [&](uint32_t n, uint32_t p0, uint32_t stride) -> std::string {
+        return b.dflash ? b.dflash->add_context(b.fwd.features(), n, p0, stride) : std::string();
+    };
     r.cached_tokens = L;
     r.cache_source = !b.prefix_reuse ? "" : L ? "live" : "none";
     std::vector<float> logits;
@@ -348,6 +376,10 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
             r.finish_reason = "error: mimo_v2 prefill: " + e; return r;
         }
         b.live.insert(b.live.end(), ids.begin() + off, ids.begin() + off + n);
+        if (auto e = add_ctx(b.fwd.feat_rows(), off + n - b.fwd.feat_rows(), b.fwd.feat_rows()); !e.empty()) {
+            b.live.clear(); b.fwd.reset();
+            r.finish_reason = "error: mimo_v2 " + e; return r;
+        }
         if (on_token && off + n < ids.size() && !on_token(std::string_view{})) { r.finish_reason = "abort"; return r; }   // liveness probe
     }
     r.prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pf).count();
@@ -383,7 +415,7 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
     // ring's slots past the rewind hold only positions older than the window). No draft: a plain one-row step.
     Ds41NgramIndex idx;
     if (b.lookup) idx.reset(b.live);
-    uint32_t n_pass = 0, n_rows = 0, n_acc = 0, n_plain = 0;
+    uint32_t n_pass = 0, n_rows = 0, n_acc = 0, n_plain = 0, df_pass = 0, df_acc = 0;
     const uint32_t V = b.model.config().vocab_size;
     std::vector<int32_t> rows; std::vector<float> vlg;
     int32_t id = Ds41Generator::sample(logits, recent, p, rng);
@@ -392,6 +424,14 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
         if (++k_done == max_new) break;   // the last token needs no forward
         std::vector<int32_t> d;
         if (b.lookup) { idx.push(id); d = idx.draft(Mimo26Forward::kDecodeRows - 1, 12); }
+        bool from_df = false;
+        if (d.empty() && b.dflash) {
+            if (auto e = b.dflash->draft(id, b.dflash_k, d, b.dflash_minp); !e.empty()) {
+                b.live.clear(); b.fwd.reset();
+                r.finish_reason = "error: mimo_v2 " + e; return r;
+            }
+            from_df = true;
+        }
         if (d.size() > max_new - k_done) d.resize(max_new - k_done);
         const uint32_t pos = b.fwd.n_pos();
         if (d.empty()) {
@@ -400,6 +440,7 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
                 r.finish_reason = "error: mimo_v2 decode: " + e; return r;
             }
             b.live.push_back(id); ++n_plain;
+            if (auto e = add_ctx(1, pos, 1); !e.empty()) { b.live.clear(); b.fwd.reset(); r.finish_reason = "error: mimo_v2 " + e; return r; }
             id = Ds41Generator::sample(logits, recent, p, rng);
             continue;
         }
@@ -419,11 +460,15 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
         }
         const uint32_t keep = 1 + acc - (drop_last ? 1u : 0u);         // the rows of id and the accepted drafts
         b.fwd.rewind(pos + keep);
+        if (keep)
+            if (auto e = add_ctx(keep, pos, uint32_t(rows.size())); !e.empty()) { b.live.clear(); b.fwd.reset(); r.finish_reason = "error: mimo_v2 " + e; return r; }
+        if (from_df) { ++df_pass; df_acc += acc; }
         b.live.insert(b.live.end(), rows.begin(), rows.begin() + keep);
         ++n_pass; n_rows += uint32_t(rows.size()); n_acc += acc;
         if (ended) break;
         id = next;
     }
+    if (b.dflash) std::fprintf(stderr, "[mimo26 dflash] %u passes, %u drafts accepted (%.2f per pass)\n", df_pass, df_acc, df_pass ? double(df_acc) / df_pass : 0.0);
     if (b.lookup) std::fprintf(stderr, "[mimo26 lookup] %u tokens: %u verify passes (%u rows, %u drafts accepted), %u plain steps\n",
                                r.completion_tokens, n_pass, n_rows, n_acc, n_plain);
     if (!pending.empty()) { text += pending; if (on_token) on_token(pending); }

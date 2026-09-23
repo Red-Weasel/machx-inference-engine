@@ -12,6 +12,7 @@
 #include "ie/expert_stream.hpp"
 #include "ie/kernel_profiler.hpp"
 #include "ie/mimo26.hpp"
+#include "ie/mimo26_dflash.hpp"
 #include "ie/mimo26_forward.hpp"
 #include "ie/ngram_draft.hpp"
 #include "ie/tokenizer.hpp"
@@ -28,9 +29,9 @@
 #include <vector>
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: ie-mimo26-run <model_dir> (--prompt TEXT | --prompt-file FILE) [--n N] [--chunk C] [--ctx MAX] [--static S] [--pinned P] [--stream Q] [--no-special] [--ranking FILE] [--kprof] [--kprof-prefill] [--lookup]\n"); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: ie-mimo26-run <model_dir> (--prompt TEXT | --prompt-file FILE) [--n N] [--chunk C] [--ctx MAX] [--static S] [--pinned P] [--stream Q] [--no-special] [--ranking FILE] [--kprof] [--kprof-prefill] [--lookup] [--dflash K] [--dflash-minp P] [--dflash-log FILE] [--spec-longest]\n"); return 2; }
     const std::string model = argv[1];
-    std::vector<std::pair<std::string, std::string>> prompts; uint32_t N = 32, C = 512, ctx = 4096; bool special = true; std::string ranking_path; bool kprof = false, kprof_pf = false, lookup = false;
+    std::vector<std::pair<std::string, std::string>> prompts; uint32_t N = 32, C = 512, ctx = 4096; bool special = true; std::string ranking_path; bool kprof = false, kprof_pf = false, lookup = false; uint32_t dflash_k = 0; float dflash_minp = 0.f; std::string dflash_log; bool spec_longest = false;
     ie::Mimo26Options opt;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i]; auto val = [&]() -> std::string { if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); } return argv[++i]; };
@@ -47,6 +48,10 @@ int main(int argc, char** argv) {
         else if (a == "--kprof") kprof = true;
         else if (a == "--kprof-prefill") kprof_pf = true;
         else if (a == "--lookup") lookup = true;
+        else if (a == "--dflash") dflash_k = uint32_t(std::atol(val().c_str()));
+        else if (a == "--dflash-minp") dflash_minp = float(std::atof(val().c_str()));
+        else if (a == "--dflash-log") dflash_log = val();
+        else if (a == "--spec-longest") spec_longest = true;
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (prompts.empty()) { std::fprintf(stderr, "no prompt\n"); return 2; }
@@ -94,7 +99,18 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "ranking: %s\n", e.c_str()); return 1; }
     ie::Mimo26Forward fwd;
     const auto t_init = std::chrono::steady_clock::now();
+    ie::Mimo26DFlash df;   // --dflash: on the last card, allocated before the forward so the auto static tier sees it
+    std::FILE* dlog = dflash_log.empty() ? nullptr : std::fopen(dflash_log.c_str(), "w");
+    if (dflash_k) {
+        if (auto e = df.load(model); !e.empty()) { std::fprintf(stderr, "%s\n", e.c_str()); return 1; }
+        if (auto e = df.init(*qs.back(), m.embed.w->data, m.config().vocab_size, df.config().window); !e.empty()) { std::fprintf(stderr, "%s\n", e.c_str()); return 1; }
+    }
     if (auto e = fwd.init(qs, m, opt); !e.empty()) { std::fprintf(stderr, "init: %s\n", e.c_str()); return 1; }
+    if (dflash_k) {
+        df.set_head(fwd.head_weights());
+        if (auto e = fwd.set_feature_layers(df.config().target_layers, df.config().window); !e.empty()) { std::fprintf(stderr, "%s\n", e.c_str()); return 1; }
+        std::printf("dflash: %u layers, block %u, drafts per pass %u, %.2f GB on the last card\n", df.config().n_layers, df.config().block, std::min(dflash_k, df.config().block - 1), df.vram_bytes() / 1e9);
+    }
     std::printf("mimo26: %zu card(s), init %.1f s, VRAM", qs.size(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t_init).count());
     for (size_t i = 0; i < qs.size(); ++i) std::printf(" %.2f GB", fwd.vram_bytes(i) / 1e9);
     std::printf(", pinned %.1f GB, static/pinned/stream per layer", fwd.pinned_bytes() / 1e9);
@@ -102,6 +118,14 @@ int main(int argc, char** argv) {
     std::printf(" (per card)\n");
     for (const auto& [pname, ptext] : prompts) {
     fwd.reset();
+    df.reset();
+    double t_draft = 0, t_ctx = 0; uint32_t df_pass = 0, df_rows = 0, df_acc = 0, df_calls = 0;
+    auto add_ctx = [&](uint32_t n, uint32_t p0, uint32_t stride) -> bool {   // the drafter's context after a forward
+        if (!dflash_k) return true;
+        const auto t0 = std::chrono::steady_clock::now();
+        if (auto e = df.add_context(fwd.features(), n, p0, stride); !e.empty()) { std::fprintf(stderr, "dflash context at %u: %s\n", p0, e.c_str()); return false; }
+        t_ctx += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); return true;
+    };
     const std::vector<int32_t> ids = tok.encode(ptext, special);
     if (prompts.size() > 1) std::printf("=== %s\n", pname.c_str());
     std::printf("prompt: %zu tokens [", ids.size());
@@ -115,6 +139,7 @@ int main(int argc, char** argv) {
     for (uint32_t off = 0; off < ids.size(); off += C) {
         const uint32_t n = std::min<uint32_t>(C, uint32_t(ids.size()) - off);
         if (auto e = fwd.forward(ids.data() + off, n, off, logits, false); !e.empty()) { std::fprintf(stderr, "prefill at %u: %s\n", off, e.c_str()); return 1; }
+        if (!add_ctx(fwd.feat_rows(), off + n - fwd.feat_rows(), fwd.feat_rows())) return 1;
     }
     const double pf_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pf).count();
     std::printf("prefill: %.2f s (%.1f tok/s)\n", pf_s, ids.size() / pf_s);
@@ -135,24 +160,35 @@ int main(int argc, char** argv) {
         return true;
     };
     uint32_t n_pass = 0, n_rows = 0, n_acc = 0, n_plain = 0;
-    if (!lookup) {
+    if (!lookup && !dflash_k) {
         for (uint32_t k = 0; k < N; ++k) {
             const int32_t next = argmax(logits.data(), V);
             if (!put(next)) break;
             if (auto e = fwd.forward(&next, 1, fwd.n_pos(), logits, false); !e.empty()) { std::fprintf(stderr, "\ndecode step %u: %s\n", k, e.c_str()); return 1; }
         }
-    } else {   // the engine's lookup loop, greedy (src/engine/mimo26_engine.cpp)
-        ie::Ds41NgramIndex idx; idx.reset(ids);
+    } else {   // the engine's lookup loop, greedy (src/engine/mimo26_engine.cpp); --dflash drafts when lookup has no copy
+        ie::Ds41NgramIndex idx; if (lookup) idx.reset(ids);
         std::vector<int32_t> rows; std::vector<float> vlg;
         int32_t id = argmax(logits.data(), V);
         for (;;) {
             if (!put(id) || out.size() == N) break;
-            idx.push(id);
-            std::vector<int32_t> d = idx.draft(ie::Mimo26Forward::kDecodeRows - 1, 12);
+            std::vector<int32_t> d;
+            if (lookup) { idx.push(id); d = idx.draft(ie::Mimo26Forward::kDecodeRows - 1, 12); }
+            // the draft source: a lookup copy first, the drafter when there is none; --spec-longest runs the drafter every
+            // step and keeps the copy only when it offers more tokens than the drafter's cut left
+            bool from_df = false;
+            if (dflash_k && (d.empty() || spec_longest)) {
+                std::vector<int32_t> dd;
+                const auto t0 = std::chrono::steady_clock::now();
+                if (auto e = df.draft(id, dflash_k, dd, dflash_minp); !e.empty()) { std::fprintf(stderr, "\ndraft at %u: %s\n", fwd.n_pos(), e.c_str()); return 1; }
+                t_draft += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); ++df_calls;
+                if (dd.size() >= d.size()) { d.swap(dd); from_df = true; }
+            }
             if (d.size() > N - out.size()) d.resize(N - out.size());
             const uint32_t pos = fwd.n_pos();
             if (d.empty()) {
                 if (auto e = fwd.forward(&id, 1, pos, logits, false); !e.empty()) { std::fprintf(stderr, "\ndecode at %u: %s\n", pos, e.c_str()); return 1; }
+                if (!add_ctx(1, pos, 1)) return 1;
                 ++n_plain; id = argmax(logits.data(), V); continue;
             }
             rows.assign(1, id); rows.insert(rows.end(), d.begin(), d.end());
@@ -163,11 +199,21 @@ int main(int argc, char** argv) {
                 if (r == d.size() || a != d[r]) { next = a; break; }
                 ++acc;
                 if (!put(a)) { ended = true; drop_last = true; break; }
-                idx.push(a);
+                if (lookup) idx.push(a);
                 if (out.size() == N) { ended = true; break; }
             }
-            fwd.rewind(pos + 1 + acc - (drop_last ? 1u : 0u));
+            const uint32_t keep = 1 + acc - (drop_last ? 1u : 0u);
+            fwd.rewind(pos + keep);
+            if (keep && !add_ctx(keep, pos, uint32_t(rows.size()))) return 1;
             ++n_pass; n_rows += uint32_t(rows.size()); n_acc += acc;
+            if (from_df) {
+                ++df_pass; df_rows += uint32_t(rows.size()); df_acc += acc;
+                if (dlog) {   // --dflash-log: the drafts' probabilities (all k rows, drafted or cut) and how many were accepted
+                    std::fprintf(dlog, "%u %zu", acc, d.size());
+                    for (float pr : df.last_probs()) std::fprintf(dlog, " %.4f", pr);
+                    std::fprintf(dlog, "\n");
+                }
+            }
             if (ended) break;
             id = next;
         }
@@ -178,6 +224,8 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < out.size(); ++i) std::printf("%s%d", i ? ", " : "", out[i]);
     std::printf("]\ndecode: %.1f ms/token (%.2f tok/s)\n", dec_s * 1000 / std::max<size_t>(1, out.size()), out.size() / std::max(dec_s, 1e-9));
     if (lookup) std::printf("lookup: %u verify passes (%u rows, %u drafts accepted), %u plain steps\n", n_pass, n_rows, n_acc, n_plain);
+    if (dflash_k) std::printf("dflash: %u passes (%u rows, %u drafts accepted = %.2f per pass), drafter %.1f ms/call over %u calls, context %.1f ms/pass\n",
+                              df_pass, df_rows, df_acc, df_pass ? double(df_acc) / df_pass : 0.0, df_calls ? t_draft / df_calls : 0.0, df_calls, df_pass ? t_ctx / df_pass : 0.0);
     double moe = 0, all = 0; uint32_t es = 0, ep = 0, em = 0;
     for (const auto& s : fwd.stats()) { moe += s.moe_ms; all += s.ms; es += s.experts_static; ep += s.experts_pinned; em += s.experts_mmap; }
     std::printf("last step: %.1f ms over the layers, %.1f ms in the expert tiers; experts static %u / pinned %u / mmap %u\n", all, moe, es, ep, em);

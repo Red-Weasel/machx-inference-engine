@@ -75,6 +75,15 @@ public:
     void set_profile_rows(const uint8_t* rows) { profile_rows_ = rows; }
     const std::vector<std::vector<uint64_t>>& profile() const { return profile_; }
     static constexpr uint32_t kDecodeRows = 8;   // a forward of at most this many rows runs the split-K decode attention
+    // P5 (DFlash): the residual stream after `layers` (their order = the features' order), the LAST min(T, max_rows) rows
+    // of every forward() call, copied to host memory (a plain vector: each card has its own SYCL context, so no one card's
+    // pinned allocation serves both), compact layer-major [layers.size()][feat_rows()][dim]. Empty = off.
+    std::string set_feature_layers(std::vector<uint32_t> layers, uint32_t max_rows);
+    const float* features() const { return h_feat_.data(); }
+    uint32_t     feat_rows() const { return feat_rows_; }
+    // The last card's fp16 lm_head [vocab, dim] and its queue (the drafter shares them).
+    const sycl::half* head_weights() const { return cards_.empty() ? nullptr : cards_.back()->head; }
+    sycl::queue*      last_queue() const { return cards_.empty() ? nullptr : cards_.back()->q; }
     uint64_t vram_bytes(size_t card) const;
     uint32_t card_static(size_t card) const { return card < cards_.size() && cards_[card]->tier_on ? cards_[card]->tier.n_static() : 0; }
     uint32_t card_pinned(size_t card) const { return card < cards_.size() && cards_[card]->tier_on ? cards_[card]->tier.n_pinned() : 0; }
@@ -118,6 +127,8 @@ private:
     Mimo26Options opt_;
     uint32_t n_pos_ = 0;
     uint32_t hi_end_ = 0;   // written_end()
+    std::vector<uint32_t> feat_layers_; uint32_t feat_max_ = 0, feat_rows_ = 0;
+    std::vector<float> h_feat_;   // [feat_layers_.size()][feat_rows_][dim] (compact per call)
     uint32_t ring_ = 0;   // the SWA layers' K/V ring slots (window + max_tokens; 0 = linear, IE_MIMO26_SWA_LINEAR=1)
     uint32_t n_calls_ = 0;
     bool profiling_ = false; const uint8_t* profile_rows_ = nullptr;

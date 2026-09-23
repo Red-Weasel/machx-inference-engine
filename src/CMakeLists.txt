@@ -128,6 +128,7 @@ add_library(ie_core
   model/mimo26.cpp
   model/mimo26_dequant.cpp
   model/mimo26_forward.cpp
+  model/mimo26_dflash.cpp
   engine/engine.cpp
   engine/ds41_engine.cpp
   engine/mimo26_engine.cpp

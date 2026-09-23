@@ -3,7 +3,7 @@
 continuation, offline -- before any engine integration.
 
   dflash_accept.py <model_dir> <dump_dir> <ids.txt> <n_prompt> [--variants plain,sink] [--max-pos N] [--call N]
-                   [--mask-emb file|target]
+                   [--mask-emb file|target] [--print-drafts FILE [--print-variant sink|plain]]
 
 <dump_dir> holds the engine's residual stream after every layer for ONE forward over ids (IE_MIMO26_DUMP=<dir> with
 ie-mimo26-score --ubatch >= len(ids): x_L{L}_s0.f32, [T, 4096] fp32). ids.txt: the prompt's ids followed by the
@@ -12,7 +12,10 @@ positions < p (the last 1024: "at most 1,024 backbone context positions precedin
 tokens after the anchor token[p], and the accepted length is the matching prefix of token[p+1 .. p+7] -- the greedy
 verify's acceptance. Prints the mean accepted drafts for k = 1..7 and the tokens per pass (k accepted + 1).
 
-Variants: plain = dflash.py's forward as shipped (no sink, no value scale); sink = the checkpoint's
+Variants: plain = dflash.py's forward WITHOUT the sink and value-scale terms, with RoPE on the first 64 of 128 dims
+(partial_rotary_factor 0.5) -- NOT dflash.py as shipped: under transformers 5.12 its Qwen3RotaryEmbedding ignores
+partial_rotary_factor and rotates all 128 dims, which drafts degenerate tokens (P5 gate finding 3: 3/35 agree; patched
+to partial RoPE, 35/35); sink = the checkpoint's
 self_attn.attention_sink_bias as a virtual key in the softmax denominator and dflash_config.attention_value_scale on
 the attention output (the main model's conventions). The better acceptance is the trained form. The mask positions use
 dflash/mask_embedding.pt (the learned vector; the target's own embedding row for the mask id is all zeros) unless
@@ -34,6 +37,8 @@ variants = arg("--variants", "plain,sink").split(",")
 max_pos = int(arg("--max-pos", "256"))
 mask_emb = arg("--mask-emb", "file")
 call = int(arg("--call", "0"))   # the forward() call whose dump to read (x_L{L}_s{call}.f32)
+drafts_out = arg("--print-drafts", "")   # one variant's drafts, "p d1 .. d7" per line (P5 gate (d) vs ie-mimo26-dflash-check)
+print_variant = arg("--print-variant", "sink")
 ddir = os.path.join(model_dir, "dflash")
 cfg = json.load(open(os.path.join(ddir, "config.json")))
 dc = cfg["dflash_config"]
@@ -131,11 +136,14 @@ def draft(p, variant):
     return (h[1:] @ W["lm_head.weight"].T).argmax(-1).tolist()                  # rows 1..7
 
 
+dfile = open(drafts_out, "w") if drafts_out else None
 for variant in variants:
     acc_k = np.zeros(BLOCK)   # acc_k[k] = sum over positions of the accepted drafts when k drafts are offered
     n = 0
     for p in range(n_prompt, min(T - BLOCK, n_prompt + max_pos)):
         d = draft(p, variant)
+        if dfile and variant == print_variant:
+            dfile.write(f"{p} " + " ".join(map(str, d)) + "\n")
         truth = ids[p + 1: p + BLOCK]
         run = 0
         while run < len(d) and d[run] == truth[run]:
@@ -148,3 +156,5 @@ for variant in variants:
     print(f"{variant} (mask {mask_emb}): {n} positions; mean accepted drafts by k: " +
           ", ".join(f"k{k} {acc_k[k] / n:.2f}" for k in range(1, BLOCK)) +
           "; tokens per pass (accepted + 1): " + ", ".join(f"k{k} {acc_k[k] / n + 1:.2f}" for k in range(1, BLOCK)), flush=True)
+if dfile:
+    dfile.close()

@@ -227,6 +227,15 @@ std::string Mimo26Forward::upload_card(Card& c) {
     return {};
 }
 
+std::string Mimo26Forward::set_feature_layers(std::vector<uint32_t> layers, uint32_t max_rows) {
+    if (cards_.empty()) return "set_feature_layers: not initialised";
+    feat_layers_ = std::move(layers); feat_max_ = feat_layers_.empty() ? 0 : std::min(max_rows, opt_.max_tokens); feat_rows_ = 0;
+    for (uint32_t L : feat_layers_) if (L >= m_->config().n_layers) return "set_feature_layers: layer " + std::to_string(L) + " out of range";
+    if (feat_layers_.empty()) return {};
+    h_feat_.assign(feat_layers_.size() * size_t(feat_max_) * m_->config().dim, 0.f);
+    return {};
+}
+
 std::string Mimo26Forward::init(const std::vector<sycl::queue*>& qs, const Mimo26Model& m, const Mimo26Options& o) {
     free_all();
     if (qs.empty()) return "no queues";
@@ -391,6 +400,13 @@ std::string Mimo26Forward::run_card(Card& c, uint32_t T, uint32_t pos0, std::vec
             stats_[L].experts_static = ts.experts_static; stats_[L].experts_pinned = ts.experts_pinned; stats_[L].experts_mmap = ts.experts_mmap;
             mimo26_axpy(q, c.moe, 1.f, c.x, size_t(T) * H);
         }
+        if (!feat_layers_.empty()) {   // P5: this layer's residual rows for the drafter, the call's last rows
+            const auto it = std::find(feat_layers_.begin(), feat_layers_.end(), L);
+            if (it != feat_layers_.end()) {
+                const uint32_t rows = std::min(T, feat_max_), fi = uint32_t(it - feat_layers_.begin());
+                q.memcpy(h_feat_.data() + (size_t(fi) * rows) * H, c.x + size_t(T - rows) * H, size_t(rows) * H * 4);   // compact [n][rows][dim]
+            }
+        }
         q.wait();
         stats_[L].ms = ms_since(t0);
         // IE_MIMO26_CHECK=1 (diagnostic): the residual stream after every layer -- non-finite count and max |x| per row,
@@ -480,6 +496,7 @@ std::string Mimo26Forward::forward(const int32_t* ids, uint32_t T, uint32_t pos0
     }
     n_pos_ = pos0 + T;
     hi_end_ = std::max(hi_end_, n_pos_);
+    feat_rows_ = feat_layers_.empty() ? 0 : std::min(T, feat_max_);
     ++n_calls_;
     profile_rows_ = nullptr;   // the mask covered this call only
     return {};

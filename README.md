@@ -21,7 +21,7 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 | model | weights | prefill | decode | also |
 |---|---|---:|---:|---|
 | **DeepSeek-V4.1-Flash** | 475 GB safetensors (FP8 dense, MXFP4 experts), 256 GB RAM | **304** tok/s at 2K, **319** at 32K–223K | **12.8** tok/s chat, **14.0** in agent loops | native vision, tool calls, 223K context, 1–2 s follow-up turns from the prompt cache |
-| **MiMo-V2.6-Flash** | 178 GB safetensors (FP8 dense, MXFP4 experts), 256 GB RAM | **429–472** tok/s at 4–6K, **434–438** at 32K, **322** at 120K | **16.1** tok/s chat, **16.8** in agent loops | released and running the same day: tool calls, thinking on/off, 120K context verified |
+| **MiMo-V2.6-Flash** | 178 GB safetensors (FP8 dense, MXFP4 experts), 256 GB RAM | **429–472** tok/s at 4–6K, **434–438** at 32K, **322** at 120K | **23.6** tok/s chat, **24.3** on agent-style copy edits | released and running the same day: its bundled DFlash drafter (speculative decoding), tool calls, thinking on/off, 120K context verified |
 | **DeepSeek-V4-Flash** | 155 GB GGUF (MXFP4 experts, Q8_0 dense) | **571** tok/s at 4K | **26.1** tok/s at 4K, **32.7** short | tool calls, prompt cache |
 | **GLM-5.3-Flash** | UD-Q4_K_XL GGUF, host-resident experts | **156** tok/s at 16K | **14.5** tok/s at 16K | MTP draft, two-GPU pipelined prefill |
 | **Qwen3.8-Flash** (Flash-Next) | 104 GB UD-Q4_K_XL GGUF | **467** tok/s pipelined | **35.0** tok/s chat, **41.8** code (lossless speculative) | native vision |
@@ -38,7 +38,7 @@ Everything runs behind one OpenAI-compatible server (`ie serve`) with tool calls
 ## Highlights
 
 - 🐋 **DeepSeek-V4.1-Flash on two B70s** — the 475 GB safetensors checkpoint with host-resident experts: 223K-token context verified, native tool calls and **image input** through `ie serve`, a prompt cache that answers follow-up turns in ~1–2 s, and prompt-lookup speculation that decodes agent tool loops **1.47× faster**. See [the V4.1 numbers](#deepseek-v41-flash).
-- 🆕 **MiMo-V2.6-Flash on release day** — Xiaomi's 309B / 15B-active hybrid sliding-window model, released September 22 and running the same day from its safetensors: new XMX attention kernels for its 192/128 head sizes, FP8 dense weights kept FP8 on the card, `ie serve` with tool calls, and Dream completing agent tasks on it. See [the MiMo numbers](#mimo-v26-flash).
+- 🆕 **MiMo-V2.6-Flash on release day** — Xiaomi's 309B / 15B-active hybrid sliding-window model, released September 22 and running the same day from its safetensors: new XMX attention kernels for its 192/128 head sizes, FP8 dense weights kept FP8 on the card, its bundled DFlash drafter decoding **1.46×** faster, `ie serve` with tool calls, and Dream completing agent tasks on it. See [the MiMo numbers](#mimo-v26-flash).
 - 🏛 **Dense, MoE and hybrid models** — GLM-5.3-Flash, DeepSeek-V4.1-Flash, MiMo-V2.6-Flash, DeepSeek-V4-Flash, Qwen3.8-Flash-Next, Qwen3.6, Qwen3 / Coder / Tongyi, Qwen3-Next, Gemma-4, gpt-oss, and Llama-compatible dense models. GLM-5.2 and Tencent Hy4-preview have experimental standalone runners. See [architecture coverage](#supported-architectures) for entry points and status.
 - 👁 **Native vision** — DeepSeek-V4.1-Flash (the checkpoint's own vision tower, no extra files), Qwen3.8-Flash-Next and experimental DeepSeek-V4-Flash-Vision-Exp, including image inputs through the OpenAI-compatible API. DeepSeek-V4 vision requires its native vision sidecar weights.
 - 🥇 **Beats llama.cpp on Arc** — on prefill *and* decode across the models below.
@@ -60,7 +60,7 @@ the benchmarked models. Prebuilt container images may lag these source updates.
 |---|---|---|
 | **GLM-5.3-Flash** · `glm5next` | UD-Q4_K_XL GGUF | `ie serve` and `ie-glm5next-run`; sparse MLA + KDA, host-resident MoE, two-GPU pipelined prefill and MTP draft; kernel and full-model validation in [PERFORMANCE.md](PERFORMANCE.md) |
 | **DeepSeek-V4.1** · safetensors directory (`deepseek_v41`) | Flash (FP8 dense, MXFP4 experts) | `ie serve <model dir>` and `ie-ds41-run`; two-card pipeline, CSA/engram/hyper-connections, three expert tiers (VRAM, pinned host RAM, NVMe), chunked long-context prefill, native DSML tool calls, native vision, prefix cache (memory + disk), prompt-lookup speculation; needs ~256 GB of system RAM |
-| **MiMo-V2.6** · safetensors directory (`mimo_v2`) | Flash-RL (FP8 dense, MXFP4 experts) | `ie serve <model dir>` and `ie-mimo26-run`; two-card pipeline, 9 full-attention + 39 sliding-window layers with sinks (K 192 / V 128) on XMX prefill and split-K decode kernels, FP8-resident dense weights, three expert tiers (VRAM, pinned host RAM, NVMe) with a CPU expert path, XML tool calls, thinking on/off, live-conversation prefix reuse, prompt-lookup speculation; text only; measured with 256 GB of system RAM. Pro not yet qualified |
+| **MiMo-V2.6** · safetensors directory (`mimo_v2`) | Flash-RL (FP8 dense, MXFP4 experts) | `ie serve <model dir>` and `ie-mimo26-run`; two-card pipeline, 9 full-attention + 39 sliding-window layers with sinks (K 192 / V 128) on XMX prefill and split-K decode kernels, FP8-resident dense weights, three expert tiers (VRAM, pinned host RAM, NVMe) with a CPU expert path, the checkpoint's DFlash drafter for speculative decoding (on by default; prompt-lookup speculation when a checkpoint has none), XML tool calls, thinking on/off, live-conversation prefix reuse; text only; measured with 256 GB of system RAM. Pro not yet qualified |
 | **DeepSeek-V4** · `deepseek4` | Flash (ggml-org MXFP4, Q8_0 dense), Flash-Vision-Exp | `ie serve`; streaming expert caches, long-context sparse attention, prompt caching and structured tool calls; experimental native vision requires sidecar weights |
 | **Qwen3.8-Flash-Next** · `qwen4exp` | Qwen4 preview | `ie serve`; DeltaNet + sparse QSA, hyper-connections, PLE embeddings, streamed MoE and native vision |
 | **Qwen3.5 / Qwen3.6 / Qwen3.8 hybrid** · `qwen35`, `qwen35moe` | 27B dense (incl. Qwen3.8-27B), 35B-A3B MoE | `ie serve`; gated-DeltaNet + full attention, dense or MoE feed-forward paths |
@@ -93,6 +93,11 @@ to native GGUF. Import format support does not add an unsupported architecture.
   expert tier sized from free VRAM (−11 %), FP8 dense weights kept FP8 on the card (−8 %, perplexity unchanged) and
   prompt-lookup speculation (−13 % on agent turns): 16.1 tok/s decode on held-out Dream prompts, 16.8 tok/s in a Dream
   agent loop. Wikitext-2 perplexity 3.4749 against llama.cpp's 3.4794 on the same checkpoint.
+- **DFlash speculative decoding, from the checkpoint's own drafter.** MiMo ships a 5-layer block drafter that reads the
+  model's hidden states and proposes 7 tokens at once; the model verifies them in one multi-row step. Drafts the
+  drafter rates below 0.7 probability are not sent (an extra verify row costs ~27 ms). Held-out Dream prompts decode
+  at **23.6 tok/s** (42.1–42.7 ms/token) against 16.2 plain and 18.1 with prompt lookup, the previous default; verbatim
+  copies run as fast as lookup's. The drafter's drafts match a CPU fp32 reference on 1,736 of 1,736 tokens.
   [Measurements and limits](docs/mimo26/MIMO_V26_FLASH_2026-09-22.md).
 
 **September 18, 2026 — DeepSeek-V4.1-Flash sees images, and agent loops decode 1.47× faster.**
@@ -265,10 +270,12 @@ RAM (115 GB pinned expert tier; 75 / 70 experts per layer in VRAM), measured Sep
 
 | workload | prefill tok/s | decode tok/s |
 |---|---:|---:|
-| 10 held-out Dream prompts (7 of 4.1–6.0K tokens), 64 greedy tokens each | **429–472** | **16.1** (62.0 ms/token) |
+| 10 held-out Dream prompts (7 of 4.1–6.0K tokens), 128 greedy tokens each, with the bundled DFlash drafter (the default) | **429–472** | **23.6** (42.1–42.7 ms/token) |
+| the same prompts: plain decoding / prompt lookup (the previous default) | — | 16.2 / 18.1 |
+| 3 copy-heavy prompts (repeat a passage, re-emit a file or JSON with a rename), 512 tokens, DFlash | — | **24.3** |
 | 32K-token haystack, needles at 10 / 50 / 90 % retrieved 3/3 | **434–438** | — |
 | ~120K-token haystack, needle retrieved (ctx 131,072) | **322–324** | 12.3–13.6 |
-| Dream agent loop through `ie serve` (write code and tests, run, fix; follow-ups from the live caches) | — | **16.8** (14.7–18.9) |
+| Dream agent loop through `ie serve` (write code and tests, run, fix; follow-ups from the live caches), before the drafter | — | **16.8** (14.7–18.9) |
 
 Wikitext-2 perplexity **3.4749** (8 × 2,048 tokens) against 3.4794 ± 0.077 for upstream llama.cpp on a BF16 conversion
 of the same checkpoint, and 3.7557 against 3.7526 at 8,192 tokens. Text only; one request at a time.
