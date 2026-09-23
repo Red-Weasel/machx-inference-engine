@@ -29,6 +29,9 @@ TOOLS = [
     {"type": "function", "function": {"name": "run_bash", "description": "Run a shell command.\nMultiline description.",
                                       "parameters": {"type": "object", "properties": {"command": {"type": "string"}, "timeout": {"type": "number"},
                                                      "background": {"type": "boolean"}}, "required": ["command"]}}},
+    {"type": "function", "function": {"name": "media_read", "description": "Inspect workspace media status.",
+                                      "parameters": {"type": "object", "properties": {"action": {"type": "string", "enum": ["status", "projects", "get", "jobs"]}},
+                                                     "required": ["action"]}}},
 ]
 
 
@@ -91,6 +94,18 @@ PARSE = [
      {"reasoning": "", "content": "", "calls": [("run_bash", {"command": "ls", "background": False}), ("read_file", {"path": "12"})]}),
     ("cut call stays text", True, "x</think>ok<tool_call><function=read_file><parameter=path>a", {"reasoning": "x", "content": "ok<tool_call><function=read_file><parameter=path>a", "calls": []}),
     ("cut inside reasoning", True, "still thinking", {"reasoning": "still thinking", "content": "", "calls": []}),
+    # Dream 2026-09-22, the uncensored checkpoint at temperature 1: a parameter with no </parameter> and a stray '">' --
+    # repaired, and the well-formed calls after it are kept
+    ("unterminated parameter repaired", True, "x</think><tool_call><function=read_file><parameter=path>a\"></function></tool_call>"
+     "<tool_call><function=run_bash><parameter=command>ls</parameter></function></tool_call>",
+     {"reasoning": "x", "content": "", "calls": [("read_file", {"path": "a"}), ("run_bash", {"command": "ls"})]}),
+    ("enum value with a stray quote snapped", False, "<tool_call><function=media_read><parameter=action>status\"</parameter></function></tool_call>",
+     {"reasoning": "", "content": "", "calls": [("media_read", {"action": "status"})]}),
+    ("non-enum value kept as written", False, "<tool_call><function=read_file><parameter=path>a\"b</parameter></function></tool_call>",
+     {"reasoning": "", "content": "", "calls": [("read_file", {"path": "a\"b"})]}),
+    ("unparseable call kept as text", False, "<tool_call><function=read_file><parameter=</function></tool_call>"
+     "<tool_call><function=run_bash><parameter=command>ls</parameter></function></tool_call>",
+     {"reasoning": "", "content": "<tool_call><function=read_file><parameter=</function></tool_call>", "calls": [("run_bash", {"command": "ls"})]}),
 ]
 for name, thinking, text, want in PARSE:
     with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as f:

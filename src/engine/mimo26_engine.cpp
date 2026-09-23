@@ -121,6 +121,30 @@ std::string param_type(const ojson& tools, const std::string& fn, const std::str
     return {};
 }
 
+// A string parameter whose schema lists an enum: a value that is not a member but becomes one once stray quotes, '>' and
+// whitespace are trimmed is snapped to that member (MiMo at temperature 1 copies the enum's JSON quote: `status"` for the
+// enum ["status", ...]); anything else is left as written.
+std::string enum_snap(const ojson& tools, const std::string& fn, const std::string& param, std::string v, uint32_t& repaired) {
+    if (!tools.is_array()) return v;
+    for (const auto& t : tools) {
+        const ojson& f = t.contains("function") ? t["function"] : t;
+        if (f.value("name", std::string()) != fn || !f.contains("parameters")) continue;
+        const ojson& p = f["parameters"];
+        if (!p.contains("properties") || !p["properties"].contains(param)) return v;
+        const ojson& e = p["properties"][param];
+        if (!e.contains("enum") || !e["enum"].is_array()) return v;
+        for (const auto& m : e["enum"]) if (m.is_string() && m.get<std::string>() == v) return v;
+        auto junk = [](char c) { return c == '"' || c == '\'' || c == '>' || c == ' ' || c == '\n'; };
+        size_t a = 0, b = v.size();
+        while (a < b && junk(v[a])) ++a;
+        while (b > a && junk(v[b - 1])) --b;
+        const std::string w = v.substr(a, b - a);
+        for (const auto& m : e["enum"]) if (m.is_string() && m.get<std::string>() == w) { ++repaired; return w; }
+        return v;
+    }
+    return v;
+}
+
 // A parameter's text as the schema says: strings stay strings; numbers / booleans / objects / arrays parse as JSON
 // (kept as the string when they do not); unknown types parse only when the text is JSON-looking.
 ojson typed_value(const std::string& v, const std::string& type) {
@@ -202,32 +226,49 @@ Mimo26Parsed mimo26_parse_completion(const std::string& text, bool thinking, con
     if (tc == std::string::npos) { r.content = rest; return r; }
     const ojson tools = tools_json.empty() ? ojson() : ojson::parse(tools_json, nullptr, false);
     ojson calls = ojson::array();
+    std::string unparsed;   // call blocks that could not be parsed, kept as text
     size_t p = tc;
     int idx = 0;
     while (p != std::string::npos) {
         const size_t f0 = rest.find("<function=", p), f1 = f0 == std::string::npos ? f0 : rest.find('>', f0);
         const size_t fe = f1 == std::string::npos ? f1 : rest.find("</function>", f1);
         const size_t te = fe == std::string::npos ? fe : rest.find("</tool_call>", fe);
-        if (te == std::string::npos) { r.malformed_call = true; break; }
+        if (te == std::string::npos) { r.malformed_call = true; unparsed += rest.substr(p); break; }
+        const size_t next_call = rest.find("<tool_call>", te + 12);
         const std::string name = rest.substr(f0 + 10, f1 - (f0 + 10));
         const std::string body = rest.substr(f1 + 1, fe - (f1 + 1));
         ojson args = ojson::object();
+        bool bad = false;
         for (size_t q = body.find("<parameter="); q != std::string::npos; q = body.find("<parameter=", q)) {
             const size_t k1 = body.find('>', q);
-            const size_t ve = k1 == std::string::npos ? k1 : body.find("</parameter>", k1);
-            if (ve == std::string::npos) { r.malformed_call = true; break; }
+            if (k1 == std::string::npos) { bad = true; break; }
             const std::string key = body.substr(q + 11, k1 - (q + 11));
-            args[key] = typed_value(strip_one_newline(body.substr(k1 + 1, ve - (k1 + 1))), param_type(tools, name, key));
-            q = ve + 12;
+            const size_t ve = body.find("</parameter>", k1), nx = body.find("<parameter=", k1);
+            if (ve != std::string::npos && (nx == std::string::npos || ve < nx)) {
+                args[key] = typed_value(enum_snap(tools, name, key, strip_one_newline(body.substr(k1 + 1, ve - (k1 + 1))), r.repaired), param_type(tools, name, key));
+                q = ve + 12;
+                continue;
+            }
+            // no </parameter> before the next parameter / the function's end: the value runs there (repair)
+            const size_t end = nx == std::string::npos ? body.size() : nx;
+            std::string v = body.substr(k1 + 1, end - (k1 + 1));
+            while (!v.empty() && (v.back() == '\n' || v.back() == ' ')) v.pop_back();
+            if (v.size() >= 2 && v.compare(v.size() - 2, 2, "\">") == 0) v.resize(v.size() - 2);
+            args[key] = typed_value(enum_snap(tools, name, key, strip_one_newline(v), r.repaired), param_type(tools, name, key));
+            ++r.repaired;
+            q = end;
         }
-        if (r.malformed_call) break;
-        char id[32]; std::snprintf(id, sizeof id, "call_%08x_%d", unsigned(std::hash<std::string>{}(name + body)), idx++);
-        calls.push_back({{"id", id}, {"type", "function"}, {"function", {{"name", name}, {"arguments", args.dump()}}}});
-        p = rest.find("<tool_call>", te + 12);
+        if (bad) { r.malformed_call = true; unparsed += rest.substr(p, te + 12 - p); }
+        else {
+            char id[32]; std::snprintf(id, sizeof id, "call_%08x_%d", unsigned(std::hash<std::string>{}(name + body)), idx++);
+            calls.push_back({{"id", id}, {"type", "function"}, {"function", {{"name", name}, {"arguments", args.dump()}}}});
+        }
+        p = next_call;
     }
-    if (r.malformed_call || calls.empty()) { r.content = rest; return r; }   // an unparseable block stays text
+    if (calls.empty()) { r.content = rest; return r; }   // nothing parseable: the whole block stays text
     std::string content = rest.substr(0, tc);
     while (!content.empty() && (content.back() == '\n' || content.back() == ' ')) content.pop_back();
+    if (!unparsed.empty()) content += (content.empty() ? "" : "\n") + unparsed;
     r.content = content;
     r.tool_calls_json = calls.dump();
     return r;
@@ -474,7 +515,15 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
     if (!pending.empty()) { text += pending; if (on_token) on_token(pending); }
     r.decode_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_dec).count();
     if (!chat) { r.text = text; return r; }
+    // IE_MIMO26_DUMP_REQ=<dir> (diagnostic): each chat's raw completion text, before parsing, as resp_<n>.txt
+    if (const char* dd = std::getenv("IE_MIMO26_DUMP_REQ"); dd && *dd) {
+        static int n_resp = 0;
+        std::ofstream(std::string(dd) + "/resp_" + std::to_string(n_resp++) + ".txt", std::ios::binary) << text;
+    }
     const Mimo26Parsed pc = mimo26_parse_completion(text, thinking, tools_json);
+    if (pc.repaired || pc.malformed_call)
+        std::fprintf(stderr, "[mimo26] tool calls: %u parameter(s) repaired (no </parameter>, or an enum value's stray quote)%s\n", pc.repaired,
+                     pc.malformed_call ? "; an unparseable call block was returned as text" : "");
     r.reasoning_content = pc.reasoning;
     r.text = pc.content;
     if (!pc.tool_calls_json.empty()) { r.tool_calls_json = pc.tool_calls_json; if (r.finish_reason == "stop") r.finish_reason = "tool_calls"; }
@@ -495,6 +544,10 @@ GenerateResult Engine::mimo26_chat(std::span<const ChatTurn> turns, const Sampli
     std::string err;
     const std::string prompt = mimo26_render_chat(msgs, std::string(tools_json), true, enable_thinking, err);
     if (!err.empty()) { r.finish_reason = "error: mimo_v2 chat template: " + err; return r; }
+    if (const char* dd = std::getenv("IE_MIMO26_DUMP_REQ"); dd && *dd) {   // (diagnostic) the rendered prompt, req_<n>.txt
+        static int n_req = 0;
+        std::ofstream(std::string(dd) + "/req_" + std::to_string(n_req++) + ".txt", std::ios::binary) << prompt;
+    }
     const auto ids = mimo26_->tok.encode(prompt, /*allow_special=*/true);
     return mimo26_run_ids(*mimo26_, ids, sp, on_token, /*chat=*/true, enable_thinking, std::string(tools_json));
 }

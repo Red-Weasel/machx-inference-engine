@@ -44,15 +44,28 @@ int32_t Ds41Generator::sample_row(float* lg, size_t V, const std::vector<int32_t
             lg[size_t(id)] = lg[size_t(id)] > 0 ? lg[size_t(id)] / sp.repeat_penalty : lg[size_t(id)] * sp.repeat_penalty;
         }
     if (sp.temperature <= 0.f) return int32_t(std::max_element(lg, lg + V) - lg);
+    // The candidates in descending logit order are needed only as far as the top-p nucleus reaches: the mass z over all
+    // kept candidates, then the top K sorted (K x4 until the nucleus fits) -- not a sort of the whole vocabulary, which cost
+    // 12 ms a row with top_k 0 (Dream's setting) and a speculative verify samples up to 8 rows (MiMo DFlash, 2026-09-22).
     std::vector<int32_t> idx(V); std::iota(idx.begin(), idx.end(), 0);
-    const size_t keep = sp.top_k && sp.top_k < V ? sp.top_k : V;
-    std::partial_sort(idx.begin(), idx.begin() + std::ptrdiff_t(keep), idx.end(), [&](int32_t a, int32_t b) { return lg[size_t(a)] > lg[size_t(b)]; });
-    idx.resize(keep);
-    std::vector<double> p(keep); double mx = lg[size_t(idx[0])] / sp.temperature, z = 0;
-    for (size_t i = 0; i < keep; ++i) { p[i] = std::exp(double(lg[size_t(idx[i])]) / sp.temperature - mx); z += p[i]; }
-    for (auto& v : p) v /= z;
-    size_t n = keep;
-    if (sp.top_p < 1.f) { double c = 0; n = 0; while (n < keep) { c += p[n]; ++n; if (c >= sp.top_p) break; } }
+    auto by_logit = [&](int32_t a, int32_t b) { return lg[size_t(a)] > lg[size_t(b)] || (lg[size_t(a)] == lg[size_t(b)] && a < b); };
+    size_t keep = V;
+    if (sp.top_k && sp.top_k < V) { std::nth_element(idx.begin(), idx.begin() + std::ptrdiff_t(sp.top_k), idx.end(), by_logit); keep = sp.top_k; }
+    const double mx = double(*std::max_element(lg, lg + V)) / sp.temperature;   // the top-k set holds the maximum
+    double z = 0;
+    for (size_t i = 0; i < keep; ++i) z += std::exp(double(lg[size_t(idx[i])]) / sp.temperature - mx);
+    const double target = sp.top_p < 1.f ? double(sp.top_p) : 2.0;
+    std::vector<double> p;
+    size_t n = 0;
+    for (size_t K = std::min<size_t>(keep, 64);; K = std::min(keep, K * 4)) {
+        if (K < keep) std::nth_element(idx.begin(), idx.begin() + std::ptrdiff_t(K), idx.begin() + std::ptrdiff_t(keep), by_logit);
+        std::sort(idx.begin(), idx.begin() + std::ptrdiff_t(K), by_logit);
+        p.resize(K);
+        for (size_t i = 0; i < K; ++i) p[i] = std::exp(double(lg[size_t(idx[i])]) / sp.temperature - mx) / z;
+        double c = 0; bool fits = false;
+        for (n = 0; n < K;) { c += p[n]; ++n; if (c >= target) { fits = true; break; } }
+        if (fits || K == keep) break;
+    }
     if (sp.min_p > 0.f) { const double floor = sp.min_p * p[0]; size_t m = 0; while (m < n && p[m] >= floor) ++m; n = std::max<size_t>(1, m); }
     double zz = 0; for (size_t i = 0; i < n; ++i) zz += p[i];
     const double r = uniform01(rng) * zz; double c = 0;

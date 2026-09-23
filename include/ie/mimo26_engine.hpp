@@ -50,7 +50,10 @@ std::string mimo26_tojson(const std::string& json_text, std::string& err);
 
 // The completion after a mimo26_render_chat prompt: reasoning up to </think> (thinking), the content, and the XML tool
 // calls as an OpenAI tool_calls JSON array ("" when none); values typed by the tool's JSON schema.
-struct Mimo26Parsed { std::string reasoning, content, tool_calls_json; bool malformed_call = false; };
+// A call whose <parameter=K> has no </parameter> is REPAIRED -- the value runs to the next parameter or the function's end,
+// a stray `">` dropped (MiMo at temperature 1 wrote `<parameter=action>status"></function>`); a call that cannot be
+// parsed stays in `content` as text and the calls around it are still returned.
+struct Mimo26Parsed { std::string reasoning, content, tool_calls_json; bool malformed_call = false; uint32_t repaired = 0; };
 Mimo26Parsed mimo26_parse_completion(const std::string& text, bool thinking, const std::string& tools_json);
 
 }  // namespace ie
