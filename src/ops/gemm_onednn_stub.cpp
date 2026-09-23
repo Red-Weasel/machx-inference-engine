@@ -56,6 +56,12 @@ sycl::event gemm_nt_f16_onednn(sycl::queue&, const sycl::half*, const sycl::half
     no_onednn("gemm_nt_f16_onednn");
 }
 
+sycl::event gemm_nt_f32_onednn(sycl::queue&, const float*, const float*, float*,
+                               uint32_t, uint32_t, uint32_t,
+                               const std::vector<sycl::event>&) {
+    no_onednn("gemm_nt_f32_onednn");
+}
+
 sycl::event gemm_bmm_nt_f16_onednn(sycl::queue&, const sycl::half*, const sycl::half*, float*,
                                    uint32_t, uint32_t, uint32_t, uint32_t,
                                    const std::vector<sycl::event>&) {

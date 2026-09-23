@@ -106,6 +106,25 @@ struct Ds41TierStats {
     double   ms_spawn = 0, ms_join = 0;
 };
 
+// What the tier needs from a model (docs/mimo26/00_PORT_PLAN.md P2): the dims, the shard store and, per MODEL
+// layer, the E-long arrays of (nibble, E8M0) expert planes. V4.1 and MiMo-V2.6 both ship compressed-tensors
+// MXFP4 experts as sibling safetensors, so one tier serves both; `from` is the V4.1 adapter.
+struct Ds41ExpertLayer { const Ds41Tensor* exp_w1 = nullptr; const Ds41Tensor* exp_w3 = nullptr; const Ds41Tensor* exp_w2 = nullptr; };
+struct Ds41ExpertSource {
+    const SafetensorsModel* store = nullptr;
+    uint32_t H = 0, EF = 0, n_experts = 0, top_k = 0;
+    uint32_t n_text_layers = 0;             // what the expert file's header must say (V4.1: n_layers)
+    std::vector<Ds41ExpertLayer> layers;    // indexed by model layer; null planes where a layer has no routed experts
+    std::string expert_file;                // the permute-free tail file for this tier ("" = the pack path)
+    // The expert down rows land fp32 on EVERY route and the scatter reads fp32 (the XMX prefill route always did; the
+    // int-dot route writes DS4GemmJob::y32, the CPU leg its fp32 rows). MiMo-V2.6 (docs/mimo26): its SwiGLU has no clamp
+    // and an expert the noaux_tc bias selects at a ~1e-5 weight emitted a raw down output of 150,585 -- past fp16's
+    // 65504 in the int-dot route's fp16 row store, a NaN step. V4.1: false (fp16 rows for T <= 8, bit for bit).
+    bool fp32_out = false;
+    // V4.1: the layer kind's counts at `first_layer` (the MTP stages route 128 / 3), IE_DS41_EXPERT_FILE for a text-layer tier.
+    static Ds41ExpertSource from(const DeepSeek41Model& m, uint32_t first_layer);
+};
+
 // The three tiers for a contiguous range of layers on one device.
 class Ds41ExpertTier {
 public:
@@ -121,6 +140,11 @@ public:
     // adds nothing. The default (one part) is byte-for-byte the whole tier; `part == n_parts`
     // is the empty subset (no expert of any layer: the control arm of docs/38).
     std::string init(sycl::queue& q, const DeepSeek41Model& m, uint32_t first_layer, uint32_t n_layers,
+                     const std::vector<std::vector<uint32_t>>& ranking,
+                     uint32_t n_static, uint32_t n_pinned, uint32_t stream_slots, uint32_t max_tokens,
+                     uint32_t part = 0, uint32_t n_parts = 1);
+    // The same over any model's expert planes (MiMo-V2.6: docs/mimo26).
+    std::string init(sycl::queue& q, const Ds41ExpertSource& s, uint32_t first_layer, uint32_t n_layers,
                      const std::vector<std::vector<uint32_t>>& ranking,
                      uint32_t n_static, uint32_t n_pinned, uint32_t stream_slots, uint32_t max_tokens,
                      uint32_t part = 0, uint32_t n_parts = 1);
@@ -162,7 +186,7 @@ public:
     }
 
 private:
-    const DeepSeek41Model* m_ = nullptr;
+    Ds41ExpertSource src_;
     uint32_t L0_ = 0, nL_ = 0, E_ = 0, TK_ = 0, H_ = 0, EF_ = 0, np_ = 0;
     Ds4SlotLayout   lay_;
     Ds4HostArena    arena_;

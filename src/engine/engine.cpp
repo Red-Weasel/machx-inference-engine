@@ -4,6 +4,7 @@
 // (hard cap 256 per docs/known_bugs.md — never submit larger T).
 #include "ie/engine.hpp"
 #include "ie/ds41_engine.hpp"
+#include "ie/mimo26_engine.hpp"
 #include "ie/reasoning.hpp"
 #include <future>
 #include "ie/qwen4exp.hpp"
@@ -203,6 +204,10 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
     e->model_path_ = gguf_path;
     if (ds41_dir(gguf_path)) {                       // DeepSeek-V4.1-Flash: a safetensors directory, its own runtime
         if (auto m = e->ds41_load(gguf_path); !m.empty()) { err = m; return nullptr; }
+        return e;
+    }
+    if (mimo26_dir(gguf_path)) {                     // MiMo-V2.6: a safetensors directory, its own runtime
+        if (auto m = e->mimo26_load(gguf_path); !m.empty()) { err = m; return nullptr; }
         return e;
     }
     if (auto m = e->gguf_.open(gguf_path); !m.empty())   { err = "gguf: " + m;  return nullptr; }
@@ -1858,6 +1863,7 @@ GenerateResult Engine::generate(const std::string& prompt,
                                 uint32_t cache_prefix_len,
                                 bool reply_cache) {
     if (arch_ == ModelArch::kDeepSeek41) return ds41_generate(prompt, sp, on_token);
+    if (arch_ == ModelArch::kMimo26) return mimo26_generate(prompt, sp, on_token);
     GenerateResult res;
     auto& q = alloc_.queue();
     q4e_vis_active_ = false;   // re-armed below iff this request carries images
@@ -3212,7 +3218,7 @@ static void ds4_finish_completion(const Tokenizer& tok, GenerateResult& res, boo
 }
 
 std::string Engine::reasoning_effort_error(std::string_view effort) const {
-    if (arch_ == ModelArch::kDeepSeek41) return ie::reasoning_effort_error(reasoning_capabilities(arch_), effort);   // no GGUF template
+    if (arch_ == ModelArch::kDeepSeek41 || arch_ == ModelArch::kMimo26) return ie::reasoning_effort_error(reasoning_capabilities(arch_), effort);   // no GGUF template
     const auto* ct=gguf_.find_kv("tokenizer.chat_template");
     return ie::reasoning_effort_error(reasoning_capabilities(arch_,
         ct && ct->type==GgufValueType::kString?ct->as_string():std::string_view{}),effort);
@@ -3228,6 +3234,7 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
         GenerateResult r;r.finish_reason="error: "+error;return r;
     }
     if (arch_ == ModelArch::kDeepSeek41) return ds41_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
+    if (arch_ == ModelArch::kMimo26) return mimo26_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
     // Vision guard: only the qwen4exp path (ChatML branch below) consumes
     // turn images; every other arch must refuse rather than silently drop.
     q4e_pending_imgs_.clear();

@@ -61,9 +61,29 @@ std::string Tokenizer::load_from_hf_json(const std::string& tokenizer_json, cons
         const auto it = vocab_lookup_.find(t); return it == vocab_lookup_.end() ? -1 : it->second; };
     bos_id_ = tok_id_of("bos_token"); eos_id_ = tok_id_of("eos_token"); pad_id_ = tok_id_of("pad_token");
     add_bos_token_ = cj.value("add_bos_token", false);
-    // the JSON's third Split is ` ?[\p{P}\p{S}]+...` with Unicode classes, so U+007E TILDE (Sm) is a
-    // symbol: the cascade's tilde-as-symbol variant (the GGUF "joyai-llm" path classed it otherwise)
-    pre_ = "joyai-llm"; joyai_ = true; hyv4_ = true; tekken_ = false; digits_1to3_ = false; ignore_merges_ = false; gemma_ = false; spm_ = false;
+    // The pre-tokenizer, from the JSON. Two shapes are known:
+    //  * ONE Split whose regex is the Qwen2 pattern, then ByteLevel (MiMo-V2.6, docs/mimo26/00_PORT_PLAN.md P1):
+    //    the GGUF path's "qwen2" split, no digit tweak, no ignore_merges;
+    //  * otherwise (DeepSeek-V4.1-Flash) the three-Split cascade: its third Split is ` ?[\p{P}\p{S}]+...` with
+    //    Unicode classes, so U+007E TILDE (Sm) is a symbol -- the cascade's tilde-as-symbol variant (the GGUF
+    //    "joyai-llm" path classed it otherwise).
+    static const char* kQwen2Regex =
+        R"rx((?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+)rx";
+    bool qwen2 = false;
+    if (tj.contains("pre_tokenizer") && tj["pre_tokenizer"].is_object()) {
+        const auto& pt = tj["pre_tokenizer"];
+        std::vector<std::string> splits;
+        auto collect = [&](const nlohmann::json& p) {
+            if (p.value("type", "") == "Split" && p.contains("pattern") && p["pattern"].is_object() && p["pattern"].contains("Regex"))
+                splits.push_back(p["pattern"]["Regex"].get<std::string>());
+        };
+        if (pt.value("type", "") == "Sequence" && pt.contains("pretokenizers")) for (const auto& p : pt["pretokenizers"]) collect(p);
+        else collect(pt);
+        qwen2 = splits.size() == 1 && splits[0] == kQwen2Regex;
+    }
+    tekken_ = false; digits_1to3_ = false; ignore_merges_ = false; gemma_ = false; spm_ = false;
+    if (qwen2) { pre_ = "qwen2";     joyai_ = false; hyv4_ = false; qwen2_unicode_ = true;  }
+    else       { pre_ = "joyai-llm"; joyai_ = true;  hyv4_ = true;  qwen2_unicode_ = false; }
     pre_warning_.clear();
     return {};
 }

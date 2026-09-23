@@ -144,6 +144,10 @@ private:
     // that deliberately omits it. P2 gate 2026-09-01: 15/62 '~'+punct pairs
     // split differently through the joyai table.
     bool        hyv4_          = false;
+    // The qwen2 regex over REAL Unicode categories (pretokenize_qwen2_unicode): set only by load_from_hf_json for a
+    // tokenizer.json whose one Split is the Qwen2 pattern (MiMo-V2.6, docs/mimo26 P1 gate finding 1). The GGUF path
+    // keeps the byte-level approximation of pretokenize_simple, byte for byte.
+    bool        qwen2_unicode_ = false;
 
     // Diagnostic for an unimplemented tokenizer.ggml.pre (see pre_warning()).
     std::string pre_warning_;

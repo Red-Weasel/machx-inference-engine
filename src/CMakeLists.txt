@@ -73,6 +73,7 @@ add_library(ie_core
   ops/deepseek41_candidate.cpp
   ops/deepseek41_attn_xmx.cpp
   ops/deepseek41_topk_split.cpp
+  ops/mimo26_ops.cpp
   ops/inkling_ops.cpp
   ops/laguna_ops.cpp
   ops/deepseek4_cache.cpp
@@ -124,8 +125,12 @@ add_library(ie_core
   model/deepseek41_residency.cpp
   model/deepseek41_weights.cpp
   model/deepseek41_experts.cpp
+  model/mimo26.cpp
+  model/mimo26_dequant.cpp
+  model/mimo26_forward.cpp
   engine/engine.cpp
   engine/ds41_engine.cpp
+  engine/mimo26_engine.cpp
   engine/glm5_server.cpp
   server/openai_proto.cpp
   server/capabilities.cpp

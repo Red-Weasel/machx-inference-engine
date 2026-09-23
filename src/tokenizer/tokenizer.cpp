@@ -430,6 +430,7 @@ std::string Tokenizer::load_from_gguf(const GgufReader& g) {
     // ignore_merges (see pretokenize_tekken + llama.cpp LLAMA_VOCAB_PRE_TYPE_TEKKEN).
     if (const auto* kv = g.find_kv("tokenizer.ggml.pre")) pre_ = std::string(kv->as_string());
     tekken_        = (pre_ == "tekken");
+    qwen2_unicode_ = false;   // the GGUF path keeps pretokenize_simple's byte-level split
     // Phase 6: DeepSeek-V4-Flash. Three-pass cascade with real Unicode classes
     // (pretokenize_joyai); digits_1to3_/ignore_merges_ below stay OFF for it —
     // its \p{N}{1,3} rule is a separate PASS, not the simple-path digit tweak,
@@ -780,6 +781,75 @@ static std::vector<std::string_view> pretokenize_simple(std::string_view text,
     return out;
 }
 
+// The qwen2 regex (the seven alternatives listed above pretokenize_simple) over REAL Unicode categories: each
+// codepoint classed by uni_class(), i.e. llama.cpp's own collapsed alphabet (\p{L} = letters, \p{N} = every number
+// category incl. No/Nl, \s = unicode_set_whitespace), so CJK punctuation is [^\s\p{L}\p{N}] (alt 4 takes its [\r\n]*
+// tail: "\u3002\n" is ONE pretoken), combining marks break a letter run, and '\u00bd' is a number. Malformed UTF-8 keeps
+// its raw byte (llama.cpp substitutes U+FFFD) -- the one known difference. Used for tokenizer.json checkpoints
+// (MiMo-V2.6: docs/mimo26 P1 gate finding 1); the GGUF qwen2 path stays on pretokenize_simple.
+static std::vector<std::string_view> pretokenize_qwen2_unicode(std::string_view text) {
+    std::vector<std::string_view> out;
+    const size_t n = text.size();
+    auto at = [&](size_t p, size_t& next) -> UniCls { size_t q = p; const uint32_t cp = utf8_decode(text, q); next = q; return uni_class(cp); };
+    auto is_crlf = [&](size_t p) { return text[p] == '\r' || text[p] == '\n'; };
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char c = uint8_t(text[i]);
+        // alt 1: (?i:'s|'t|'re|'ve|'m|'ll|'d)
+        if (c == '\'' && i + 1 < n) {
+            const unsigned char a = uint8_t(text[i + 1]) | 0x20;
+            size_t len = 0;
+            if (a == 's' || a == 't' || a == 'm' || a == 'd') len = 2;
+            else if (i + 2 < n) {
+                const unsigned char b = uint8_t(text[i + 2]) | 0x20;
+                if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) len = 3;
+            }
+            if (len) { out.emplace_back(text.substr(i, len)); i += len; continue; }
+        }
+        size_t i1 = 0;
+        const UniCls k0 = at(i, i1);
+        // alt 2: [^\r\n\p{L}\p{N}]?\p{L}+  (the optional prefix is ONE codepoint)
+        {
+            size_t j = i;
+            if (k0 != kULet && k0 != kUNum && !is_crlf(i)) j = i1;
+            size_t nx = 0;
+            if (j < n && at(j, nx) == kULet) {
+                while (j < n) { size_t q = 0; if (at(j, q) != kULet) break; j = q; }
+                out.emplace_back(text.substr(i, j - i)); i = j; continue;
+            }
+        }
+        // alt 3: \p{N}  (one codepoint)
+        if (k0 == kUNum) { out.emplace_back(text.substr(i, i1 - i)); i = i1; continue; }
+        // alt 4:  ?[^\s\p{L}\p{N}]+[\r\n]*
+        {
+            size_t j = i;
+            if (text[j] == ' ') ++j;
+            size_t q = 0;
+            if (j < n) {
+                const UniCls kj = at(j, q);
+                if (kj != kUWs && kj != kULet && kj != kUNum) {
+                    j = q;
+                    while (j < n) { const UniCls kk = at(j, q); if (kk == kUWs || kk == kULet || kk == kUNum) break; j = q; }
+                    while (j < n && is_crlf(j)) ++j;
+                    out.emplace_back(text.substr(i, j - i)); i = j; continue;
+                }
+            }
+        }
+        // alts 5/6/7: whitespace (\s = kUWs; the run is walked by codepoint)
+        if (k0 == kUWs) {
+            size_t e = i, last_nl = std::string_view::npos, last_start = i;
+            while (e < n) { size_t q = 0; if (at(e, q) != kUWs) break; if (is_crlf(e)) last_nl = e; last_start = e; e = q; }
+            if (last_nl != std::string_view::npos) { out.emplace_back(text.substr(i, last_nl + 1 - i)); i = last_nl + 1; }   // alt 5
+            else if (e == n)                      { out.emplace_back(text.substr(i, e - i)); i = e; }                        // alt 6 at the end
+            else if (last_start > i)              { out.emplace_back(text.substr(i, last_start - i)); i = last_start; }      // alt 6: the run minus its last codepoint
+            else                                  { out.emplace_back(text.substr(i, e - i)); i = e; }                        // alt 7: one codepoint
+            continue;
+        }
+        out.emplace_back(text.substr(i, i1 - i)); i = i1;   // unreachable for the classes above; guarantees progress
+    }
+    return out;
+}
+
 // Wave-1: tekken pre-tokenizer (Mistral Nemo / Small-24B / Devstral / Codestral).
 // Mirrors llama.cpp LLAMA_VOCAB_PRE_TYPE_TEKKEN (llama-vocab.cpp). Original
 // tokenizer.json regex (the authoritative spec), alternatives tried in order:
@@ -1097,6 +1167,7 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text, bool allow_special
         // all other pre-types (default/qwen2/llama-bpe) use the shared simple path.
         const auto pretoks = (joyai_ || hyv4_) ? pretokenize_joyai(chunk, hyv4_)
                            : tekken_ ? pretokenize_tekken(chunk)
+                           : qwen2_unicode_ ? pretokenize_qwen2_unicode(chunk)
                                      : pretokenize_simple(chunk, digits_1to3_);
         for (auto pt : pretoks) {
             // Byte-encode each byte of the pretoken.

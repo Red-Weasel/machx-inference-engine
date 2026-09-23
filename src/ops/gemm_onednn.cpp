@@ -64,6 +64,7 @@ struct OnednnCtx {
     // SAME (M,N,K) with a different memory layout, so sharing one map by shape
     // would hand back a primitive built for the wrong strides.
     std::map<std::tuple<uint32_t, uint32_t, uint32_t>, CachedMatmul> nt_prims;
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t>, CachedMatmul> nt32_prims;   // gemm_nt_f32_onednn (fp32 operands)
     std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, CachedMatmul> bmm_prims;
 };
 
@@ -164,6 +165,48 @@ sycl::event gemm_nt_f16_onednn(sycl::queue& q,
     auto& cm = it->second;
     cm.a_mem.set_data_handle(const_cast<sycl::half*>(A));
     cm.b_mem.set_data_handle(const_cast<sycl::half*>(W));
+    cm.y_mem.set_data_handle(y);
+
+    return dnnl::sycl_interop::execute(
+        cm.prim, ctx.strm,
+        {{DNNL_ARG_SRC, cm.a_mem}, {DNNL_ARG_WEIGHTS, cm.b_mem},
+         {DNNL_ARG_DST, cm.y_mem}},
+        deps);
+}
+
+// The fp32 twin of gemm_nt_f16_onednn: A [M, K], W [N, K] (read in place, the same strides trick) and y all fp32,
+// fpmath pinned to strict so an environment default cannot turn it into TF32. MiMo-V2.6's router at prefill
+// (docs/mimo26): routing near-ties make its precision matter.
+sycl::event gemm_nt_f32_onednn(sycl::queue& q,
+                               const float* A, const float* W,
+                               float* y,
+                               uint32_t M, uint32_t N, uint32_t K,
+                               const std::vector<sycl::event>& deps) {
+    auto& ctx = ctx_for(q);
+
+    const auto key = std::make_tuple(M, N, K);
+    auto it = ctx.nt32_prims.find(key);
+    if (it == ctx.nt32_prims.end()) {
+        using dt  = dnnl::memory::data_type;
+        using tag = dnnl::memory::format_tag;
+        dnnl::memory::desc a_md({M, K}, dt::f32, tag::ab);
+        dnnl::memory::desc b_md({K, N}, dt::f32, dnnl::memory::dims{1, K});
+        dnnl::memory::desc y_md({M, N}, dt::f32, tag::ab);
+        dnnl::primitive_attr attr;
+        attr.set_deterministic(onednn_deterministic());
+        attr.set_fpmath_mode(dnnl::fpmath_mode::strict);
+        dnnl::matmul::primitive_desc pd(ctx.eng, a_md, b_md, y_md, attr);
+        CachedMatmul cm;
+        cm.prim  = dnnl::matmul(pd);
+        cm.a_mem = dnnl::memory(a_md, ctx.eng, nullptr);
+        cm.b_mem = dnnl::memory(b_md, ctx.eng, nullptr);
+        cm.y_mem = dnnl::memory(y_md, ctx.eng, nullptr);
+        it = ctx.nt32_prims.emplace(key, std::move(cm)).first;
+    }
+
+    auto& cm = it->second;
+    cm.a_mem.set_data_handle(const_cast<float*>(A));
+    cm.b_mem.set_data_handle(const_cast<float*>(W));
     cm.y_mem.set_data_handle(y);
 
     return dnnl::sycl_interop::execute(

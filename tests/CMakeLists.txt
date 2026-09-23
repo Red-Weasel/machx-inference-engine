@@ -721,3 +721,15 @@ set_tests_properties(ds41_hc_parity_test PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(ds41_residency_plan_test unit/ds41_residency_plan_test.cpp)
 target_link_libraries(ds41_residency_plan_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME ds41_residency_plan_test COMMAND ds41_residency_plan_test)
+
+# MiMo-V2.6 P1 (docs/mimo26/00_PORT_PLAN.md): config parse, bind over the real checkpoint, host dequant vs the llama.cpp
+# converter's and gguf-py's values (tools/mimo26/ref_dump.py). SKIPs (77) without the checkpoint or the reference dump.
+add_executable(mimo26_model_test unit/mimo26_model_test.cpp)
+target_link_libraries(mimo26_model_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME mimo26_model_test COMMAND mimo26_model_test)
+set_tests_properties(mimo26_model_test PROPERTIES SKIP_RETURN_CODE 77)
+# MiMo-V2.6 P2 kernels vs host references (attention with K 192 / V 128, sinks, window). Needs a GPU; SKIPs (77) without.
+add_executable(mimo26_ops_test unit/mimo26_ops_test.cpp)
+target_link_libraries(mimo26_ops_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME mimo26_ops_test COMMAND mimo26_ops_test)
+set_tests_properties(mimo26_ops_test PROPERTIES SKIP_RETURN_CODE 77)

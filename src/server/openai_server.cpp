@@ -248,7 +248,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
             // `stop` sequences (Phase L): watched on the streamed text; for a
             // deepseek4 thinking request only the part after </think> counts.
             const bool separate_thinking_ns =
-                (eng.arch() == ModelArch::kDeepSeek4 || eng.arch() == ModelArch::kGlm5Next || eng.arch() == ModelArch::kDeepSeek41)
+                (eng.arch() == ModelArch::kDeepSeek4 || eng.arch() == ModelArch::kGlm5Next || eng.arch() == ModelArch::kDeepSeek41 || eng.arch() == ModelArch::kMimo26)
                 && cr.enable_thinking;
             std::string acc_ns;
             bool stopped_ns = false;
@@ -386,7 +386,8 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 // at the end.
                 const bool ds4 = (eng.arch() == ModelArch::kDeepSeek4);
                 const bool ds41 = (eng.arch() == ModelArch::kDeepSeek41);
-                const bool structured = ds4 || eng.arch() == ModelArch::kGlm5Next || eng.arch() == ModelArch::kDeepSeek41;
+                const bool mimo = (eng.arch() == ModelArch::kMimo26);   // the engine parses MiMo's XML tool calls (docs/mimo26 P3b)
+                const bool structured = ds4 || eng.arch() == ModelArch::kGlm5Next || eng.arch() == ModelArch::kDeepSeek41 || mimo;
                 const std::string DSML_OPEN = ds41 ? "<｜DSML｜" : "<｜DSML｜tool_calls";
                 static const std::string THINK_CLOSE = "</think>";
                 bool   in_reason       = structured && cr.enable_thinking;
@@ -527,7 +528,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 // Engine::chat produced; other arches use the streamed accumulator.
                 std::string tcframe = stopped ? std::string{} : (structured && !r.tool_calls_json.empty())
                     ? oai::chat_chunk_sse_tool_calls_json(model_id, id, created, r.tool_calls_json)
-                    : ds41 ? std::string{} : oai::chat_chunk_sse_tool_calls(model_id, id, created, harmony ? r.text : acc);
+                    : (ds41 || mimo) ? std::string{} : oai::chat_chunk_sse_tool_calls(model_id, id, created, harmony ? r.text : acc);
                 std::string fin_reason = stopped ? "stop" : r.finish_reason;
                 if (!tcframe.empty()) {
                     sink.write(tcframe.data(), tcframe.size());

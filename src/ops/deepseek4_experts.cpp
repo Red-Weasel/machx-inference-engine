@@ -319,7 +319,7 @@ inline void mxfp4_tile_m1(const sycl::sub_group& sg, uint32_t lane,
                           const uint8_t* qs_plane, const uint8_t* e_plane,
                           const block_q8_1x* X8, sycl::half* y,
                           uint32_t K, uint32_t N, uint32_t n0,
-                          const uint16_t* lut_slm) {
+                          const uint16_t* lut_slm, float* y32 = nullptr) {
     const uint32_t bpc = K / kQK_MXFP4;
     const uint32_t nc  = sycl::min(uint32_t(NC), N - n0);
 
@@ -357,7 +357,7 @@ inline void mxfp4_tile_m1(const sycl::sub_group& sg, uint32_t lane,
     for (int c = 0; c < NC; ++c) {
         if (uint32_t(c) >= nc) continue;
         const float r = sycl::reduce_over_group(sg, acc[c], sycl::plus<float>());
-        if (lane == 0) y[uint64_t(n0) + c] = sycl::half(r);
+        if (lane == 0) { if (y32) y32[uint64_t(n0) + c] = r; else y[uint64_t(n0) + c] = sycl::half(r); }
     }
 }
 
@@ -458,7 +458,7 @@ inline void mxfp4_tile(const sycl::sub_group& sg, uint32_t lane,
                        const uint8_t* qs_plane, const uint8_t* e_plane,
                        const block_q8_1x* X8, sycl::half* y,
                        uint32_t K, uint32_t N, uint32_t M, uint32_t n0,
-                       const uint16_t* lut = nullptr) {
+                       const uint16_t* lut = nullptr, float* y32 = nullptr) {
     const uint32_t bpc = K / kQK_MXFP4;
     const uint32_t nc  = sycl::min(uint32_t(NC), N - n0);
 
@@ -533,7 +533,7 @@ inline void mxfp4_tile(const sycl::sub_group& sg, uint32_t lane,
             for (int mm = 0; mm < kMTile; ++mm) {
                 if (uint32_t(mm) >= mt) continue;
                 const float r = sycl::reduce_over_group(sg, acc[c][mm], sycl::plus<float>());
-                if (lane == 0) y[uint64_t(m0 + mm) * N + n0 + c] = sycl::half(r);
+                if (lane == 0) { const uint64_t oi = uint64_t(m0 + mm) * N + n0 + c; if (y32) y32[oi] = r; else y[oi] = sycl::half(r); }
             }
         }
     }
@@ -605,6 +605,7 @@ struct Iq3JobDev {
 struct MxJobDev {
     const uint8_t*     qs; const uint8_t* ep;
     const block_q8_1x* x;  sycl::half*    y;  uint32_t M;
+    float*             y32;   // DS4GemmJob::y32 (null: fp16 into y)
 };
 union JobDevSlot { Iq3JobDev iq3; MxJobDev mx; };
 
@@ -658,8 +659,9 @@ sycl::event gemm_mxfp4_grouped(sycl::queue& q, const JobDevSlot* jobs, uint32_t 
             const uint32_t rows = sycl::min(uint32_t(kMTile), J.M - m0);
             mxfp4_tile<NC, true>(it.get_sub_group(), lid % kSG, J.qs, J.ep,
                            J.x + uint64_t(m0) * (K / kQK_MXFP4),
-                           J.y + uint64_t(m0) * N, K, N, rows, n0,
-                           lut.get_multi_ptr<sycl::access::decorated::no>().get());
+                           J.y32 ? nullptr : J.y + uint64_t(m0) * N, K, N, rows, n0,
+                           lut.get_multi_ptr<sycl::access::decorated::no>().get(),
+                           J.y32 ? J.y32 + uint64_t(m0) * N : nullptr);
         });
     });
 }
@@ -717,7 +719,7 @@ sycl::event gemm_mxfp4_grouped_m1(sycl::queue& q, const JobDevSlot* jobs, uint32
             if (n0 >= N) return;
             const MxJobDev J = jobs[it.get_group(0)].mx;
             mxfp4_tile_m1<NC>(it.get_sub_group(), lid % kSG, J.qs, J.ep, J.x, J.y, K, N, n0,
-                              lut_slm.get_multi_ptr<sycl::access::decorated::no>().get());
+                              lut_slm.get_multi_ptr<sycl::access::decorated::no>().get(), J.y32);
         });
     });
 }
@@ -965,8 +967,8 @@ std::string ds4_expert_gemm_q8_grouped(sycl::queue& q, const DS4GemmJob* jobs,
         const auto& J = jobs[i];
         constexpr uint64_t limit = std::numeric_limits<ptrdiff_t>::max();
         if (!b.K || !b.N || b.K % (b.dtype == DType::kIQ3_XXS ? 256 : 32) ||
-            J.e >= b.E || !J.x_q8 || !J.y)
-            return "ds4_expert_gemm_q8_grouped: invalid shape, expert index, or operand";
+            J.e >= b.E || !J.x_q8 || (!J.y && !J.y32) || (J.y32 && b.dtype != DType::kMXFP4))
+            return "ds4_expert_gemm_q8_grouped: invalid shape, expert index, or operand (fp32 rows are MXFP4-only)";
         if (uint64_t(b.K / 32) > limit / sizeof(block_q8_1x) / J.M ||
             uint64_t(b.N) > limit / sizeof(sycl::half) / J.M)
             return "ds4_expert_gemm_q8_grouped: tensor byte span overflow";
@@ -1011,7 +1013,7 @@ std::string ds4_expert_gemm_q8_grouped(sycl::queue& q, const DS4GemmJob* jobs,
                                  b.dp + uint64_t(J.e) * b.dp_stride, X8, J.y, J.M};
                 else
                     hs[j].mx  = {b.mx_qs + uint64_t(J.e) * b.mx_qs_stride,
-                                 b.mx_e  + uint64_t(J.e) * b.mx_e_stride, X8, J.y, J.M};
+                                 b.mx_e  + uint64_t(J.e) * b.mx_e_stride, X8, J.y, J.M, J.y32};
             }
             // A kernel, not a memcpy, for the reason stated at ds4_gemm_mxfp4_xmx:
             // the memcpy's SUBMISSION blocked the host until the queue's prior

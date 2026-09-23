@@ -625,3 +625,34 @@ set_target_properties(ie_ds41_protocol_fixture PROPERTIES OUTPUT_NAME "ie-ds41-p
 add_executable(ie_ds41_cache_test ds41_cache_test.cpp)
 target_link_libraries(ie_ds41_cache_test PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_ds41_cache_test PROPERTIES OUTPUT_NAME "ie-ds41-cache-test")
+
+# MiMo-V2.6 P1 (docs/mimo26/00_PORT_PLAN.md): the engine's tokenizer.json path in llama-tokenize's --ids shape
+add_executable(ie_mimo26_tokenize mimo26_tokenize.cpp)
+target_link_libraries(ie_mimo26_tokenize PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_mimo26_tokenize PROPERTIES OUTPUT_NAME "ie-mimo26-tokenize")
+# MiMo-V2.6 P2 (docs/mimo26/00_PORT_PLAN.md): greedy generation and llama-perplexity-protocol NLL against the oracle
+add_executable(ie_mimo26_run mimo26_run.cpp)
+target_link_libraries(ie_mimo26_run PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_mimo26_run PROPERTIES OUTPUT_NAME "ie-mimo26-run")
+add_executable(ie_mimo26_ppl mimo26_ppl.cpp)
+target_link_libraries(ie_mimo26_ppl PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_mimo26_ppl PROPERTIES OUTPUT_NAME "ie-mimo26-ppl")
+add_executable(ie_mimo26_score mimo26_score.cpp)
+target_link_libraries(ie_mimo26_score PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_mimo26_score PROPERTIES OUTPUT_NAME "ie-mimo26-score")
+# MiMo-V2.6 P3b: the C++ chat template / completion parser for tools/mimo26/check_template.py
+add_executable(ie_mimo26_chat_render mimo26_chat_render.cpp)
+target_link_libraries(ie_mimo26_chat_render PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_mimo26_chat_render PROPERTIES OUTPUT_NAME "ie-mimo26-chat-render")
+# MiMo-V2.6 P4: an expert-residency ranking from real chat traffic
+add_executable(ie_mimo26_profile mimo26_profile.cpp)
+target_link_libraries(ie_mimo26_profile PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_mimo26_profile PROPERTIES OUTPUT_NAME "ie-mimo26-profile")
+# MiMo-V2.6 P4: the attention kernels timed in isolation
+add_executable(ie_mimo26_attn_bench mimo26_attn_bench.cpp)
+target_link_libraries(ie_mimo26_attn_bench PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_mimo26_attn_bench PROPERTIES OUTPUT_NAME "ie-mimo26-attn-bench")
+# MiMo-V2.6 P3b gate (b): a follow-up turn on decode-written caches vs a cold prefill
+add_executable(ie_mimo26_reuse mimo26_reuse.cpp)
+target_link_libraries(ie_mimo26_reuse PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_mimo26_reuse PROPERTIES OUTPUT_NAME "ie-mimo26-reuse")

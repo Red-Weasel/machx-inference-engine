@@ -9,7 +9,7 @@
 
 namespace ie {
 
-enum class ModelArch { kQwen35Moe, kQwen3Dense, kQwen35Dense, kLlama3, kQwen3Moe, kQwen3Next, kGemma4, kGptOss, kDeepSeek4, kInkling, kLaguna, kGlmDsa, kQwen4Exp, kGlm5Next, kHyv4, kDeepSeek41, kUnknown };
+enum class ModelArch { kQwen35Moe, kQwen3Dense, kQwen35Dense, kLlama3, kQwen3Moe, kQwen3Next, kGemma4, kGptOss, kDeepSeek4, kInkling, kLaguna, kGlmDsa, kQwen4Exp, kGlm5Next, kHyv4, kDeepSeek41, kMimo26, kUnknown };
 
 // Identify the forward implementation from general.architecture.
 // "qwen35moe" → crown (DeltaNet+full-attn+MoE); "qwen3"/"qwen2" → plain dense

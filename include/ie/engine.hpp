@@ -59,6 +59,9 @@ struct Glm5Bundle;
 // DeepSeek-V4.1-Flash (kDeepSeek41): a model DIRECTORY (safetensors), the resident two-card
 // runtime, the tokenizer.json tokenizer and the V4.1 prompt format. src/engine/ds41_engine.cpp.
 struct Ds41Bundle;
+// MiMo-V2.6 (kMimo26): a model DIRECTORY (config.json model_type mimo_v2), the two-card forward, the tokenizer.json
+// tokenizer and the checkpoint's chat template. src/engine/mimo26_engine.cpp (docs/mimo26/00_PORT_PLAN.md P3b).
+struct Mimo26Bundle;
 
 // Pinned (USM host) staging buffer for the host-bounced logits row. Every
 // multi-card / host-runtime path (DenseModelTP, qwen3next, qwen35 TP/split,
@@ -212,6 +215,8 @@ public:
     ModelArch arch()    const noexcept { return arch_; }
     // A DeepSeek-V4.1 model directory (config.json names deepseek_v41)? Such a path loads without GGUF.
     static bool ds41_dir(const std::string& path);
+    // A MiMo-V2.6 model directory (config.json model_type mimo_v2)?
+    static bool mimo26_dir(const std::string& path);
     uint32_t  max_ctx() const noexcept { return opts_.max_ctx; }
     uint32_t  parallel() const noexcept { return opts_.parallel; }
     uint32_t  vocab()   const noexcept {
@@ -471,6 +476,11 @@ private:
     GenerateResult ds41_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
                             bool enable_thinking, std::string_view tools_json, std::string_view reasoning_effort);
     GenerateResult ds41_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token);
+    // mimo26 (src/engine/mimo26_engine.cpp): the directory load and the chat/generate routes
+    std::string    mimo26_load(const std::string& dir);
+    GenerateResult mimo26_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
+                              bool enable_thinking, std::string_view tools_json, std::string_view reasoning_effort);
+    GenerateResult mimo26_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token);
     // qwen4exp forward, defined in engine.cpp (Q4eBundle is incomplete here).
     sycl::event q4e_forward(sycl::queue& q, const int32_t* ids, uint32_t T, uint32_t pos);
     sycl::event glm5_forward(sycl::queue& q, const int32_t* ids, uint32_t T, uint32_t pos);
@@ -528,6 +538,7 @@ private:
     // mmap its tensors point at is still alive.
     std::unique_ptr<Ds4Bundle> ds4_;
     std::unique_ptr<Ds41Bundle> ds41_;   // deepseek41 only; frees its runtime in its own destructor
+    std::unique_ptr<Mimo26Bundle> mimo26_;   // mimo_v2 only; frees its runtime in its own destructor
     uint32_t        ds4_vocab_ = 0;       // cached: vocab() cannot see into Ds4Bundle
     // DeepSeek-V4-Flash-Vision-Exp (docs/deepseek4/70_VISION_EXP_PORT_PLAN.md P3/P4).
     // load() finds the vision sidecar beside the GGUF and uploads the tower on

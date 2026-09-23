@@ -278,6 +278,9 @@ struct DS4GemmJob {
     // shared f16 activation block.  Defaulted so every existing site is
     // unaffected.
     uint32_t      row0  = 0;
+    // MXFP4 banks only: when set, the rows land here as fp32 [M, bank.N] and `y` is not written (MiMo-V2.6's unclamped
+    // SwiGLU experts can exceed fp16's range, docs/mimo26). Defaulted null: every existing site writes fp16, bit for bit.
+    float*        y32   = nullptr;
 };
 
 // Device-side descriptor staging for the grouped launch.

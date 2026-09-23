@@ -851,6 +851,13 @@ sycl::event gemm_nt_f16_onednn(sycl::queue& q,
                                uint32_t M, uint32_t N, uint32_t K,
                                const std::vector<sycl::event>& deps = {});
 
+// The fp32 twin: A [M, K], W [N, K] (in place, as above), y [M, N], all fp32; strict fp32 math (never TF32).
+sycl::event gemm_nt_f32_onednn(sycl::queue& q,
+                               const float* A, const float* W,
+                               float* y,
+                               uint32_t M, uint32_t N, uint32_t K,
+                               const std::vector<sycl::event>& deps = {});
+
 // y[M, N] (fp32) = A[M, K] (fp16) @ W[N, K]^T, where W is NOT stored: it is the
 // Q8_0-SoA pair (`qs` int8 [N][K], `d` fp16 [N][K/group]) that DeepSeek-V4's
 // `ds4_build_q8_soa` produces, decoded as W[n][k] = qs[n][k] * d[n][k/group].

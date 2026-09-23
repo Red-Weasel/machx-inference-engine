@@ -10,6 +10,7 @@ namespace ie {
 std::string server_reasoning_error(const std::string& path,std::string_view effort) {
     if(effort.empty())return {};
     if(Engine::ds41_dir(path))return reasoning_effort_error(reasoning_capabilities(ModelArch::kDeepSeek41),effort);
+    if(Engine::mimo26_dir(path))return reasoning_effort_error(reasoning_capabilities(ModelArch::kMimo26),effort);
     GgufReader g;
     if(auto e=g.open(path);!e.empty())return "gguf: "+e;
     const auto* ct=g.find_kv("tokenizer.chat_template");
@@ -23,13 +24,13 @@ bool server_supports_arch(ModelArch arch) noexcept {
         case ModelArch::kQwen3Moe: case ModelArch::kQwen3Next:
         case ModelArch::kGemma4: case ModelArch::kGptOss:
         case ModelArch::kDeepSeek4: case ModelArch::kQwen4Exp:
-        case ModelArch::kGlm5Next: case ModelArch::kDeepSeek41: return true;
+        case ModelArch::kGlm5Next: case ModelArch::kDeepSeek41: case ModelArch::kMimo26: return true;
         default: return false;
     }
 }
 bool server_streams_experts(ModelArch arch) noexcept {
     return arch == ModelArch::kDeepSeek4 || arch == ModelArch::kQwen4Exp ||
-           arch == ModelArch::kGlm5Next || arch == ModelArch::kDeepSeek41;
+           arch == ModelArch::kGlm5Next || arch == ModelArch::kDeepSeek41 || arch == ModelArch::kMimo26;
 }
 std::string server_capabilities_json(const std::string& model_path) {
     using nlohmann::json;
@@ -37,6 +38,7 @@ std::string server_capabilities_json(const std::string& model_path) {
     std::string name;
     std::string chat_template;
     if (!model_path.empty() && Engine::ds41_dir(model_path)) { arch = ModelArch::kDeepSeek41; name = "deepseek_v41"; }
+    else if (!model_path.empty() && Engine::mimo26_dir(model_path)) { arch = ModelArch::kMimo26; name = "mimo_v2"; }
     else if (!model_path.empty()) {
         GgufReader g;
         if (auto e = g.open(model_path); !e.empty()) throw std::runtime_error("gguf: " + e);
@@ -61,7 +63,7 @@ std::string server_capabilities_json(const std::string& model_path) {
     const bool cache = generic || arch == ModelArch::kQwen35Moe ||
         arch == ModelArch::kQwen35Dense || arch == ModelArch::kQwen3Next ||
         arch == ModelArch::kGemma4 || arch == ModelArch::kQwen4Exp ||
-        arch == ModelArch::kDeepSeek4 || arch == ModelArch::kDeepSeek41;
+        arch == ModelArch::kDeepSeek4 || arch == ModelArch::kDeepSeek41 || arch == ModelArch::kMimo26;
     const bool spec = generic || arch == ModelArch::kQwen35Dense || arch == ModelArch::kGemma4;
     // int8 KV is only offered where the Engine uses ordinary KvCache; multi-GPU
     // and concurrency combinations remain subject to Engine's load validation.

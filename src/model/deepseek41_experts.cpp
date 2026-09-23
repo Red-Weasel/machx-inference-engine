@@ -251,7 +251,31 @@ void Ds41ExpertTier::free_storage(sycl::queue& q) {
     ready_ = false; empty_ = false;
 }
 
+Ds41ExpertSource Ds41ExpertSource::from(const DeepSeek41Model& m, uint32_t first_layer) {
+    const auto& c = m.config();
+    Ds41ExpertSource s;
+    s.store = &m.store(); s.H = c.dim; s.EF = c.moe_inter_dim;
+    s.n_experts = c.n_routed(first_layer); s.top_k = c.n_activated(first_layer);   // the layer kind's counts (the MTP stages: 128 / 3)
+    s.n_text_layers = c.n_layers;
+    s.layers.resize(c.n_layers + c.n_mtp_layers);
+    for (uint32_t L = 0; L < s.layers.size(); ++L) {
+        const auto& Lw = m.layers()[L];
+        if (Lw.exp_w1.empty()) continue;
+        s.layers[L] = Ds41ExpertLayer{Lw.exp_w1.data(), Lw.exp_w3.data(), Lw.exp_w2.data()};
+    }
+    // the file holds the text layers' experts; an MTP tier (the drafter's) skips it
+    if (const char* f = std::getenv("IE_DS41_EXPERT_FILE"); f && *f && first_layer < c.n_layers) s.expert_file = f;
+    return s;
+}
+
 std::string Ds41ExpertTier::init(sycl::queue& q, const DeepSeek41Model& m, uint32_t first_layer, uint32_t n_layers,
+                                 const std::vector<std::vector<uint32_t>>& ranking,
+                                 uint32_t n_static, uint32_t n_pinned, uint32_t stream_slots, uint32_t max_tokens,
+                                 uint32_t part, uint32_t n_parts) {
+    return init(q, Ds41ExpertSource::from(m, first_layer), first_layer, n_layers, ranking, n_static, n_pinned, stream_slots, max_tokens, part, n_parts);
+}
+
+std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint32_t first_layer, uint32_t n_layers,
                                  const std::vector<std::vector<uint32_t>>& ranking,
                                  uint32_t n_static, uint32_t n_pinned, uint32_t stream_slots, uint32_t max_tokens,
                                  uint32_t part, uint32_t n_parts) {
@@ -261,10 +285,13 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const DeepSeek41Model& m, uint3
     // thread that submits the GPU work -- gate 13 isolated it at ~26 ms/token idle (183-189 -> 159-160)
     // and ~190 ms/token under a 400% CPU load (docs/deepseek41/35 step 3). Numerics-free; on by default.
     kmp_set_blocktime(0);
-    const auto& c = m.config();
-    m_ = &m; L0_ = first_layer; nL_ = n_layers; E_ = c.n_routed(first_layer); TK_ = c.n_activated(first_layer);   // the layer kind's counts (the MTP stages: 128 / 3)
-    H_ = c.dim; EF_ = c.moe_inter_dim; np_ = n_pinned; share_ = n_parts > 1;
-    if (first_layer + n_layers > c.n_layers + c.n_mtp_layers) return "tier: layer range out of the text path";
+    src_ = s;
+    L0_ = first_layer; nL_ = n_layers; E_ = s.n_experts; TK_ = s.top_k;   // the layer kind's counts (the MTP stages: 128 / 3)
+    H_ = s.H; EF_ = s.EF; np_ = n_pinned; share_ = n_parts > 1;
+    if (!s.store || first_layer + n_layers > s.layers.size()) return "tier: layer range out of the model's layers";
+    for (uint32_t l = 0; l < n_layers; ++l)
+        if (!s.layers[first_layer + l].exp_w1 || !s.layers[first_layer + l].exp_w3 || !s.layers[first_layer + l].exp_w2)
+            return "tier: layer " + std::to_string(first_layer + l) + " has no routed experts";
     if (n_parts == 0 || part > n_parts) return "tier: part " + std::to_string(part) + " of " + std::to_string(n_parts) + " parts";
     // part == n_parts: the empty subset -- no expert of any layer (the expert-parallel control arm)
     if (auto e = ds41_slot_layout(H_, EF_, lay_); !e.empty()) return e;
@@ -290,10 +317,10 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const DeepSeek41Model& m, uint3
     // fault). Expert bytes no longer go through the mapping at all -- every fill below reads
     // with pread (ds41_slot_pack_pread) -- but the dense path still does; keep the whole-mapping
     // MADV_NORMAL for it. One call per shard. No WILLNEED.
-    if (!m.store().advise(MADV_NORMAL)) return "tier: madvise(MADV_NORMAL) failed on a shard mapping";
+    if (!s.store->advise(MADV_NORMAL)) return "tier: madvise(MADV_NORMAL) failed on a shard mapping";
     mm_stage_.resize(mm_stage_slots_);
-    const char* file_env = std::getenv("IE_DS41_EXPERT_FILE");
-    const std::string file_path = (file_env && L0_ < c.n_layers) ? file_env : "";   // the file holds the text layers' experts; an MTP tier (the drafter's) skips it
+    const std::string file_path = s.expert_file;
+    // the file holds the text layers' experts; an MTP tier (the drafter's) skips it
     if (!file_path.empty()) {
         // the staging slots as anonymous huge-page memory imported into the driver (docs/40 step 0(c):
         // O_DIRECT into host USM is refused with EFAULT; imported anonymous memory takes it and DMAs)
@@ -318,13 +345,13 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const DeepSeek41Model& m, uint3
     for (auto& b : bounce_)
         if (posix_memalign(&b, size_t(kPage), size_t(ds41_pack_bounce_bytes(lay_))) != 0) return "tier: bounce alloc failed";
     dq_ = std::make_unique<sycl::queue>(q.get_context(), q.get_device(), sycl::property_list{sycl::property::queue::in_order{}});
-    const auto& store = m.store();
+    const auto& store = *s.store;
 
     // pinned tier: arena slots, pread-packed straight into the pinned slot, kReaders at a time
     if (n_pinned) {
         if (auto e = arena_.init_set_per_layer(q, slot_bytes, E_, pinned_ids); !e.empty()) return "tier arena: " + e;
         for (uint32_t l = 0; l < n_layers; ++l) {
-            const auto& Lw = m.layers()[L0_ + l];
+            const auto& Lw = s.layers[L0_ + l];
             const auto e = parallel_fill(uint32_t(pinned_ids[l].size()), [&](uint32_t i, uint32_t th) -> std::string {
                 const uint32_t ex = pinned_ids[l][i];
                 void* dst = arena_.slot(l, ex);
@@ -348,7 +375,7 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const DeepSeek41Model& m, uint3
         if (fd < 0 || dfd < 0) return "tier: IE_DS41_EXPERT_FILE " + file_path + ": " + std::strerror(errno);
         Ds41ExpertFileHeader hd{};
         if (pread(fd, &hd, sizeof hd, 0) != ssize_t(sizeof hd) || std::memcmp(hd.magic, kDs41ExpertFileMagic, 8) != 0) { close(fd); close(dfd); return "tier: expert file: not an IESLOT01 file"; }
-        if (hd.H != H_ || hd.EF != EF_ || hd.n_layers != c.n_layers || hd.n_experts != E_ || hd.slot_bytes != lay_.bytes) { close(fd); close(dfd);
+        if (hd.H != H_ || hd.EF != EF_ || hd.n_layers != s.n_text_layers || hd.n_experts != E_ || hd.slot_bytes != lay_.bytes) { close(fd); close(dfd);
             return "tier: expert file: layout mismatch (H " + std::to_string(hd.H) + " EF " + std::to_string(hd.EF) + " layers " + std::to_string(hd.n_layers) + " experts " + std::to_string(hd.n_experts) + " slot " + std::to_string(hd.slot_bytes) + ")"; }
         std::vector<uint64_t> table(size_t(hd.n_layers) * hd.n_experts);
         if (pread(fd, table.data(), table.size() * 8, off_t(hd.table_off)) != ssize_t(table.size() * 8)) { close(fd); close(dfd); return "tier: expert file: table read failed"; }
@@ -362,7 +389,7 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const DeepSeek41Model& m, uint3
         if (covered) {   // the sample: the pack path's bytes == the file's, byte for byte
             void* a = nullptr; void* b = nullptr;
             if (posix_memalign(&a, kPage, size_t(lay_.bytes)) != 0 || posix_memalign(&b, kPage, size_t(lay_.bytes)) != 0) { close(dfd); return "tier: expert file: sample alloc failed"; }
-            const auto& Lw = m.layers()[L0_ + uint32_t(sl0)];
+            const auto& Lw = s.layers[L0_ + uint32_t(sl0)];
             std::string e1 = ds41_slot_pack_pread(lay_, store, Lw.exp_w1[se0], Lw.exp_w3[se0], Lw.exp_w2[se0], a, bounce_[0]);
             std::string e2 = e1.empty() ? ds41_slot_pread_file(dfd, mm_file_off_[size_t(sl0) * E_ + se0], b, lay_.bytes, 0, 1, nullptr) : std::string();
             const bool same = e1.empty() && e2.empty() && std::memcmp(a, b, size_t(lay_.bytes)) == 0;
@@ -375,7 +402,7 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const DeepSeek41Model& m, uint3
     }
     cpu_start(q);
     for (uint32_t l = 0; l < n_layers; ++l) {
-        const auto& Lw = m.layers()[L0_ + l]; const auto& r = sub[l];
+        const auto& Lw = s.layers[L0_ + l]; const auto& r = sub[l];
         for (uint32_t b0 = 0; b0 < n_static; b0 += mm_stage_slots_) {
             const uint32_t bn = std::min(mm_stage_slots_, n_static - b0);
             const auto e = parallel_fill(bn, [&](uint32_t i, uint32_t th) -> std::string {
@@ -418,7 +445,8 @@ void Ds41ExpertTier::cpu_start(sycl::queue& q) {
     cpu_.nthreads = int(cpu_.cores.size());
     cpu_.lay = &lay_; cpu_.x.assign(size_t(cpu_.max_rows()) * H_, 0.f); cpu_.scratch.assign(size_t(kCpuExpertRows) * 2 * EF_, 0.f); cpu_.out.assign(size_t(kCpuExpertRows) * H_, 0.f);
     cpu_.h_rows = sycl::malloc_host<sycl::half>(size_t(cpu_.max_rows()) * TK_ * H_, q);
-    if (cpu_.cont_rows > CpuMiss::kMaxRows) cpu_.h_rows32 = sycl::malloc_host<float>(size_t(cpu_.cont_rows) * TK_ * H_, q);
+    if (cpu_.cont_rows > CpuMiss::kMaxRows || src_.fp32_out)   // fp32_out: decode rows land fp32 too
+        cpu_.h_rows32 = sycl::malloc_host<float>(size_t(std::max(cpu_.cont_rows, CpuMiss::kMaxRows)) * TK_ * H_, q);
     if (cpu_.cont_rows > CpuMiss::kMaxRows && !cpu_.h_rows32) cpu_.cont_rows = 0;   // no fp32 staging: continuations keep the GPU route
     cpu_.stop = false; cpu_.pending = false; cpu_.done = true;
     // the reader threads (this thread's OpenMP team) keep off the worker's cores: pinned to the rest
@@ -528,7 +556,7 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
     const uint64_t fetched0 = cache_.stats().bytes_fetched;   // the pinned tier's H2D bytes, counted at the cache's misses
     const uint64_t shits0 = cache_.stats().stream_hits;       // ... and the pinned experts a stream slot already held
     const uint32_t l = L - L0_, H = H_, EF = EF_, K = TK_, E = E_;
-    const auto& Lw = m_->layers()[L];
+    const auto& Lw = src_.layers[L];
     st_ = Ds41TierStats{};
 
     // ---- counting sort by expert (V4's packing) -------------------------------------------
@@ -600,7 +628,8 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
             }
             cpu_.limit = swiglu_limit;
             q.memcpy(cpu_.x.data(), x, size_t(T) * H * 4).wait();      // the activations, host side
-            cpu_.f32 = T > CpuMiss::kMaxRows;
+            cpu_.f32 = T > CpuMiss::kMaxRows || src_.fp32_out;   // the rows the XMX route's fp32 scatter reads
+            if (cpu_.f32 && !cpu_.h_rows32) return "tier: the CPU leg has no fp32 row staging";
             { std::lock_guard<std::mutex> lk(cpu_.mu); cpu_.pending = true; cpu_.done = false; }
             cpu_.cv.notify_all();
             cpu_leg = true; tc = std::chrono::steady_clock::now();
@@ -654,7 +683,7 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
                             if (sl == 0) n_file.fetch_add(1);
                             return {};
                         }
-                        if (auto er = ds41_slot_pack_pread(lay_, m_->store(), Lw.exp_w1[e], Lw.exp_w3[e], Lw.exp_w2[e], mm_stage_[(b0 + i) % mm_stage_slots_], bounce_[th],
+                        if (auto er = ds41_slot_pack_pread(lay_, *src_.store, Lw.exp_w1[e], Lw.exp_w3[e], Lw.exp_w2[e], mm_stage_[(b0 + i) % mm_stage_slots_], bounce_[th],
                                                            &ns_read[th], &ns_perm[th], sl, ns); !er.empty())
                             return "tier mmap pack (expert " + std::to_string(e) + ", slice " + std::to_string(sl) + "): " + er;
                         return {};
@@ -721,10 +750,17 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
     // pipelined stack). IE_DS41_PREFILL_XMX=0 restores the int-dot W4A8 route.
     static const bool prefill_xmx = [] { const char* e = std::getenv("IE_DS41_PREFILL_XMX"); return !(e && *e && std::string(e) == "0"); }();
     const bool xmx = prefill_xmx && ds4_expert_xmx_on() && T > 8 && !ep_export_ && !ep_import_ && bws_.g_f && bws_.u_f && bws_.y_f32;
+    // Ds41ExpertSource::fp32_out (MiMo-V2.6): the int-dot route's down rows land fp32 in y_f32 too (DS4GemmJob::y32),
+    // so every call scatters from fp32 -- the XMX route already does
+    const bool f32_rows = xmx || src_.fp32_out;
+    if (src_.fp32_out && (!bws_.y_f32 || ep_export_ || ep_import_)) return "tier: fp32_out needs the fp32 row workspace and no expert parallel";
     static thread_local std::vector<DS4XmxGemmJob> xmx_jobs;
-    auto push_job = [&](const DS4ExpertBank& bank, uint32_t n_e, const void* x_in, uint32_t x_row_blocks, sycl::half* out, uint32_t out_stride, uint32_t o) {
-        if (!row_jobs || n_e <= 1) { bws_.jobs.push_back({bank, 0, n_e, x_in, out, o}); return; }
-        for (uint32_t r = 0; r < n_e; ++r) bws_.jobs.push_back({bank, 0, 1u, static_cast<const block_q8_1x*>(x_in) + uint64_t(r) * x_row_blocks, out + uint64_t(r) * out_stride, o + r});
+    auto push_job = [&](const DS4ExpertBank& bank, uint32_t n_e, const void* x_in, uint32_t x_row_blocks, sycl::half* out, uint32_t out_stride, uint32_t o,
+                        float* out32 = nullptr) {   // out32: fp32 rows instead of `out` (fp32_out's down jobs)
+        if (!row_jobs || n_e <= 1) { bws_.jobs.push_back({bank, 0, n_e, x_in, out32 ? nullptr : out, o, out32}); return; }
+        for (uint32_t r = 0; r < n_e; ++r) bws_.jobs.push_back({bank, 0, 1u, static_cast<const block_q8_1x*>(x_in) + uint64_t(r) * x_row_blocks,
+                                                               out32 ? nullptr : out + uint64_t(r) * out_stride, o + r,
+                                                               out32 ? out32 + uint64_t(r) * out_stride : nullptr});
     };
     // THE FETCH PIPELINE (V4's, measured 1.8-1.9x on this box): group g+1's acquire is issued
     // BEFORE group g's GEMMs, so the copy engine and the EUs overlap instead of alternating.
@@ -789,7 +825,8 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
             const uint32_t e = occ[i]; const uint32_t o = off[e], n_e = off[e + 1] - o;
             const void* he = hq8 + uint64_t(o) * (EF / 32);
             if (xmx) { xmx_jobs.push_back({ds4_slot_bank(lay_.down, cache_.slot_ptr(l, slot_of[int32_t(e)])), 0, n_e, o, bws_.y_f32 + uint64_t(o) * H}); continue; }
-            push_job(ds4_slot_bank(lay_.down, cache_.slot_ptr(l, slot_of[int32_t(e)])), n_e, he, EF / 32, static_cast<sycl::half*>(bws_.yp) + uint64_t(o) * H, H, o);
+            push_job(ds4_slot_bank(lay_.down, cache_.slot_ptr(l, slot_of[int32_t(e)])), n_e, he, EF / 32, static_cast<sycl::half*>(bws_.yp) + uint64_t(o) * H, H, o,
+                     src_.fp32_out ? bws_.y_f32 + uint64_t(o) * H : nullptr);
         }
         if (xmx) { if (auto e = ds4_expert_gemm_xmx_grouped(q, xmx_jobs.data(), uint32_t(xmx_jobs.size()), bws_.h_h, EF, bws_.w16, bws_.w16_cap); !e.empty()) return fail("tier down (xmx): " + e); }
         else if (auto e = ds4_expert_gemm_q8_grouped(q, bws_.jobs.data(), uint32_t(bws_.jobs.size()), bws_.grp); !e.empty()) return fail("tier down: " + e);
@@ -831,7 +868,8 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
         for (size_t p = 0; p < mm.size(); ++p) {
             const uint32_t e = mm[p]; const uint32_t o = off[e], n_e = off[e + 1] - o;
             if (xmx) { xmx_jobs.push_back({mm_bank(lay_.down, p), 0, n_e, o, bws_.y_f32 + uint64_t(o) * H}); continue; }
-            push_job(mm_bank(lay_.down, p), n_e, hq8 + uint64_t(o) * (EF / 32), EF / 32, static_cast<sycl::half*>(bws_.yp) + uint64_t(o) * H, H, o);
+            push_job(mm_bank(lay_.down, p), n_e, hq8 + uint64_t(o) * (EF / 32), EF / 32, static_cast<sycl::half*>(bws_.yp) + uint64_t(o) * H, H, o,
+                     src_.fp32_out ? bws_.y_f32 + uint64_t(o) * H : nullptr);
         }
         if (xmx) { if (auto e = ds4_expert_gemm_xmx_grouped(q, xmx_jobs.data(), uint32_t(xmx_jobs.size()), bws_.h_h, EF, bws_.w16, bws_.w16_cap); !e.empty()) return fail("tier mmap down (xmx): " + e); }
         else if (auto e = ds4_expert_gemm_q8_grouped(q, bws_.jobs.data(), uint32_t(bws_.jobs.size()), bws_.grp); !e.empty()) return fail("tier mmap down: " + e);
@@ -844,7 +882,7 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
         st_.ms_cpu = ms_since(tc); st_.ms_cpu_work = cpu_.work_ms;
         for (size_t i = 0; i < cpu_.work.size();) {          // one copy per run of consecutive packed rows (an expert's rows at least)
             size_t j = i + 1; while (j < cpu_.work.size() && cpu_.work[j].row == cpu_.work[j - 1].row + 1) ++j;
-            if (xmx) q.memcpy(bws_.y_f32 + uint64_t(cpu_.work[i].row) * H, cpu_.h_rows32 + i * H, (j - i) * H * 4);   // the XMX scatter reads y_f32
+            if (f32_rows) q.memcpy(bws_.y_f32 + uint64_t(cpu_.work[i].row) * H, cpu_.h_rows32 + i * H, (j - i) * H * 4);   // the fp32 scatter reads y_f32
             else q.memcpy(static_cast<sycl::half*>(bws_.yp) + uint64_t(cpu_.work[i].row) * H, cpu_.h_rows + i * H, (j - i) * H * 2);
             i = j;
         }
@@ -852,7 +890,7 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
     if (ep_export_) { q.wait(); }                                                         // the rows are the product; no scatter
     else {
         if (ep_import_) if (auto e = ep_import_(q, static_cast<sycl::half*>(bws_.yp), TK); !e.empty()) return "tier ep import: " + e;
-        if (xmx) ds4_expert_scatter_accum_f32(q, bws_.y_f32, bws_.tk2p, bws_.w_pk, y, T, K, H).wait();
+        if (f32_rows) ds4_expert_scatter_accum_f32(q, bws_.y_f32, bws_.tk2p, bws_.w_pk, y, T, K, H).wait();
         else ds4_expert_scatter_accum(q, bws_.yp, bws_.tk2p, bws_.w_pk, y, T, K, H).wait();
     }
     st_.ms_tail = ms_since(t4);

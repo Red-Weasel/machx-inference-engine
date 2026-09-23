@@ -22,6 +22,8 @@ inline ReasoningCapabilities reasoning_capabilities(ModelArch arch, std::string_
         return {true,{"low","high","max"},"low","on/off selects the DeepSeek thinking template"};
     if (arch == ModelArch::kDeepSeek41)
         return {true,{"low","high","max"},"high","on/off selects the DeepSeek-V4.1 thinking template; the effort is its numeric budget (low 50, high 75, max 100)"};
+    if (arch == ModelArch::kMimo26)
+        return {true,{}, {},"on/off selects MiMo-V2.6's thinking prompt (off renders <think></think>)"};
     if (arch == ModelArch::kGptOss)
         return {false,{"low","medium","high"},"high","Harmony controls effort, with no reasoning-off switch"};
     if ((arch==ModelArch::kLlama3 || arch==ModelArch::kQwen3Dense) &&
