@@ -1,7 +1,8 @@
 // tools/mimo26_run.cpp -- ie-mimo26-run: MiMo-V2.6 greedy generation on 1-2 cards (P2 bring-up, docs/mimo26/00_PORT_PLAN.md).
 //   ie-mimo26-run <model_dir> (--prompt TEXT | --prompt-file FILE) [--n N] [--chunk C] [--ctx MAX]
 //                 [--static S] [--pinned P] [--stream Q] [--no-special] [--ranking FILE] [--kprof] [--kprof-prefill]
-// --static 0 sizes each card's static expert tier from its free VRAM (Mimo26Options::n_static). --lookup decodes with
+// --static 0 sizes each card's static expert tier from its free VRAM (Mimo26Options::n_static); --reserve-mib N keeps N MiB
+// more free on the first card under --static 0 (P6.3: the vision tower's encode block priced in an A-B-A). --lookup decodes with
 // prompt-lookup speculation (greedy; the engine's mimo26_run_ids loop): a copy of >= 12 context tokens verified up to
 // 8 rows at a time.
 // The prompt is tokenized raw (special tokens parsed unless --no-special; no chat template), prefilled in chunks of C,
@@ -29,7 +30,7 @@
 #include <vector>
 
 int main(int argc, char** argv) {
-    if (argc < 3) { std::fprintf(stderr, "usage: ie-mimo26-run <model_dir> (--prompt TEXT | --prompt-file FILE) [--n N] [--chunk C] [--ctx MAX] [--static S] [--pinned P] [--stream Q] [--no-special] [--ranking FILE] [--kprof] [--kprof-prefill] [--lookup] [--dflash K] [--dflash-minp P] [--dflash-log FILE] [--spec-longest]\n"); return 2; }
+    if (argc < 3) { std::fprintf(stderr, "usage: ie-mimo26-run <model_dir> (--prompt TEXT | --prompt-file FILE) [--n N] [--chunk C] [--ctx MAX] [--static S] [--pinned P] [--stream Q] [--no-special] [--ranking FILE] [--kprof] [--kprof-prefill] [--lookup] [--dflash K] [--dflash-minp P] [--dflash-log FILE] [--spec-longest] [--reserve-mib N]\n"); return 2; }
     const std::string model = argv[1];
     std::vector<std::pair<std::string, std::string>> prompts; uint32_t N = 32, C = 512, ctx = 4096; bool special = true; std::string ranking_path; bool kprof = false, kprof_pf = false, lookup = false; uint32_t dflash_k = 0; float dflash_minp = 0.f; std::string dflash_log; bool spec_longest = false;
     ie::Mimo26Options opt;
@@ -43,6 +44,7 @@ int main(int argc, char** argv) {
         else if (a == "--static") opt.n_static = uint32_t(std::atol(val().c_str()));
         else if (a == "--pinned") opt.n_pinned = uint32_t(std::atol(val().c_str()));
         else if (a == "--stream") opt.stream_slots = uint32_t(std::atol(val().c_str()));
+        else if (a == "--reserve-mib") opt.reserve_card0 = uint64_t(std::atol(val().c_str())) << 20;
         else if (a == "--no-special") special = false;
         else if (a == "--ranking") ranking_path = val();
         else if (a == "--kprof") kprof = true;

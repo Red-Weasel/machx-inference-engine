@@ -208,7 +208,8 @@ int run_openai_server(Engine& eng, const std::string& model_id,
         res.set_content(
             "{\"default_generation_settings\":{\"n_ctx\":" +
                 std::to_string(eng.max_ctx()) + "},\"total_slots\":" +
-                std::to_string(eng.parallel()) + ",\"memory_residency\":" + eng.memory_residency_json() + "}",
+                std::to_string(eng.parallel()) + ",\"memory_residency\":" + eng.memory_residency_json() +
+                ",\"vision\":" + eng.vision_status_json() + "}",   // readiness of THIS load (P11), beside the arch flag in /capabilities
             "application/json");
     });
     // 501 (not 404): clients like Seal treat 501 as a permanent capability
@@ -314,6 +315,19 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 return;
             }
             if (r.finish_reason.starts_with("error:")) {
+                // an image the CLIENT sent that cannot be used (undecodable bytes, a decode failure, an aspect ratio
+                // above 200, placeholders that do not match the images) is the request's fault: 400, not a server error
+                const bool client_image = r.finish_reason.find("vision:") != std::string::npos &&
+                    (r.finish_reason.find("not a decodable image") != std::string::npos ||
+                     r.finish_reason.find("image decode failed") != std::string::npos ||
+                     r.finish_reason.find("aspect ratio") != std::string::npos ||
+                     r.finish_reason.find("image is empty") != std::string::npos) ||
+                    r.finish_reason.find("placeholders than images") != std::string::npos;
+                if (client_image) {
+                    res.status = 400;
+                    res.set_content(oai::error_json(r.finish_reason, "invalid_request_error", "invalid_image"), "application/json");
+                    return;
+                }
                 fault.observe(r.finish_reason);   // latch a lost device → /health 503
                 exit_on_device_loss(fault);
                 res.status = fault.faulted() ? 503 : 500;

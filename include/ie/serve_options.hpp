@@ -14,6 +14,7 @@ struct LaunchOptions {
     std::string host = "127.0.0.1";
     uint16_t port = 11435;
     uint32_t max_queue = 8;   // requests allowed to WAIT for a generation slot; beyond → HTTP 429
+    double vram_reserve_gib = -1;   // --vram-reserve-gib: VRAM the auto expert tier leaves free per card (mimo_v2, deepseek41); -1 = the engine default
 };
 
 // Parse without side effects: validation completes before loading a model or
@@ -89,6 +90,7 @@ inline LaunchOptions parse_launch_options(const std::vector<std::string>& args) 
             out.defaults.reasoning_effort=v;
         }
         else if (flag == "--prefill-chunk") e.prefill_chunk = uint32_t(integer(1, INT32_MAX));
+        else if (flag == "--vram-reserve-gib") out.vram_reserve_gib = double(number(0, 24));
         else if (flag == "--parallel") e.parallel = uint32_t(integer(1, 4));
         else if (flag == "--max-queue") out.max_queue = uint32_t(integer(0, 1024));
         else if (flag == "--slot-ctx") e.slot_ctx = uint32_t(integer(0, INT32_MAX));

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """An fp32 reference forward of MiMo-V2.6 straight from the checkpoint (docs/mimo26/00_PORT_PLAN.md, P2 arbiter).
 
-  ref_forward.py <model_dir> <ids.txt> <out.bin> [--max-seqs N] [--dump-dir DIR]
+  ref_forward.py <model_dir> <ids.txt> <out.bin> [--max-seqs N] [--dump-dir DIR] [--splice ROWS.f32]...
 
 Semantics transcribed from the checkpoint's own modeling_mimo_v2.py (MiMoV2Attention / MiMoV2MoEGate / MiMoV2MoE /
 MiMoV2RotaryEmbedding), weights dequantised EXACTLY (FP8 x F32 128-block scale_inv with llama.cpp's TP-aware qkv
@@ -9,6 +9,8 @@ regroup -- verified bit-exact against the engine in P1; MXFP4 E2M1 x 2^(e-127); 
 (norms, softmax and routing in fp32/fp64). No fp16 anywhere: this is the "exact math" both the engine and llama.cpp
 approximate. Writes MLOG (tools/mimo26/compare_logits.py) with the logits at every position of each sequence.
 --dump-dir writes the residual stream after every layer, x_L{L}_s{S}.f32 [T, H], for a per-layer bisect.
+--splice ROWS.f32 (repeatable, P6.2): an id < 0 is an image position; its embedding row comes from the splice files
+([N, H] f32, the fp32 tower's merged output) in sequence order, one file per image in the order the images appear.
 """
 import json
 import math
@@ -74,6 +76,7 @@ def main():
     model, ids_path, out_path = sys.argv[1:4]
     max_seqs = int(sys.argv[sys.argv.index("--max-seqs") + 1]) if "--max-seqs" in sys.argv else None
     dump = sys.argv[sys.argv.index("--dump-dir") + 1] if "--dump-dir" in sys.argv else None
+    splices = [sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--splice"]
     if dump:
         os.makedirs(dump, exist_ok=True)
     cfg = json.load(open(os.path.join(model, "config.json")))
@@ -89,7 +92,28 @@ def main():
     from conversion.mimo import MimoV2Model
 
     emb = st.get("model.embed_tokens.weight")
-    xs = [emb[torch.tensor(s)].float() for s in seqs]                       # per sequence [T, H]
+    xs = []
+    rows_left = [np.fromfile(f, dtype="<f4").reshape(-1, H) for f in splices]   # image rows, consumed in order
+    for s in seqs:
+        ids = torch.tensor(s)
+        x = emb[ids.clamp(min=0)].float()                                     # per sequence [T, H]; image slots overwritten below
+        neg = torch.nonzero(ids < 0).flatten().tolist()
+        pos = 0
+        while pos < len(neg):                                                 # each run of consecutive image ids is one image
+            end = pos
+            while end + 1 < len(neg) and neg[end + 1] == neg[end] + 1:
+                end += 1
+            n = end - pos + 1
+            if not rows_left:
+                sys.exit(f"sequence has {n} image ids at {neg[pos]} but no --splice rows are left")
+            r = rows_left.pop(0)
+            if r.shape[0] != n:
+                sys.exit(f"splice holds {r.shape[0]} rows but the sequence has {n} image ids at {neg[pos]}")
+            x[neg[pos]:neg[end] + 1] = torch.from_numpy(r.copy())
+            pos = end + 1
+        xs.append(x)
+    if rows_left:
+        sys.exit(f"{len(rows_left)} --splice file(s) were not consumed by any image ids")
     t0 = time.time()
     for L in range(cfg["num_hidden_layers"]):
         p = f"model.layers.{L}."

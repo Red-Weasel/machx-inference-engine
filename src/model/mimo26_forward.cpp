@@ -202,7 +202,8 @@ std::string Mimo26Forward::upload_card(Card& c) {
             const uint64_t free_now = dev.get_info<sycl::ext::intel::info::device::free_memory>();
             double reserve_gib = 1.5;
             if (const char* v = std::getenv("IE_MIMO26_VRAM_RESERVE_GIB"); v && *v) reserve_gib = std::max(0.0, std::atof(v));
-            const uint64_t reserve = uint64_t(reserve_gib * 1073741824.0) + ds4_expert_batch_ws_bytes(T, cfg.n_activated_experts, H, cfg.moe_inter_dim);
+            const uint64_t reserve = uint64_t(reserve_gib * 1073741824.0) + ds4_expert_batch_ws_bytes(T, cfg.n_activated_experts, H, cfg.moe_inter_dim)
+                                   + (&c == cards_.front().get() ? opt_.reserve_card0 : 0);   // the vision tower's encode block (P6.2)
             Ds4SlotLayout lay;
             if (auto e = ds41_slot_layout(H, cfg.moe_inter_dim, lay); !e.empty()) return e;
             const uint64_t slots = free_now > reserve ? (free_now - reserve) / (uint64_t(n_moe) * lay.bytes) : 0;
@@ -485,8 +486,20 @@ std::string Mimo26Forward::forward(const int32_t* ids, uint32_t T, uint32_t pos0
     const uint8_t* emb = m_->embed.w->data;
     for (uint32_t t = 0; t < T; ++t) {
         const int32_t id = ids[t];
-        if (id < 0 || uint32_t(id) >= cfg.vocab_size) return "token id " + std::to_string(id) + " out of range";
-        mimo26_bf16_to_f32(emb + size_t(id) * H * 2, H, h_x_.data() + size_t(t) * H);
+        if (id < 0) {                                        // an image position (P6.2): its row comes from the provider
+            if (!vis_provider_) return "token id " + std::to_string(id) + " is an image position but no vision provider is set";
+            const float* row = nullptr;
+            try {                                            // the provider encodes on the device: a SYCL fault is an error string here
+                if (auto e = vis_provider_(pos0 + t, row); !e.empty()) return e.starts_with("vision:") ? e : "vision: " + e;
+            } catch (const std::exception& e) {
+                return std::string("vision: ") + e.what();
+            }
+            if (!row) return "vision: the provider returned no row for position " + std::to_string(pos0 + t);
+            std::memcpy(h_x_.data() + size_t(t) * H, row, size_t(H) * 4);
+        } else {
+            if (uint32_t(id) >= cfg.vocab_size) return "token id " + std::to_string(id) + " out of range";
+            mimo26_bf16_to_f32(emb + size_t(id) * H * 2, H, h_x_.data() + size_t(t) * H);
+        }
         h_pos_[t] = int32_t(pos0 + t);
     }
     try {

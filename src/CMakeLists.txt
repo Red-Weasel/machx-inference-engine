@@ -129,6 +129,8 @@ add_library(ie_core
   model/mimo26_dequant.cpp
   model/mimo26_forward.cpp
   model/mimo26_dflash.cpp
+  model/mimo26_vision.cpp
+  model/mimo26_vision_tower.cpp
   engine/engine.cpp
   engine/ds41_engine.cpp
   engine/mimo26_engine.cpp
@@ -158,6 +160,9 @@ set_source_files_properties(model/ds4_vision.cpp PROPERTIES
 # The V4.1 image plan must round exactly as Python does: icpx's default fast model turns x / 14 into x * (1 / 14),
 # and floor(1134 / 14) came out 80 (docs/deepseek41/94).
 set_source_files_properties(model/ds41_vision.cpp PROPERTIES
+  COMPILE_OPTIONS "-fp-model=precise")
+# the MiMo-V2.6 resize plan must round exactly as Python does (docs/mimo26/00_PORT_PLAN.md, P6.1)
+set_source_files_properties(model/mimo26_vision.cpp PROPERTIES
   COMPILE_OPTIONS "-fp-model=precise")
 set_source_files_properties(model/deepseek41_engram.cpp PROPERTIES
   COMPILE_OPTIONS "-fopenmp")

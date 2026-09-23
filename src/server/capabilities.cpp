@@ -80,7 +80,7 @@ std::string server_capabilities_json(const std::string& model_path) {
                       {"thinking_description",reasoning.thinking_description}}},
         {"features",{{"prompt_cache",cache},{"speculative",spec},{"int8_kv",kv8},
                      {"context_shift",false},
-                     {"vision",arch==ModelArch::kDeepSeek4 || arch==ModelArch::kQwen4Exp || arch==ModelArch::kDeepSeek41}}},
+                     {"vision",arch==ModelArch::kDeepSeek4 || arch==ModelArch::kQwen4Exp || arch==ModelArch::kDeepSeek41 || arch==ModelArch::kMimo26}}},
         {"defaults",{{"temperature",0.7},{"top_k",40},{"top_p",0.95},{"min_p",0.0},
                      {"repeat_penalty",1.0},{"repeat_last_n",64},{"presence_penalty",0.0},
                      {"frequency_penalty",0.0},{"seed",0},{"max_tokens",16384},
@@ -93,6 +93,10 @@ std::string server_capabilities_json(const std::string& model_path) {
                              "CPU threads configure OpenMP expert work; GPU kernels have separate scheduling."})}
     };
     if(reasoning.thinking)j["load"].push_back("thinking");
+    if (arch == ModelArch::kMimo26 || arch == ModelArch::kDeepSeek41) {   // the auto expert tier honours a VRAM headroom knob;
+        j["load"].push_back("vram_reserve_gib");                              // Dream sends the advertised default EXPLICITLY, so it
+        j["defaults"]["vram_reserve_gib"] = arch == ModelArch::kMimo26 ? 1.5 : 6.0;   // must equal each engine's own (mimo26_forward.cpp
+    }                                                                         // 1.5; Ds41Forward::ResidentOptions::vram_reserve 6 GiB)
     if(!reasoning.effort_levels.empty()) {
         j["load"].push_back("reasoning_effort");
         j["defaults"]["reasoning_effort"]=reasoning.default_effort;

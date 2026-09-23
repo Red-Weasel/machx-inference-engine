@@ -21,6 +21,7 @@
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -35,6 +36,7 @@ struct Mimo26Options {
     // each card's static tier fills the VRAM it has free after its dense set, caches and workspaces, less the tier's
     // batch workspace and IE_MIMO26_VRAM_RESERVE_GIB (default 1.5); its pinned count is then min(n_pinned, 256 - static)
     uint32_t n_static = 48, n_pinned = 208, stream_slots = 8;
+    uint64_t reserve_card0 = 0;     // bytes the AUTO tier on the first card leaves free besides the reserve (the vision tower's encode block, P6.2)
     std::vector<std::vector<uint32_t>> ranking;   // [n_layers][E] most-important-first; empty = identity
 };
 
@@ -55,6 +57,12 @@ public:
     // T <= max_tokens rows at positions [pos0, pos0 + T); pos0 must equal n_pos() (the caches hold [0, pos0)).
     // logits: all_rows ? [T, vocab] : [1, vocab] (the last row), fp32 on the host.
     std::string forward(const int32_t* ids, uint32_t T, uint32_t pos0, std::vector<float>& logits, bool all_rows);
+    // Vision (P6.2, docs/mimo26/00_PORT_PLAN.md; V4.1's Phase 56 shape). An image position carries a NEGATIVE id, unique
+    // per image and slot: the prefix cache's match reads it off the id. Its stream row comes from the provider, not
+    // from the embedding table: `row` [dim] f32 for absolute position `pos`, "" on success. Positions stay 1-D.
+    using VisionProvider = std::function<std::string(uint32_t pos, const float*& row)>;
+    void set_vision_provider(VisionProvider p) { vis_provider_ = std::move(p); }
+    void clear_vision() { vis_provider_ = nullptr; }
     void     reset() { n_pos_ = 0; hi_end_ = 0; }
     uint32_t n_pos() const { return n_pos_; }
     // Keep only positions [0, n) (n <= n_pos()): the full layers' caches truncate for free; an SWA ring still holds
@@ -138,6 +146,7 @@ private:
     std::vector<int32_t> h_ridx_;
     std::vector<float>   h_rw_;
     std::vector<int32_t> h_pos_;
+    VisionProvider vis_provider_;
     static constexpr uint32_t kHeadRows = 256;   // the LM head runs in row blocks of this size
 };
 

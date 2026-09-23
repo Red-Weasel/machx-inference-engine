@@ -209,6 +209,10 @@ void pil_resize(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh
 
 }  // namespace
 
+void ds4_pil_resize(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh) {
+    pil_resize(src, sw, sh, dst, dw, dh);
+}
+
 std::string ds4_load_image_mem(const void* bytes, size_t nbytes, std::vector<float>& px,
                                uint32_t& H, uint32_t& W, Ds4VisGeom& geom) {
     return ds4_load_image_planned(bytes, nbytes, [](uint32_t w, uint32_t h) { return ds4_vis_plan(w, h); }, px, H, W, geom);

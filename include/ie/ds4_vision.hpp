@@ -138,6 +138,8 @@ private:
 // Sets H = geom.best_h, W = geom.best_w. "" on success.
 std::string ds4_load_image_mem(const void* bytes, size_t nbytes, std::vector<float>& px,
                                uint32_t& H, uint32_t& W, Ds4VisGeom& geom);
+// PIL Image.resize(BICUBIC) on packed u8 RGB: the resampler the loaders here use (MiMo-V2.6's loader too).
+void ds4_pil_resize(const uint8_t* src, int sw, int sh, uint8_t* dst, int dw, int dh);
 std::string ds4_load_image(const std::string& path, std::vector<float>& px,
                            uint32_t& H, uint32_t& W, Ds4VisGeom& geom);
 // The same decode + PIL-exact resize/pad + normalise, on a canvas planned by `plan(src_w, src_h)`.

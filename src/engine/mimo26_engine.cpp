@@ -8,6 +8,7 @@
 #include "ie/expert_stream.hpp"
 #include "ie/mimo26_engine.hpp"
 #include "ie/ngram_draft.hpp"
+#include "stb/stb_image.h"   // stbi_info_from_memory (the implementation is instantiated in qwen4_image.cpp)
 
 #include "../../third_party/nlohmann/json.hpp"
 
@@ -274,6 +275,46 @@ Mimo26Parsed mimo26_parse_completion(const std::string& text, bool thinking, con
     return r;
 }
 
+// ---- P6.2: images (docs/mimo26/00_PORT_PLAN.md "P6.2 design") -------------------------------------------------------
+constexpr std::string_view kMimo26ImagePlaceholder = "<|vision_start|><|image_pad|><|vision_end|>";   // the template's own
+
+std::string mimo26_place_images(std::string text, size_t n_images) {
+    size_t markers = 0;
+    for (size_t p = text.find(kChatImageMarker); p != std::string::npos; p = text.find(kChatImageMarker, p + kChatImageMarker.size())) ++markers;
+    if (markers == n_images) {
+        for (size_t p = text.find(kChatImageMarker); p != std::string::npos; p = text.find(kChatImageMarker, p + kMimo26ImagePlaceholder.size()))
+            text.replace(p, kChatImageMarker.size(), kMimo26ImagePlaceholder);
+        return text;
+    }
+    for (size_t p = text.find(kChatImageMarker); p != std::string::npos; p = text.find(kChatImageMarker)) text.erase(p, kChatImageMarker.size());
+    std::string front;
+    for (size_t i = 0; i < n_images; ++i) front += kMimo26ImagePlaceholder;
+    return front + text;
+}
+
+int32_t mimo26_image_id(uint64_t image_hash, uint32_t slot) {
+    uint64_t x = image_hash + 0x9E3779B97F4A7C15ull * (uint64_t(slot) + 1);
+    x ^= x >> 30; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 27; x *= 0x94D049BB133111EBull; x ^= x >> 31;
+    return -1 - int32_t(x >> 33);
+}
+
+uint64_t mimo26_image_hash(const std::string& bytes) {
+    uint64_t h = 0xCBF29CE484222325ull;
+    for (char c : bytes) { h ^= uint8_t(c); h *= 0x100000001B3ull; }
+    return h;
+}
+
+namespace {
+// The image's dimensions from its header (no decode): the token count is known before anything is encoded.
+std::string mimo26_image_size(const void* bytes, size_t nbytes, uint32_t& width, uint32_t& height) {
+    int w = 0, h = 0, comp = 0;
+    if (!stbi_info_from_memory(static_cast<const stbi_uc*>(bytes), int(nbytes), &w, &h, &comp) || w <= 0 || h <= 0)
+        return std::string("vision: not a decodable image: ") + (stbi_failure_reason() ? stbi_failure_reason() : "unknown format");
+    width = uint32_t(w); height = uint32_t(h);
+    return {};
+}
+}  // namespace
+
 bool Engine::mimo26_dir(const std::string& path) {
     std::ifstream f(path + "/config.json");
     if (!f) return false;
@@ -338,6 +379,29 @@ std::string Engine::mimo26_load(const std::string& dir) {
         if (auto e = b->dflash->init(*b->qs.back(), b->model.embed.w->data, b->model.config().vocab_size, b->dflash->config().window); !e.empty())
             return "mimo_v2 " + e;
         b->dflash_k = std::min(b->dflash_k, b->dflash->config().block - 1);
+    }
+    // P6.2: the vision tower, staged in pinned host memory BEFORE the forward sizes its tiers (the pinned budget then sees
+    // it, and the auto static tier on the first card leaves the encode block free). Nothing of it stays on a card between
+    // images. IE_MIMO26_VISION=0 leaves it out; a failure here is reported on every image request instead of failing the load.
+    if (const char* v = std::getenv("IE_MIMO26_VISION"); v && std::string(v) == "0") b->vis_error = "vision is disabled (IE_MIMO26_VISION=0)";
+    else if (!b->model.store().find("visual.patch_embed.proj.weight")) b->vis_error = "this checkpoint has no vision tower";
+    else if (b->model.config().dim != 4096 || !b->model.config().image_token_id) b->vis_error = "this checkpoint's text width or image token differs from the mimovl tower's";
+    else {
+        const auto tv = std::chrono::steady_clock::now();
+        std::string e = b->vis_alloc.init_with(b->qs[0]->get_context(), b->qs[0]->get_device());
+        if (e.empty()) e = b->vis.load_from([m = &b->model](const std::string& n) { return m->store().find(n); });
+        if (e.empty()) e = b->vis.stage_host(b->vis_alloc);
+        if (e.empty()) {
+            b->vis_ready = true; b->vis_error.clear();
+            mo.reserve_card0 = b->vis.encode_bytes();
+            std::fprintf(stderr, "[mimo26] vision tower staged in pinned host memory in %.0f ms; %.0f MiB on the first card while an image encodes, nothing between\n",
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tv).count(), double(b->vis.encode_bytes()) / 1048576.0);
+        } else { b->vis_error = e; std::fprintf(stderr, "[mimo26] vision tower NOT available: %s\n", e.c_str()); }
+    }
+    {   // per-image token budget: the tower's scratch cap (2,048 = 8,192 patches) unless a smaller IE_MIMO26_IMAGE_TOKENS
+        const uint32_t cap = MimoVisionOptions{}.max_patches / (kMimoVisMerge * kMimoVisMerge);
+        b->image_tokens = cap;
+        if (const char* v = std::getenv("IE_MIMO26_IMAGE_TOKENS"); v && *v) b->image_tokens = std::min<uint32_t>(cap, std::max(1, std::atoi(v)));
     }
     if (auto e = b->fwd.init(b->qs, b->model, mo); !e.empty()) return "mimo_v2 forward: " + e;
     if (b->dflash) {
@@ -464,7 +528,10 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
         if (!emit(id)) break;
         if (++k_done == max_new) break;   // the last token needs no forward
         std::vector<int32_t> d;
-        if (b.lookup) { idx.push(id); d = idx.draft(Mimo26Forward::kDecodeRows - 1, 12); }
+        if (b.lookup) {
+            idx.push(id); d = idx.draft(Mimo26Forward::kDecodeRows - 1, 12);
+            for (size_t i = 0; i < d.size(); ++i) if (d[i] < 0) { d.resize(i); break; }   // a copy of an image's pad run is not a draft (P6.2)
+        }
         bool from_df = false;
         if (d.empty() && b.dflash) {
             if (auto e = b.dflash->draft(id, b.dflash_k, d, b.dflash_minp); !e.empty()) {
@@ -536,10 +603,26 @@ GenerateResult Engine::mimo26_chat(std::span<const ChatTurn> turns, const Sampli
                                    bool enable_thinking, std::string_view tools_json, std::string_view reasoning_effort) {
     GenerateResult r;
     (void)reasoning_effort;   // validated by Engine::chat (MiMo has no effort levels)
+    Mimo26Bundle& b = *mimo26_;
+    // P6.2: one image of the request -- its bytes, its plan (from the header alone), and its rows once something asks
+    struct Img { const std::string* bytes = nullptr; uint64_t hash = 0; MimoVisGeom geom; uint32_t n = 0, pos0 = 0; std::vector<float> rows; };
+    std::vector<Img> images;
     std::vector<Mimo26Message> msgs;
     for (const auto& t : turns) {
-        if (!t.images.empty()) { r.finish_reason = "error: mimo_v2 image input is not wired in this engine yet"; return r; }
-        msgs.push_back({t.role, t.content_without_tool_calls.value_or(t.content), t.reasoning_content.value_or(""), t.tool_calls_json});
+        std::string content = t.content_without_tool_calls.value_or(t.content);
+        if (!t.images.empty()) {
+            if (!b.vis_ready) { r.finish_reason = "error: mimo_v2 image input: " + b.vis_error; return r; }
+            content = mimo26_place_images(std::move(content), t.images.size());
+            for (const auto& bytes : t.images) {
+                Img im; im.bytes = &bytes; im.hash = mimo26_image_hash(bytes);
+                uint32_t w = 0, h = 0;
+                if (auto e = mimo26_image_size(bytes.data(), bytes.size(), w, h); !e.empty()) { r.finish_reason = "error: " + e; return r; }
+                if (auto e = mimo26_vis_plan(h, w, im.geom, mimo26_image_max_px(b.image_tokens)); !e.empty()) { r.finish_reason = "error: " + e; return r; }
+                im.n = im.geom.tokens();
+                images.push_back(std::move(im));
+            }
+        }
+        msgs.push_back({t.role, std::move(content), t.reasoning_content.value_or(""), t.tool_calls_json});
     }
     std::string err;
     const std::string prompt = mimo26_render_chat(msgs, std::string(tools_json), true, enable_thinking, err);
@@ -548,8 +631,43 @@ GenerateResult Engine::mimo26_chat(std::span<const ChatTurn> turns, const Sampli
         static int n_req = 0;
         std::ofstream(std::string(dd) + "/req_" + std::to_string(n_req++) + ".txt", std::ios::binary) << prompt;
     }
-    const auto ids = mimo26_->tok.encode(prompt, /*allow_special=*/true);
-    return mimo26_run_ids(*mimo26_, ids, sp, on_token, /*chat=*/true, enable_thinking, std::string(tools_json));
+    std::vector<int32_t> ids = b.tok.encode(prompt, /*allow_special=*/true);
+    if (images.empty()) return mimo26_run_ids(b, ids, sp, on_token, /*chat=*/true, enable_thinking, std::string(tools_json));
+    // the processor's expansion: each image's one <|image_pad|> becomes its N image ids (negative: the forward takes
+    // their rows from the provider, the prefix cache matches them like any other ids)
+    const int32_t pad = int32_t(b.model.config().image_token_id);
+    std::vector<int32_t> full; full.reserve(ids.size() + images.size() * b.image_tokens);
+    size_t k = 0;
+    for (int32_t id : ids) {
+        if (id != pad) { full.push_back(id); continue; }
+        if (k >= images.size()) { r.finish_reason = "error: the prompt holds more image placeholders than images"; return r; }
+        Img& im = images[k++]; im.pos0 = uint32_t(full.size());
+        for (uint32_t s = 0; s < im.n; ++s) full.push_back(mimo26_image_id(im.hash, s));
+    }
+    if (k != images.size()) { r.finish_reason = "error: the prompt holds fewer image placeholders than images"; return r; }
+    // an image is decoded and encoded on the first row asked of it: a prefix-cached image is never encoded again
+    b.fwd.set_vision_provider([&b, &images](uint32_t pos, const float*& row) -> std::string {
+        const uint32_t H = b.model.config().dim;
+        for (auto& im : images) {
+            if (pos < im.pos0 || pos - im.pos0 >= im.n) continue;
+            if (im.rows.empty()) {
+                const auto t0 = std::chrono::steady_clock::now();
+                std::vector<float> pv; MimoVisGeom g;
+                if (auto e = mimo26_load_image_mem(im.bytes->data(), im.bytes->size(), pv, g, mimo26_image_max_px(b.image_tokens)); !e.empty()) return e;
+                if (g.tokens() != im.n) return "the image plan changed between the size probe and the decode";
+                if (auto e = b.vis.encode_gpu(b.vis_alloc, pv, g, im.rows); !e.empty()) return e;
+                if (im.rows.size() != size_t(im.n) * H) return "the tower returned " + std::to_string(im.rows.size() / H) + " rows for " + std::to_string(im.n) + " image tokens";
+                std::fprintf(stderr, "[mimo26] vision: image at %u, %ux%u patches -> %u tokens, encoded in %.0f ms\n", im.pos0, g.grid_h, g.grid_w, im.n,
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            }
+            row = im.rows.data() + size_t(pos - im.pos0) * H;
+            return {};
+        }
+        return "position " + std::to_string(pos) + " is outside every image of this request";
+    });
+    GenerateResult res = mimo26_run_ids(b, full, sp, on_token, /*chat=*/true, enable_thinking, std::string(tools_json));
+    b.fwd.clear_vision();                                              // the provider captures this frame's locals
+    return res;
 }
 
 GenerateResult Engine::mimo26_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token) {

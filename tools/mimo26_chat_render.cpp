@@ -2,7 +2,8 @@
 // parse) for tools/mimo26/check_template.py to diff against the checkpoint's own Jinja template (P3b).
 //   ie-mimo26-chat-render render <case.json>      -> the prompt text on stdout
 //   ie-mimo26-chat-render parse  <case.json>      -> {"reasoning", "content", "tool_calls"} as JSON on stdout
-// case.json: {"messages": [{"role", "content", "reasoning_content"?, "tool_calls"? (OpenAI array)}], "tools": [...]?,
+// case.json: {"messages": [{"role", "content", "reasoning_content"?, "tool_calls"? (OpenAI array), "images"? (count; the content
+//             holds the server's <<ie-image>> marker per image, P6.2)}], "tools": [...]?,
 //             "thinking": bool, "completion": "..." (parse only)}
 #include "ie/mimo26_engine.hpp"
 
@@ -25,6 +26,8 @@ int main(int argc, char** argv) {
             ie::Mimo26Message x;
             x.role = m.value("role", "");
             x.content = m.contains("content") && m["content"].is_string() ? m["content"].get<std::string>() : std::string();
+            // P6.2: "images": N -- the server's kChatImageMarker in the content stands where each image part sat
+            if (m.contains("images") && m["images"].is_number_unsigned()) x.content = ie::mimo26_place_images(x.content, m["images"].get<size_t>());
             x.reasoning = m.contains("reasoning_content") && m["reasoning_content"].is_string() ? m["reasoning_content"].get<std::string>() : std::string();
             if (m.contains("tool_calls")) x.tool_calls_json = m["tool_calls"].dump();
             msgs.push_back(std::move(x));

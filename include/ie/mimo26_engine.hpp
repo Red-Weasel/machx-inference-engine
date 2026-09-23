@@ -3,9 +3,11 @@
 // conversation (the ids whose K/V the caches hold). Built and used in src/engine/mimo26_engine.cpp; complete here so
 // Engine's destructor can destroy the unique_ptr. One request at a time (EngineOptions::parallel is 1 for this arch).
 #pragma once
+#include "ie/allocator.hpp"
 #include "ie/mimo26.hpp"
 #include "ie/mimo26_dflash.hpp"
 #include "ie/mimo26_forward.hpp"
+#include "ie/mimo26_vision.hpp"
 #include "ie/tokenizer.hpp"
 
 #include <sycl/sycl.hpp>
@@ -30,6 +32,13 @@ struct Mimo26Bundle {
     std::unique_ptr<Mimo26DFlash>             dflash;           // the checkpoint's DFlash drafter (IE_MIMO26_DFLASH=K), null = off
     uint32_t                                  dflash_k = 0;     // drafts per pass
     float                                     dflash_minp = 0.7f;   // drafts cut at the first one below this drafter probability
+    // P6.2: the checkpoint's vision tower, staged in pinned host memory at load; its device block exists only while an
+    // image encodes (on the first card). IE_MIMO26_VISION=0 leaves it out; a staging failure is reported per image request.
+    DeviceAllocator                           vis_alloc;   // declared BEFORE vis: MimoVision frees its pinned memory through it
+    MimoVision                                vis;
+    bool                                      vis_ready = false;
+    std::string                               vis_error = "vision tower not staged";
+    uint32_t                                  image_tokens = 2048;   // per-image token budget (IE_MIMO26_IMAGE_TOKENS), <= the tower's cap
     // Drain before the frees: an aborted generation can leave kernels in flight.
     ~Mimo26Bundle() {
         for (auto& q : queues) if (q) { try { q->wait_and_throw(); } catch (const sycl::exception& e) { std::fprintf(stderr, "[mimo26] teardown drain: %s\n", e.what()); } }
@@ -37,6 +46,16 @@ struct Mimo26Bundle {
         fwd.free_all();
     }
 };
+
+// P6.2: the turn's text with `<|vision_start|><|image_pad|><|vision_end|>` per image -- where the server's
+// kChatImageMarker sits when the markers match the images, else all of them in front (V4.1's rule).
+std::string mimo26_place_images(std::string text, size_t n_images);
+// The id of an image position: negative, and a function of the image's bytes and the slot -- two images never share a
+// prefix in the prompt cache, the same image at the same place always does (V4.1's ds41_image_id).
+int32_t mimo26_image_id(uint64_t image_hash, uint32_t slot);
+uint64_t mimo26_image_hash(const std::string& bytes);    // FNV-1a over the file bytes
+// The pixel budget that keeps an image at or under `tokens` image tokens (256 pixels per token after the resize).
+inline uint64_t mimo26_image_max_px(uint32_t tokens) { return uint64_t(tokens) * kMimoVisFactor * kMimoVisFactor; }
 
 // The checkpoint's chat_template.jinja in C++ (P3b): a tools block as the first system turn, ChatML turns with no
 // separator between them, assistant turns as <think>{reasoning}</think>{content}{tool calls} (calls as

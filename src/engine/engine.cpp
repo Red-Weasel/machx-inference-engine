@@ -5,6 +5,8 @@
 #include "ie/engine.hpp"
 #include "ie/ds41_engine.hpp"
 #include "ie/mimo26_engine.hpp"
+#include "ie/ds41_vision.hpp"        // kDs41VisMaxTok (vision_status_json)
+#include "../../third_party/nlohmann/json.hpp"
 #include "ie/reasoning.hpp"
 #include <future>
 #include "ie/qwen4exp.hpp"
@@ -3215,6 +3217,32 @@ static void ds4_finish_completion(const Tokenizer& tok, GenerateResult& res, boo
         std::fprintf(stderr, "[ds4-chat] completion cut inside a tool call (finish %s); the partial call was dropped\n",
                      res.finish_reason.c_str());
     }
+}
+
+std::string Engine::vision_status_json() const {
+    bool ready = false; std::string reason; long tokens = -1;
+    switch (arch_) {
+        case ModelArch::kMimo26:
+            if (mimo26_) { ready = mimo26_->vis_ready; reason = ready ? "" : mimo26_->vis_error; tokens = long(mimo26_->image_tokens); }
+            else reason = "model not loaded";
+            break;
+        case ModelArch::kDeepSeek41:
+            if (ds41_) { ready = ds41_->vis_ready; reason = ready ? "" : ds41_->vis_error; tokens = long(kDs41VisMaxTok); }
+            else reason = "model not loaded";
+            break;
+        case ModelArch::kDeepSeek4:
+            ready = ds4_vis_ != nullptr;
+            if (!ready) reason = "this deepseek4 load has no vision sidecar (*-Native.safetensors beside the GGUF, or $IE_DS4_VISION)";
+            break;
+        case ModelArch::kQwen4Exp:
+            ready = true;
+            break;
+        default:
+            reason = "this architecture has no vision input";
+    }
+    nlohmann::json j{{"ready", ready}, {"reason", reason}};
+    if (tokens >= 0) j["image_tokens"] = tokens;
+    return j.dump();
 }
 
 std::string Engine::reasoning_effort_error(std::string_view effort) const {

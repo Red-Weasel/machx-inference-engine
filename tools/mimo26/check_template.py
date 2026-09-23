@@ -62,11 +62,25 @@ CASES = [
         {"role": "tool", "tool_call_id": "c2", "content": "x"}]},
     {"name": "unicode + json-ish content", "thinking": True, "messages": [
         {"role": "user", "content": "日本語で答えて。{\"k\": [1, 2]} <b>tags</b>\t\ttabs"}]},
+    # P6.2: image parts. Jinja sees the OpenAI parts; the engine sees the server's text (a <<ie-image>> marker per image part,
+    # text parts concatenated) with the image count, and places <|vision_start|><|image_pad|><|vision_end|> at each marker.
+    {"name": "image then text", "thinking": False, "messages": [
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}, {"type": "text", "text": "What is drawn here?"}]}],
+     "engine_messages": [{"role": "user", "content": "<<ie-image>>What is drawn here?", "images": 1}]},
+    {"name": "text, two images, text", "thinking": True, "messages": [
+        {"role": "system", "content": "Be brief."},
+        {"role": "user", "content": [{"type": "text", "text": "Compare "}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+                                     {"type": "image_url", "image_url": {"url": "data:image/png;base64,BBBB"}}, {"type": "text", "text": " -- which is brighter?"}]}],
+     "engine_messages": [{"role": "system", "content": "Be brief."},
+                         {"role": "user", "content": "Compare <<ie-image>><<ie-image>> -- which is brighter?", "images": 2}]},
+    {"name": "images without markers go in front", "thinking": False, "messages": [
+        {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}, {"type": "text", "text": "Describe."}]}],
+     "engine_messages": [{"role": "user", "content": "Describe.", "images": 1}]},
 ]
 
 fails = 0
 for c in CASES:
-    msgs_engine = c["messages"]
+    msgs_engine = c.get("engine_messages", c["messages"])
     msgs_jinja = copy.deepcopy(c["messages"])
     for m in msgs_jinja:
         for tc in m.get("tool_calls", []):

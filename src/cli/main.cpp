@@ -18,6 +18,7 @@ namespace {
 const char* USAGE =
   "usage: ie <run|serve> <model.gguf> [--ctx N] [--port P] [--host H] [--gpus N]\n"
   "                                [--prefill-chunk N] [--spec] [--parallel N] [--temp F]\n"
+  "                                [--vram-reserve-gib F]\n"
   "                                (--parallel N = 1..4 concurrent generations; >1\n"
   "                                 interleaves requests on the 27B 2-GPU split path\n"
   "                                 via host-staged slot switching, other archs run\n"
@@ -27,6 +28,8 @@ const char* USAGE =
   "                                 slot; beyond that the server answers HTTP 429 at once.\n"
   "                                 Default 8. /health reports inflight/queued.)\n"
   "                                (--prefill-chunk = tokens per prefill forward, default 256.\n"
+  "                                 --vram-reserve-gib = GiB the auto expert tier leaves free per card\n"
+  "                                 (mimo_v2, deepseek41; default 1.5; raise it for very long contexts).\n"
   "                                 On DeepSeek-V4 this is the largest T any forward submits;\n"
   "                                 1024 measured pp512 72 -> 105 tok/s BUT needs a lowered\n"
   "                                 expert-slot count, which is still bench-only, or it OOMs.)\n"
@@ -152,6 +155,11 @@ int main(int argc, char** argv) {
     const auto& host = launch.host;
     const int port = launch.port;
     ie::oai::configure_server_defaults(launch.defaults);
+    if (launch.vram_reserve_gib >= 0) {   // the auto expert tiers read their headroom from the environment at load
+        const auto g = std::to_string(launch.vram_reserve_gib);
+        setenv("IE_MIMO26_VRAM_RESERVE_GIB", g.c_str(), 1);
+        setenv("IE_DS41_VRAM_RESERVE_GIB", g.c_str(), 1);
+    }
     if (opts.cpu_threads) {
         const auto n = std::to_string(opts.cpu_threads);
         setenv("OMP_NUM_THREADS", n.c_str(), 1);

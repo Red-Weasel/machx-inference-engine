@@ -210,6 +210,9 @@ public:
 
     const Tokenizer&  tokenizer() const noexcept { return tok_; }
     const std::string& memory_residency_json() const noexcept { return memory_residency_json_; }
+    // Vision READINESS of this load (not the architecture's support, which `ie capabilities` reports): {"ready": bool,
+    // "reason": "<why not, or empty>", "image_tokens": N (when the arch caps an image)} -- served at /props (P11).
+    std::string vision_status_json() const;
     // Crown-arch (qwen35moe) config view; meaningless when arch() is dense.
     const QwenConfig& config()    const noexcept { return model_.config(); }
     ModelArch arch()    const noexcept { return arch_; }

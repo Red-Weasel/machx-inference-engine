@@ -630,6 +630,10 @@ set_target_properties(ie_ds41_cache_test PROPERTIES OUTPUT_NAME "ie-ds41-cache-t
 add_executable(ie_mimo26_tokenize mimo26_tokenize.cpp)
 target_link_libraries(ie_mimo26_tokenize PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_mimo26_tokenize PROPERTIES OUTPUT_NAME "ie-mimo26-tokenize")
+# MiMo-V2.6 P6.1 (docs/mimo26/00_PORT_PLAN.md): the vision input and tower gate
+add_executable(ie_mimo26_vision_test mimo26_vision_test.cpp)
+target_link_libraries(ie_mimo26_vision_test PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_mimo26_vision_test PROPERTIES OUTPUT_NAME "ie-mimo26-vision-test")
 # MiMo-V2.6 P2 (docs/mimo26/00_PORT_PLAN.md): greedy generation and llama-perplexity-protocol NLL against the oracle
 add_executable(ie_mimo26_run mimo26_run.cpp)
 target_link_libraries(ie_mimo26_run PRIVATE ie_core ie_sycl_flags)

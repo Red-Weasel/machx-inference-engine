@@ -11,6 +11,7 @@ Checks, each printed ok/FAIL with its evidence:
   cancel     a stream closed after 5 chunks; the next request still answers
   reuse      turn 2 extends turn 1 (its answer + a new question): usage cached_tokens > 0
   memory     RssAnon of the server over N short requests: the growth after the first 3 (warm-up)
+  props      GET /props carries "vision": {"ready": bool, "reason": str} -- the readiness of THIS load (P11)
 """
 import http.client
 import json
@@ -127,5 +128,11 @@ for i in range(n_mem):
     samples.append(rss_anon())
 growth = samples[-1] - samples[min(2, len(samples) - 1)]
 check("memory", growth < 64, f"RssAnon MiB over {n_mem} requests: {samples[:3]} ... {samples[-3:]} (growth after warm-up {growth} MiB)")
+c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+c.request("GET", "/props")
+props = json.loads(c.getresponse().read())
+vision = props.get("vision") if isinstance(props, dict) else None
+check("props", isinstance(vision, dict) and isinstance(vision.get("ready"), bool) and isinstance(vision.get("reason"), str)
+      and (vision["ready"] or bool(vision["reason"])), f"vision={vision}")
 print("PASS" if not fails else f"FAIL ({fails})")
 sys.exit(1 if fails else 0)
