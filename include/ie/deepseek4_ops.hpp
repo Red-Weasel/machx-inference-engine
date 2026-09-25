@@ -231,6 +231,22 @@ sycl::event ds4_swiglu_clamped_to_f16(sycl::queue& q,
                                       sycl::half* y, size_t n, float limit,
                                       const std::vector<sycl::event>& deps = {});
 
+// MiMo-V2.6 (docs/mimo26/P7_FIX64_FIX70.md section 6, fix-list #74): the rows of ds4_swiglu_clamped_to_f16's output that
+// overflowed. Over `rows` rows of `EF`: a row whose fp16 products hold an inf / NaN (by bits: a product >= 65520 rounds to
+// inf) is recomputed from the fp32 gate / up -- the same expression -- times 2^-k, k the smallest that keeps its largest
+// product under 65520, and k is written to shift[row]; a clean row is NOT written (shift[row] = 0), so it stays bit for
+// bit what ds4_swiglu_clamped_to_f16 stored. A non-finite fp32 product stays non-finite (k is capped).
+sycl::event ds4_swiglu_f16_rescale_overflow(sycl::queue& q, const float* gate, const float* up, sycl::half* y, int32_t* shift,
+                                            uint32_t rows, uint32_t EF, float limit, const std::vector<sycl::event>& deps = {});
+// The same for ds4_swiglu_clamped_h's rows (the int-dot / decode route: gate / up are fp16 there). A row rescaled by 2^-k
+// quantizes (quantize_q8_1: a per-32-block scale) to the same q8 codes, so the int-dot down row is exactly 2^-k times.
+sycl::event ds4_swiglu_h_rescale_overflow(sycl::queue& q, const sycl::half* gate, const sycl::half* up, sycl::half* y, int32_t* shift,
+                                          uint32_t rows, uint32_t EF, float limit, const std::vector<sycl::event>& deps = {});
+// w[r] *= 2^shift[r] (exact): the routing weight of a row stored x 2^-k, so a fp32 scatter of the linear down GEMM's
+// output adds exactly the unscaled row.
+sycl::event ds4_scale_pow2_rows(sycl::queue& q, float* w, const int32_t* shift, uint32_t rows,
+                                const std::vector<sycl::event>& deps = {});
+
 // fp16-in / fp16-out SwiGLU — collapses a FOUR-launch chain into ONE.
 //
 // Every routed-expert site in the engine spells the same thing:

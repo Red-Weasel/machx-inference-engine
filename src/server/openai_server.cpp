@@ -131,6 +131,17 @@ static void log_gen_speed(const GenerateResult& r) {
     std::fflush(stderr);
 }
 
+// #64: a generation that ends in an error reaches the client as its finish reason ("error: ..."); say it on the log too,
+// with the request's shape. Without this line a failed turn left nothing in the log (live 2026-09-24 12:59: a turn died,
+// cause unknown). Every model's serve path comes through here.
+static void log_gen_error(const std::string& id, const GenerateResult& r) {
+    std::string why = r.finish_reason.starts_with("error:") ? r.finish_reason.substr(6) : r.finish_reason;
+    if (!why.empty() && why.front() == ' ') why.erase(0, 1);
+    std::fprintf(stderr, "[req] generation error: %s (%s; prompt %u tok, %u cached; completion %u tok)\n",
+                 why.c_str(), id.c_str(), r.prompt_tokens, r.cached_tokens, r.completion_tokens);
+    std::fflush(stderr);
+}
+
 int run_openai_server(Engine& eng, const std::string& model_id,
                       const std::string& host, int port, uint32_t max_queue) {
     httplib::Server srv;
@@ -208,7 +219,8 @@ int run_openai_server(Engine& eng, const std::string& model_id,
         res.set_content(
             "{\"default_generation_settings\":{\"n_ctx\":" +
                 std::to_string(eng.max_ctx()) + "},\"total_slots\":" +
-                std::to_string(eng.parallel()) + ",\"memory_residency\":" + eng.memory_residency_json() +
+                std::to_string(eng.parallel()) + ",\"prompt_cache_slots\":" + std::to_string(eng.prompt_cache_slots()) +
+                ",\"memory_residency\":" + eng.memory_residency_json() +
                 ",\"vision\":" + eng.vision_status_json() + "}",   // readiness of THIS load (P11), beside the arch flag in /capabilities
             "application/json");
     });
@@ -315,6 +327,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 return;
             }
             if (r.finish_reason.starts_with("error:")) {
+                log_gen_error(id, r);
                 // an image the CLIENT sent that cannot be used (undecodable bytes, a decode failure, an aspect ratio
                 // above 200, placeholders that do not match the images) is the request's fault: 400, not a server error
                 const bool client_image = r.finish_reason.find("vision:") != std::string::npos &&
@@ -520,6 +533,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                     sink.write(ev.data(), ev.size());
                 }
                 if (r.finish_reason.starts_with("error:")) {
+                    log_gen_error(id, r);
                     fault.observe(r.finish_reason);   // latch a lost device → /health 503
                     exit_on_device_loss(fault);
                     const std::string ev = "data: " + oai::error_json(r.finish_reason)

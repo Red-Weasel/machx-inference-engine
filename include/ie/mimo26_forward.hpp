@@ -17,6 +17,7 @@
 
 #include "ie/deepseek41_experts.hpp"
 #include "ie/mimo26.hpp"
+#include "ie/mimo26_host_rules.hpp"   // Mimo26Scan (the NaN probe)
 
 #include <sycl/sycl.hpp>
 
@@ -24,6 +25,7 @@
 #include <functional>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ie {
@@ -74,6 +76,17 @@ public:
     uint32_t written_end() const { return hi_end_; }
     uint32_t ring() const { return ring_; }                           // 0 = linear SWA caches
     uint32_t window() const { return m_ ? m_->config().window : 0; }
+    // P7 (#70, docs/mimo26/P7_FIX64_FIX70.md): the conversation state as device byte spans, for the host slots. Card
+    // `card`'s share of the state for positions [0, n) written up to `hi` (n <= hi): every full layer's K / V rows [0, n)
+    // per kv head, every SWA ring's slots of the positions it still holds, [max(0, hi - ring()), n) -- at most two runs
+    // per head -- in a fixed order (layer; K heads; V heads). Nothing else is state: rows past n are rewritten before a
+    // forward reads them, and no forward reads a ring slot outside that range. Saved at (n_pos(), written_end()) and
+    // written back before set_state(n, hi), the caches read exactly what they read before. `rings_only` (#87, the
+    // prompt-end snapshot): the SWA rings' spans alone -- the full layers' rows [0, n) stay on the card.
+    void         state_spans(size_t card, uint32_t n, uint32_t hi, std::vector<std::pair<void*, uint64_t>>& out, bool rings_only = false) const;
+    std::string  set_state(uint32_t n, uint32_t hi);   // n_pos() = n, written_end() = hi -- the spans for (n, hi) written first
+    size_t       n_cards() const { return cards_.size(); }
+    sycl::queue* card_queue(size_t card) const { return card < cards_.size() ? cards_[card]->q : nullptr; }
     uint32_t capacity() const { return opt_.max_ctx; }
     uint32_t max_tokens() const { return opt_.max_tokens; }
     const std::vector<Mimo26LayerStats>& stats() const { return stats_; }
@@ -82,6 +95,17 @@ public:
     void set_profile(bool on) { profiling_ = on; if (on && m_) profile_.assign(m_->config().n_layers, std::vector<uint64_t>(m_->config().n_routed_experts, 0)); }
     void set_profile_rows(const uint8_t* rows) { profile_rows_ = rows; }
     const std::vector<std::vector<uint64_t>>& profile() const { return profile_; }
+    // (diagnostic, docs/mimo26/P7_FIX64_FIX70.md section 6: the NaN probe) set_probe(L, row): every forward() then checks
+    // layer L's intermediates after each op -- the input, the attention norm, qkv, q/k/v, the attention, o_proj, the
+    // residual, the ffn norm, the router / the dense FFN's gate, up and SwiGLU, the MoE / down output, the layer's output
+    // -- each copied to the host and scanned by bits (mimo26_scan_*), the whole block and row `row` of the call alone, and
+    // keeps that row's MoE input and routing in the IE_MIMO26_CHECK_DUMP layout (H f32, top-k i32 ids, top-k f32
+    // weights) for tools/mimo26/expert_recompute.py. A wait and a copy per op; L = -1 turns it off.
+    struct ProbeOp { std::string op; uint32_t rows = 0, cols = 0; Mimo26Scan all, row; };
+    void set_probe(int layer, int row) { probe_layer_ = layer; probe_row_ = row; probe_ops_.clear(); probe_moe_.clear(); probe_moe_out_.clear(); }
+    const std::vector<ProbeOp>& probe_ops() const { return probe_ops_; }
+    const std::vector<uint8_t>& probe_moe_row() const { return probe_moe_; }
+    const std::vector<float>&   probe_moe_out() const { return probe_moe_out_; }   // the watched row of the MoE output [H]
     static constexpr uint32_t kDecodeRows = 8;   // a forward of at most this many rows runs the split-K decode attention
     // P5 (DFlash): the residual stream after `layers` (their order = the features' order), the LAST min(T, max_rows) rows
     // of every forward() call, copied to host memory (a plain vector: each card has its own SYCL context, so no one card's
@@ -129,6 +153,11 @@ private:
     template <class T> T* dev(Card& c, size_t n);
     std::string upload_card(Card& c);
     std::string run_card(Card& c, uint32_t T, uint32_t pos0, std::vector<float>& logits, bool all_rows);
+    void        probe_op(sycl::queue& q, const char* op, const void* dev, bool f16, uint32_t rows, uint32_t cols);
+    int probe_layer_ = -1, probe_row_ = -1;
+    std::vector<ProbeOp> probe_ops_;
+    std::vector<uint8_t> probe_moe_;
+    std::vector<float>   probe_moe_out_;
 
     std::vector<std::unique_ptr<Card>> cards_;
     const Mimo26Model* m_ = nullptr;

@@ -325,4 +325,12 @@ GenerateResult Engine::ds41_generate(const std::string& prompt, const SamplingPa
     return ds41_run_ids(*ds41_, ids, sp, on_token, /*split_thinking=*/false);
 }
 
+uint32_t Engine::ds41_prompt_cache_slots() const {
+    // V4.1 keeps other conversations in host slots under a byte budget (Phase 46): at least the live one plus one
+    // saved conversation when the cache is on with a budget; the exact count depends on their lengths.
+    const Ds41Bundle& b = *ds41_;
+    if (!b.fwd.prefix_cache()) return 0;   // --no-prompt-cache, IE_DS41_PROMPT_CACHE=0 or speculation: nothing is reused
+    return b.fwd.prefix_cache_options().host_budget > 0 ? 2 : 1;
+}
+
 }  // namespace ie

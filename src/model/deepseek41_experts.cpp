@@ -236,6 +236,7 @@ void Ds41ExpertTier::free_storage(sycl::queue& q) {
     cpu_stop(); if (cpu_.h_rows) { sycl::free(cpu_.h_rows, q); cpu_.h_rows = nullptr; }
     if (cpu_.h_rows32) { sycl::free(cpu_.h_rows32, q); cpu_.h_rows32 = nullptr; }
     if (bws_.max_tokens) ds4_expert_batch_ws_free(q, bws_);
+    if (row_shift_) { sycl::free(row_shift_, q); row_shift_ = nullptr; }
     for (void** p : {reinterpret_cast<void**>(&h_row_tok_), reinterpret_cast<void**>(&h_tk2p_), reinterpret_cast<void**>(&h_w_pk_), reinterpret_cast<void**>(&h_w_pk2_)}) if (*p) { sycl::free(*p, q); *p = nullptr; }
     for (auto* sp : mm_stage_) if (sp) {
         if (stage_imported_) { if (ze_drv_ && ze_release_) reinterpret_cast<ze_result_t (*)(ze_driver_handle_t, void*)>(ze_release_)(static_cast<ze_driver_handle_t>(ze_drv_), sp); munmap(sp, size_t(lay_.bytes)); }
@@ -420,6 +421,10 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint
     { const size_t n = size_t(max_tokens) * TK_;
       h_row_tok_ = sycl::malloc_host<int32_t>(n, q); h_tk2p_ = sycl::malloc_host<int32_t>(n, q); h_w_pk_ = sycl::malloc_host<float>(n, q); h_w_pk2_ = sycl::malloc_host<float>(n, q);
       if (!h_row_tok_ || !h_tk2p_ || !h_w_pk_ || !h_w_pk2_) return "tier: pinned packing staging alloc failed"; }
+    if (src_.f16_rescale) {   // #74: the per-packed-row power of two of the SwiGLU rescale (a clean row keeps 0)
+        row_shift_ = sycl::malloc_device<int32_t>(size_t(max_tokens) * TK_, q);
+        if (!row_shift_) return "tier: row shift alloc failed";
+    }
     ready_ = true;
     return {};
 }
@@ -754,6 +759,11 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
     // so every call scatters from fp32 -- the XMX route already does
     const bool f32_rows = xmx || src_.fp32_out;
     if (src_.fp32_out && (!bws_.y_f32 || ep_export_ || ep_import_)) return "tier: fp32_out needs the fp32 row workspace and no expert parallel";
+    // #74 (Ds41ExpertSource::f16_rescale): both GPU routes store the SwiGLU products fp16 (the XMX route from fp32 gate / up,
+    // the int-dot route from fp16 ones); a row that overflowed is rescaled and its weight scaled back in the fp32 scatter
+    // (fp32_out puts the int-dot route's rows through it too). Every packed row starts unscaled
+    const bool rescale = row_shift_ && f32_rows;
+    if (rescale) q.memset(row_shift_, 0, size_t(TK) * 4);
     static thread_local std::vector<DS4XmxGemmJob> xmx_jobs;
     auto push_job = [&](const DS4ExpertBank& bank, uint32_t n_e, const void* x_in, uint32_t x_row_blocks, sycl::half* out, uint32_t out_stride, uint32_t o,
                         float* out32 = nullptr) {   // out32: fp32 rows instead of `out` (fp32_out's down jobs)
@@ -814,9 +824,13 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
         // recomputes -- never read in between.
         const uint32_t r0 = off[occ[gb[g]]], nr = off[occ[gb[g + 1] - 1] + 1] - r0;
         const uint64_t HN = uint64_t(nr) * EF;
-        if (xmx) ds4_swiglu_clamped_to_f16(q, bws_.g_f + uint64_t(r0) * EF, bws_.u_f + uint64_t(r0) * EF, bws_.h_h + uint64_t(r0) * EF, HN, swiglu_limit);
-        else {
+        if (xmx) {
+            ds4_swiglu_clamped_to_f16(q, bws_.g_f + uint64_t(r0) * EF, bws_.u_f + uint64_t(r0) * EF, bws_.h_h + uint64_t(r0) * EF, HN, swiglu_limit);
+            if (rescale)   // #74: rows whose fp16 products overflowed, rescaled (the group's other rows untouched)
+                ds4_swiglu_f16_rescale_overflow(q, bws_.g_f + uint64_t(r0) * EF, bws_.u_f + uint64_t(r0) * EF, bws_.h_h + uint64_t(r0) * EF, row_shift_ + r0, nr, EF, swiglu_limit);
+        } else {
         ds4_swiglu_clamped_h(q, bws_.g_h + uint64_t(r0) * EF, bws_.u_h + uint64_t(r0) * EF, bws_.h_h + uint64_t(r0) * EF, HN, swiglu_limit);
+        if (rescale) ds4_swiglu_h_rescale_overflow(q, bws_.g_h + uint64_t(r0) * EF, bws_.u_h + uint64_t(r0) * EF, bws_.h_h + uint64_t(r0) * EF, row_shift_ + r0, nr, EF, swiglu_limit);
         quantize_q8_1(q, bws_.h_h + uint64_t(r0) * EF, hq8 + uint64_t(r0) * (EF / 32), uint32_t(HN));
         }
         // down jobs
@@ -860,8 +874,13 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
         for (size_t p = 0; p < mm.size(); ++p) {          // these rows are scattered: per expert
             const uint32_t e = mm[p]; const uint32_t o = off[e], n_e = off[e + 1] - o;
             const uint64_t HN = uint64_t(n_e) * EF;
-            if (xmx) { ds4_swiglu_clamped_to_f16(q, bws_.g_f + uint64_t(o) * EF, bws_.u_f + uint64_t(o) * EF, bws_.h_h + uint64_t(o) * EF, HN, swiglu_limit); continue; }
+            if (xmx) {
+                ds4_swiglu_clamped_to_f16(q, bws_.g_f + uint64_t(o) * EF, bws_.u_f + uint64_t(o) * EF, bws_.h_h + uint64_t(o) * EF, HN, swiglu_limit);
+                if (rescale) ds4_swiglu_f16_rescale_overflow(q, bws_.g_f + uint64_t(o) * EF, bws_.u_f + uint64_t(o) * EF, bws_.h_h + uint64_t(o) * EF, row_shift_ + o, n_e, EF, swiglu_limit);
+                continue;
+            }
             ds4_swiglu_clamped_h(q, bws_.g_h + uint64_t(o) * EF, bws_.u_h + uint64_t(o) * EF, bws_.h_h + uint64_t(o) * EF, HN, swiglu_limit);
+            if (rescale) ds4_swiglu_h_rescale_overflow(q, bws_.g_h + uint64_t(o) * EF, bws_.u_h + uint64_t(o) * EF, bws_.h_h + uint64_t(o) * EF, row_shift_ + o, n_e, EF, swiglu_limit);
             quantize_q8_1(q, bws_.h_h + uint64_t(o) * EF, hq8 + uint64_t(o) * (EF / 32), uint32_t(HN));
         }
         bws_.jobs.clear(); xmx_jobs.clear();
@@ -884,12 +903,16 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
             size_t j = i + 1; while (j < cpu_.work.size() && cpu_.work[j].row == cpu_.work[j - 1].row + 1) ++j;
             if (f32_rows) q.memcpy(bws_.y_f32 + uint64_t(cpu_.work[i].row) * H, cpu_.h_rows32 + i * H, (j - i) * H * 4);   // the fp32 scatter reads y_f32
             else q.memcpy(static_cast<sycl::half*>(bws_.yp) + uint64_t(cpu_.work[i].row) * H, cpu_.h_rows + i * H, (j - i) * H * 2);
+            // #74: a CPU row is exact fp32 -- a group's rescale may have scanned its stale slot of h_h (a group's SwiGLU spans
+            // the packed rows between its experts), so its shift goes back to 0
+            if (rescale) q.memset(row_shift_ + cpu_.work[i].row, 0, (j - i) * 4);
             i = j;
         }
     }
     if (ep_export_) { q.wait(); }                                                         // the rows are the product; no scatter
     else {
         if (ep_import_) if (auto e = ep_import_(q, static_cast<sycl::half*>(bws_.yp), TK); !e.empty()) return "tier ep import: " + e;
+        if (rescale) ds4_scale_pow2_rows(q, bws_.w_pk, row_shift_, TK);   // #74: a rescaled row's weight x 2^k
         if (f32_rows) ds4_expert_scatter_accum_f32(q, bws_.y_f32, bws_.tk2p, bws_.w_pk, y, T, K, H).wait();
         else ds4_expert_scatter_accum(q, bws_.yp, bws_.tk2p, bws_.w_pk, y, T, K, H).wait();
     }

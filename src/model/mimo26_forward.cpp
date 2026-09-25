@@ -2,6 +2,7 @@
 #include "ie/mimo26_forward.hpp"
 
 #include "ie/kernel_profiler.hpp"
+#include "ie/mimo26_host_rules.hpp"
 #include "ie/mimo26_ops.hpp"
 #include "ie/ops.hpp"
 
@@ -186,6 +187,7 @@ std::string Mimo26Forward::upload_card(Card& c) {
         }
         if (const char* fe = std::getenv("IE_MIMO26_EXPERT_FILE"); fe && *fe) s.expert_file = fe;
         s.fp32_out = true;   // no SwiGLU clamp: expert outputs can exceed fp16 (see Ds41ExpertSource::fp32_out)
+        s.f16_rescale = true;   // ... and so can the SwiGLU products the XMX route stores fp16 (#74, Ds41ExpertSource::f16_rescale)
         std::vector<std::vector<uint32_t>> ranking = opt_.ranking;
         if (ranking.empty()) {
             ranking.assign(cfg.n_layers, std::vector<uint32_t>(E));
@@ -235,6 +237,57 @@ std::string Mimo26Forward::set_feature_layers(std::vector<uint32_t> layers, uint
     if (feat_layers_.empty()) return {};
     h_feat_.assign(feat_layers_.size() * size_t(feat_max_) * m_->config().dim, 0.f);
     return {};
+}
+
+void Mimo26Forward::state_spans(size_t ci, uint32_t n, uint32_t hi, std::vector<std::pair<void*, uint64_t>>& out, bool rings_only) const {
+    out.clear();
+    if (ci >= cards_.size() || !m_ || n == 0) return;
+    const auto& cfg = m_->config();
+    const Card& c = *cards_[ci];
+    for (uint32_t L = c.L0; L < c.L1; ++L) {
+        const Dense& d = c.dense[L - c.L0];
+        // the caches' layout (upload_card): k [n_kv, slots, head_dim], v [n_kv, slots, v_row]; a linear cache holds position
+        // p at slot p, an SWA ring at p % ring_ (and holds only [written_end - ring_, n_pos) of them)
+        const bool in_ring = cfg.is_swa(L) && ring_;
+        if (rings_only && !in_ring) continue;
+        const uint64_t n_kv = cfg.n_kv(L), slots = in_ring ? ring_ : opt_.max_ctx;
+        const uint64_t k_row = cfg.head_dim, v_row = cfg.is_swa(L) ? cfg.v_head_dim : cfg.head_dim;
+        uint32_t runs[4] = {0, n, 0, 0}, n_runs = 1;
+        if (in_ring) n_runs = mimo26_ring_runs(std::min(hi > ring_ ? hi - ring_ : 0u, n), n, ring_, runs);
+        for (const auto& [base, row] : {std::pair<sycl::half*, uint64_t>{d.k, k_row}, std::pair<sycl::half*, uint64_t>{d.v, v_row}})
+            for (uint64_t h = 0; h < n_kv; ++h)
+                for (uint32_t r = 0; r < n_runs; ++r)
+                    out.push_back({base + (h * slots + runs[2 * r]) * row, uint64_t(runs[2 * r + 1] - runs[2 * r]) * row * sizeof(sycl::half)});
+    }
+}
+
+std::string Mimo26Forward::set_state(uint32_t n, uint32_t hi) {
+    if (cards_.empty()) return "set_state: not initialised";
+    if (n > hi || hi > opt_.max_ctx)
+        return "set_state: " + std::to_string(n) + " positions written to " + std::to_string(hi) + " do not fit the capacity " + std::to_string(opt_.max_ctx);
+    n_pos_ = n; hi_end_ = hi; feat_rows_ = 0;
+    return {};
+}
+
+void Mimo26Forward::probe_op(sycl::queue& q, const char* op, const void* dev, bool f16, uint32_t rows, uint32_t cols) {
+    q.wait();
+    const size_t n = size_t(rows) * cols;
+    const bool watch = probe_row_ >= 0 && uint32_t(probe_row_) < rows;
+    ProbeOp p; p.op = op; p.rows = rows; p.cols = cols;
+    if (f16) {
+        std::vector<uint16_t> h(n);
+        q.memcpy(h.data(), dev, n * 2).wait();
+        p.all = mimo26_scan_f16(h.data(), n);
+        if (watch) p.row = mimo26_scan_f16(h.data() + size_t(probe_row_) * cols, cols);
+    } else {
+        std::vector<float> f(n);
+        q.memcpy(f.data(), dev, n * 4).wait();
+        p.all = mimo26_scan_f32(f.data(), n);
+        if (watch) p.row = mimo26_scan_f32(f.data() + size_t(probe_row_) * cols, cols);
+        if (watch && p.op == "moe")                            // the row itself, for an fp64 comparison (tools/mimo26/moe_agree.py)
+            probe_moe_out_.assign(f.begin() + std::ptrdiff_t(size_t(probe_row_) * cols), f.begin() + std::ptrdiff_t(size_t(probe_row_ + 1) * cols));
+    }
+    probe_ops_.push_back(std::move(p));
 }
 
 std::string Mimo26Forward::init(const std::vector<sycl::queue*>& qs, const Mimo26Model& m, const Mimo26Options& o) {
@@ -324,12 +377,19 @@ std::string Mimo26Forward::run_card(Card& c, uint32_t T, uint32_t pos0, std::vec
             mimo26_fp8_to_f16(q, w8, sr, c.wscratch, N_, K_);
             prof(nm, gemm_nt_f16_onednn(q, act, c.wscratch, y, T, N_, K_));
         };
+        // (diagnostic) the NaN probe (set_probe): this layer's ops, each scanned by bits once it has run
+        const bool probe = int(L) == probe_layer_;
+        auto pr = [&](const char* op, const void* p, bool f16, uint32_t cols) { if (probe) [[unlikely]] probe_op(q, op, p, f16, T, cols); };
+        pr("in", c.x, false, H);
         mimo26_rms_norm(q, c.x, d.attn_norm, c.xn16, nullptr, T, H, cfg.norm_eps);
+        pr("attn_norm", c.xn16, true, H);
         dense("mimo26.gemm.qkv", c.xn16, d.qkv8, d.qkv_s, d.qkv, c.qkv32, Nqkv, H);
+        pr("qkv", c.qkv32, false, Nqkv);
         if (swa) {
             mimo26_split_qkv(q, c.qkv32, c.Q, c.K, c.V, T, n_q, n_kv, hd, hdv);
             rope_partial(q, c.Q, c.pos, c.Q, T, n_q, hd, RD, theta);
             rope_partial(q, c.K, c.pos, c.K, T, n_kv, hd, RD, theta);
+            pr("q", c.Q, true, n_q * hd); pr("k", c.K, true, n_kv * hd); pr("v", c.V, true, n_kv * hdv);
             // a step through the split-K decode attention, a chunk through mimo26_attention_prefill_xmx (ring or linear);
             // IE_MIMO26_SPLIT_DECODE=0 / IE_MIMO26_SWA_PREFILL=naive: mimo26_attention
             static const bool swa_xmx = [] { const char* v = std::getenv("IE_MIMO26_SWA_PREFILL"); return !(v && std::string(v) == "naive"); }();
@@ -346,6 +406,7 @@ std::string Mimo26Forward::run_card(Card& c, uint32_t T, uint32_t pos0, std::vec
             mimo26_split_qkv(q, c.qkv32, c.Q, c.K, c.Vp, T, n_q, n_kv, hd, hdv, {}, hd);
             rope_partial(q, c.Q, c.pos, c.Q, T, n_q, hd, RD, theta);
             rope_partial(q, c.K, c.pos, c.K, T, n_kv, hd, RD, theta);
+            pr("q", c.Q, true, n_q * hd); pr("k", c.K, true, n_kv * hd); pr("v", c.Vp, true, n_kv * hd);
             static const int full_prefill = [] { const char* v = std::getenv("IE_MIMO26_FULL_PREFILL");
                                                  const std::string m = v ? v : ""; return m == "naive" ? 0 : m == "fa2" ? 1 : 2; }();
             if (T > kDecodeRows && full_prefill == 2) {
@@ -359,14 +420,22 @@ std::string Mimo26Forward::run_card(Card& c, uint32_t T, uint32_t pos0, std::vec
                 mimo26_attention(q, c.Q, c.K, c.Vp, d.k, d.v, c.attn, T, pos0, n_q, n_kv, hd, hdv, opt_.max_ctx, 0, nullptr, {}, 0, hd);
             }
         }
+        pr("attn", c.attn, true, n_q * hdv);
         prof("mimo26.gemm.o", gemm_nt_f16_onednn(q, c.attn, d.o, c.o32, T, H, n_q * hdv));
+        pr("o_proj", c.o32, false, H);
         mimo26_axpy(q, c.o32, cfg.value_scale, c.x, size_t(T) * H);
+        pr("x+attn", c.x, false, H);
         mimo26_rms_norm(q, c.x, d.ffn_norm, c.xn16, c.xn32, T, H, cfg.norm_eps);
+        pr("ffn_norm", c.xn32, false, H);
         if (!Lw.moe) {
             dense("mimo26.gemm.mlp_gate", c.xn16, d.gate8, d.gate_s, d.gate, c.gate32, FI, H);
+            pr("gate", c.gate32, false, FI);
             dense("mimo26.gemm.mlp_up", c.xn16, d.up8, d.up_s, d.up, c.up32, FI, H);
+            pr("up", c.up32, false, FI);
             mimo26_swiglu_f32(q, c.gate32, c.up32, c.h16, size_t(T) * FI);
+            pr("swiglu", c.h16, true, FI);
             dense("mimo26.gemm.mlp_down", c.h16, d.down8, d.down_s, d.down, c.o32, H, FI);
+            pr("down", c.o32, false, H);
             mimo26_axpy(q, c.o32, 1.f, c.x, size_t(T) * H);
         } else {
             // noaux_tc: sigmoid scores, select the top-k of (score + bias), weight by the unbiased scores normalised to 1
@@ -394,11 +463,19 @@ std::string Mimo26Forward::run_card(Card& c, uint32_t T, uint32_t pos0, std::vec
                 for (uint32_t t = 0; t < T; ++t)
                     if (!profile_rows_ || profile_rows_[t])
                         for (uint32_t k = 0; k < TK; ++k) ++profile_[L][uint32_t(h_ridx_[size_t(t) * TK + k])];
+            pr("router", c.rlogits, false, E);
+            if (probe && probe_row_ >= 0 && uint32_t(probe_row_) < T) {   // (diagnostic) the watched row's MoE input and routing
+                probe_moe_.assign(size_t(H) * 4 + size_t(TK) * 8, 0);
+                q.memcpy(probe_moe_.data(), c.xn32 + size_t(probe_row_) * H, size_t(H) * 4).wait();
+                std::memcpy(probe_moe_.data() + size_t(H) * 4, h_ridx_.data() + size_t(probe_row_) * TK, size_t(TK) * 4);
+                std::memcpy(probe_moe_.data() + size_t(H) * 4 + size_t(TK) * 4, h_rw_.data() + size_t(probe_row_) * TK, size_t(TK) * 4);
+            }
             const auto tm = std::chrono::steady_clock::now();
             if (auto e = c.tier.moe(q, L, c.xn32, h_ridx_.data(), h_rw_.data(), T, c.moe, inf); !e.empty()) return "layer " + std::to_string(L) + " tier: " + e;
             stats_[L].moe_ms = ms_since(tm);
             const auto& ts = c.tier.last();
             stats_[L].experts_static = ts.experts_static; stats_[L].experts_pinned = ts.experts_pinned; stats_[L].experts_mmap = ts.experts_mmap;
+            pr("moe", c.moe, false, H);
             mimo26_axpy(q, c.moe, 1.f, c.x, size_t(T) * H);
         }
         if (!feat_layers_.empty()) {   // P5: this layer's residual rows for the drafter, the call's last rows
@@ -409,6 +486,7 @@ std::string Mimo26Forward::run_card(Card& c, uint32_t T, uint32_t pos0, std::vec
             }
         }
         q.wait();
+        pr("out", c.x, false, H);
         stats_[L].ms = ms_since(t0);
         // IE_MIMO26_CHECK=1 (diagnostic): the residual stream after every layer -- non-finite count and max |x| per row,
         // and for the dense FFN / the routed MoE output the largest |value| entering the residual. Prints only rows

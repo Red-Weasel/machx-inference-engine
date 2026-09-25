@@ -17,6 +17,7 @@
 
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ie {
@@ -44,12 +45,21 @@ public:
     // of `stride` >= T rows per target layer, as the forward exports them -- a verify exports all its rows and adds only the
     // accepted first T; 0 = T). pos0 < ctx_end() replaces the rows at and after pos0 (a rewind); pos0 > ctx_end() leaves a
     // gap: the context restarts at pos0 (drafts attend only to positions the ring holds, so a gap costs acceptance, never
-    // correctness).
+    // correctness). A feature fp16 cannot hold (NaN, inf, |x| >= 65520: the fc GEMM's input is fp16) is refused with its
+    // position before anything is written (#64: it would poison every draft attending to it); the caller resets.
     std::string add_context(const float* feats, uint32_t T, uint32_t pos0, uint32_t stride = 0);
     uint32_t ctx_end() const { return ctx_end_; }
     // Drop the positions at and after L (the target's prefix reuse); the ring's slots older than hi - R are gone.
     void     rewind(uint32_t L);
     void     reset() { ctx_end_ = ctx_lo_ = hi_ = 0; }
+    // P7 (#70, docs/mimo26/P7_FIX64_FIX70.md) host slots: the context as device byte spans -- every layer's K / V ring slots
+    // of the positions [lo, end) (at most two runs per kv head; order: layer; K heads; V heads) -- and its bookkeeping.
+    // Saved at (ctx_lo(), ctx_end(), ctx_hi()) and written back before set_state, the drafter drafts exactly as before.
+    void         state_spans(uint32_t lo, uint32_t end, std::vector<std::pair<void*, uint64_t>>& out) const;
+    std::string  set_state(uint32_t lo, uint32_t end, uint32_t hi);
+    uint32_t     ctx_lo() const { return ctx_lo_; }
+    uint32_t     ctx_hi() const { return hi_; }
+    sycl::queue* queue() const { return q_; }
     // The drafts after `anchor` (the token at position p = ctx_end(), not yet in the target's caches): up to block - 1
     // greedy tokens, `k` of them returned -- cut before the first draft whose softmax probability under the drafter is
     // below `min_p` (0 keeps all k: a verify row costs ~25 ms, so a likely rejection is cheaper not drafted).

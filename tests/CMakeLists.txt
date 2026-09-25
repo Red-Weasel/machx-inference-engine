@@ -737,3 +737,11 @@ add_executable(mimo26_ops_test unit/mimo26_ops_test.cpp)
 target_link_libraries(mimo26_ops_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME mimo26_ops_test COMMAND mimo26_ops_test)
 set_tests_properties(mimo26_ops_test PROPERTIES SKIP_RETURN_CODE 77)
+# Host-only (no GPU, no SYCL): MiMo-V2.6 serving rules (docs/mimo26/P7_FIX64_FIX70.md) -- the host slots' ring runs, servable
+# prefix, continuation test and admission policy (#70), and the drafter's fp16 range check (#64). Self-contained TU + the
+# rules' source; does NOT link ie_core.
+add_executable(mimo26_host_rules_test
+  unit/mimo26_host_rules_test.cpp
+  ${CMAKE_SOURCE_DIR}/src/model/mimo26_host_rules.cpp)
+target_include_directories(mimo26_host_rules_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME mimo26_host_rules_test COMMAND mimo26_host_rules_test)

@@ -7,6 +7,7 @@
 #include "ie/deepseek41_generate.hpp"   // Ds41Generator::sample: the engine's host sampler
 #include "ie/expert_stream.hpp"
 #include "ie/mimo26_engine.hpp"
+#include "ie/mimo26_host_rules.hpp"
 #include "ie/ngram_draft.hpp"
 #include "stb/stb_image.h"   // stbi_info_from_memory (the implementation is instantiated in qwen4_image.cpp)
 
@@ -16,6 +17,8 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <exception>
 #include <fstream>
 #include <iterator>
 #include <omp.h>
@@ -411,6 +414,21 @@ std::string Engine::mimo26_load(const std::string& dir) {
                      b->dflash_k, b->dflash_minp, b->dflash->vram_bytes() / 1e9);
     }
     if (const char* v = std::getenv("IE_MIMO26_PROMPT_CACHE"); !opts_.prompt_cache || (v && std::string(v) == "0")) b->prefix_reuse = false;
+    // P7 (#70, docs/mimo26/P7_FIX64_FIX70.md): HOST SLOTS -- other conversations' states kept in host RAM and swapped back in
+    // when a prompt matches one better than the live state. IE_MIMO26_PROMPT_CACHE_GIB is their budget (16; 0 = the live
+    // conversation only), IE_MIMO26_CACHE_KEEP_FREE_GIB the MemAvailable floor a new slot must leave (24); with prefix reuse
+    // off (IE_MIMO26_PROMPT_CACHE=0, --no-prompt-cache) there are none
+    {
+        Mimo26PrefixCache::Options co;
+        if (const char* g = std::getenv("IE_MIMO26_PROMPT_CACHE_GIB"); g && *g) co.budget = uint64_t(std::max(0.0, std::atof(g)) * 1073741824.0);
+        if (const char* g = std::getenv("IE_MIMO26_CACHE_KEEP_FREE_GIB"); g && *g) co.keep_free = uint64_t(std::max(0.0, std::atof(g)) * 1073741824.0);
+        if (!b->prefix_reuse) co.budget = 0;
+        if (auto e = b->cache.init(b->fwd, b->dflash.get(), co); !e.empty()) return "mimo_v2 host slots: " + e;
+        if (b->cache.slots_on())
+            std::fprintf(stderr, "[mimo26] host slots ON: up to %.1f GiB of other conversations in host RAM, kept above %.1f GiB MemAvailable "
+                                 "(IE_MIMO26_PROMPT_CACHE_GIB=0 off)\n", double(co.budget) / 1073741824.0, double(co.keep_free) / 1073741824.0);
+        else if (b->prefix_reuse) std::fprintf(stderr, "[mimo26] host slots off (IE_MIMO26_PROMPT_CACHE_GIB=0): only the live conversation is reused\n");
+    }
     // prompt-lookup speculation (P4: held-out Dream turns -13 % per token, 76 % of drafts accepted; greedy near-ties can
     // resolve differently from one-row decoding -- 1 of 7 distinct held-out outputs identical over 256 tokens, every
     // divergence a near-tie, gate P4-1). With the DFlash drafter on it defaults OFF: the drafter alone decodes the held-out
@@ -450,42 +468,86 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
     const uint32_t room = cap - uint32_t(ids.size());
     const uint32_t max_new = sp.max_tokens == 0 ? room : std::min(sp.max_tokens, room);
 
-    // live-conversation prefix reuse: the caches hold b.live; keep the common prefix when the SWA rings still hold the
-    // window before it (every position the reused prefix's last window needs), else start over
+    // what serves the prompt (P3b live reuse + P7 host slots, #70, docs/mimo26/P7_FIX64_FIX70.md): the live state's common
+    // prefix while the SWA rings still hold the window before it (mimo26_servable), or another conversation's host slot
+    // swapped in when it serves clearly more (the live conversation kept in a slot first); then the caches are cut there
     const auto t_pf = std::chrono::steady_clock::now();
     uint32_t L = 0;
-    if (b.prefix_reuse) {
-        const size_t lim = std::min(b.live.size(), ids.size() - 1);   // at least one token runs, for the logits
-        while (L < lim && b.live[L] == ids[L]) ++L;
-        const uint32_t ring = b.fwd.ring(), win = b.fwd.window();
-        // the ring's oldest valid position is written_end() - ring, not live.size() - ring: a lookup verify's rejected rows
-        // were written past the live end and overwrote ring slots of older positions (gate finding 3)
-        if (ring && std::max<size_t>(b.live.size(), b.fwd.written_end()) - L + win > ring) L = 0;
-    }
+    std::string source;
+    if (b.prefix_reuse)
+        if (auto e = b.cache.prepare(ids, b.live, L, source); !e.empty()) {
+            b.live.clear(); b.fwd.reset(); if (b.dflash) b.dflash->reset(); b.cache.live_lost();
+            r.finish_reason = "error: mimo_v2 prefix cache: " + e; return r;
+        }
     b.fwd.rewind(L);
     b.live.resize(L);
     if (L == 0) b.fwd.reset();
     if (b.dflash) { if (L == 0) b.dflash->reset(); else b.dflash->rewind(L); }
+    r.restore_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pf).count();
+    // #64: a DRAFTER fault -- a draft or a context update that fails (a non-finite draft row, a feature fp16 cannot hold, a
+    // SYCL error on its card) -- costs the drafter, not the request: logged once, drafting off for the rest of this request,
+    // the drafter reset. The target's caches are intact; the next request's prefill re-syncs the drafter (the gap rule of
+    // Mimo26DFlash::add_context). Only a TARGET forward failure clears the live state.
+    bool df_on = b.dflash != nullptr;
+    uint32_t df_fault_at = 0;   // completion tokens before the fault
+    std::string df_reason;      // the fault's own words (a refused feature names its target layer and position)
+    auto df_fail = [&](const std::string& what) {
+        std::fprintf(stderr, "[mimo26 dflash] drafter fault at position %u (%u tokens generated): %s -- drafting off for the rest of this request, "
+                             "the drafter reset; the target's caches are intact\n", b.fwd.n_pos(), r.completion_tokens, what.c_str());
+        df_on = false; df_fault_at = r.completion_tokens; df_reason = what;
+        b.dflash->reset();
+    };
+    // #74: a row about to be sampled that holds a non-finite logit is a TARGET fault and is never sampled from: the greedy
+    // argmax of a NaN row is token 0 and the sampler's sort is undefined over one, so the reply would be silent garbage.
+    // The caches may hold the poison (a NaN spreads through the full-attention layers): the live state is cleared, as for
+    // any failed forward, and the request fails. Bit test (mimo26_scan_f32): the fast fp model may fold a float check away.
+    auto sampled_ok = [&](const float* row, size_t n, uint32_t pos, const char* where) -> bool {
+        const Mimo26Scan s = mimo26_scan_f32(row, n);
+        if (!s.non_finite) return true;
+        std::fprintf(stderr, "[mimo26] %s: %llu of %zu logits non-finite at position %u -- not sampled; the request fails and the conversation's "
+                             "caches are cleared%s%s\n", where, (unsigned long long)s.non_finite, n, pos,
+                     df_reason.empty() ? "" : "; earlier in this request the drafter refused: ", df_reason.c_str());
+        b.live.clear(); b.fwd.reset(); if (b.dflash) b.dflash->reset(); b.cache.live_lost();
+        r.finish_reason = std::string("error: mimo_v2 ") + where + ": non-finite logits at position " + std::to_string(pos) +
+                          (df_reason.empty() ? std::string() : " (earlier: " + df_reason + ")");
+        return false;
+    };
     // the drafter's context follows every forward: the call's exported rows [p0, p0 + n) (a verify adds only its kept rows)
-    auto add_ctx = [&](uint32_t n, uint32_t p0, uint32_t stride) -> std::string {
-        return b.dflash ? b.dflash->add_context(b.fwd.features(), n, p0, stride) : std::string();
+    auto add_ctx = [&](uint32_t n, uint32_t p0, uint32_t stride) {
+        if (!df_on) return;
+        std::string e;
+        try { e = b.dflash->add_context(b.fwd.features(), n, p0, stride); } catch (const std::exception& x) { e = std::string("dflash: ") + x.what(); }
+        if (!e.empty()) df_fail(e);
     };
     r.cached_tokens = L;
-    r.cache_source = !b.prefix_reuse ? "" : L ? "live" : "none";
+    r.cache_source = !b.prefix_reuse ? "" : source;
+    // IE_MIMO26_LOGITS_FAULT=N (diagnostic, the #74 gate): the process's N-th logits row about to be sampled is overwritten
+    // with NaN, as an fp16 overflow upstream leaves it
+    auto inject_fault = [](float* row, size_t n) {
+        static const long fault_at = [] { const char* v = std::getenv("IE_MIMO26_LOGITS_FAULT"); return v && *v ? std::atol(v) : 0L; }();
+        static long n_rows = 0;
+        if (++n_rows != fault_at) return;
+        const uint32_t nan_bits = 0x7FC00000u;
+        for (size_t i = 0; i < n; ++i) std::memcpy(row + i, &nan_bits, 4);
+    };
     std::vector<float> logits;
     const uint32_t chunk = b.fwd.max_tokens();
     for (uint32_t off = L; off < ids.size(); off += chunk) {
         const uint32_t n = std::min<uint32_t>(chunk, uint32_t(ids.size()) - off);
         if (auto e = b.fwd.forward(ids.data() + off, n, off, logits, false); !e.empty()) {
-            b.live.clear(); b.fwd.reset();
+            b.live.clear(); b.fwd.reset(); b.cache.live_lost();
             r.finish_reason = "error: mimo_v2 prefill: " + e; return r;
         }
         b.live.insert(b.live.end(), ids.begin() + off, ids.begin() + off + n);
-        if (auto e = add_ctx(b.fwd.feat_rows(), off + n - b.fwd.feat_rows(), b.fwd.feat_rows()); !e.empty()) {
-            b.live.clear(); b.fwd.reset();
-            r.finish_reason = "error: mimo_v2 " + e; return r;
-        }
+        add_ctx(b.fwd.feat_rows(), off + n - b.fwd.feat_rows(), b.fwd.feat_rows());
         if (on_token && off + n < ids.size() && !on_token(std::string_view{})) { r.finish_reason = "abort"; return r; }   // liveness probe
+    }
+    inject_fault(logits.data(), logits.size());
+    if (!sampled_ok(logits.data(), logits.size(), uint32_t(ids.size()) - 1, "prefill")) return r;
+    // the live state holds the whole prompt (a slot it continued is dropped; #87: the prompt-end snapshot is taken)
+    if (auto e = b.cache.prompt_done(uint32_t(ids.size())); !e.empty()) {
+        b.live.clear(); b.fwd.reset(); if (b.dflash) b.dflash->reset(); b.cache.live_lost();
+        r.finish_reason = "error: mimo_v2 prefix cache: " + e; return r;
     }
     r.prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pf).count();
 
@@ -533,32 +595,39 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
             for (size_t i = 0; i < d.size(); ++i) if (d[i] < 0) { d.resize(i); break; }   // a copy of an image's pad run is not a draft (P6.2)
         }
         bool from_df = false;
-        if (d.empty() && b.dflash) {
-            if (auto e = b.dflash->draft(id, b.dflash_k, d, b.dflash_minp); !e.empty()) {
-                b.live.clear(); b.fwd.reset();
-                r.finish_reason = "error: mimo_v2 " + e; return r;
-            }
-            from_df = true;
+        if (d.empty() && df_on) {
+            // IE_MIMO26_DFLASH_FAULT=N (diagnostic, the #64 gate): the process's N-th draft fails as a drafter fault would
+            static const long fault_at = [] { const char* v = std::getenv("IE_MIMO26_DFLASH_FAULT"); return v && *v ? std::atol(v) : 0L; }();
+            static long n_drafts = 0;
+            std::string e;
+            try { e = ++n_drafts == fault_at ? std::string("dflash: injected fault (IE_MIMO26_DFLASH_FAULT)") : b.dflash->draft(id, b.dflash_k, d, b.dflash_minp); }
+            catch (const std::exception& x) { e = std::string("dflash: ") + x.what(); }
+            if (e.empty()) from_df = true;
+            else { d.clear(); df_fail(e); }   // (a failed draft may hold the rows before the bad one: none is used)
         }
         if (d.size() > max_new - k_done) d.resize(max_new - k_done);
         const uint32_t pos = b.fwd.n_pos();
         if (d.empty()) {
             if (auto e = b.fwd.forward(&id, 1, pos, logits, false); !e.empty()) {
-                b.live.clear(); b.fwd.reset();
+                b.live.clear(); b.fwd.reset(); b.cache.live_lost();
                 r.finish_reason = "error: mimo_v2 decode: " + e; return r;
             }
             b.live.push_back(id); ++n_plain;
-            if (auto e = add_ctx(1, pos, 1); !e.empty()) { b.live.clear(); b.fwd.reset(); r.finish_reason = "error: mimo_v2 " + e; return r; }
+            add_ctx(1, pos, 1);
+            inject_fault(logits.data(), logits.size());
+            if (!sampled_ok(logits.data(), logits.size(), pos, "decode")) return r;
             id = Ds41Generator::sample(logits, recent, p, rng);
             continue;
         }
         rows.assign(1, id); rows.insert(rows.end(), d.begin(), d.end());
         if (auto e = b.fwd.forward(rows.data(), uint32_t(rows.size()), pos, vlg, true); !e.empty()) {
-            b.live.clear(); b.fwd.reset();
+            b.live.clear(); b.fwd.reset(); b.cache.live_lost();
             r.finish_reason = "error: mimo_v2 lookup verify: " + e; return r;
         }
         uint32_t acc = 0; int32_t next = -1; bool ended = false, drop_last = false;
         for (uint32_t rr = 0; rr <= d.size(); ++rr) {
+            inject_fault(vlg.data() + size_t(rr) * V, V);
+            if (!sampled_ok(vlg.data() + size_t(rr) * V, V, pos + rr, "verify")) return r;
             const int32_t a = Ds41Generator::sample_row(vlg.data() + size_t(rr) * V, V, recent, p, rng);
             if (rr == d.size() || a != d[rr]) { next = a; break; }
             ++acc;
@@ -568,15 +637,15 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
         }
         const uint32_t keep = 1 + acc - (drop_last ? 1u : 0u);         // the rows of id and the accepted drafts
         b.fwd.rewind(pos + keep);
-        if (keep)
-            if (auto e = add_ctx(keep, pos, uint32_t(rows.size())); !e.empty()) { b.live.clear(); b.fwd.reset(); r.finish_reason = "error: mimo_v2 " + e; return r; }
+        if (keep) add_ctx(keep, pos, uint32_t(rows.size()));
         if (from_df) { ++df_pass; df_acc += acc; }
         b.live.insert(b.live.end(), rows.begin(), rows.begin() + keep);
         ++n_pass; n_rows += uint32_t(rows.size()); n_acc += acc;
         if (ended) break;
         id = next;
     }
-    if (b.dflash) std::fprintf(stderr, "[mimo26 dflash] %u passes, %u drafts accepted (%.2f per pass)\n", df_pass, df_acc, df_pass ? double(df_acc) / df_pass : 0.0);
+    if (b.dflash) std::fprintf(stderr, "[mimo26 dflash] %u passes, %u drafts accepted (%.2f per pass)%s\n", df_pass, df_acc, df_pass ? double(df_acc) / df_pass : 0.0,
+                               df_on ? "" : ("; OFF after a drafter fault at token " + std::to_string(df_fault_at)).c_str());
     if (b.lookup) std::fprintf(stderr, "[mimo26 lookup] %u tokens: %u verify passes (%u rows, %u drafts accepted), %u plain steps\n",
                                r.completion_tokens, n_pass, n_rows, n_acc, n_plain);
     if (!pending.empty()) { text += pending; if (on_token) on_token(pending); }
@@ -673,6 +742,12 @@ GenerateResult Engine::mimo26_chat(std::span<const ChatTurn> turns, const Sampli
 GenerateResult Engine::mimo26_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token) {
     const auto ids = mimo26_->tok.encode(prompt, /*allow_special=*/true);
     return mimo26_run_ids(*mimo26_, ids, sp, on_token, /*chat=*/false, false, {});
+}
+
+uint32_t Engine::mimo26_prompt_cache_slots() const {
+    const Mimo26Bundle& b = *mimo26_;
+    if (!b.prefix_reuse) return 0;   // no prefix reuse at all, not even the live conversation
+    return b.cache.guaranteed_slots(opts_.max_ctx, b.dflash != nullptr);
 }
 
 }  // namespace ie

@@ -7,6 +7,7 @@
 #include "ie/mimo26.hpp"
 #include "ie/mimo26_dflash.hpp"
 #include "ie/mimo26_forward.hpp"
+#include "ie/mimo26_prefix_cache.hpp"
 #include "ie/mimo26_vision.hpp"
 #include "ie/tokenizer.hpp"
 
@@ -32,6 +33,9 @@ struct Mimo26Bundle {
     std::unique_ptr<Mimo26DFlash>             dflash;           // the checkpoint's DFlash drafter (IE_MIMO26_DFLASH=K), null = off
     uint32_t                                  dflash_k = 0;     // drafts per pass
     float                                     dflash_minp = 0.7f;   // drafts cut at the first one below this drafter probability
+    // P7 (#70): what serves a prompt -- the live conversation, or another one kept in a host slot and swapped back in
+    // (docs/mimo26/P7_FIX64_FIX70.md). Attached to fwd and dflash; freed in the destructor before them.
+    Mimo26PrefixCache                         cache;
     // P6.2: the checkpoint's vision tower, staged in pinned host memory at load; its device block exists only while an
     // image encodes (on the first card). IE_MIMO26_VISION=0 leaves it out; a staging failure is reported per image request.
     DeviceAllocator                           vis_alloc;   // declared BEFORE vis: MimoVision frees its pinned memory through it
@@ -42,6 +46,7 @@ struct Mimo26Bundle {
     // Drain before the frees: an aborted generation can leave kernels in flight.
     ~Mimo26Bundle() {
         for (auto& q : queues) if (q) { try { q->wait_and_throw(); } catch (const sycl::exception& e) { std::fprintf(stderr, "[mimo26] teardown drain: %s\n", e.what()); } }
+        cache.free_all();
         if (dflash) dflash->free_all();
         fwd.free_all();
     }

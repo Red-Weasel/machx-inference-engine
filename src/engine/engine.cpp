@@ -3219,6 +3219,12 @@ static void ds4_finish_completion(const Tokenizer& tok, GenerateResult& res, boo
     }
 }
 
+uint32_t Engine::prompt_cache_slots() const {
+    if (mimo26_) return mimo26_prompt_cache_slots();
+    if (ds41_) return ds41_prompt_cache_slots();
+    return prompt_cache_on_ ? 1u : 0u;   // the other arches: the live conversation's prefix, when the cache is on
+}
+
 std::string Engine::vision_status_json() const {
     bool ready = false; std::string reason; long tokens = -1;
     switch (arch_) {

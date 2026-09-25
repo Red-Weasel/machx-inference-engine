@@ -1135,6 +1135,74 @@ sycl::event ds4_swiglu_clamped_to_f16(sycl::queue& q,
     });
 }
 
+sycl::event ds4_swiglu_f16_rescale_overflow(sycl::queue& q, const float* gate, const float* up, sycl::half* y, int32_t* shift,
+                                            uint32_t rows, uint32_t EF, float limit, const std::vector<sycl::event>& deps) {
+    constexpr uint32_t WG = 256;
+    if (!rows) return q.submit([&](sycl::handler& h) { h.depends_on(deps); h.single_task([] {}); });
+    return ie::ps(q, "ds4_swiglu_f16_rescale_overflow", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(rows) * WG, WG), [=](sycl::nd_item<1> it) {
+            const size_t r = it.get_group(0), l = it.get_local_id(0), base = r * EF;
+            uint32_t bad = 0;                                        // an inf / NaN among the row's fp16 products, by bits
+            for (size_t i = l; i < EF; i += WG) bad |= uint32_t((sycl::bit_cast<uint16_t>(y[base + i]) & 0x7C00u) == 0x7C00u);
+            bad = sycl::reduce_over_group(it.get_group(), bad, sycl::bit_or<uint32_t>());
+            if (!bad) { if (l == 0) shift[r] = 0; return; }          // a clean row is left exactly as it was stored
+            float mx = 0.f;                                          // the row's products again in fp32, the same expression
+            for (size_t i = l; i < EF; i += WG) {
+                const float g = sycl::fmin(gate[base + i], limit), u = sycl::fmin(sycl::fmax(up[base + i], -limit), limit);
+                mx = sycl::fmax(mx, sycl::fabs((g * sigmoid_ref(g)) * u));
+            }
+            mx = sycl::reduce_over_group(it.get_group(), mx, sycl::maximum<float>());
+            int k = 0; float m = mx;
+            while (!(m < 65520.f) && k < 120) { m *= 0.5f; ++k; }
+            const float s = sycl::ldexp(1.f, -k);
+            for (size_t i = l; i < EF; i += WG) {
+                const float g = sycl::fmin(gate[base + i], limit), u = sycl::fmin(sycl::fmax(up[base + i], -limit), limit);
+                y[base + i] = sycl::half((g * sigmoid_ref(g)) * u * s);
+            }
+            if (l == 0) shift[r] = k;
+        });
+    });
+}
+
+sycl::event ds4_swiglu_h_rescale_overflow(sycl::queue& q, const sycl::half* gate, const sycl::half* up, sycl::half* y, int32_t* shift,
+                                          uint32_t rows, uint32_t EF, float limit, const std::vector<sycl::event>& deps) {
+    constexpr uint32_t WG = 256;
+    if (!rows) return q.submit([&](sycl::handler& h) { h.depends_on(deps); h.single_task([] {}); });
+    return ie::ps(q, "ds4_swiglu_h_rescale_overflow", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(size_t(rows) * WG, WG), [=](sycl::nd_item<1> it) {
+            const size_t r = it.get_group(0), l = it.get_local_id(0), base = r * EF;
+            uint32_t bad = 0;                                        // an inf / NaN among the row's fp16 products, by bits
+            for (size_t i = l; i < EF; i += WG) bad |= uint32_t((sycl::bit_cast<uint16_t>(y[base + i]) & 0x7C00u) == 0x7C00u);
+            bad = sycl::reduce_over_group(it.get_group(), bad, sycl::bit_or<uint32_t>());
+            if (!bad) { if (l == 0) shift[r] = 0; return; }          // a clean row is left exactly as it was stored
+            float mx = 0.f;                                          // ds4_swiglu_clamped_h's products again, in fp32
+            for (size_t i = l; i < EF; i += WG) {
+                const float g = sycl::fmin(float(gate[base + i]), limit), u = sycl::fmin(sycl::fmax(float(up[base + i]), -limit), limit);
+                mx = sycl::fmax(mx, sycl::fabs((g * sigmoid_ref(g)) * u));
+            }
+            mx = sycl::reduce_over_group(it.get_group(), mx, sycl::maximum<float>());
+            int k = 0; float m = mx;
+            while (!(m < 65520.f) && k < 120) { m *= 0.5f; ++k; }
+            const float s = sycl::ldexp(1.f, -k);
+            for (size_t i = l; i < EF; i += WG) {
+                const float g = sycl::fmin(float(gate[base + i]), limit), u = sycl::fmin(sycl::fmax(float(up[base + i]), -limit), limit);
+                y[base + i] = sycl::half((g * sigmoid_ref(g)) * u * s);
+            }
+            if (l == 0) shift[r] = k;
+        });
+    });
+}
+
+sycl::event ds4_scale_pow2_rows(sycl::queue& q, float* w, const int32_t* shift, uint32_t rows, const std::vector<sycl::event>& deps) {
+    if (!rows) return q.submit([&](sycl::handler& h) { h.depends_on(deps); h.single_task([] {}); });
+    return ie::ps(q, "ds4_scale_pow2_rows", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(rows), [=](sycl::id<1> i) { if (shift[i]) w[i] = sycl::ldexp(w[i], shift[i]); });
+    });
+}
+
 // fp16-in / fp16-out — see the header for why this exists and why it is
 // bit-identical to cast + cast + ds4_swiglu_clamped + cast.  The body below is
 // character-for-character the fp32 body above; only the loads and the store

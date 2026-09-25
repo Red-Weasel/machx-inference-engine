@@ -129,6 +129,8 @@ add_library(ie_core
   model/mimo26_dequant.cpp
   model/mimo26_forward.cpp
   model/mimo26_dflash.cpp
+  model/mimo26_host_rules.cpp
+  model/mimo26_prefix_cache.cpp
   model/mimo26_vision.cpp
   model/mimo26_vision_tower.cpp
   engine/engine.cpp

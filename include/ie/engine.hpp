@@ -213,6 +213,11 @@ public:
     // Vision READINESS of this load (not the architecture's support, which `ie capabilities` reports): {"ready": bool,
     // "reason": "<why not, or empty>", "image_tokens": N (when the arch caps an image)} -- served at /props (P11).
     std::string vision_status_json() const;
+    // Conversations the server keeps at once, counting the live one: 0 = no prefix reuse, 1 = only the live
+    // conversation's KV is reused (a side request evicts it), more = host slots hold whole conversations (sized for
+    // full-length ones; the memory floor can keep fewer). Arches not surveyed report 1. Served at /props as
+    // "prompt_cache_slots"; clients decide whether side requests are cheap.
+    uint32_t prompt_cache_slots() const;
     // Crown-arch (qwen35moe) config view; meaningless when arch() is dense.
     const QwenConfig& config()    const noexcept { return model_.config(); }
     ModelArch arch()    const noexcept { return arch_; }
@@ -476,6 +481,8 @@ private:
     sycl::event ds4_forward(sycl::queue& q, const int32_t* ids, uint32_t T, uint32_t pos);
     // deepseek41 (src/engine/ds41_engine.cpp): the directory load and the chat/generate routes
     std::string    ds41_load(const std::string& dir);
+    uint32_t ds41_prompt_cache_slots() const;
+    uint32_t mimo26_prompt_cache_slots() const;
     GenerateResult ds41_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
                             bool enable_thinking, std::string_view tools_json, std::string_view reasoning_effort);
     GenerateResult ds41_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token);

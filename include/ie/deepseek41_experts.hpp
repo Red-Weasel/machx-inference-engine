@@ -121,6 +121,11 @@ struct Ds41ExpertSource {
     // and an expert the noaux_tc bias selects at a ~1e-5 weight emitted a raw down output of 150,585 -- past fp16's
     // 65504 in the int-dot route's fp16 row store, a NaN step. V4.1: false (fp16 rows for T <= 8, bit for bit).
     bool fp32_out = false;
+    // MiMo-V2.6 (docs/mimo26/P7_FIX64_FIX70.md section 6, fix-list #74): the XMX route's SwiGLU products are stored fp16 for
+    // the down GEMM, and with no clamp one can pass 65,504 -- expert 70 at layer 47 reached 67,504 at a ~0 routing weight
+    // and turned the row NaN. On: a row that overflowed is rescaled by a power of two (ds4_swiglu_f16_rescale_overflow) and
+    // its routing weight scaled back before the fp32 scatter; rows that did not overflow are untouched. V4.1: false.
+    bool f16_rescale = false;
     // V4.1: the layer kind's counts at `first_layer` (the MTP stages route 128 / 3), IE_DS41_EXPERT_FILE for a text-layer tier.
     static Ds41ExpertSource from(const DeepSeek41Model& m, uint32_t first_layer);
 };
@@ -216,6 +221,7 @@ private:
     // The mmap tier's transient bank, kept across calls and grown when a call needs more: a
     // per-call malloc_device of ~1 GiB cost 3.4 s per pp2048 pass (docs/deepseek41/23, run J).
     uint8_t* mm_dev_ = nullptr; size_t mm_dev_cap_ = 0;
+    int32_t* row_shift_ = nullptr;   // Ds41ExpertSource::f16_rescale: per packed row, the power of two its SwiGLU row was stored at
     std::vector<std::vector<uint8_t>> tier_;   // [layer][expert]: 0 static, 1 pinned, 2 mmap, 3 not this part
     bool ep_export_ = false;                   // expert parallel: leave the packed rows, skip the scatter
     std::function<std::string(sycl::queue&, sycl::half*, uint32_t)> ep_import_;   // ... or import the other tier's rows before it

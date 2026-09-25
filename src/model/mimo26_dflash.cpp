@@ -3,6 +3,7 @@
 
 #include "ie/kernel_profiler.hpp"
 #include "ie/mimo26.hpp"       // mimo26_bf16_to_f32
+#include "ie/mimo26_host_rules.hpp"
 #include "ie/mimo26_ops.hpp"
 #include "ie/ops.hpp"
 
@@ -164,11 +165,42 @@ void Mimo26DFlash::rewind(uint32_t L) {
     ctx_lo_ = std::min(ctx_lo_, L);                        // (nothing left before L: the context restarts at L)
 }
 
+void Mimo26DFlash::state_spans(uint32_t lo, uint32_t end, std::vector<std::pair<void*, uint64_t>>& out) const {
+    out.clear();
+    uint32_t runs[4];
+    const uint32_t n_runs = mimo26_ring_runs(lo, end, R_, runs);
+    const uint64_t HD = cfg_.head_dim, R = R_;
+    for (const auto& y : L_)                                  // the ring [n_kv, R, head_dim], position p at slot p % R
+        for (sycl::half* base : {y.kc, y.vc})
+            for (uint64_t h = 0; h < cfg_.n_kv; ++h)
+                for (uint32_t r = 0; r < n_runs; ++r)
+                    out.push_back({base + (h * R + runs[2 * r]) * HD, uint64_t(runs[2 * r + 1] - runs[2 * r]) * HD * sizeof(sycl::half)});
+}
+
+std::string Mimo26DFlash::set_state(uint32_t lo, uint32_t end, uint32_t hi) {
+    if (!q_ || L_.empty()) return "dflash: not initialised";
+    // add_context / rewind keep the context inside the ring's last R_ written positions (an emptied context may sit below)
+    if (lo > end || end > hi || end - lo > R_ || (end > lo && hi > R_ && lo < hi - R_))
+        return "dflash: a context [" + std::to_string(lo) + ", " + std::to_string(end) + ") written to " + std::to_string(hi) + " does not fit the ring of " + std::to_string(R_);
+    ctx_lo_ = lo; ctx_end_ = end; hi_ = hi;
+    return {};
+}
+
 std::string Mimo26DFlash::add_context(const float* feats, uint32_t T, uint32_t pos0, uint32_t stride) {
     if (!q_ || L_.empty()) return "dflash: not initialised";
     if (T == 0) return {};
     if (stride == 0) stride = T;
     if (T > stride || stride > max_rows_) return "dflash: " + std::to_string(stride) + " context rows exceed " + std::to_string(max_rows_);
+    // #64 (docs/mimo26/P7_FIX64_FIX70.md): the fc GEMM reads these rows as fp16. A value fp16 cannot hold would make the
+    // row inf, the hidden norm NaN and every draft that attends to the position a "no finite maximum" -- refused here, with
+    // where it is, before any bookkeeping or ring slot changes (the caller resets the drafter and decodes without it)
+    for (uint32_t f = 0; f < uint32_t(cfg_.target_layers.size()); ++f) {
+        const float* blk = feats + size_t(f) * stride * cfg_.hidden;
+        const size_t n = size_t(T) * cfg_.hidden, i = mimo26_first_non_f16(blk, n);
+        if (i < n)
+            return "dflash: target layer " + std::to_string(cfg_.target_layers[f]) + " feature " + std::to_string(blk[i]) + " at position " +
+                   std::to_string(pos0 + i / cfg_.hidden) + " (dim " + std::to_string(i % cfg_.hidden) + ") is outside fp16's range";
+    }
     if (pos0 < ctx_end_) rewind(pos0);
     if (pos0 > ctx_end_) ctx_lo_ = pos0;   // a gap: the context restarts here
     sycl::queue& q = *q_;

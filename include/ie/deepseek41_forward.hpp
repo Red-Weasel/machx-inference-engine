@@ -211,6 +211,7 @@ public:
     std::string set_prefix_cache(bool on, const PrefixCacheOptions& o);
     std::string set_prefix_cache(bool on) { return set_prefix_cache(on, PrefixCacheOptions{}); }
     bool prefix_cache() const { return pc_on_; }
+    const PrefixCacheOptions& prefix_cache_options() const noexcept { return pc_opt_; }
     // Positions of `ids` served from cached state: the state is left holding exactly ids[0, reused) (n_pos() == reused),
     // reused <= ids.size() - 1 because the caller needs the last token's logits. reused == 0: nothing matched and the
     // state is untouched (the caller's pos0 = 0 prefill resets it). `source` says where it came from ("live",
