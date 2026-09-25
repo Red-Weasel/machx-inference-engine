@@ -119,6 +119,8 @@ private:
 // already exceed the budget.
 inline constexpr uint32_t kMaxTokensUnlimited = UINT32_MAX;
 
+struct VitalsWindow;   // ie/vitals.hpp
+
 struct SamplingParams {
     float    temperature    = 0.7f;
     uint32_t top_k          = 40;
@@ -133,6 +135,8 @@ struct SamplingParams {
     bool     ignore_eos     = false;  // benchmarking: keep decoding exactly
                                       // max_tokens, never stop on eos/stop ids
                                       // (fixed-budget tg, == llama --ignore-eos).
+    VitalsWindow* vitals    = nullptr;  // ie_vitals (docs/mimo26/IE_VITALS.md): a generator that supports it
+                                        // (MiMo-V2.6) records per-token diagnostics here; never read back by it
 };
 
 struct EngineOptions {

@@ -29,6 +29,15 @@ struct Ds41SampleParams {
     uint64_t seed = 42;
 };
 
+// What sample_row saw of the distribution it drew from (ie_vitals, docs/mimo26/IE_VITALS.md). Filled only when asked
+// for (a non-null pointer) and only at temperature > 0; the greedy path reports has_H = false (no extra vocabulary pass).
+struct Ds41SampleStats {
+    bool   has_H = false;
+    double H = 0;        // entropy in nats of the tempered softmax over the kept candidates (the whole vocabulary at
+                         // top_k 0), after the repeat penalty, before the top-p / min-p cut
+    double margin = 0;   // p(top-1) - p(top-2) in that distribution
+};
+
 struct Ds41GenStats {
     double   prefill_s = 0, decode_s = 0;
     double   restore_s = 0;         // of prefill_s: restoring the cached prefix
@@ -72,8 +81,11 @@ public:
                     const std::function<bool(std::string_view)>& on_piece,
                     std::vector<int32_t>& out_ids, Ds41GenStats& st);
     // The sampler alone (host): the chosen id for `logits`, with the penalty over `recent`.
-    static int32_t sample(std::vector<float>& logits, const std::vector<int32_t>& recent, const Ds41SampleParams& sp, uint64_t& rng_state);
-    static int32_t sample_row(float* logits, size_t V, const std::vector<int32_t>& recent, const Ds41SampleParams& sp, uint64_t& rng_state);
+    // `stats` (optional, read-only diagnostics) never changes the pick or the RNG stream.
+    static int32_t sample(std::vector<float>& logits, const std::vector<int32_t>& recent, const Ds41SampleParams& sp, uint64_t& rng_state,
+                          Ds41SampleStats* stats = nullptr);
+    static int32_t sample_row(float* logits, size_t V, const std::vector<int32_t>& recent, const Ds41SampleParams& sp, uint64_t& rng_state,
+                              Ds41SampleStats* stats = nullptr);
     // DSpark P4 (docs/deepseek41/58): with a drafter attached, run() speculates at temperature <= 0 -- five drafts
     // verified in one T = 6 step, greedy acceptance with the plain sampler, rollback_to, the rings re-seeded;
     // token for token the plain loop's stream. At temperature > 0 the plain loop runs (said once on stderr).

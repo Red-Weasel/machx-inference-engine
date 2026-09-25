@@ -3,6 +3,7 @@
 #pragma once
 #include "ie/engine.hpp"
 #include "ie/tokenizer.hpp"
+#include "ie/vitals.hpp"
 #include <string>
 #include <vector>
 
@@ -16,6 +17,8 @@ struct ChatRequest {
     bool stream_tool_preview = false;  // opt-in: stream the text of a forming tool call
                                        // as delta.tool_call_preview, so a client can show
                                        // the code being written. Off = byte-identical stream.
+    bool ie_vitals = false;   // opt-in: per-token diagnostics in the stream (docs/mimo26/IE_VITALS.md).
+                              // Off = byte-identical stream.
     std::string reasoning_effort;  // empty keeps the selected model's default
     std::string model;        // echoed back, not used for routing in v1
     std::string tools_json;   // raw OpenAI `tools` array (dumped); empty = none
@@ -75,6 +78,15 @@ std::string chat_chunk_sse_usage(const std::string& model, const std::string& id
                                  uint32_t cached_tokens = 0);
 
 std::string models_json(const std::string& model_id);
+
+// ie_vitals (docs/mimo26/IE_VITALS.md). `frame` is one SSE frame "data: {...}\n\n"; the result carries one more
+// top-level member "key": value_json (a chunk-level extension, like `timings`).
+std::string sse_add_field(const std::string& frame, const std::string& key, const std::string& value_json);
+// {"n":..,"H_mean":..,"H_max":..,"margin_min":..,"n_hi":..,"draft":{"offered":..,"accepted":..}} of the window since
+// the last reset (the H fields are null when no token of the window had an entropy: greedy decoding).
+std::string vitals_window_json(const VitalsWindow& w);
+// The request's summary, for the usage chunk: the window's totals plus what the result already carries.
+std::string vitals_summary_json(const VitalsWindow& w, const GenerateResult& r);
 
 // {"error":{"message":..,"type":..[,"code":..]}} with the message JSON-escaped
 // (invalid UTF-8 replaced, never thrown on) — for every hand-built error body.

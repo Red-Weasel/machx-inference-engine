@@ -9,6 +9,7 @@
 #include "ie/mimo26_engine.hpp"
 #include "ie/mimo26_host_rules.hpp"
 #include "ie/ngram_draft.hpp"
+#include "ie/vitals.hpp"
 #include "stb/stb_image.h"   // stbi_info_from_memory (the implementation is instantiated in qwen4_image.cpp)
 
 #include "../../third_party/nlohmann/json.hpp"
@@ -460,6 +461,12 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
                               bool chat, bool thinking, const std::string& tools_json) {
     GenerateResult r;
     kmp_set_blocktime(0);   // the HTTP pool thread's own OpenMP team must not spin (ds41_engine.cpp)
+    // ie_vitals (docs/mimo26/IE_VITALS.md): passive -- the sampler reports into `sv`, emit() copies it to the window;
+    // nothing here reads the window back
+    VitalsWindow* const vit = sp.vitals;
+    if (vit) vit->active = true;
+    Ds41SampleStats sv;
+    Ds41SampleStats* const svp = vit ? &sv : nullptr;
     if (chat) r.tool_calls_json = "[]";
     const uint32_t cap = b.fwd.capacity();
     r.prompt_tokens = uint32_t(ids.size());
@@ -563,6 +570,7 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
     auto emit = [&](int32_t id) -> bool {
         if (!sp.ignore_eos && std::find(b.eos.begin(), b.eos.end(), id) != b.eos.end()) { r.finish_reason = "stop"; return false; }
         ++r.completion_tokens;
+        if (vit) vit->add_token(sv.has_H, sv.H, sv.margin);   // sv: the sample that produced id (the last one taken)
         recent.push_back(id);
         if (recent.size() > 512) recent.erase(recent.begin());
         pending += b.tok.decode(std::vector<int32_t>{id});
@@ -585,7 +593,7 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
     uint32_t n_pass = 0, n_rows = 0, n_acc = 0, n_plain = 0, df_pass = 0, df_acc = 0;
     const uint32_t V = b.model.config().vocab_size;
     std::vector<int32_t> rows; std::vector<float> vlg;
-    int32_t id = Ds41Generator::sample(logits, recent, p, rng);
+    int32_t id = Ds41Generator::sample(logits, recent, p, rng, svp);
     for (uint32_t k_done = 0;;) {
         if (!emit(id)) break;
         if (++k_done == max_new) break;   // the last token needs no forward
@@ -616,7 +624,7 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
             add_ctx(1, pos, 1);
             inject_fault(logits.data(), logits.size());
             if (!sampled_ok(logits.data(), logits.size(), pos, "decode")) return r;
-            id = Ds41Generator::sample(logits, recent, p, rng);
+            id = Ds41Generator::sample(logits, recent, p, rng, svp);
             continue;
         }
         rows.assign(1, id); rows.insert(rows.end(), d.begin(), d.end());
@@ -628,7 +636,7 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
         for (uint32_t rr = 0; rr <= d.size(); ++rr) {
             inject_fault(vlg.data() + size_t(rr) * V, V);
             if (!sampled_ok(vlg.data() + size_t(rr) * V, V, pos + rr, "verify")) return r;
-            const int32_t a = Ds41Generator::sample_row(vlg.data() + size_t(rr) * V, V, recent, p, rng);
+            const int32_t a = Ds41Generator::sample_row(vlg.data() + size_t(rr) * V, V, recent, p, rng, svp);
             if (rr == d.size() || a != d[rr]) { next = a; break; }
             ++acc;
             if (!emit(a)) { ended = true; drop_last = true; break; }   // an eos / abort row is not part of the context
@@ -638,7 +646,7 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
         const uint32_t keep = 1 + acc - (drop_last ? 1u : 0u);         // the rows of id and the accepted drafts
         b.fwd.rewind(pos + keep);
         if (keep) add_ctx(keep, pos, uint32_t(rows.size()));
-        if (from_df) { ++df_pass; df_acc += acc; }
+        if (from_df) { ++df_pass; df_acc += acc; if (vit) vit->add_draft(uint32_t(d.size()), acc); }
         b.live.insert(b.live.end(), rows.begin(), rows.begin() + keep);
         ++n_pass; n_rows += uint32_t(rows.size()); n_acc += acc;
         if (ended) break;

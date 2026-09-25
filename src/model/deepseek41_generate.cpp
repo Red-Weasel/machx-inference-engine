@@ -32,18 +32,20 @@ size_t utf8_complete_prefix(const std::string& b) {
 
 }  // namespace
 
-int32_t Ds41Generator::sample(std::vector<float>& lg, const std::vector<int32_t>& recent, const Ds41SampleParams& sp, uint64_t& rng) {
-    return sample_row(lg.data(), lg.size(), recent, sp, rng);
+int32_t Ds41Generator::sample(std::vector<float>& lg, const std::vector<int32_t>& recent, const Ds41SampleParams& sp, uint64_t& rng,
+                              Ds41SampleStats* stats) {
+    return sample_row(lg.data(), lg.size(), recent, sp, rng, stats);
 }
 
-int32_t Ds41Generator::sample_row(float* lg, size_t V, const std::vector<int32_t>& recent, const Ds41SampleParams& sp, uint64_t& rng) {
+int32_t Ds41Generator::sample_row(float* lg, size_t V, const std::vector<int32_t>& recent, const Ds41SampleParams& sp, uint64_t& rng,
+                                  Ds41SampleStats* stats) {
     if (sp.repeat_penalty != 1.f && sp.repeat_window)
         for (size_t i = recent.size() > sp.repeat_window ? recent.size() - sp.repeat_window : 0; i < recent.size(); ++i) {
             const int32_t id = recent[i];
             if (id < 0 || size_t(id) >= V) continue;
             lg[size_t(id)] = lg[size_t(id)] > 0 ? lg[size_t(id)] / sp.repeat_penalty : lg[size_t(id)] * sp.repeat_penalty;
         }
-    if (sp.temperature <= 0.f) return int32_t(std::max_element(lg, lg + V) - lg);
+    if (sp.temperature <= 0.f) { if (stats) stats->has_H = false; return int32_t(std::max_element(lg, lg + V) - lg); }
     // The candidates in descending logit order are needed only as far as the top-p nucleus reaches: the mass z over all
     // kept candidates, then the top K sorted (K x4 until the nucleus fits) -- not a sort of the whole vocabulary, which cost
     // 12 ms a row with top_k 0 (Dream's setting) and a speculative verify samples up to 8 rows (MiMo DFlash, 2026-09-22).
@@ -65,6 +67,16 @@ int32_t Ds41Generator::sample_row(float* lg, size_t V, const std::vector<int32_t
         double c = 0; bool fits = false;
         for (n = 0; n < K;) { c += p[n]; ++n; if (c >= target) { fits = true; break; } }
         if (fits || K == keep) break;
+    }
+    if (stats) {
+        // ie_vitals: H = log z - (1/z) sum_i e_i a_i with a_i = l_i/T - mx, e_i = exp(a_i), over the same kept set as z. A
+        // separate read-only pass (only when asked), so z, p and the draw below are untouched.
+        double s = 0;
+        if (keep == V) for (size_t i = 0; i < V; ++i) { const double a = double(lg[i]) / sp.temperature - mx; s += std::exp(a) * a; }
+        else for (size_t i = 0; i < keep; ++i) { const double a = double(lg[size_t(idx[i])]) / sp.temperature - mx; s += std::exp(a) * a; }
+        stats->has_H = true;
+        stats->H = std::log(z) - s / z;
+        stats->margin = p[0] - (p.size() > 1 ? p[1] : 0.0);
     }
     if (sp.min_p > 0.f) { const double floor = sp.min_p * p[0]; size_t m = 0; while (m < n && p[m] >= floor) ++m; n = std::max<size_t>(1, m); }
     double zz = 0; for (size_t i = 0; i < n; ++i) zz += p[i];

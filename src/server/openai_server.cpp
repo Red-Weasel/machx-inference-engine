@@ -439,11 +439,25 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                     else if ((lead & 0xF8) == 0xF0) need = 4;
                     return (end - (i - 1) >= need) ? end : (i - 1);
                 };
+                // ie_vitals (opt-in, docs/mimo26/IE_VITALS.md): the engine fills `vw` as it commits tokens; every
+                // written chunk carries the window once it holds >= 16 tokens (or at a tool-call boundary), the
+                // finish chunk carries the rest and the usage chunk the summary. Off: `vit` returns the frame as is.
+                VitalsWindow vw;
+                SamplingParams run_sp = cr.sampling;
+                if (cr.ie_vitals) run_sp.vitals = &vw;
+                bool vit_force = false;   // a tool call opened: report the window on the next chunk, however short
+                auto vit = [&](std::string f, bool final_chunk = false) -> std::string {
+                    if (!cr.ie_vitals || !vw.active || vw.window_empty()) return f;
+                    if (!final_chunk && !vit_force && vw.n < 16) return f;
+                    f = oai::sse_add_field(f, "ie_vitals", oai::vitals_window_json(vw));
+                    vw.reset_window(); vit_force = false;
+                    return f;
+                };
                 auto flush_to = [&](size_t upto) {
                     upto = utf8_safe(acc, upto);
                     if (upto > streamed) {
-                        auto f = oai::chat_chunk_sse(model_id, id, created,
-                            std::string_view(acc).substr(streamed, upto - streamed), "");
+                        auto f = vit(oai::chat_chunk_sse(model_id, id, created,
+                            std::string_view(acc).substr(streamed, upto - streamed), ""));
                         if (sink.write(f.data(), f.size())) streamed = upto;
                         else sink_alive = false;   // client gone — stop generating
                     }
@@ -456,8 +470,8 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 auto flush_tool_preview_to = [&](size_t upto) {
                     upto = utf8_safe(acc, upto);
                     if (upto > tool_streamed) {
-                        auto f = oai::chat_chunk_sse_tool_preview(model_id, id, created,
-                            std::string_view(acc).substr(tool_streamed, upto - tool_streamed));
+                        auto f = vit(oai::chat_chunk_sse_tool_preview(model_id, id, created,
+                            std::string_view(acc).substr(tool_streamed, upto - tool_streamed)));
                         if (sink.write(f.data(), f.size())) tool_streamed = upto;
                         else sink_alive = false;
                     }
@@ -465,13 +479,13 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 auto flush_reason_to = [&](size_t upto) {
                     upto = utf8_safe(acc, upto);
                     if (upto > reason_streamed) {
-                        auto f = oai::chat_chunk_sse_reasoning(model_id, id, created,
-                            std::string_view(acc).substr(reason_streamed, upto - reason_streamed));
+                        auto f = vit(oai::chat_chunk_sse_reasoning(model_id, id, created,
+                            std::string_view(acc).substr(reason_streamed, upto - reason_streamed)));
                         if (sink.write(f.data(), f.size())) reason_streamed = upto;
                         else sink_alive = false;
                     }
                 };
-                auto r = eng.chat(cr.turns, cr.sampling,
+                auto r = eng.chat(cr.turns, run_sp,
                     [&](std::string_view t) {
                         if (!sink_alive || adm.stopping()) return false;  // client gone /
                                                         // server stopping → abort (frees the gate)
@@ -515,6 +529,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                             size_t cut = tc;
                             if (ds41 && in_dsml)
                                 for (int k = 0; k < 2 && cut > std::max(content_start, streamed) && acc[cut - 1] == '\n'; ++k) --cut;
+                            vit_force = true;
                             flush_to(cut); in_tool = true; tool_streamed = cut;
                             if (cr.stream_tool_preview && sink_alive) flush_tool_preview_to(acc.size());
                             return sink_alive;
@@ -574,14 +589,15 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                     } else if (ds41) flush_to(content_start + r.text.size());
                     else flush_to(acc.size());
                 }
-                auto fin = oai::chat_chunk_sse(model_id, id, created, "", fin_reason,
-                                               fin_reason == "length" ? r.truncated_tool_call : std::string{});
+                auto fin = vit(oai::chat_chunk_sse(model_id, id, created, "", fin_reason,
+                                               fin_reason == "length" ? r.truncated_tool_call : std::string{}), /*final_chunk=*/true);
                 sink.write(fin.data(), fin.size());
                 // Real token usage so streaming clients get live context % + tok/s
                 // (without this the client accounts zeros).
                 auto us = oai::chat_chunk_sse_usage(model_id, id, created,
                                                     r.prompt_tokens, r.completion_tokens,
                                                     r.cached_tokens);
+                if (cr.ie_vitals && vw.active) us = oai::sse_add_field(us, "ie_vitals_summary", oai::vitals_summary_json(vw, r));
                 sink.write(us.data(), us.size());
                 static const std::string done = "data: [DONE]\n\n";
                 sink.write(done.data(), done.size());

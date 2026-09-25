@@ -135,6 +135,7 @@ static ChatRequest parse_chat_request_impl(const std::string& body, ChatRequest 
     out.stream = j.value("stream", false);
     out.enable_thinking = j.value("enable_thinking", out.enable_thinking);
     out.stream_tool_preview = j.value("stream_tool_preview", out.stream_tool_preview);
+    out.ie_vitals = j.value("ie_vitals", out.ie_vitals);
     if(j.contains("reasoning_effort") && !j["reasoning_effort"].is_null()) {
         if(!j["reasoning_effort"].is_string())throw std::runtime_error("reasoning_effort must be a string");
         out.reasoning_effort=j["reasoning_effort"].get<std::string>();
@@ -604,6 +605,31 @@ std::string chat_chunk_sse_usage(const std::string& model, const std::string& id
                   {"total_tokens", prompt_tokens + completion_tokens},
                   {"prompt_tokens_details", {{"cached_tokens", cached_tokens}}}};
     return "data: " + j.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
+}
+
+std::string sse_add_field(const std::string& frame, const std::string& key, const std::string& value_json) {
+    const size_t close = frame.rfind('}');
+    if (close == std::string::npos) return frame;
+    return frame.substr(0, close) + ",\"" + key + "\":" + value_json + frame.substr(close);
+}
+
+static json vitals_num(double v) { return std::round(v * 1e4) / 1e4; }   // 4 decimals: enough for a diagnostic
+
+std::string vitals_window_json(const VitalsWindow& w) {
+    json j = {{"n", w.n}, {"n_hi", w.n_hi}, {"draft", {{"offered", w.draft_offered}, {"accepted", w.draft_accepted}}}};
+    j["H_mean"]     = w.n_H ? vitals_num(w.sum_H / w.n_H) : json();
+    j["H_max"]      = w.n_H ? vitals_num(w.max_H) : json();
+    j["margin_min"] = w.n_H ? vitals_num(w.min_margin) : json();
+    return j.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
+std::string vitals_summary_json(const VitalsWindow& w, const GenerateResult& r) {
+    json j = {{"tokens", w.tot_n}, {"n_hi", w.tot_n_hi}, {"draft_offered", w.tot_offered}, {"draft_accepted", w.tot_accepted},
+              {"cached_tokens", r.cached_tokens}, {"prefill_ms", vitals_num(r.prefill_ms)}, {"restore_ms", vitals_num(r.restore_ms)}};
+    j["H_mean"] = w.tot_n_H ? vitals_num(w.tot_sum_H / w.tot_n_H) : json();
+    if (!r.cache_source.empty()) j["cache_source"] = r.cache_source;   // empty: the prefix cache is off
+    if (r.decode_ms > 0) j["decode_tps"] = vitals_num(r.completion_tokens * 1000.0 / r.decode_ms);
+    return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
 std::string models_json(const std::string& model_id) {
