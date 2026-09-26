@@ -12,17 +12,40 @@
 # past the key. The compiler, the build flags and the per-source options of these files are keyed as well (the flags
 # file of src/CMakeLists.txt); the GPU driver and the loaded oneDNN are keyed at run time (deepseek41_prefix_cache.cpp).
 #
-# NOT listed, and why:
-#   src/model/deepseek41_prompt.cpp, src/tokenizer/*   they make the token ids, and the ids ARE the entry's lookup key: a
-#                                                      rendering change gives other ids, which simply match nothing
-#   src/model/deepseek41_dspark.cpp                    the drafter: speculation (IE_DS41_SPEC=1) keeps the prompt cache off
-#   src/model/deepseek41_residency.cpp                 ds41_plan_residency is called by its unit test only; the serve path
-#                                                      places experts in init_resident (deepseek41_forward.cpp, listed)
-#   src/engine/ds41_engine.cpp                         it chooses options, not arithmetic: the head (logits only, never
-#                                                      cached state), the context capacity, the cache's budgets, the image
-#                                                      plumbing. The expert tail file it enables is verified byte for byte
-#                                                      against the pack path at load (deepseek41_experts.cpp)
-#   src/core/allocator.cpp                             the vision tower's pinned staging: allocation, no arithmetic
+# NOT listed, and why. One `unlisted:` line per source, with the reason. tests/unit/ds41_prefix_key_test.cpp (part 3)
+# runs nm over the build's objects and fails when a listed source calls a function DEFINED in a source that is neither
+# listed nor named here -- so a new call into an unlisted file cannot slip past the key either (the #include check alone
+# missed gemm_fp16.cpp and qwen4_image.cpp, 2026-09-25). Naming a file here is a claim that the V4.1 serve path cannot
+# change cached state through it; when in doubt, list it instead.
+#   unlisted: src/model/deepseek41_prompt.cpp        it makes the token ids, and the ids ARE the entry's lookup key: a
+#   unlisted: src/tokenizer/tokenizer.cpp            rendering change gives other ids, which simply match nothing
+#                                                    (deepseek41_generate.cpp calls find_token and decode: text only)
+#   unlisted: src/model/deepseek41_dspark.cpp        the drafter: speculation (IE_DS41_SPEC=1) keeps the prompt cache off
+#                                                    (ds41_engine.cpp: set_prefix_cache only when !spec)
+#   unlisted: src/model/deepseek41_residency.cpp     ds41_plan_residency is called by its unit test only; the serve path
+#                                                    places experts in init_resident (deepseek41_forward.cpp, listed)
+#   unlisted: src/engine/ds41_engine.cpp             it chooses options, not arithmetic: the head (logits only, never
+#                                                    cached state), the context capacity, the cache's budgets, the image
+#                                                    plumbing. The expert tail file it enables is verified byte for byte
+#                                                    against the pack path at load (deepseek41_experts.cpp)
+#   unlisted: src/core/allocator.cpp                 the vision tower's pinned staging (DeviceAllocator::malloc) and the
+#                                                    P2P probe deepseek4.cpp calls: allocation and topology, no arithmetic
+#   unlisted: src/core/dtype.cpp                     type_info/bytes_for: dtype names in expert_stream.cpp's error messages,
+#                                                    V4 GGUF tensor sizes in deepseek4.cpp; no V4.1 value passes through
+#   unlisted: src/loaders/gguf_reader.cpp            GgufReader::find_tensor: V4's GGUF load (deepseek4.cpp); V4.1 reads
+#                                                    safetensors (safetensors_reader.cpp, listed)
+#   unlisted: src/ops/deepseek4_cache.cpp            Ds4LayerCache: V4's KV cache (deepseek4.cpp); V4.1's caches live in
+#                                                    deepseek41_forward.cpp. deepseek4.cpp is listed for ds4_hc_mix only
+#   unlisted: src/ops/ds4_decode_gemv.cpp            V4's decode GEMVs (deepseek4.cpp's forward); V4.1 decodes through
+#                                                    gemv_fp8.cpp (listed)
+#   unlisted: src/ops/elementwise.cpp                cast_fp32_to_fp16/cast_fp16_to_fp32: V4's forward (deepseek4.cpp) and
+#                                                    ds4_experts_forward, which V4.1 calls only in the NON-resident
+#                                                    streaming-MoE branch of deepseek41_forward.cpp -- and set_prefix_cache
+#                                                    refuses non-resident mode ("resident mode only"), so no entry is made there
+#   unlisted: src/ops/gemv_mxfp4.cpp                 ds4_expert_gemv's MXFP4 GEMVs: reached only through ds4_experts_forward,
+#                                                    the same non-resident branch (the resident tier uses the grouped routes)
+#   unlisted: src/ops/gemv_iq3_xxs.cpp               ds4_expert_gemv / ds4_expert_bank_upload's IQ3_XXS: V4 GGUF banks only;
+#                                                    V4.1's banks are MXFP4 (ds41_expert_bank_upload)
 #
 # ---- the entry format, the key and the chunk plan ----------------------------------------------------------------------
 src/model/deepseek41_prefix_cache.cpp      # what a checkpoint holds, the disk layout, the restore paths
@@ -40,6 +63,8 @@ src/model/deepseek4.cpp                    # ds4_hc_mix, the hyper-connection mi
 src/model/qwen3moe_pack.cpp                # build_moe_packing: the routed rows' order the expert kernels and the scatter use
 src/model/ds41_vision.cpp                  # an image inside a persisted prefix: the V4.1 image plan and its rows
 src/model/ds4_vision.cpp                   # ... and the vision tower that encodes it
+src/model/qwen4_image.cpp                  # ... the stb_image implementation (its STBI_ONLY_* set) that decodes the pixels;
+                                           # an image's positions are keyed by its FILE bytes (ds41_image_id), not its pixels
 src/loaders/safetensors_reader.cpp         # which checkpoint bytes every tensor reads
 # ---- the kernels ----------------------------------------------------------------------------------------------------------
 src/ops/deepseek41_ops.cpp                 # the V4.1 hyper-connection mixes and collapse, the engram gate
@@ -55,6 +80,7 @@ src/ops/deepseek4_experts.cpp              # expert gather and cast, the grouped
 src/ops/gemv_fp8.cpp                       # the FP8 GEMVs and gemv_f16_rows: decode-shaped rows and short continuations
 src/ops/gemv_q8dot.cpp                     # quantize_q8_1: the expert activations' Q8_1 quantisation
 src/ops/gemm_onednn.cpp                    # the oneDNN GEMM wrapper behind every prefill projection, its determinism switch
+src/ops/gemm_fp16.cpp                      # gemm_fp16: the vision tower's GEMMs (ds4_vision.cpp)
 src/ops/cpu_moe_mxfp4.cpp                  # the CPU expert leg, which also serves prefill chunks
 src/core/expert_stream.cpp                 # the expert cache and arena the tier fetches from, the slot views (ds4_slot_bank)
 # ---- the headers the files above include, transitively (the unit test checks this closure) -------------------------------
@@ -92,6 +118,7 @@ include/ie/ngram_draft.hpp
 include/ie/ops.hpp
 include/ie/quant_blocks.hpp
 include/ie/qwen3moe_pack.hpp
+include/ie/qwen4_vision.hpp
 include/ie/safetensors.hpp
 include/ie/tensor.hpp
 include/ie/tokenizer.hpp

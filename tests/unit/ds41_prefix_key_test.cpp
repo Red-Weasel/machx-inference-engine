@@ -1,14 +1,21 @@
 // tests/unit/ds41_prefix_key_test.cpp -- #48 (docs/deepseek41/103): the V4.1 disk prompt cache's key. CPU only, no SYCL:
 //   g++ -std=c++20 -O1 -Wall -Wextra -I include tests/unit/ds41_prefix_key_test.cpp src/model/deepseek41_prefix_key.cpp
 //   ./a.out <repository root> [<input list to check instead of src/model/deepseek41_numerics_inputs.txt>]
+//           [--objects <ie_core's object files>...]
 // Part 1, the derivation: FNV-1a 64 against its published vectors; the same inputs give the same key; a changed flag,
 // file hash, compiler line, model, format or runtime gives another. Part 2, the input list (needs the root): every
 // listed file exists, nothing is listed twice, and every header a listed file includes is listed too -- so a new #include
-// in a numerics source cannot slip past the key.
+// in a numerics source cannot slip past the key. Part 3, the calls (needs the objects; ctest passes ie_core's): with `nm`
+// over them, every function a listed source calls that is DEFINED in another source must be defined in a listed one or in
+// one the list names on an `unlisted:` comment line (with its reason) -- so a new call into an unlisted file cannot slip
+// past the key either. A symbol some listed object defines counts as keyed (an inline or template a listed header emits).
 #include "ie/deepseek41_prefix_key.hpp"
 
 #include <cstdio>
+#include <cstdlib>
+#include <cxxabi.h>
 #include <filesystem>
+#include <map>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -137,13 +144,116 @@ void part2(const std::filesystem::path& root, const std::filesystem::path& list_
         check(listed.count(must) == 1, std::string("listed: ") + must);
 }
 
+// the `unlisted: <path>` comment lines of the input list: the sources it names as reachable but not keyed
+std::set<std::string> read_unlisted(const std::filesystem::path& p) {
+    std::set<std::string> out;
+    std::ifstream f(p);
+    for (std::string line; std::getline(f, line);) {
+        const auto h = line.find('#'), u = line.find("unlisted:");
+        if (h == std::string::npos || u == std::string::npos || u < h) continue;
+        std::istringstream is(line.substr(u + 9)); std::string path;
+        if (is >> path) out.insert(path);
+    }
+    return out;
+}
+
+// `nm <flags> <object>`: (type letter, mangled name) per symbol line; `ok` false when nm could not run or failed
+std::vector<std::pair<char, std::string>> nm(const char* flags, const std::string& obj, bool& ok) {
+    std::string quoted = "'";
+    for (char c : obj) { if (c == '\'') quoted += "'\\''"; else quoted += c; }
+    quoted += "'";
+    std::vector<std::pair<char, std::string>> out;
+    FILE* p = popen(("nm " + std::string(flags) + " " + quoted + " 2>/dev/null").c_str(), "r");
+    if (!p) { ok = false; return out; }
+    char buf[8192];
+    while (std::fgets(buf, sizeof buf, p)) {
+        std::istringstream is(buf); std::vector<std::string> w; for (std::string t; is >> t;) w.push_back(t);
+        if (w.size() == 2 && w[0].size() == 1) out.push_back({w[0][0], w[1]});                     // "U name"
+        else if (w.size() >= 3 && w[1].size() == 1) out.push_back({w[1][0], w[2]});                // "addr T name"
+    }
+    ok = pclose(p) == 0 && ok;
+    return out;
+}
+
+std::string demangle(const std::string& s) {
+    int st = 0; char* d = abi::__cxa_demangle(s.c_str(), nullptr, nullptr, &st);
+    std::string r = st == 0 && d ? d : s; std::free(d);
+    return r.size() > 160 ? r.substr(0, 160) + "..." : r;
+}
+
+// an object of ie_core (<build>/src/CMakeFiles/ie_core.dir/<dir>/<name>.cpp.o) -> its source relative to the root
+std::string source_of(const std::filesystem::path& root, const std::string& obj) {
+    const auto d = obj.rfind(".dir/");
+    if (d == std::string::npos || obj.size() < d + 8 || obj.compare(obj.size() - 2, 2, ".o") != 0) return "";
+    const std::string rest = obj.substr(d + 5, obj.size() - 2 - (d + 5));   // CMake may write "ie_core.dir/./core/..."
+    for (const std::string& cand : {"src/" + rest, rest}) {
+        const std::string norm = std::filesystem::path(cand).lexically_normal().generic_string();
+        if (std::filesystem::is_regular_file(root / norm)) return norm;
+    }
+    return "";
+}
+
+void part3(const std::filesystem::path& root, const std::filesystem::path& list_path, const std::vector<std::string>& objects) {
+    const auto list = read_list(list_path);
+    const std::set<std::string> listed(list.begin(), list.end());
+    const auto unlisted = read_unlisted(list_path);
+    bool clean = true, nm_ok = true, mapped = true, have_all = true;
+    for (const auto& u : unlisted) if (listed.count(u)) { clean = false; std::printf("       %s is both listed and named unlisted\n", u.c_str()); }
+    check(clean, "no source is both listed and named unlisted (" + std::to_string(unlisted.size()) + " named)");
+    // who defines what: every global symbol each source's object defines, strong or weak
+    std::map<std::string, std::string> obj_of;                  // source -> object
+    std::map<std::string, std::set<std::string>> defined_in;    // symbol -> sources
+    for (const auto& o : objects) {
+        const std::string src = source_of(root, o);
+        if (src.empty()) { mapped = false; std::printf("       no source found for object %s\n", o.c_str()); continue; }
+        obj_of[src] = o;
+        for (const auto& [t, sym] : nm("--defined-only", o, nm_ok))
+            if (std::string("TDBRWVGS").find(t) != std::string::npos) defined_in[sym].insert(src);
+    }
+    check(mapped, "every object maps to a source (" + std::to_string(objects.size()) + " objects)");
+    for (const auto& p : list)
+        if (p.size() > 4 && p.compare(p.size() - 4, 4, ".cpp") == 0 && !obj_of.count(p)) { have_all = false; std::printf("       no object for listed %s\n", p.c_str()); }
+    check(have_all, "every listed source has an object");
+    // the calls: a listed object's undefined symbol that no listed object defines, but an unnamed source does
+    std::map<std::string, std::set<std::string>> gaps;          // "definer <- listed caller" -> symbols
+    size_t n_calls = 0;
+    for (const auto& p : list) {
+        const auto it = obj_of.find(p);
+        if (it == obj_of.end()) continue;
+        for (const auto& [t, sym] : nm("--undefined-only", it->second, nm_ok)) {
+            const auto d = defined_in.find(sym);
+            if (d == defined_in.end()) continue;                // outside the project: the SYCL runtime, oneDNN, libc
+            ++n_calls;
+            bool keyed = false;
+            for (const auto& s : d->second) keyed = keyed || listed.count(s);
+            if (keyed) continue;
+            for (const auto& s : d->second)
+                if (!unlisted.count(s)) gaps[s + " <- " + p].insert(sym);
+        }
+    }
+    check(nm_ok, "nm read every object");
+    for (const auto& [where, syms] : gaps) {
+        std::printf("       %s:\n", where.c_str());
+        for (const auto& s : syms) std::printf("         %s\n", demangle(s).c_str());
+    }
+    check(gaps.empty(), "every project function a listed source calls is defined in a listed or a named-unlisted source (" +
+                        std::to_string(n_calls) + " calls checked)");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     part1();
-    if (argc >= 2) {
+    std::vector<std::string> objects;
+    int n_pos = argc;   // the positional arguments end at --objects
+    for (int i = 1; i < argc; ++i)
+        if (std::string(argv[i]) == "--objects") { n_pos = i; for (int j = i + 1; j < argc; ++j) objects.push_back(argv[j]); break; }
+    if (n_pos >= 2) {
         const std::filesystem::path root = argv[1];
-        part2(root, argc >= 3 ? std::filesystem::path(argv[2]) : root / "src/model/deepseek41_numerics_inputs.txt");
+        const std::filesystem::path list = n_pos >= 3 ? std::filesystem::path(argv[2]) : root / "src/model/deepseek41_numerics_inputs.txt";
+        part2(root, list);
+        if (!objects.empty()) part3(root, list, objects);
+        else std::printf("[skip] the call check needs ie_core's objects after --objects\n");
     } else std::printf("[skip] the input list checks need the repository root as the first argument\n");
     std::printf("\nDS41 PREFIX KEY: %s\n", g_fail ? "FAILURE(S)" : "PASS");
     return g_fail ? 1 : 0;

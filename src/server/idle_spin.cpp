@@ -151,7 +151,7 @@ std::vector<ThreadDelta> top_thread_deltas(const std::vector<ThreadCpu>& before,
     return out;
 }
 
-std::string idle_spin_report(const IdleSpinDetector& d, const std::vector<ThreadDelta>& top, double interval_s,
+std::string idle_spin_report(const IdleSpinDetector& d, const std::vector<ThreadDelta>& top, double interval_s, bool baseline,
                              size_t threads, const std::vector<ThreadCpu>& comms, int omp_default_team, int pid) {
     const IdleSpinConfig& c = d.config();
     char b[512];
@@ -169,7 +169,7 @@ std::string idle_spin_report(const IdleSpinDetector& d, const std::vector<Thread
     if (!names.empty()) s += names.size() > 3 ? ", ...)" : ")";
     std::snprintf(b, sizeof b, ", OpenMP default team %d | busiest over the last %.1f s:", omp_default_team, interval_s);
     s += b;
-    if (top.empty()) s += " (no per-thread baseline yet)";
+    if (top.empty()) s += baseline ? " (no thread had CPU time in the interval)" : " (no per-thread baseline yet)";
     for (size_t i = 0; i < top.size(); ++i) {
         const auto& t = top[i];
         std::snprintf(b, sizeof b, "%s tid %d \"%.32s\" %c %.2f cores (usr %.2f sys %.2f) wchan %.40s%s", i ? ";" : "", t.tid, t.comm.c_str(),

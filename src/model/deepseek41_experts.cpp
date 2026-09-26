@@ -235,7 +235,10 @@ void Ds41ExpertTier::free_storage(sycl::queue& q) {
     mm_reader_stop();
     // #54: the DMA queue drained before anything its copies touch is freed -- the staging slots (their source) and the
     // bank (their destination) below. The reader waits its own DMAs, so this is idle unless the reader threw mid-fill.
-    if (dq_) dq_->wait();
+    // A lost device must not throw out of a teardown (as Ds4ExpertCache::free_storage's drain).
+    if (dq_) { try { dq_->wait(); } catch (const std::exception& e) {
+        std::fprintf(stderr, "[ds41 tier] DMA queue drain failed on free_storage: %s\n", e.what());
+    } }
     cpu_stop(); if (cpu_.h_rows) { sycl::free(cpu_.h_rows, q); cpu_.h_rows = nullptr; }
     if (cpu_.h_rows32) { sycl::free(cpu_.h_rows32, q); cpu_.h_rows32 = nullptr; }
     if (bws_.max_tokens) ds4_expert_batch_ws_free(q, bws_);
@@ -250,7 +253,12 @@ void Ds41ExpertTier::free_storage(sycl::queue& q) {
     for (void* b : bounce_) std::free(b);
     bounce_.clear();
     if (mm_dev_) { sycl::free(mm_dev_, q); mm_dev_ = nullptr; mm_dev_cap_ = 0; }
-    if (dq_) { dq_->wait_and_throw(); dq_.reset(); }
+    if (dq_) {
+        try { dq_->wait_and_throw(); } catch (const std::exception& e) {
+            std::fprintf(stderr, "[ds41 tier] DMA queue final drain failed on free_storage: %s\n", e.what());
+        }
+        dq_.reset();
+    }
     cache_.free_storage(); arena_.free_storage();
     ready_ = false; empty_ = false;
 }

@@ -690,7 +690,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 std::vector<ThreadDelta> top = top_thread_deltas(spin_prev, cur, now - spin_prev_t, tps, 5);
                 { std::lock_guard<std::mutex> lk(g_http_tids_mu); for (auto& d : top) d.http = g_http_tids.count(d.tid) != 0; }
                 for (auto& d : top) d.wchan = proc_self_thread_wchan(d.tid);
-                std::fprintf(stderr, "%s\n", idle_spin_report(spin, top, now - spin_prev_t, cur.size() + more, cur,
+                std::fprintf(stderr, "%s\n", idle_spin_report(spin, top, now - spin_prev_t, !spin_prev.empty(), cur.size() + more, cur,
                                                               omp_get_max_threads(), int(getpid())).c_str());
                 std::fflush(stderr);
             }

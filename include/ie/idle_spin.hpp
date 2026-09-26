@@ -79,7 +79,8 @@ std::vector<ThreadDelta> top_thread_deltas(const std::vector<ThreadCpu>& before,
                                            double interval_s, double ticks_per_s, size_t top_n);
 // The one log line. `threads` is the process's thread count, `comms` its threads' names, `omp_default_team` what
 // omp_get_max_threads() says on the watcher (the team a new parallel region would start), `pid` for the stack hint.
-std::string idle_spin_report(const IdleSpinDetector& d, const std::vector<ThreadDelta>& top, double interval_s,
+// `baseline` says whether `top` came from two snapshots: an empty `top` then means no thread had CPU in the interval.
+std::string idle_spin_report(const IdleSpinDetector& d, const std::vector<ThreadDelta>& top, double interval_s, bool baseline,
                              size_t threads, const std::vector<ThreadCpu>& comms, int omp_default_team, int pid);
 
 }  // namespace ie

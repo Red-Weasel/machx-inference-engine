@@ -179,7 +179,7 @@ void proc_tests() {
     td[0].tid = 501; td[0].comm = "ie"; td[0].state = 'R'; td[0].cores = 0.99; td[0].usr = 0.40; td[0].sys = 0.59; td[0].http = true; td[0].wchan = "0";
     td[1].tid = 502; td[1].comm = "ie"; td[1].state = 'R'; td[1].cores = 0.98; td[1].usr = 0.98; td[1].sys = 0.0; td[1].wchan = "0";
     const std::vector<ie::ThreadCpu> names = {{1, "ie", 'S', 0, 0}, {2, "ie", 'S', 0, 0}, {3, "ze_worker", 'S', 0, 0}};
-    const std::string line = ie::idle_spin_report(d, td, 5.0, 342, names, 20, 4242);
+    const std::string line = ie::idle_spin_report(d, td, 5.0, true, 342, names, 20, 4242);
     std::printf("       %s\n", line.c_str());
     check(line.rfind("[ie] idle spin: 9.00 cores for 65 s", 0) == 0, "the line opens with the rate and the duration");
     check(line.find("threshold 2.00 cores over 60 s") != std::string::npos && line.find("report 1, again every 600 s") != std::string::npos, "... the threshold and the repeat");
@@ -187,6 +187,12 @@ void proc_tests() {
     check(line.find("tid 501 \"ie\" R 0.99 cores (usr 0.40 sys 0.59) wchan 0 [http request thread]") != std::string::npos, "... each busy thread with usr/sys, wchan and the HTTP tag");
     check(line.find("eu-stack -p 4242") != std::string::npos, "... and the command for the stacks");
     check(line.find('\n') == std::string::npos, "one line");
+    // an empty busy list: with a baseline it means no thread had CPU in the interval, not that the baseline is missing
+    const std::string quiet = ie::idle_spin_report(d, {}, 5.0, true, 342, names, 20, 4242);
+    check(quiet.find("(no thread had CPU time in the interval)") != std::string::npos && quiet.find("baseline") == std::string::npos,
+          "an empty busy list with a baseline: \"no thread had CPU time in the interval\"");
+    const std::string first = ie::idle_spin_report(d, {}, 5.0, false, 342, names, 20, 4242);
+    check(first.find("(no per-thread baseline yet)") != std::string::npos, "... and without one: \"no per-thread baseline yet\"");
 }
 
 }  // namespace
