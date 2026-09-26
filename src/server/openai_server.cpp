@@ -1,4 +1,5 @@
 #include "ie/openai_server.hpp"
+#include "ie/idle_spin.hpp"
 #include "ie/openai_proto.hpp"
 #include "ie/server_admission.hpp"
 #include "ie/stop_sequences.hpp"
@@ -7,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
@@ -15,6 +17,8 @@
 #include <malloc.h>
 #include <filesystem>
 #include <memory>
+#include <omp.h>
+#include <set>
 #include <thread>
 #include <mutex>
 #include <unistd.h>
@@ -142,6 +146,18 @@ static void log_gen_error(const std::string& id, const GenerateResult& r) {
     std::fflush(stderr);
 }
 
+// #29: the HTTP pool's threads that ran a chat request, so the idle-spin report can tell them from the engine's own
+// threads (a thread inherits its creator's name, so most of them read "ie"). The pool is fixed-size: the set stays small.
+static std::mutex g_http_tids_mu;
+static std::set<int> g_http_tids;
+static void note_http_thread() {
+    thread_local bool noted = false;
+    if (noted) return;
+    noted = true;
+    std::lock_guard<std::mutex> lk(g_http_tids_mu);
+    g_http_tids.insert(current_tid());
+}
+
 int run_openai_server(Engine& eng, const std::string& model_id,
                       const std::string& host, int port, uint32_t max_queue) {
     httplib::Server srv;
@@ -153,6 +169,12 @@ int run_openai_server(Engine& eng, const std::string& model_id,
     // and /health, /props and the 429s themselves still get one.
     Admission adm(eng.parallel(), max_queue);
     DeviceFaultLatch fault;
+    // #29 (docs/server_idle_spin_watchdog_2026-09-24.md): the idle-spin watchdog. The watcher thread below samples it;
+    // /health reports these two values.
+    std::string spin_warn;
+    const IdleSpinConfig spin_cfg = idle_spin_config(std::getenv("IE_IDLE_SPIN_WATCHDOG"), std::getenv("IE_IDLE_SPIN_CORES"), &spin_warn);
+    if (!spin_warn.empty()) std::fprintf(stderr, "[ie] %s\n", spin_warn.c_str());
+    std::atomic<double> spin_s{0.0}, spin_cores{0.0};
     const unsigned pool_threads = eng.parallel() + max_queue + 4;
     srv.new_task_queue = [pool_threads] { return new httplib::ThreadPool(pool_threads); };
     std::atomic<uint64_t> req_no{0};
@@ -205,6 +227,8 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                          {"parallel", eng.parallel()}, {"max_queue", max_queue}};
         if (fault.faulted()) { h["reason"] = fault.reason(); res.status = 503; }
         if (adm.stopping())  { h["status"] = "stopping"; res.status = 503; }
+        // #29: seconds > 0 while an idle spin lasts; cores = the CPU rate over the latest full idle window
+        if (spin_cfg.enabled) h["idle_spin"] = {{"seconds", std::llround(spin_s.load())}, {"cores", std::round(spin_cores.load() * 100.0) / 100.0}};
         res.set_content(h.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
                         "application/json");
     });
@@ -234,6 +258,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
 
     srv.Post("/v1/chat/completions", [&](const httplib::Request& req,
                                          httplib::Response& res) {
+        note_http_thread();   // #29: the idle-spin report tags this thread
         auto cr = oai::parse_chat_request(req.body);
         if(cr.error.empty())cr.error=eng.reasoning_effort_error(cr.reasoning_effort);
         if (!cr.error.empty()) {
@@ -635,10 +660,45 @@ int run_openai_server(Engine& eng, const std::string& model_id,
     // once the listener has returned for any reason (/admin/shutdown).
     std::signal(SIGTERM, on_stop_signal);
     std::signal(SIGINT,  on_stop_signal);
+    if (spin_cfg.enabled)
+        std::fprintf(stderr, "[ie] idle-spin watchdog on: a report when the process burns >= %.2f cores for %.0f s with nothing in flight "
+                             "(IE_IDLE_SPIN_CORES sets the rate, IE_IDLE_SPIN_WATCHDOG=0 turns it off)\n", spin_cfg.min_cores, spin_cfg.window_s);
+    else std::fprintf(stderr, "[ie] idle-spin watchdog off (IE_IDLE_SPIN_WATCHDOG=0)\n");
     std::atomic<bool> listening{true};
     std::thread watcher([&] {
+        // #29: the idle-spin watchdog's sampler, every spin_cfg.sample_s. A sample is idle when nothing is in flight or
+        // queued AND no request was admitted since the previous one (one could have come and gone in between). The
+        // per-thread snapshot is taken on idle samples only -- a report needs a whole idle window -- and is bounded.
+        const double tps = double(sysconf(_SC_CLK_TCK));
+        IdleSpinDetector spin(spin_cfg, tps);
+        const auto t_origin = std::chrono::steady_clock::now();
+        const uint32_t spin_every = std::max<uint32_t>(1u, uint32_t(spin_cfg.sample_s * 10.0 + 0.5));   // 100 ms ticks
+        uint32_t spin_tick = 0;
+        uint64_t spin_admitted = adm.admitted();
+        std::vector<ThreadCpu> spin_prev; double spin_prev_t = 0;
+        auto spin_sample = [&] {
+            const double now = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_origin).count();
+            const uint64_t admitted = adm.admitted();
+            const bool idle = adm.inflight() == 0 && adm.queued() == 0 && admitted == spin_admitted;
+            spin_admitted = admitted;
+            const bool due = spin.update(now, proc_self_cpu_ticks(), idle);
+            spin_s.store(spin.spin_seconds()); spin_cores.store(spin.cores());
+            size_t more = 0;
+            std::vector<ThreadCpu> cur;
+            if (idle) cur = proc_self_threads(4096, &more);
+            if (due) {
+                std::vector<ThreadDelta> top = top_thread_deltas(spin_prev, cur, now - spin_prev_t, tps, 5);
+                { std::lock_guard<std::mutex> lk(g_http_tids_mu); for (auto& d : top) d.http = g_http_tids.count(d.tid) != 0; }
+                for (auto& d : top) d.wchan = proc_self_thread_wchan(d.tid);
+                std::fprintf(stderr, "%s\n", idle_spin_report(spin, top, now - spin_prev_t, cur.size() + more, cur,
+                                                              omp_get_max_threads(), int(getpid())).c_str());
+                std::fflush(stderr);
+            }
+            spin_prev = std::move(cur); spin_prev_t = now;
+        };
         while (listening.load()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            if (spin_cfg.enabled && ++spin_tick % spin_every == 0) spin_sample();
             const int sig = g_signal.load();
             if (sig == 0 && !admin_stop.load()) continue;
             std::fprintf(stderr, "[ie] %s — stopping: aborting %u in-flight, refusing %u queued\n",

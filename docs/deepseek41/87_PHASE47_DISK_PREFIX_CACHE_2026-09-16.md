@@ -16,7 +16,9 @@ nothing of the previous one.
    prompt, the state at the first-user boundary (>= 4,096 tokens) is written once per distinct prefix -- the rings and
    halves from the checkpoint block, the latents / index keys read from the devices, tmp + rename on a background
    thread. `prefix_prepare` loads an entry whose whole prefix the prompt holds when it beats the live state and host
-   slots. File key: model shape + a fingerprint of the embedding bytes + this executable's size and mtime (a rebuild
+   slots. [2026-09-24, #48: the executable's identity in this key is replaced by a numerics manifest + the runtime's
+   driver and oneDNN, so a rebuild that changes no arithmetic keeps the entries -- docs/103.]
+   File key: model shape + a fingerprint of the embedding bytes + this executable's size and mtime (a rebuild
    may change the arithmetic). Budget 8 GiB (LRU by mtime), never below 32 GiB free on the filesystem.
    `$XDG_CACHE_HOME` or `~/.cache` `/machx-ie/deepseek41-prefix`; `IE_DS41_PROMPT_CACHE_DIR` (`0` = off),
    `IE_DS41_PROMPT_CACHE_DISK_GIB`.

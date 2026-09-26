@@ -37,6 +37,8 @@ sycl::event gemm_fp16_onednn(sycl::queue& q,
 // faster path, so it must ask before calling — and this build says no.
 bool onednn_available() noexcept { return false; }
 
+std::string onednn_runtime_version() { return "oneDNN off"; }
+
 // Unreachable when callers honour onednn_available().  They abort rather than
 // return an empty event: silently leaving `y` untouched would look like a
 // working forward pass producing garbage logits, which is precisely the failure

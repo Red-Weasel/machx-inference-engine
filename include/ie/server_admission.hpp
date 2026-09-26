@@ -38,6 +38,7 @@ public:
         }
         --avail_;
         ++inflight_;
+        ++admitted_;
         return true;
     }
     void release() {
@@ -54,6 +55,9 @@ public:
     uint32_t inflight()  const noexcept { return inflight_.load(); }
     uint32_t queued()    const noexcept { return waiting_.load(); }
     uint32_t max_queue() const noexcept { return max_queue_; }
+    // Requests that ever got a run slot (monotonic; refusals do not count). The idle-spin watchdog (#29) compares it
+    // between its samples: a request that started and finished in between was activity, though inflight reads 0 at both.
+    uint64_t admitted()  const noexcept { return admitted_.load(); }
 
 private:
     std::mutex              mu_;
@@ -62,6 +66,7 @@ private:
     const uint32_t          max_queue_;
     std::atomic<uint32_t>   waiting_{0};    // written under mu_, read lock-free
     std::atomic<uint32_t>   inflight_{0};   // written under mu_, read lock-free
+    std::atomic<uint64_t>   admitted_{0};   // written under mu_, read lock-free
     std::atomic<bool>       stopping_{false};
 };
 

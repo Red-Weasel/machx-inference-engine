@@ -29,8 +29,9 @@ int main() {
     //    the remaining waiter with a refusal and refuses new arrivals.
     {
         ie::Admission adm(1, 2);
+        assert(adm.admitted() == 0);
         assert(adm.acquire());                       // runs
-        assert(adm.inflight() == 1 && adm.queued() == 0);
+        assert(adm.inflight() == 1 && adm.queued() == 0 && adm.admitted() == 1);
         std::atomic<int> got{0}, refused{0}, done{0};
         auto waiter = [&] {
             if (adm.acquire()) ++got; else ++refused;
@@ -41,16 +42,17 @@ int main() {
         const auto t0 = std::chrono::steady_clock::now();
         assert(!adm.acquire());                      // queue full → immediate false
         assert(std::chrono::steady_clock::now() - t0 < std::chrono::milliseconds(500));
-        assert(adm.queued() == 2 && adm.inflight() == 1);
+        assert(adm.queued() == 2 && adm.inflight() == 1 && adm.admitted() == 1);   // a refusal is not admitted
         adm.release();                               // slot → one waiter
         assert(eventually([&] { return got.load() == 1 && adm.queued() == 1; }));
-        assert(adm.inflight() == 1);
+        assert(adm.inflight() == 1 && adm.admitted() == 2);                        // the waiter got the slot
         adm.shutdown();                              // remaining waiter refused
         assert(eventually([&] { return done.load() == 2; }));
         assert(got.load() == 1 && refused.load() == 1);
         assert(!adm.acquire() && adm.stopping());
+        assert(adm.admitted() == 2);                                                // neither refusal counted
         t1.join(); t2.join();
-        std::puts("admission: bounded queue / release / shutdown OK");
+        std::puts("admission: bounded queue / release / shutdown / admitted count OK");
     }
     // 2. max_queue=0: never wait — a second arrival is refused at once.
     {
@@ -59,6 +61,7 @@ int main() {
         assert(!adm.acquire());
         adm.release();
         assert(adm.acquire());
+        assert(adm.admitted() == 2);                 // two runs; the refusal between them is not one
         std::puts("admission: max_queue=0 OK");
     }
     // 3. parallel=0 is clamped to 1 (never a deadlocked server).

@@ -4,6 +4,9 @@
 // Every device transfer goes through memory pinned in THAT card's context (the pool blocks, the per-card bounce):
 // a pageable or foreign-context host pointer turns a SYCL memcpy into the multi-minute stall of 2026-09-01.
 #include "ie/deepseek41_forward.hpp"
+#include "ie/deepseek41_prefix_key.hpp"
+#include "ie/ops.hpp"                        // onednn_runtime_version
+#include "deepseek41_numerics_manifest.h"    // generated at build time (#48): kDs41NumericsManifest
 
 #include <algorithm>
 #include <chrono>
@@ -14,9 +17,7 @@
 #include <string>
 #include <vector>
 
-#include <sys/stat.h>
 #include <sys/statvfs.h>
-#include <unistd.h>
 
 namespace ie {
 namespace {
@@ -36,12 +37,6 @@ constexpr uint64_t kBounceFloats = 16ull << 20;   // 64 MiB per card
 constexpr char kDiskMagic[8] = {'D', 'S', '4', '1', 'P', 'F', 'X', '1'};
 uint64_t ds41pc_fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
     const auto* b = static_cast<const uint8_t*>(p); for (size_t i = 0; i < n; ++i) h = (h ^ b[i]) * 1099511628211ull; return h;
-}
-// the executable's identity: a rebuild may change the arithmetic, so its disk entries are not reused
-std::string ds41pc_exe_id() {
-    char path[4096]; const ssize_t n = readlink("/proc/self/exe", path, sizeof path - 1); if (n <= 0) return "exe?";
-    path[n] = 0; struct stat st {}; if (stat(path, &st) != 0) return "exe?";
-    return std::to_string(uint64_t(st.st_size)) + ":" + std::to_string(uint64_t(st.st_mtim.tv_sec)) + "." + std::to_string(uint64_t(st.st_mtim.tv_nsec));
 }
 uint64_t ds41pc_fs_free(const std::string& dir) { struct statvfs v {}; return statvfs(dir.c_str(), &v) == 0 ? uint64_t(v.f_bavail) * v.f_frsize : 0; }
 struct Ds41pcFile {
@@ -106,21 +101,31 @@ std::string Ds41Forward::set_prefix_cache(bool on, const PrefixCacheOptions& o) 
     pc_bounce_n_ = kBounceFloats;
     pc_ckpts_.assign(o.checkpoints, PcCkpt{});
     pc_on_ = true;
+    uint32_t disk_other = 0;
     if (!o.disk_dir.empty()) {
-        // the key: the model's shape, a fingerprint of its embedding bytes, this executable
-        std::string key = "L" + std::to_string(c.n_layers) + " H" + std::to_string(c.dim) + " HD" + std::to_string(c.head_dim) +
-                          " IHD" + std::to_string(c.index_head_dim) + " W" + std::to_string(c.window_size) + " R";
-        for (uint32_t L = 0; L < c.n_layers; ++L) key += std::to_string(m_->layers()[L].kind.compress_ratio) + (m_->layers()[L].kind.is_kv_source ? "s" : "");
-        if (m_->embed.w && m_->embed.w->data) key += " E" + std::to_string(ds41pc_fnv(m_->embed.w->data, std::min<size_t>(m_->embed.w->nbytes, 1u << 20)));
-        key += " X" + ds41pc_exe_id();
-        pc_disk_key_ = key;
+        // #48 (docs/deepseek41/103): the key -- the model (its shape and a fingerprint of its embedding bytes), the entry
+        // format, this build's numerics manifest (the sources whose code can change a cached value, the compiler, the
+        // flags) and the runtime that still generates arithmetic (each card's GPU and driver, the oneDNN library loaded).
+        // Not this executable's identity: a rebuild that changes no arithmetic keeps the entries.
+        std::string model = "L" + std::to_string(c.n_layers) + " H" + std::to_string(c.dim) + " HD" + std::to_string(c.head_dim) +
+                            " IHD" + std::to_string(c.index_head_dim) + " W" + std::to_string(c.window_size) + " R";
+        for (uint32_t L = 0; L < c.n_layers; ++L) model += std::to_string(m_->layers()[L].kind.compress_ratio) + (m_->layers()[L].kind.is_kv_source ? "s" : "");
+        if (m_->embed.w && m_->embed.w->data) model += " E" + std::to_string(ds41pc_fnv(m_->embed.w->data, std::min<size_t>(m_->embed.w->nbytes, 1u << 20)));
+        std::string runtime = onednn_runtime_version();
+        for (size_t ci = 0; ci < cards_.size(); ++ci) {
+            const sycl::device dev = cards_[ci]->q->get_device();
+            runtime += (ci ? "; " : " | ") + dev.get_info<sycl::info::device::name>() + " driver " + dev.get_info<sycl::info::device::driver_version>();
+        }
+        pc_disk_key_ = ds41_prefix_disk_key(model, kDs41PrefixDiskFormat, kDs41NumericsManifest, runtime);
         std::error_code ec; std::filesystem::create_directories(o.disk_dir, ec);
-        lk.unlock(); pc_disk_scan(); lk.lock();
+        lk.unlock(); disk_other = pc_disk_scan(); lk.lock();
     }
     uint64_t pinned = 0; for (size_t ci = 0; ci < cards_.size(); ++ci) pinned += pc_block_[ci] * o.checkpoints * 4 + kBounceFloats * 4;
     std::fprintf(stderr, "[ds41 prefix cache] on: %u checkpoints (%.1f MiB pinned with the bounces), host slots up to %.1f GiB, disk %s\n",
                  o.checkpoints, double(pinned) / 1048576.0, double(o.host_budget) / 1073741824.0,
-                 o.disk_dir.empty() ? "off" : (o.disk_dir + " (" + std::to_string(pc_disk_.size()) + " entries for this build)").c_str());
+                 o.disk_dir.empty() ? "off" : (o.disk_dir + " (" + std::to_string(pc_disk_.size()) + " entries for numerics " +
+                                               ds41_numerics_fingerprint(kDs41NumericsManifest) + "; " + std::to_string(disk_other) +
+                                               " written under another key ignored)").c_str());
     return {};
 }
 
@@ -390,15 +395,18 @@ std::string Ds41Forward::prefix_prepare(const std::vector<int32_t>& ids, uint32_
 // ---- Phase 47: disk entries -------------------------------------------------------------------------------------------
 // file: magic, u32 version, u32 key length + key, u32 n + ids, u32 n_layers, nc[n_layers] u32, part_valid[n_layers] u8,
 // then per model layer: ring [WIN, HD], the ratio-2 halves [2 R HD], the latents [nc HD] and index keys [nc IHD] (fp32)
-void Ds41Forward::pc_disk_scan() {
+uint32_t Ds41Forward::pc_disk_scan() {
     std::vector<PcDisk> found;
+    uint32_t other = 0;   // entries written under another key: another numerics manifest, runtime, format or model
     std::error_code ec;
     for (const auto& de : std::filesystem::directory_iterator(pc_opt_.disk_dir, ec)) {
         if (!de.is_regular_file() || de.path().extension() != ".ds41pfx") continue;
         Ds41pcFile f(de.path().string(), "rb"); if (!f.f) continue;
         char magic[8]; uint32_t ver = 0, klen = 0, n = 0;
-        if (!f.r(magic, 8) || std::memcmp(magic, kDiskMagic, 8) != 0 || !f.r(&ver, 4) || ver != 1 || !f.r(&klen, 4) || klen > 65536) continue;
-        std::string key(klen, '\0'); if (!f.r(key.data(), klen) || key != pc_disk_key_) continue;   // another build or model
+        if (!f.r(magic, 8) || std::memcmp(magic, kDiskMagic, 8) != 0 || !f.r(&ver, 4)) continue;
+        if (ver != kDs41PrefixDiskFormat || !f.r(&klen, 4) || klen > 65536) { ++other; continue; }
+        std::string key(klen, '\0'); if (!f.r(key.data(), klen)) continue;
+        if (key != pc_disk_key_) { ++other; continue; }   // the LRU budget ages these out (prefix_persist's writer)
         if (!f.r(&n, 4) || n == 0 || n > (1u << 24)) continue;
         PcDisk d; d.path = de.path().string(); d.ids.resize(n);
         if (!f.r(d.ids.data(), size_t(n) * 4)) continue;
@@ -407,6 +415,7 @@ void Ds41Forward::pc_disk_scan() {
     }
     std::lock_guard<std::mutex> lk(pc_mu_);
     pc_disk_ = std::move(found);
+    return other;
 }
 
 std::string Ds41Forward::prefix_persist(uint32_t pos) {
@@ -474,7 +483,7 @@ std::string Ds41Forward::prefix_persist(uint32_t pos) {
         {
             Ds41pcFile f(tmp, "wb");
             if (f.f) {
-                const uint32_t ver = 1, klen = uint32_t(key.size()), n = uint32_t(ids.size());
+                const uint32_t ver = kDs41PrefixDiskFormat, klen = uint32_t(key.size()), n = uint32_t(ids.size());
                 ok = f.w(kDiskMagic, 8) && f.w(&ver, 4) && f.w(&klen, 4) && f.w(key.data(), klen) && f.w(&n, 4) && f.w(ids.data(), size_t(n) * 4) &&
                      f.w(&n_layers, 4) && f.w(e.nc.data(), size_t(n_layers) * 4) && f.w(e.part_valid.data(), n_layers) && f.w(body.data(), body.size() * 4);
                 ok = ok && std::fflush(f.f) == 0;
@@ -508,7 +517,7 @@ std::string Ds41Forward::pc_load_disk(const PcDisk& d) {
     const auto& c = m_->config(); const uint64_t WIN = c.window_size, HD = c.head_dim, IHD = c.index_head_dim;
     Ds41pcFile f(d.path, "rb"); if (!f.f) return "cannot open";
     char magic[8]; uint32_t ver = 0, klen = 0, n = 0, nl = 0;
-    if (!f.r(magic, 8) || std::memcmp(magic, kDiskMagic, 8) != 0 || !f.r(&ver, 4) || ver != 1 || !f.r(&klen, 4) || klen > 65536) return "bad header";
+    if (!f.r(magic, 8) || std::memcmp(magic, kDiskMagic, 8) != 0 || !f.r(&ver, 4) || ver != kDs41PrefixDiskFormat || !f.r(&klen, 4) || klen > 65536) return "bad header";
     std::string key(klen, '\0'); if (!f.r(key.data(), klen) || key != pc_disk_key_) return "key mismatch";
     if (!f.r(&n, 4) || n != d.ids.size()) return "id count mismatch";
     std::vector<int32_t> ids(n); if (!f.r(ids.data(), size_t(n) * 4) || ids != d.ids) return "ids mismatch";

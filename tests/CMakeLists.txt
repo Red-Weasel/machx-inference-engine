@@ -749,3 +749,20 @@ add_executable(mimo26_host_rules_test
   ${CMAKE_SOURCE_DIR}/src/model/mimo26_host_rules.cpp)
 target_include_directories(mimo26_host_rules_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME mimo26_host_rules_test COMMAND mimo26_host_rules_test)
+# Host-only (no GPU, no SYCL): #48 (docs/deepseek41/103) -- the V4.1 disk prompt cache key (the derivation) and its input
+# list (every listed file exists, the list is closed under #include). Self-contained TU + the key's source; the repository
+# root is its argument.
+add_executable(ds41_prefix_key_test
+  unit/ds41_prefix_key_test.cpp
+  ${CMAKE_SOURCE_DIR}/src/model/deepseek41_prefix_key.cpp)
+target_include_directories(ds41_prefix_key_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME ds41_prefix_key_test COMMAND ds41_prefix_key_test ${CMAKE_SOURCE_DIR})
+# Host-only (no GPU, no SYCL): #29 (docs/server_idle_spin_watchdog_2026-09-24.md) -- the idle-spin watchdog's detector on
+# fake samples, its /proc readers against a thread it spins, and its report line. Self-contained TU + the watchdog's source.
+find_package(Threads REQUIRED)
+add_executable(idle_spin_test
+  unit/idle_spin_test.cpp
+  ${CMAKE_SOURCE_DIR}/src/server/idle_spin.cpp)
+target_include_directories(idle_spin_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_link_libraries(idle_spin_test PRIVATE Threads::Threads)
+add_test(NAME idle_spin_test COMMAND idle_spin_test)

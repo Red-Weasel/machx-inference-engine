@@ -131,6 +131,13 @@ sycl::event gemm_fp16_onednn(sycl::queue& q,
 
 bool onednn_available() noexcept { return true; }
 
+std::string onednn_runtime_version() {
+    const dnnl_version_t* v = dnnl_version();   // the loaded library's, not the headers'
+    std::string s = "oneDNN " + std::to_string(v->major) + "." + std::to_string(v->minor) + "." + std::to_string(v->patch);
+    if (v->hash) { s += " "; s += v->hash; }
+    return s;
+}
+
 // y[M, N] fp32 = A[M, K] fp16 @ W[N, K]^T fp16.
 //
 // The one line that matters is b_md: dims {K, N} with strides {1, K}.  Element

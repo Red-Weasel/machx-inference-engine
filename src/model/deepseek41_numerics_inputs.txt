@@ -1,0 +1,99 @@
+# src/model/deepseek41_numerics_inputs.txt -- #48 (docs/deepseek41/103): the files whose bytes key the V4.1 disk prompt cache.
+#
+# A disk entry is the state a prompt prefix leaves in the caches (docs/deepseek41/86-87): every layer's window ring, the
+# ratio-2 layers' held half and, on the kv-source layers, the compressed latents and index keys. An entry may be loaded
+# only by a build that computes those values the same way, so this list is every file whose code can change one of them.
+# The rule for doubt is to INCLUDE: a spurious invalidation costs one cold first turn (~30 s of re-prefill); a missed one
+# serves state the current code would not have produced.
+#
+# Format: one path per line, relative to the repository root; '#' starts a comment. src/CMakeLists.txt hashes every
+# listed file into the numerics manifest (src/model/deepseek41_numerics.cmake). tests/unit/ds41_prefix_key_test.cpp
+# fails when a listed file includes a project or third-party header that is not listed, so a new #include cannot slip
+# past the key. The compiler, the build flags and the per-source options of these files are keyed as well (the flags
+# file of src/CMakeLists.txt); the GPU driver and the loaded oneDNN are keyed at run time (deepseek41_prefix_cache.cpp).
+#
+# NOT listed, and why:
+#   src/model/deepseek41_prompt.cpp, src/tokenizer/*   they make the token ids, and the ids ARE the entry's lookup key: a
+#                                                      rendering change gives other ids, which simply match nothing
+#   src/model/deepseek41_dspark.cpp                    the drafter: speculation (IE_DS41_SPEC=1) keeps the prompt cache off
+#   src/model/deepseek41_residency.cpp                 ds41_plan_residency is called by its unit test only; the serve path
+#                                                      places experts in init_resident (deepseek41_forward.cpp, listed)
+#   src/engine/ds41_engine.cpp                         it chooses options, not arithmetic: the head (logits only, never
+#                                                      cached state), the context capacity, the cache's budgets, the image
+#                                                      plumbing. The expert tail file it enables is verified byte for byte
+#                                                      against the pack path at load (deepseek41_experts.cpp)
+#   src/core/allocator.cpp                             the vision tower's pinned staging: allocation, no arithmetic
+#
+# ---- the entry format, the key and the chunk plan ----------------------------------------------------------------------
+src/model/deepseek41_prefix_cache.cpp      # what a checkpoint holds, the disk layout, the restore paths
+src/model/deepseek41_prefix_key.cpp        # the key derivation
+src/model/deepseek41_generate.cpp          # the chunk plan: where chunks end, which is where checkpoints and the persisted
+                                           # first-user boundary fall. Another chunking computes other bits
+# ---- the forward and the model it reads ---------------------------------------------------------------------------------
+src/model/deepseek41_forward.cpp           # prefill, continuation and decode: every layer body and state update, placement
+src/model/deepseek41.cpp                   # the config and layer kinds the forward reads: dims, ratios, RoPE, norms, eps
+src/model/deepseek41_weights.cpp           # the resident dense set: FP8 to fp16 dequant, the fp16 views the prefill GEMMs read
+src/model/deepseek41_engram.cpp            # the engram tables, the hash and the row gathers added to the stream at 1 and 14
+src/model/deepseek41_experts.cpp           # the routed-expert tier: slot packing, the int-dot and XMX routes, the CPU leg,
+                                           # the scatter
+src/model/deepseek4.cpp                    # ds4_hc_mix, the hyper-connection mix every V4.1 layer runs (V4's kernel)
+src/model/qwen3moe_pack.cpp                # build_moe_packing: the routed rows' order the expert kernels and the scatter use
+src/model/ds41_vision.cpp                  # an image inside a persisted prefix: the V4.1 image plan and its rows
+src/model/ds4_vision.cpp                   # ... and the vision tower that encodes it
+src/loaders/safetensors_reader.cpp         # which checkpoint bytes every tensor reads
+# ---- the kernels ----------------------------------------------------------------------------------------------------------
+src/ops/deepseek41_ops.cpp                 # the V4.1 hyper-connection mixes and collapse, the engram gate
+src/ops/deepseek41_upload.cpp              # the FP8 dense dequant, the streaming-mode expert bank
+src/ops/deepseek41_candidate.cpp           # the two-level candidate top-k and the ascending pick sort
+src/ops/deepseek41_attn_xmx.cpp            # the XMX gathered decode and continuation attention
+src/ops/deepseek41_topk_split.cpp          # the split top-k past 131k keys
+src/ops/deepseek4_attn.cpp                 # RMSNorm, RoPE, the compressor pool, masks, attention, indexer score and top-k
+src/ops/deepseek4_attn_xmx.cpp             # the XMX attention behind ds4_attention_segs
+src/ops/deepseek4_topk_radix.cpp           # the radix top-k behind the indexer
+src/ops/deepseek4_ops.cpp                  # the router top-k, the clamped SwiGLU variants
+src/ops/deepseek4_experts.cpp              # expert gather and cast, the grouped int-dot and XMX GEMMs, the scatters
+src/ops/gemv_fp8.cpp                       # the FP8 GEMVs and gemv_f16_rows: decode-shaped rows and short continuations
+src/ops/gemv_q8dot.cpp                     # quantize_q8_1: the expert activations' Q8_1 quantisation
+src/ops/gemm_onednn.cpp                    # the oneDNN GEMM wrapper behind every prefill projection, its determinism switch
+src/ops/cpu_moe_mxfp4.cpp                  # the CPU expert leg, which also serves prefill chunks
+src/core/expert_stream.cpp                 # the expert cache and arena the tier fetches from, the slot views (ds4_slot_bank)
+# ---- the headers the files above include, transitively (the unit test checks this closure) -------------------------------
+include/ie/allocator.hpp
+include/ie/cpu_moe_mxfp4.hpp
+include/ie/deepseek4.hpp
+include/ie/deepseek41.hpp
+include/ie/deepseek41_attn_xmx.hpp
+include/ie/deepseek41_candidate.hpp
+include/ie/deepseek41_dspark.hpp
+include/ie/deepseek41_engram.hpp
+include/ie/deepseek41_experts.hpp
+include/ie/deepseek41_forward.hpp
+include/ie/deepseek41_generate.hpp
+include/ie/deepseek41_prefix_key.hpp
+include/ie/deepseek41_topk_split.hpp
+include/ie/deepseek41_upload.hpp
+include/ie/deepseek41_weights.hpp
+include/ie/deepseek4_attn.hpp
+include/ie/deepseek4_cache.hpp
+include/ie/deepseek4_experts.hpp
+include/ie/deepseek4_ops.hpp
+include/ie/dequant_ref.hpp
+include/ie/dp4a.hpp
+include/ie/ds41_vision.hpp
+include/ie/ds4_decode_gemv.hpp
+include/ie/ds4_vision.hpp
+include/ie/dtype.hpp
+include/ie/expert_stream.hpp
+include/ie/fp8.hpp
+include/ie/gguf.hpp
+include/ie/kernel_profiler.hpp
+include/ie/model_config.hpp
+include/ie/ngram_draft.hpp
+include/ie/ops.hpp
+include/ie/quant_blocks.hpp
+include/ie/qwen3moe_pack.hpp
+include/ie/safetensors.hpp
+include/ie/tensor.hpp
+include/ie/tokenizer.hpp
+third_party/nlohmann/json.hpp              # config.json and the engram tables' JSON
+third_party/stb/stb_image.h                # the image decode (ds41_vision.cpp)

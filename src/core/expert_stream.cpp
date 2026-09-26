@@ -1502,6 +1502,10 @@ std::string Ds4ExpertCache::init(sycl::queue& compute, const Ds4HostArena& arena
 }
 
 void Ds4ExpertCache::free_storage() noexcept {
+    // #54 (docs/deepseek41/104): a fill still on the transfer queue writes a slot freed below and reads an arena slot its
+    // owner frees next. The owners drain their COMPUTE queue before a teardown, which covers every fill a GEMM consumed,
+    // but not one issued and never consumed (a pipelined fetch ahead of a failed group; a speculate()). Drain it first.
+    if (xq_) { try { xq_->wait(); } catch (...) {} }
     if (cq_) for (uint8_t* p : dev_) if (p) sycl::free(p, *cq_);
     if (cq_) for (uint8_t*& p : bank_) if (p) { sycl::free(p, *cq_); p = nullptr; }
     bank_slots_ = 0; bank_stride_ = 0;

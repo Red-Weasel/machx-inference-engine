@@ -122,6 +122,7 @@ add_library(ie_core
   model/deepseek41_prompt.cpp
   model/deepseek41_generate.cpp
   model/deepseek41_prefix_cache.cpp
+  model/deepseek41_prefix_key.cpp
   model/deepseek41_residency.cpp
   model/deepseek41_weights.cpp
   model/deepseek41_experts.cpp
@@ -139,6 +140,7 @@ add_library(ie_core
   engine/glm5_server.cpp
   server/openai_proto.cpp
   server/capabilities.cpp
+  server/idle_spin.cpp
   server/openai_server.cpp
 )
 target_include_directories(ie_core
@@ -169,6 +171,68 @@ set_source_files_properties(model/mimo26_vision.cpp PROPERTIES
 set_source_files_properties(model/deepseek41_engram.cpp PROPERTIES
   COMPILE_OPTIONS "-fopenmp")
 target_link_options(ie_core PUBLIC -fopenmp)
+
+# ---- #48 (docs/deepseek41/103): the V4.1 disk prompt cache's numerics key -------------------------------------------
+# The cache keys its disk entries by a NUMERICS MANIFEST instead of this executable's identity, so a rebuild that changes
+# no arithmetic keeps the cache. The manifest is the SHA-256 of every file whose code can change a cached value
+# (model/deepseek41_numerics_inputs.txt lists them, with the reasons), the compiler's version line and the build flags
+# that reach those files -- the flags file below. model/deepseek41_numerics.cmake writes it into a generated header at
+# build time. This block sits after every set_source_files_properties above: it records their per-source options.
+set(IE_DS41_NUMERICS_LIST ${CMAKE_CURRENT_SOURCE_DIR}/model/deepseek41_numerics_inputs.txt)
+set(IE_DS41_NUMERICS_DIR  ${CMAKE_CURRENT_BINARY_DIR}/generated)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${IE_DS41_NUMERICS_LIST})   # a new input: re-read the list
+file(READ ${IE_DS41_NUMERICS_LIST} _ds41n)
+string(REGEX REPLACE "[][;]" " " _ds41n "${_ds41n}")       # CMake list syntax: see deepseek41_numerics.cmake
+string(REPLACE "\n" ";" _ds41n "${_ds41n}")
+set(_ds41n_files)
+string(TOUPPER "${CMAKE_BUILD_TYPE}" _ds41n_bt)
+get_target_property(_ds41n_sco ie_sycl_flags INTERFACE_COMPILE_OPTIONS)
+get_target_property(_ds41n_slo ie_sycl_flags INTERFACE_LINK_OPTIONS)
+get_target_property(_ds41n_scd ie_sycl_flags INTERFACE_COMPILE_DEFINITIONS)
+get_target_property(_ds41n_clo ie_core INTERFACE_LINK_OPTIONS)
+set(_ds41n_flags "compiler_id=${CMAKE_CXX_COMPILER_ID}\ncompiler_version=${CMAKE_CXX_COMPILER_VERSION}\n")
+string(APPEND _ds41n_flags "build_type=${CMAKE_BUILD_TYPE}\ncxx_flags=${CMAKE_CXX_FLAGS}\ncxx_flags_build_type=${CMAKE_CXX_FLAGS_${_ds41n_bt}}\n")
+string(APPEND _ds41n_flags "sycl_target=${IE_SYCL_TARGET}\nsycl_device_hint=${IE_SYCL_DEVICE_HINT}\n")
+string(APPEND _ds41n_flags "onednn=${IE_ENABLE_ONEDNN}\nonednn_version_at_configure=${DNNL_VERSION}\nesimd_experiments=${IE_ENABLE_UNSAFE_BMG_ESIMD_EXPERIMENTS}\n")
+string(APPEND _ds41n_flags "sycl_compile_options=${_ds41n_sco}\nsycl_link_options=${_ds41n_slo}\nsycl_compile_definitions=${_ds41n_scd}\ncore_link_options=${_ds41n_clo}\n")
+foreach(_l IN LISTS _ds41n)
+  string(REGEX REPLACE "#.*$" "" _l "${_l}")
+  string(STRIP "${_l}" _l)
+  if(_l STREQUAL "")
+    continue()
+  endif()
+  list(APPEND _ds41n_files ${CMAKE_SOURCE_DIR}/${_l})
+  if(_l MATCHES "^src/(.+\\.cpp)$")                          # the per-source options set above (-fopenmp, -mavx2 ...)
+    get_source_file_property(_o ${CMAKE_MATCH_1} COMPILE_OPTIONS)
+    if(_o)
+      string(APPEND _ds41n_flags "source_options ${_l}=${_o}\n")
+    endif()
+  endif()
+endforeach()
+string(REPLACE ";" " " _ds41n_flags "${_ds41n_flags}")         # list-valued properties, flattened
+file(MAKE_DIRECTORY ${IE_DS41_NUMERICS_DIR})
+set(_ds41n_old "")
+if(EXISTS ${IE_DS41_NUMERICS_DIR}/deepseek41_numerics_flags.txt)
+  file(READ ${IE_DS41_NUMERICS_DIR}/deepseek41_numerics_flags.txt _ds41n_old)
+endif()
+if(NOT _ds41n_old STREQUAL _ds41n_flags)                         # rewritten only on a change: the stamp's DEPENDS below
+  file(WRITE ${IE_DS41_NUMERICS_DIR}/deepseek41_numerics_flags.txt "${_ds41n_flags}")
+endif()
+add_custom_command(
+  OUTPUT     ${IE_DS41_NUMERICS_DIR}/deepseek41_numerics.stamp
+  BYPRODUCTS ${IE_DS41_NUMERICS_DIR}/deepseek41_numerics_manifest.h
+  COMMAND ${CMAKE_COMMAND} -DROOT=${CMAKE_SOURCE_DIR} -DLIST=${IE_DS41_NUMERICS_LIST}
+          -DFLAGS=${IE_DS41_NUMERICS_DIR}/deepseek41_numerics_flags.txt -DCXX=${CMAKE_CXX_COMPILER}
+          -DOUT=${IE_DS41_NUMERICS_DIR}/deepseek41_numerics_manifest.h
+          -DSTAMP=${IE_DS41_NUMERICS_DIR}/deepseek41_numerics.stamp
+          -P ${CMAKE_CURRENT_SOURCE_DIR}/model/deepseek41_numerics.cmake
+  DEPENDS ${_ds41n_files} ${IE_DS41_NUMERICS_LIST} ${IE_DS41_NUMERICS_DIR}/deepseek41_numerics_flags.txt
+          ${CMAKE_CURRENT_SOURCE_DIR}/model/deepseek41_numerics.cmake ${CMAKE_CXX_COMPILER}
+  COMMENT "DeepSeek-V4.1 numerics manifest (the disk prompt cache key, docs/deepseek41/103)"
+  VERBATIM)
+add_custom_target(ie_ds41_numerics DEPENDS ${IE_DS41_NUMERICS_DIR}/deepseek41_numerics.stamp)
+add_dependencies(ie_core ie_ds41_numerics)
+target_include_directories(ie_core PRIVATE ${IE_DS41_NUMERICS_DIR})
 
 add_executable(ie cli/main.cpp)
 target_link_libraries(ie PRIVATE ie_core ie_sycl_flags)

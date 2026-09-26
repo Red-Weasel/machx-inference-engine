@@ -201,8 +201,9 @@ public:
         uint64_t keep_free = 24ull << 30;          // never grow the host slots below this much MemAvailable
         uint32_t min_slot_tokens = 1024;           // a state shorter than this is not worth keeping in a host slot
         // Phase 47 (docs/deepseek41/87): DISK entries -- a prompt prefix's state (typically a system prompt + tools) written
-        // once and loaded by later processes. Empty dir = off. Keyed by the token ids, the model's shape and this
-        // executable's size + mtime (a rebuild may change the arithmetic, so its entries are not trusted).
+        // once and loaded by later processes. Empty dir = off. Keyed by the token ids, the model's shape and (#48,
+        // docs/deepseek41/103) the build's numerics manifest plus the runtime's driver and oneDNN: an entry computed by
+        // other arithmetic is not trusted, and a rebuild that changes no arithmetic keeps the entries.
         std::string disk_dir;
         uint64_t disk_budget = 8ull << 30;         // bytes of entries kept, least recently used removed first
         uint64_t disk_keep_free = 32ull << 30;     // never write when the filesystem would fall under this
@@ -420,9 +421,9 @@ private:
     // Phase 47: the disk entries' index (ids read from each file's header) and the writer
     struct PcDisk { std::string path; std::vector<int32_t> ids; uint64_t bytes = 0; };
     std::vector<PcDisk>       pc_disk_;
-    std::string               pc_disk_key_;         // model shape + executable identity
+    std::string               pc_disk_key_;         // model + format + numerics manifest + runtime (ds41_prefix_disk_key)
     std::thread               pc_writer_;
-    void        pc_disk_scan();
+    uint32_t    pc_disk_scan();                     // the index of this key's entries; returns how many carry another key
     std::string pc_load_disk(const PcDisk& d);      // a disk entry -> the live state at its position
     void        pc_join_writer() { if (pc_writer_.joinable()) pc_writer_.join(); }
 };

@@ -233,6 +233,9 @@ Ds41ExpertTier::~Ds41ExpertTier() { mm_reader_stop(); cpu_stop(); }
 
 void Ds41ExpertTier::free_storage(sycl::queue& q) {
     mm_reader_stop();
+    // #54: the DMA queue drained before anything its copies touch is freed -- the staging slots (their source) and the
+    // bank (their destination) below. The reader waits its own DMAs, so this is idle unless the reader threw mid-fill.
+    if (dq_) dq_->wait();
     cpu_stop(); if (cpu_.h_rows) { sycl::free(cpu_.h_rows, q); cpu_.h_rows = nullptr; }
     if (cpu_.h_rows32) { sycl::free(cpu_.h_rows32, q); cpu_.h_rows32 = nullptr; }
     if (bws_.max_tokens) ds4_expert_batch_ws_free(q, bws_);
@@ -649,6 +652,13 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
     if (!mm.empty()) {
         const size_t need = mm.size() * lay_.bytes;
         if (need > mm_dev_cap_) {
+            // #54 (docs/deepseek41/104): sycl::free is not ordered against any queue, so the old bank goes only once
+            // nothing can reach it: the mmap group's GEMMs read it on `q`, the fill's DMAs write it on dq_. A successful
+            // moe() already returns with both drained, so on that path these waits find idle queues (and a regrow is
+            // rare: the bank only grows); they make the invariant hold here instead of in every earlier exit -- an error
+            // return between the mmap group's launches leaves its GEMMs queued.
+            q.wait();
+            if (dq_) dq_->wait();
             if (mm_dev_) sycl::free(mm_dev_, q);
             mm_dev_ = sycl::malloc_device<uint8_t>(need, q); mm_dev_cap_ = mm_dev_ ? need : 0;
             if (!mm_dev_) return "tier mmap: device alloc failed";

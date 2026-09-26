@@ -151,6 +151,18 @@ and every generation is refused with 503 `code:"device_lost"` until the process
 is restarted. Nothing in the engine re-creates a lost context, so a supervisor
 should restart on a 503 health check rather than keep sending requests.
 
+`/health` also carries `"idle_spin":{"seconds":N,"cores":X}` from the idle-spin
+watchdog. The watchdog samples the process's CPU every 5 s. When nothing has been
+in flight, queued or admitted for a whole 60 s window and the process still burned
+at least `IE_IDLE_SPIN_CORES` cores (default 2.0) over that window, it logs one
+`[ie] idle spin:` line and repeats it every 10 minutes while the spin lasts. The
+line names the busiest threads (usr/sys split, kernel wait channel, whether each
+is an HTTP request thread) and the `eu-stack` command for their stacks.
+`seconds` is how long the spin has lasted (0 when none); `cores` is the rate over
+the latest idle window. `IE_IDLE_SPIN_WATCHDOG=0` turns the watchdog off (the
+field is then absent). It never stops or restarts anything
+(docs/server_idle_spin_watchdog_2026-09-24.md).
+
 Every error body is JSON-escaped (`error_json`), including exception text.
 
 A client that disconnects is detected during prefill (the engine probes the

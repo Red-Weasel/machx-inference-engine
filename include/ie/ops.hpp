@@ -835,6 +835,12 @@ sycl::event gemm_fp16_onednn(sycl::queue& q,
 // rather than quietly returning a wrong or empty result.
 bool onednn_available() noexcept;
 
+// The oneDNN library this process loaded: "oneDNN <major>.<minor>.<patch> <git hash>", or "oneDNN off" in a build
+// without it. oneDNN generates its GPU kernels at run time, so a library swapped under an unchanged binary (the
+// /opt/intel/oneapi/dnnl/latest link moving) can change prefill arithmetic; the V4.1 disk prompt cache keys its entries
+// by it (#48, docs/deepseek41/103).
+std::string onednn_runtime_version();
+
 // y[M, N] (fp32) = A[M, K] (fp16) @ W[N, K]^T (fp16), fp32 accumulate.
 //
 // W is consumed IN PLACE in its row-major [N, K] form — the layout DeepSeek-V4's
