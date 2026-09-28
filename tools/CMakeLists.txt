@@ -342,6 +342,25 @@ add_executable(ie_glm5next_run glm5next_run.cpp)
 target_link_libraries(ie_glm5next_run PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_glm5next_run PROPERTIES OUTPUT_NAME "ie-glm5next-run")
 
+# GLM-5.3-Flash request lanes + the two-card decode pipe (P4 B7, docs/glm53/P4_B7_LANES.md): every prompt solo on lane 0,
+# then over L lanes (serial interleave and/or card-pipelined), byte-identical to solo with the CPU leg off; A-B-A timing.
+add_executable(ie_glm_lanes_test glm5next_lanes_test.cpp)
+target_link_libraries(ie_glm_lanes_test PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_glm_lanes_test PROPERTIES OUTPUT_NAME "ie-glm-lanes-test")
+
+# P4 B14 phase 1a: the 35B-A3B crown split's decode ops at 2..16 rows, byte for byte against the one-row route, and the
+# shared-weight step's cost at G = 1..16 rows (--dry / --selftest need no device).
+add_executable(ie_q35m_rows_test q35m_rows_test.cpp)
+target_link_libraries(ie_q35m_rows_test PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_q35m_rows_test PROPERTIES OUTPUT_NAME "ie-q35m-rows-test")
+
+# P4 B17: Flash-Next (qwen4exp) row batching -- every shared decode op at 2..16 rows byte for byte against the one-row route
+# on real weights (--ops), and the end-to-end twin-lane identity + group-step timing on the real split (--model); --selftest
+# needs no device.
+add_executable(ie_q4e_rows_test q4e_rows_test.cpp)
+target_link_libraries(ie_q4e_rows_test PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_q4e_rows_test PROPERTIES OUTPUT_NAME "ie-q4e-rows-test")
+
 # qwen4exp Q5_1 GEMV/GEMM + BF16/Q5_K conversion gate (expert down banks are
 # Q5_1 — native GPU path; correctness vs CPU refs, no model file).
 add_executable(ie_qwen4_quant_test qwen4_quant_test.cpp)
@@ -368,6 +387,12 @@ set_target_properties(ie_slot_stash_test PROPERTIES OUTPUT_NAME "ie-slot-stash-t
 add_executable(ie_batched_equiv_test ie_batched_equiv_test.cpp)
 target_link_libraries(ie_batched_equiv_test PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_batched_equiv_test PROPERTIES OUTPUT_NAME "ie-batched-equiv-test")
+
+# P4 B18: the 27B split's request-lane steps (forward_stage pieces, forward_stage_rows groups of every size) against
+# --parallel 1's forward / forward_pipelined, bit for bit (GPU; the host rules are tests/unit/q27_lanes_test.cpp).
+add_executable(ie_q27_lanes_equiv q27_lanes_equiv_test.cpp)
+target_link_libraries(ie_q27_lanes_equiv PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_q27_lanes_equiv PROPERTIES OUTPUT_NAME "ie-q27-lanes-equiv")
 
 # qwen4exp PLE n-gram machinery gate (no model file): host hash/gather vs
 # hand-computed + independent references; device blk.1 PLE layer vs CPU fp64;
@@ -527,6 +552,12 @@ add_executable(ie_ds41_lookup_test ds41_lookup_test.cpp)
 target_link_libraries(ie_ds41_lookup_test PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_ds41_lookup_test PROPERTIES OUTPUT_NAME "ie-ds41-lookup-test")
 
+# DeepSeek-V4.1-Flash P4 B6a (docs/deepseek41/P4_B6A_LANES.md): lanes and the card pipe -- every interleaved / pipelined
+# sequence byte-identical to its solo run (lookup verify steps included), the steady-window aggregate, a lane through a host slot
+add_executable(ie_ds41_lanes_test ds41_lanes_test.cpp)
+target_link_libraries(ie_ds41_lanes_test PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_ds41_lanes_test PROPERTIES OUTPUT_NAME "ie-ds41-lanes-test")
+
 add_executable(ie_ds41_vision_test ds41_vision_test.cpp)
 target_link_libraries(ie_ds41_vision_test PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_ds41_vision_test PROPERTIES OUTPUT_NAME "ie-ds41-vision-test")
@@ -672,3 +703,8 @@ set_target_properties(ie_mimo26_nan_probe PROPERTIES OUTPUT_NAME "ie-mimo26-nan-
 add_executable(ie_mimo26_dflash_check mimo26_dflash_check.cpp)
 target_link_libraries(ie_mimo26_dflash_check PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_mimo26_dflash_check PROPERTIES OUTPUT_NAME "ie-mimo26-dflash-check")
+# MiMo-V2.6 P4 B1 (~/ds41_work/p60/p4_mimo_batching_design.md): lanes with serial interleaving -- each interleaved sequence
+# byte-identical to its solo run, a mid-run finish / re-admit, a lane's state through a host slot into another lane
+add_executable(ie_mimo26_lanes_test mimo26_lanes_test.cpp)
+target_link_libraries(ie_mimo26_lanes_test PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_mimo26_lanes_test PROPERTIES OUTPUT_NAME "ie-mimo26-lanes-test")

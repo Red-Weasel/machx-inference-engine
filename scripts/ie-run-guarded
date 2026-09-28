@@ -5,26 +5,58 @@
 # (2026-08-27 freeze: pinned malloc_host banks + model mmap exhausted 249 GB;
 # journald's "Under memory pressure" was the machine's last words).
 #
-# usage: ie-run-guarded [--mem 200G] [--timeout 1800] <binary> [args...]
+# usage: ie-run-guarded [--mem 200G] [--timeout 1800] [--cards LIST] <binary> [args...]
+#
+# Card locks (docs/serve_config.md, "Card locks"): card N's lock is an exclusive
+# flock on /tmp/ie-card-N.lock ($IE_CARD_LOCK_DIR overrides /tmp).
+#   --cards 0,1  takes those cards' locks only (no single-flight lock): runs on
+#                different cards may coexist, two on the same card are refused.
+#   no --cards   the single-flight lock /tmp/ie-gpu.lock as before, PLUS every
+#                card lock 0..7, so a whole-machine run and a per-card run (or an
+#                `ie supervise` child) exclude each other.
+# The started process inherits the locks and IE_GPU_LOCK_HELD (LIST, or "all"),
+# so `ie serve --cards` / `ie supervise` under it do not try to take them again.
+# Two per-card runs each get their own --mem cap: size them for the machine.
 set -u
 MEM=200G
 TMO=1800
+CARDS=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --mem)     MEM="$2"; shift 2 ;;
         --timeout) TMO="$2"; shift 2 ;;
+        --cards)   CARDS="$2"; shift 2 ;;
         *) break ;;
     esac
 done
-[[ $# -ge 1 ]] || { echo "usage: ie-run-guarded [--mem 200G] [--timeout SECS] <binary> [args...]" >&2; exit 2; }
+[[ $# -ge 1 ]] || { echo "usage: ie-run-guarded [--mem 200G] [--timeout SECS] [--cards LIST] <binary> [args...]" >&2; exit 2; }
 
-LOCK=/tmp/ie-gpu.lock
-exec 9>"$LOCK"
-if ! flock -w 5 9; then
-    echo "ie-run-guarded: another engine process holds $LOCK (pid $(cat "$LOCK" 2>/dev/null)); refusing to stack" >&2
-    exit 3
+LOCKDIR="${IE_CARD_LOCK_DIR:-/tmp}"
+take_card() {   # take card $1's lock on a fresh descriptor (kept open: inherited by the exec'd process)
+    local c="$1" f="$LOCKDIR/ie-card-$1.lock" fd
+    exec {fd}>>"$f"
+    if ! flock -n "$fd"; then
+        echo "ie-run-guarded: card $c is in use by another engine process (pid $(cat "$f" 2>/dev/null)); refusing to stack" >&2
+        exit 3
+    fi
+    echo $$ > "$f"
+}
+
+if [[ -n "$CARDS" ]]; then
+    [[ "$CARDS" =~ ^[0-9]+(,[0-9]+)*$ ]] || { echo "ie-run-guarded: --cards needs a list like 1 or 0,1" >&2; exit 2; }
+    for c in ${CARDS//,/ }; do take_card "$c"; done
+    export IE_GPU_LOCK_HELD="$CARDS"
+else
+    LOCK=/tmp/ie-gpu.lock
+    exec 9>"$LOCK"
+    if ! flock -w 5 9; then
+        echo "ie-run-guarded: another engine process holds $LOCK (pid $(cat "$LOCK" 2>/dev/null)); refusing to stack" >&2
+        exit 3
+    fi
+    echo $$ >&9
+    for c in 0 1 2 3 4 5 6 7; do take_card "$c"; done
+    export IE_GPU_LOCK_HELD=all
 fi
-echo $$ >&9
 
 if command -v systemd-run >/dev/null 2>&1; then
     exec systemd-run --user --scope -q \

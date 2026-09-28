@@ -15,6 +15,7 @@
 #include "ie/deepseek4_attn.hpp"
 #include "ie/kernel_profiler.hpp"
 #include "ie/qwen4_quant.hpp"
+#include "ie/q4e_lanes.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -1061,8 +1062,11 @@ std::string Qwen4ExpModel::prepare_bank_views() {
     return {};
 }
 
-std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk) {
+std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
+                                        uint32_t lanes, uint32_t lane_ctx) {
     if (!alloc_) return "qwen4exp runtime: load() first";
+    if (lanes > 1 && mtp_.loaded)
+        return "qwen4exp runtime: request lanes are refused with the MTP head (spec decode)";
     max_ctx_ = max_ctx; max_chunk_ = max_chunk;
     const uint32_t H = cfg_.hidden, MT = max_chunk;
     const uint32_t D = cfg_.hc_count * H;                     // 10240
@@ -1158,6 +1162,57 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk) {
     sh_g_ = ah(cfg_.shared_expert_ffn); sh_u_ = ah(cfg_.shared_expert_ffn);
     sh_h_ = ah(cfg_.shared_expert_ffn); sh_y_ = ah(H); sh_s_ = ah(1);
     moe_acc_ = af(H);
+    bool own_ple = false;
+    for (int32_t l : cfg_.ple_layers)
+        if (uint32_t(l) >= layer_lo_ && uint32_t(l) < layer_hi_) own_ple = true;
+    // P4 B8 request lanes 1..lanes-1: allocated here, before the expert cache, and taken out of its budget below.
+    uint64_t lanes_total = 0;
+    if (lanes > 1) {
+        const uint32_t lctx = lane_ctx ? std::min(lane_ctx, max_ctx) : max_ctx;
+        Q4eLaneShape sh;
+        sh.n_full = uint32_t(nf); sh.n_lin = uint32_t(nl);
+        sh.n_kv_heads = cfg_.n_kv_heads; sh.head_dim = cfg_.head_dim;
+        sh.idx_head_dim = cfg_.indexer_top_k ? cfg_.indexer_head_dim : 0;
+        sh.v_heads = cfg_.ssm_v_heads; sh.state = cfg_.ssm_state;
+        sh.conv_channels = CC; sh.conv_kernel = cfg_.ssm_conv_kernel;
+        sh.ple_conv_floats = (cfg_.has_ple() && own_ple) ? uint64_t(kPleStateRows) * kPleSI : 0;
+        lane_bytes_ = q4e_lane_bytes(sh, lctx);
+        lanes_total = lane_bytes_ * (lanes - 1);
+        lanes_.resize(lanes);
+        uint64_t got = 0;   // what the extra lanes' allocations add up to, checked against the arithmetic
+        for (uint32_t i = 1; i < lanes; ++i) {
+            LaneState& s = lanes_[i];
+            const std::string who = "qwen4exp lane " + std::to_string(i);
+            s.max_ctx = lctx;
+            KvCacheConfig lkc{uint32_t(nf), cfg_.n_kv_heads, lctx, cfg_.head_dim, false};
+            if (auto e = s.kv.init(*alloc_, lkc); !e.empty()) return who + " kv: " + e;
+            if (auto e = s.dn.init(*alloc_, dc); !e.empty()) return who + " dn: " + e;
+            const uint64_t se = s.dn.state_elems_per_layer() * uint64_t(nl);
+            const uint64_t ce = s.dn.conv_elems_per_layer() * uint64_t(nl);
+            got += 2 * s.kv.bytes_per_layer() * uint64_t(nf) + se * 4 + ce * 2;
+            if (cfg_.indexer_top_k) {
+                s.idx_kcache = ah(uint64_t(nf) * lctx * cfg_.indexer_head_dim);
+                s.blk_keys   = af(uint64_t(nf) * (lctx / 4) * cfg_.indexer_head_dim);
+                s.blk_done.assign(uint32_t(nf), 0);
+                if (!s.idx_kcache || !s.blk_keys) return who + ": indexer alloc failed";
+                got += uint64_t(nf) * lctx * cfg_.indexer_head_dim * 2 +
+                       uint64_t(nf) * (lctx / 4) * cfg_.indexer_head_dim * 4;
+            }
+            s.snap_dn_state = af(se);
+            s.snap_dn_conv  = ah(ce);
+            if (!s.snap_dn_state || !s.snap_dn_conv) return who + ": snapshot alloc failed";
+            got += se * 4 + ce * 2;
+            if (sh.ple_conv_floats) {
+                s.ple_conv_state = af(sh.ple_conv_floats);
+                s.snap_ple_conv  = af(sh.ple_conv_floats);
+                if (!s.ple_conv_state || !s.snap_ple_conv) return who + ": ple alloc failed";
+                got += 2 * sh.ple_conv_floats * 4;
+            }
+        }
+        if (got != lanes_total)
+            return "qwen4exp lanes: allocated " + std::to_string(got) + " B, the arithmetic says " +
+                   std::to_string(lanes_total) + " B";
+    }
     {   // MoE VRAM expert cache: C slots/layer within IE_Q4E_ECACHE_GB
         // (default 10 GiB). C is derived from the summed per-layer slot sizes.
         uint64_t sum_slot = 0;
@@ -1179,6 +1234,22 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk) {
         const uint64_t used = dev_bytes_ + (1536ull << 20); // weights + ws estimate
         uint64_t budget = gmem > used + reserve ? gmem - used - reserve
                                                 : 4ull << 30;
+        if (lanes_total) {
+            // P4 B8: the extra lanes come out of the cache. Refuse, with the numbers, when what is left cannot hold
+            // kQ4eLaneMinSlots experts per layer (q4e_lanes_cache_fit, ie/q4e_lanes.hpp).
+            uint64_t left = 0;
+            const std::string refusal = q4e_lanes_cache_fit(budget, lane_bytes_, uint32_t(lanes_.size() - 1), lanes_[1].max_ctx,
+                                                            sum_slot, left);
+            std::fprintf(stderr,
+                "[qwen4exp] lanes: %zu extra x %.3f GiB at ctx %u -> expert-cache budget %.2f -> %.2f GiB "
+                "(%llu -> %llu slots/layer)\n",
+                lanes_.size() - 1, lane_bytes_ / 1073741824.0, lanes_[1].max_ctx, budget / 1073741824.0,
+                left / 1073741824.0,
+                (unsigned long long)std::min<uint64_t>(cfg_.n_experts, budget / sum_slot),
+                (unsigned long long)std::min<uint64_t>(cfg_.n_experts, left / sum_slot));
+            if (!refusal.empty()) return refusal;
+            budget = left;
+        }
         if (const char* e = std::getenv("IE_Q4E_ECACHE_GB"))
             if (int v = std::atoi(e); v > 0) {
                 // CLAMP to the adaptive fit: an override above what the card
@@ -1220,9 +1291,6 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk) {
             alloc_->queue().get_context(), alloc_->queue().get_device(),
             sycl::property_list{sycl::property::queue::in_order{}});
     }
-    bool own_ple = false;
-    for (int32_t l : cfg_.ple_layers)
-        if (uint32_t(l) >= layer_lo_ && uint32_t(l) < layer_hi_) own_ple = true;
     if (cfg_.has_ple() && own_ple) {
         e16_ = ah(uint64_t(MT) * H);
         ple_key_out_ = ah(uint64_t(MT) * D);
@@ -1252,6 +1320,11 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk) {
         blk_done_.assign(nf2, 0);
     }
     if (layer_hi_ == cfg_.n_layers) logits_ = ah(cfg_.vocab);
+    // P4 B17: a row group's logits (lanes only; ~7.9 MB at vocab 248K, inside the 4 GiB reserve, not in the lane admission)
+    if (lanes > 1 && layer_hi_ == cfg_.n_layers) {
+        rows_logits_ = ah(uint64_t(kMaxRows) * cfg_.vocab);
+        if (!rows_logits_) return "qwen4exp runtime: rows logits alloc failed";
+    }
     if (mtp_.loaded) {
         KvCacheConfig mkc{1u, cfg_.n_kv_heads, max_ctx, cfg_.head_dim, false};
         if (auto e = mtp_.kv.init(*alloc_, mkc); !e.empty()) return "mtp kv: " + e;
@@ -1313,7 +1386,52 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk) {
     xg16_  = ah(PICKS * H);
     sgateT_ = ah(MT);
     reset_state();
+    for (uint32_t i = 1; i < uint32_t(lanes_.size()); ++i) {   // every extra lane starts as a fresh sequence
+        if (auto e = select_lane(i); !e.empty()) return e;
+        reset_state();
+    }
+    if (auto e = select_lane(0); !e.empty()) return e;
     return {};
+}
+
+void Qwen4ExpModel::swap_live(LaneState& s) noexcept {
+    using std::swap;
+    swap(kv_, s.kv);
+    swap(dn_, s.dn);
+    swap(idx_kcache_, s.idx_kcache);
+    swap(blk_keys_, s.blk_keys);
+    swap(blk_done_, s.blk_done);
+    swap(ple_conv_state_, s.ple_conv_state);
+    swap(ple_hist_, s.ple_hist);
+    swap(snap_dn_state_, s.snap_dn_state);
+    swap(snap_dn_conv_, s.snap_dn_conv);
+    swap(snap_ple_conv_, s.snap_ple_conv);
+    swap(snap_ple_hist_, s.snap_ple_hist);
+    swap(snap_blk_done_, s.snap_blk_done);
+    swap(snap_depth_, s.snap_depth);
+    swap(vis_spans_, s.vis_spans);
+    swap(vis_rows_, s.vis_rows);
+    swap(mrope3_, s.mrope3);
+    swap(mrope_n_, s.mrope_n);
+    swap(mrope_delta_, s.mrope_delta);
+    swap(max_ctx_, s.max_ctx);
+}
+
+std::string Qwen4ExpModel::select_lane(uint32_t lane) {
+    if (lane == lane_) return {};
+    if (lane >= lanes_.size())
+        return "qwen4exp select_lane: lane " + std::to_string(lane) + " of " + std::to_string(n_lanes());
+    if (spec_verify_) return "qwen4exp select_lane: refused in spec-verify mode";
+    // Park the live lane in its slot (which held the placeholder), then take the target's state out of its slot.
+    swap_live(lanes_[lane_]);
+    swap_live(lanes_[lane]);
+    lane_ = lane;
+    return {};
+}
+
+uint32_t Qwen4ExpModel::lane_ctx(uint32_t lane) const noexcept {
+    if (lane == lane_) return max_ctx_;
+    return lane < lanes_.size() ? lanes_[lane].max_ctx : 0;
 }
 
 std::string Qwen4ExpModel::load_mtp(const GgufReader& mg,
@@ -1765,7 +1883,14 @@ std::string Qwen4ExpModel::mtp_draft(int32_t t_next, uint32_t pos, uint32_t K,
     return {};
 }
 
-std::string Qwen4ExpModel::stash_slot(SlotState& s, uint32_t depth) {
+namespace {
+// P4 B15: SlotStateT's buffers: a vector always resizes; pinned host bytes may fail to allocate
+bool q4e_slot_resize(std::vector<uint8_t>& b, size_t n) { b.resize(n); return true; }
+bool q4e_slot_resize(Qwen4ExpModel::PinnedBytes& b, size_t n) { return b.resize(n); }
+}  // namespace
+
+template <class Buf>
+std::string Qwen4ExpModel::stash_slot(SlotStateT<Buf>& s, uint32_t depth) {
     if (mtp_.loaded) return "qwen4exp stash: MTP state not stashable (no spec+parallel)";
     sycl::queue& q = alloc_->queue();
     s.depth = 0;
@@ -1777,8 +1902,8 @@ std::string Qwen4ExpModel::stash_slot(SlotState& s, uint32_t depth) {
         const uint64_t slice  = uint64_t(depth) * kc.head_dim * sizeof(sycl::half);
         const uint64_t stride = uint64_t(kc.max_ctx) * kc.head_dim;   // halves
         const uint64_t nsl    = uint64_t(kc.n_layers_full) * kc.n_kv_heads;
-        s.kv_k.resize(nsl * slice);
-        s.kv_v.resize(nsl * slice);
+        if (!q4e_slot_resize(s.kv_k, nsl * slice) || !q4e_slot_resize(s.kv_v, nsl * slice))
+            return "qwen4exp stash: host buffer alloc failed (kv)";
         for (uint64_t sl = 0; sl < nsl; ++sl) {
             q.memcpy(s.kv_k.data() + sl * slice, kv_.k_ptr() + sl * stride, slice);
             q.memcpy(s.kv_v.data() + sl * slice, kv_.v_ptr() + sl * stride, slice);
@@ -1793,8 +1918,8 @@ std::string Qwen4ExpModel::stash_slot(SlotState& s, uint32_t depth) {
         const uint32_t nblk    = (depth + 3) / 4;
         const uint64_t bslice  = uint64_t(nblk) * ihd * sizeof(float);
         const uint64_t bstride = uint64_t(max_ctx_ / 4) * ihd;        // floats
-        s.idxk.resize(uint64_t(nf) * kslice);
-        s.blkk.resize(uint64_t(nf) * bslice);
+        if (!q4e_slot_resize(s.idxk, uint64_t(nf) * kslice) || !q4e_slot_resize(s.blkk, uint64_t(nf) * bslice))
+            return "qwen4exp stash: host buffer alloc failed (indexer)";
         for (uint32_t l = 0; l < nf; ++l) {
             q.memcpy(s.idxk.data() + uint64_t(l) * kslice,
                      idx_kcache_ + uint64_t(l) * kstride, kslice);
@@ -1808,14 +1933,14 @@ std::string Qwen4ExpModel::stash_slot(SlotState& s, uint32_t depth) {
                             dn_.config().n_layers_linear * sizeof(float);
         const uint64_t cb = dn_.conv_elems_per_layer() *
                             dn_.config().n_layers_linear * sizeof(sycl::half);
-        s.dns.resize(sb);
-        s.dnc.resize(cb);
+        if (!q4e_slot_resize(s.dns, sb) || !q4e_slot_resize(s.dnc, cb))
+            return "qwen4exp stash: host buffer alloc failed (deltanet)";
         q.memcpy(s.dns.data(), dn_.state_ptr(), sb);
         q.memcpy(s.dnc.data(), dn_.conv_state_ptr(), cb);
     }
     if (ple_conv_state_) {
         const uint64_t pb = uint64_t(kPleStateRows) * kPleSI * sizeof(float);
-        s.ple.resize(pb);
+        if (!q4e_slot_resize(s.ple, pb)) return "qwen4exp stash: host buffer alloc failed (ple)";
         q.memcpy(s.ple.data(), ple_conv_state_, pb);
     }
     q.wait();   // D2H must land before the caller releases the turn gate
@@ -1825,8 +1950,11 @@ std::string Qwen4ExpModel::stash_slot(SlotState& s, uint32_t depth) {
     return {};
 }
 
-std::string Qwen4ExpModel::unstash_slot(const SlotState& s) {
+template <class Buf>
+std::string Qwen4ExpModel::unstash_slot(const SlotStateT<Buf>& s) {
     if (!s.depth) return "qwen4exp unstash: empty slot";
+    // (P4 B15: a slot restored into another lane -- the rows must fit this lane's capacity; the copies use its strides)
+    if (s.depth >= max_ctx_) return "qwen4exp unstash: depth " + std::to_string(s.depth) + " >= this lane's capacity " + std::to_string(max_ctx_);
     sycl::queue& q = alloc_->queue();
     const KvCacheConfig& kc = kv_.config();
     {
@@ -1871,6 +1999,11 @@ std::string Qwen4ExpModel::unstash_slot(const SlotState& s) {
         if (full_idx_[L] >= 0) kv_.set_length(uint32_t(full_idx_[L]), s.depth);
     return {};
 }
+
+template std::string Qwen4ExpModel::stash_slot<std::vector<uint8_t>>(SlotStateT<std::vector<uint8_t>>&, uint32_t);
+template std::string Qwen4ExpModel::unstash_slot<std::vector<uint8_t>>(const SlotStateT<std::vector<uint8_t>>&);
+template std::string Qwen4ExpModel::stash_slot<Qwen4ExpModel::PinnedBytes>(SlotStateT<PinnedBytes>&, uint32_t);
+template std::string Qwen4ExpModel::unstash_slot<Qwen4ExpModel::PinnedBytes>(const SlotStateT<PinnedBytes>&);
 
 std::string Qwen4ExpModel::snapshot(uint32_t depth) {
     sycl::queue& q = alloc_->queue();
@@ -3561,6 +3694,418 @@ std::string Qwen4ExpModel::forward_range(const int32_t* tokens_host, uint32_t T,
     }
     q.wait();
     return {};
+}
+
+// ============================ P4 B17: row batching ===========================
+// One pass over the stage's blocks for G lanes' 1-row steps (header: forward_rows). Every shared op below is the row-exact
+// twin of what run_block runs at T == 1 on the default decode route (rows_off_reason refuses any other route); every
+// per-lane op is run_block's T == 1 call on that lane's buffers at row i's offsets. run_block itself is untouched.
+
+Qwen4ExpModel::LaneRef Qwen4ExpModel::lane_ref(uint32_t lane) noexcept {
+    LaneRef r;
+    if (lane == lane_) {
+        r.kv = &kv_; r.dn = &dn_; r.idx_kcache = idx_kcache_; r.blk_keys = blk_keys_; r.blk_done = &blk_done_;
+        r.ple_conv = ple_conv_state_; r.ple_hist = &ple_hist_; r.max_ctx = max_ctx_;
+        r.vision = mrope_n_ != 0 || !vis_spans_.empty();
+    } else {
+        LaneState& s = lanes_[lane];
+        r.kv = &s.kv; r.dn = &s.dn; r.idx_kcache = s.idx_kcache; r.blk_keys = s.blk_keys; r.blk_done = &s.blk_done;
+        r.ple_conv = s.ple_conv_state; r.ple_hist = &s.ple_hist; r.max_ctx = s.max_ctx;
+        r.vision = s.mrope_n != 0 || !s.vis_spans.empty();
+    }
+    return r;
+}
+
+uint32_t Qwen4ExpModel::rows_max() const noexcept {
+    return q4e_rows_max_group(ecache_slots_, cfg_.n_experts_used);
+}
+
+std::string Qwen4ExpModel::rows_off_reason() const {
+    Q4eRowsRoute r;
+    r.dense_q8 = qwen4exp_dense_q8();
+    r.a16 = dense_a16();
+    r.smallk = std::getenv("IE_GEMV_SMALLK") != nullptr;
+    { const char* v = std::getenv("IE_Q4E_DECODE_GROUPED"); r.decode_grouped = !(v && v[0] == '0'); }
+    for (const char* n : {"IE_Q4E_MOE_EXPMAJOR", "IE_Q4E_SV_NO_G1", "IE_Q4E_SV_NO_G2", "IE_Q4E_SV_NO_RED"})
+        if (std::getenv(n)) r.moe_alt = true;
+    r.tp = bool(tp_sync_) || tp_e_lo_ != 0 || tp_e_hi_ != 0xFFFFFFFFu;
+    for (uint32_t L = layer_lo_; L < layer_hi_; ++L)
+        if (L < lin_idx_.size() && lin_idx_[L] >= 0 && (layers_[L].qkv_q8.qs == nullptr) != (layers_[L].gate_q8.qs == nullptr))
+            r.dn_mixed = true;
+    r.n_lanes = n_lanes();
+    r.slots_per_layer = ecache_slots_;
+    r.top_k = cfg_.n_experts_used;
+    std::string why = q4e_rows_route_refusal(r);
+    if (why.empty() && mtp_.loaded) why = "the MTP head";
+    if (why.empty() && layer_hi_ == cfg_.n_layers && !rows_logits_) why = "no rows logits buffer";
+    if (why.empty() && max_chunk_ < kMaxRows) why = "the workspaces hold " + std::to_string(max_chunk_) + " rows";
+    return why;
+}
+
+std::string Qwen4ExpModel::forward_rows(const uint32_t* lanes, const int32_t* ids, const uint32_t* pos, uint32_t G,
+                                        const float* wide_in_host, float* wide_out_host) {
+    const std::string who = "qwen4exp rows: ";
+    if (G < 2 || G > kMaxRows || G > rows_max() || G > max_chunk_)
+        return who + std::to_string(G) + " rows (2.." + std::to_string(std::min<uint32_t>(rows_max(), kMaxRows)) + " here)";
+    if (spec_verify_) return who + "refused in spec-verify mode";
+    const bool tail = layer_hi_ == cfg_.n_layers;
+    bool own_ple = false;
+    for (int32_t l : cfg_.ple_layers)
+        if (uint32_t(l) >= layer_lo_ && uint32_t(l) < layer_hi_) own_ple = true;
+    if ((layer_lo_ == 0 || own_ple) && !ids) return who + "this stage needs the token ids";
+    if (layer_lo_ != 0 && !wide_in_host) return who + "this stage needs the wide input";
+    if (!tail && !wide_out_host) return who + "this stage needs a wide output";
+    if (tail && (!rows_logits_ || (!lm_head && !lmh_q8.qs))) return who + "no rows logits / head on the tail stage";
+    LaneRef lr[kMaxRows];
+    for (uint32_t i = 0; i < G; ++i) {
+        if (lanes[i] >= n_lanes()) return who + "lane " + std::to_string(lanes[i]) + " of " + std::to_string(n_lanes());
+        for (uint32_t j = 0; j < i; ++j)
+            if (lanes[j] == lanes[i]) return who + "lane " + std::to_string(lanes[i]) + " twice in one group";
+        lr[i] = lane_ref(lanes[i]);
+        if (pos[i] == 0) return who + "lane " + std::to_string(lanes[i]) + " at position 0 (a new sequence runs alone)";
+        if (pos[i] + 1 > lr[i].max_ctx)
+            return who + "lane " + std::to_string(lanes[i]) + ": ctx " + std::to_string(pos[i] + 1) + " > max_ctx " +
+                   std::to_string(lr[i].max_ctx);
+        if (lr[i].vision) return who + "lane " + std::to_string(lanes[i]) + " has vision staging";
+    }
+    sycl::queue& q = alloc_->queue();
+    const uint32_t H = cfg_.hidden, D = cfg_.hc_count * H;
+    if (ids) q.memcpy(d_tokens_, ids, G * sizeof(int32_t));
+    {
+        int32_t p[kMaxRows];
+        for (uint32_t i = 0; i < G; ++i) p[i] = int32_t(pos[i]);
+        q.memcpy(d_pos_, p, G * sizeof(int32_t)).wait();
+    }
+    if (wide_in_host) {
+        q.memcpy(wide_, wide_in_host, uint64_t(G) * D * sizeof(float)).wait();
+    } else {
+        if (!token_embd) return who + "head stage needs layer 0";
+        gather_embed_rows(q, token_embd, d_tokens_, emb_, G, H);
+        qwen4_hc_expand_streams(q, emb_, wide_, G, H, cfg_.hc_count);
+    }
+    for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
+        run_block_rows(L, G, lr, pos, ids);
+        if (!block_err_.empty()) {
+            std::string e; e.swap(block_err_);
+            return e;
+        }
+    }
+    if (!tail) {
+        q.wait();
+        q.memcpy(wide_out_host, wide_, uint64_t(G) * D * sizeof(float)).wait();
+        return {};
+    }
+    // Final HC merge in <= 4-row chunks (forward_range's T == 1 call runs the v3 grid; qwen4_hc_mix_v2 switches grids above
+    // 4 rows), then the head once over the G rows: the batched int-dot twin of the T == 1 _g GEMV, or F16 rows in <= 8.
+    const uint32_t R = cfg_.hc_low_rank;
+    for (uint32_t r0 = 0; r0 < G; r0 += 4)
+        qwen4_hc_mix_v2(q, wide_ + uint64_t(r0) * D, out_hc_norm, out_hc_down, out_hc_up, nullptr,
+                        xn_ws_ + uint64_t(r0) * D, lo_ws_ + uint64_t(r0) * R, mixed_ + uint64_t(r0) * H, nullptr,
+                        std::min(4u, G - r0), H, cfg_.hc_count, R, cfg_.rms_eps);
+    const uint32_t V = cfg_.vocab;
+    if (qwen4exp_dense_q8() && lmh_q8.qs) {
+        quantize_q8_1(q, mixed_, act_q8T_, G * H);
+        gemv_q8_0_soa_q8_batched(q, act_q8T_, lmh_q8.qs, lmh_q8.d, rows_logits_, H, V, G);
+    } else {
+        for (uint32_t r0 = 0; r0 < G; r0 += 8)
+            gemv_fp16_rows(q, mixed_ + uint64_t(r0) * H, H, lm_head, rows_logits_ + uint64_t(r0) * V, V, H, V,
+                           std::min(8u, G - r0));
+    }
+    q.wait();
+    return {};
+}
+
+void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, const uint32_t* pos, const int32_t* ids) {
+    sycl::queue& q = alloc_->queue();
+    const uint32_t H = cfg_.hidden, D = cfg_.hc_count * H, R = cfg_.hc_low_rank, HC = cfg_.hc_count;
+    const uint32_t SI = cfg_.ssm_inner, SKH = cfg_.ssm_k_heads, SVH = cfg_.ssm_v_heads;
+    const uint32_t SHD = cfg_.ssm_state, CC = SI + 2u * SKH * SHD, KW = SKH * SHD;
+    const uint32_t HD = cfg_.head_dim, NQ = cfg_.n_q_heads * HD, NKV = cfg_.n_kv_heads * HD;
+    const uint32_t EF = cfg_.expert_ffn, SEF = cfg_.shared_expert_ffn;
+    const float eps = cfg_.rms_eps;
+    const float qscale = 1.0f / std::sqrt(float(SHD));
+    const Qwen4ExpLayer& w = layers_[L];
+    // Shared projections. Int-dot (a Q8-SoA tensor): quantize_q8_1 over the G rows + gemv_q8_0_soa_q8_batched -- the batched
+    // twin of the T == 1 quantize_q8_1 + gemv_q8_0_soa_q8_g (same lane map, same per-lane block order, same sub-group
+    // reduce). F16: gemv_fp16_rows in <= 8-row chunks -- the T == 1 kernel's K-slices verbatim per row (above 8 rows
+    // gemv_fp16_rows would fall back to per-row gemv_fp16; the chunks keep one kernel family for every row).
+    auto q8_rows = [&](const sycl::half* X, const Qwen4ExpLayer::Q8W& Wq, sycl::half* Y, uint32_t K, uint32_t N) {
+        quantize_q8_1(q, X, act_q8T_, G * K);
+        gemv_q8_0_soa_q8_batched(q, act_q8T_, Wq.qs, Wq.d, Y, K, N, G);
+    };
+    auto f16_rows = [&](const sycl::half* X, uint32_t K, const sycl::half* W, sycl::half* Y, uint32_t N) {
+        for (uint32_t r0 = 0; r0 < G; r0 += 8)
+            gemv_fp16_rows(q, X + uint64_t(r0) * K, K, W, Y + uint64_t(r0) * N, N, K, N, std::min(8u, G - r0));
+    };
+    // HC mix in <= 4-row chunks (qwen4_hc_mix_v2: the v3 grid at T <= 4 -- what T == 1 runs -- and the v2 grid above;
+    // the two reassociate the fp32 sums differently).
+    auto hc_mix = [&](const float* norm, const sycl::half* down, const sycl::half* up, const float* inject) {
+        for (uint32_t r0 = 0; r0 < G; r0 += 4)
+            qwen4_hc_mix_v2(q, wide_ + uint64_t(r0) * D, norm, down, up, inject, xn_ws_ + uint64_t(r0) * D,
+                            lo_ws_ + uint64_t(r0) * R, mixed_ + uint64_t(r0) * H, inj_ + uint64_t(r0) * HC,
+                            std::min(4u, G - r0), H, HC, R, eps);
+    };
+
+    // ---- PLE (its block's first op): the hash, the history and the conv state are the lane's ----
+    if (cfg_.is_ple_layer(L)) {
+        PleHashConsts pc{};
+        for (int i = 0; i < 3; ++i) pc.M[i] = cfg_.ple_layer_multipliers[i];
+        for (int h = 0; h < 16; ++h) { pc.V[h] = cfg_.ple_head_vocab_sizes[h]; pc.O[h] = cfg_.ple_head_offsets[h]; }
+        pc.eos = cfg_.ple_eos_token;
+        std::vector<uint64_t> rows(uint64_t(G) * 16);
+        for (uint32_t i = 0; i < G; ++i) qwen4_ple_hash(pc, ids + i, 1, *lr[i].ple_hist, rows.data() + uint64_t(i) * 16);
+        std::vector<float> E(uint64_t(G) * H);
+        qwen4_ple_gather(ple_table->data, rows.data(), G, E.data());
+        std::vector<sycl::half> E16(E.size());
+        for (size_t i = 0; i < E.size(); ++i) E16[i] = sycl::half(E[i]);
+        q.memcpy(e16_, E16.data(), E16.size() * 2).wait();
+        f16_rows(e16_, H, w.ple_key, ple_key_out_, D);
+        f16_rows(e16_, H, w.ple_value, ple_v_out_, H);
+        for (uint32_t i = 0; i < G; ++i)
+            qwen4_ple_layer(q, ple_key_out_ + uint64_t(i) * D, ple_v_out_ + uint64_t(i) * H, wide_ + uint64_t(i) * D,
+                            w.ple_norm_key, w.ple_norm_query, w.ple_norm_conv, w.ple_conv, lr[i].ple_conv, ple_ws_, 1, eps);
+    }
+
+    // ---- attn site: HC mix -> token mixer -> HC combine ----
+    hc_mix(w.hc_attn_norm, w.hc_attn_down, w.hc_attn_up, w.hc_attn_inject);
+    if (lin_idx_[L] >= 0) {
+        const uint32_t li = uint32_t(lin_idx_[L]);
+        // (rows_off_reason: qkv and gate share a dtype, so the gate's int-dot reuses qkv's quantized rows like T == 1)
+        if (w.qkv_q8.qs) q8_rows(mixed_, w.qkv_q8, dn_qkv_, H, CC);
+        else             f16_rows(mixed_, H, w.attn_qkv, dn_qkv_, CC);
+        for (uint32_t i = 0; i < G; ++i) {
+            sycl::half* cst = lr[i].dn->conv_state_ptr() + uint64_t(li) * lr[i].dn->conv_elems_per_layer();
+            depthwise_conv1d_causal(q, dn_qkv_ + uint64_t(i) * CC, w.ssm_conv, cst, dn_conv_ + uint64_t(i) * CC, 1, CC,
+                                    cfg_.ssm_conv_kernel);
+        }
+        cast_qkv_split_fp16_to_fp32(q, dn_conv_, dn_qpre_, dn_kpre_, dn_vpre_, G, KW, SI);
+        l2_norm_scale(q, dn_qpre_, dn_qpre_, G * SKH, SHD, qscale, 1e-6f);
+        l2_norm_scale(q, dn_kpre_, dn_kpre_, G * SKH, SHD, 1.0f, 1e-6f);
+        repeat_interleave_heads(q, dn_qpre_, dn_qrep_, G, SKH, SHD, SVH / SKH);
+        repeat_interleave_heads(q, dn_kpre_, dn_krep_, G, SKH, SHD, SVH / SKH);
+        gemv_fp16_rows_dual(q, mixed_, H, w.ssm_alpha, dn_ab64_, w.ssm_beta, dn_ab64_ + 64, 128, H, 64, G);
+        extract_cols(q, dn_ab64_, dn_a48_, G, SVH, 128);
+        extract_cols(q, dn_ab64_ + 64, dn_b48_, G, SVH, 128);
+        compute_g_beta_h16(q, dn_a48_, dn_b48_, w.ssm_a, w.ssm_dt, dn_g_, dn_beta_, G, SVH);
+        for (uint32_t i = 0; i < G; ++i) {
+            float* st = lr[i].dn->state_ptr() + uint64_t(li) * lr[i].dn->state_elems_per_layer();
+            deltanet_recurrence(q, dn_qrep_ + uint64_t(i) * SI, dn_krep_ + uint64_t(i) * SI, dn_vpre_ + uint64_t(i) * SI,
+                                dn_g_ + uint64_t(i) * SVH, dn_beta_ + uint64_t(i) * SVH, st, dn_out_ + uint64_t(i) * SI,
+                                1, 1, SVH, SHD, SHD);
+        }
+        if (w.gate_q8.qs) gemv_q8_0_soa_q8_batched(q, act_q8T_, w.gate_q8.qs, w.gate_q8.d, dn_z_, H, SI, G);
+        else              f16_rows(mixed_, H, w.attn_gate, dn_z_, SI);
+        gated_rms_norm(q, dn_out_, dn_z_, w.ssm_norm, dn_gn_, G * SVH, SHD, eps, /*sigmoid_gate=*/true);
+        if (w.out_q8.qs) q8_rows(dn_gn_, w.out_q8, blockout_, SI, H);
+        else             f16_rows(dn_gn_, SI, w.ssm_out, blockout_, H);
+    } else {
+        if (w.q_q8.qs) q8_rows(mixed_, w.q_q8, qg_, H, NQ * 2);
+        else           f16_rows(mixed_, H, w.attn_q, qg_, NQ * 2);
+        f16_rows(mixed_, H, w.attn_k, ak_, NKV);
+        f16_rows(mixed_, H, w.attn_v, av_, NKV);
+        split_q_gate_per_head(q, qg_, aq_, agate_, G, cfg_.n_q_heads, HD);
+        rms_norm_f32w(q, aq_, w.attn_q_norm, aq_, G * cfg_.n_q_heads, HD, eps);
+        rms_norm_f32w(q, ak_, w.attn_k_norm, ak_, G * cfg_.n_kv_heads, HD, eps);
+        rope_partial(q, aq_, d_pos_, aq_, G, cfg_.n_q_heads, HD, cfg_.rope_dim, cfg_.rope_theta);
+        rope_partial(q, ak_, d_pos_, ak_, G, cfg_.n_kv_heads, HD, cfg_.rope_dim, cfg_.rope_theta);
+        const uint32_t li = uint32_t(full_idx_[L]);
+        const uint32_t dense_ok = cfg_.indexer_top_k ? cfg_.indexer_top_k + 3 : UINT32_MAX;
+        const uint32_t IHD = cfg_.indexer_head_dim;
+        const uint32_t IQW = cfg_.indexer_n_heads * IHD;
+        if (cfg_.indexer_top_k) {
+            f16_rows(mixed_, H, w.idx_q_proj, idx_q_, IQW);
+            f16_rows(mixed_, H, w.idx_k_proj, idx_kraw_, IHD);
+            rms_norm_f32w(q, idx_q_, w.idx_q_norm, idx_q_, G * cfg_.indexer_n_heads, IHD, eps);
+            rope_partial(q, idx_q_, d_pos_, idx_q_, G, cfg_.indexer_n_heads, IHD, cfg_.rope_dim, cfg_.rope_theta);
+            for (uint32_t i = 0; i < G; ++i) {   // the lane's raw key at its position, its complete blocks pooled once
+                const uint32_t mc = lr[i].max_ctx;
+                q.memcpy(lr[i].idx_kcache + (uint64_t(li) * mc + pos[i]) * IHD, idx_kraw_ + uint64_t(i) * IHD,
+                         uint64_t(IHD) * sizeof(sycl::half));
+                const uint32_t nb_tot = (pos[i] + 1) / 4;
+                uint32_t& bd = (*lr[i].blk_done)[li];
+                if (nb_tot > bd) {
+                    qsa_pool_norm_rope(q, lr[i].idx_kcache + uint64_t(li) * mc * IHD, w.idx_k_norm,
+                                       lr[i].blk_keys + uint64_t(li) * (mc / 4) * IHD, bd, nb_tot - bd, cfg_.rope_theta, eps);
+                    bd = nb_tot;
+                }
+            }
+        }
+        for (uint32_t i = 0; i < G; ++i) {   // attention on the lane's KV (run_block's T == 1 calls at row i)
+            KvCache& kv = *lr[i].kv;
+            const uint32_t mc = lr[i].max_ctx, p = pos[i];
+            const uint64_t per_layer_kv = uint64_t(cfg_.n_kv_heads) * mc * HD;
+            sycl::half* kc = kv.k_ptr() + per_layer_kv * li;
+            sycl::half* vc = kv.v_ptr() + per_layer_kv * li;
+            const sycl::half* qi = aq_ + uint64_t(i) * NQ;
+            sycl::half* oi = attn_out_ + uint64_t(i) * NQ;
+            if (p + 1 <= dense_ok) {
+                full_attention(q, qi, ak_ + uint64_t(i) * NKV, av_ + uint64_t(i) * NKV, kc, vc, oi, 1, p,
+                               cfg_.n_q_heads, cfg_.n_kv_heads, HD, mc);
+            } else {
+                kv.append(q, li, p, 1, ak_ + uint64_t(i) * NKV, av_ + uint64_t(i) * NKV);
+                const uint32_t kblk = cfg_.indexer_top_k / 4;
+                const uint32_t n_vis = (p + 1) / 4;
+                const bool select = n_vis > kblk;
+                if (select) {
+                    qsa_score(q, idx_q_ + uint64_t(i) * IQW, lr[i].blk_keys + uint64_t(li) * (mc / 4) * IHD, qsa_scores_,
+                              n_vis);
+                    ds4_indexer_topk(q, qsa_scores_, d_pos_ + i, qsa_blk_sel_, 1, n_vis, kblk, /*compress_rate=*/4);
+                }
+                qsa_expand_sel(q, select ? qsa_blk_sel_ : nullptr, kblk, int32_t(p), qsa_sel_, qsa_nsel_);
+                qsa_gather_n(q, kc, vc, qsa_gk_, qsa_gv_, qsa_sel_, qsa_nsel_, qsa_sel_cap_, cfg_.n_kv_heads, HD, mc,
+                             qsa_sel_cap_);
+                qsa_attend_splitk(q, qi, qsa_gk_, qsa_gv_, qsa_nsel_, oi, qsa_part_, cfg_.n_q_heads, cfg_.n_kv_heads, HD,
+                                  qsa_sel_cap_);
+            }
+            kv.set_length(li, p + 1);
+        }
+        sigmoid_gate(q, attn_out_, agate_, attn_out_, uint64_t(G) * NQ);
+        if (w.attnout_q8.qs) q8_rows(attn_out_, w.attnout_q8, blockout_, NQ, H);
+        else                 f16_rows(attn_out_, NQ, w.attn_output, blockout_, H);
+    }
+    qwen4_hc_combine(q, wide_, blockout_, inj_, G, H, HC);
+
+    // ---- ffn site: HC mix -> MoE (+ shared expert) -> HC combine ----
+    hc_mix(w.hc_ffn_norm, w.hc_ffn_down, w.hc_ffn_up, w.hc_ffn_inject);
+    // The grouped MoE body: run_block's sv || dg1 branch (the SAME code the T == 1 decode runs, IE_Q4E_DECODE_GROUPED) at
+    // T = G, without the parity capture, the bisect switches and verify expert parallelism (rows_off_reason refuses those).
+    // A COPY, not a hoist: run_block stays byte for byte. The expert union fits the cache (G <= rows_max()).
+    {
+        const uint32_t NU = cfg_.n_experts_used;
+        ECache& ec = ecache_[L];
+        auto ensure_slot_on = [&](sycl::queue& uq, uint32_t e) -> uint8_t* {
+            int32_t sl = ec.slot_of[e];
+            if (sl >= 0) ++ecache_hits; else ++ecache_misses;
+            if (sl < 0) {
+                uint32_t v = 0; uint64_t best = UINT64_MAX;
+                for (uint32_t c2 = 0; c2 < ecache_slots_; ++c2)
+                    if (ec.last_use[c2] < best) { best = ec.last_use[c2]; v = c2; }
+                if (ec.expert_in[v] >= 0) ec.slot_of[ec.expert_in[v]] = -1;
+                ec.expert_in[v] = int32_t(e);
+                ec.slot_of[e]   = int16_t(v);
+                sl = int32_t(v);
+                uint8_t* dst = static_cast<uint8_t*>(ec.base) + uint64_t(v) * ec.slot_bytes;
+                auto srcp = [&](const Qwen4ExpLayer::BankView& bv) {
+                    return bv.raw ? bv.raw + uint64_t(e) * bv.slice_bytes
+                                  : reinterpret_cast<const uint8_t*>(bv.f16) + uint64_t(e) * bv.slice_bytes;
+                };
+                uq.memcpy(dst + ec.gate_off, srcp(w.gate_bv), w.gate_bv.slice_bytes);
+                uq.memcpy(dst + ec.up_off,   srcp(w.up_bv),   w.up_bv.slice_bytes);
+                uq.memcpy(dst + ec.down_off, srcp(w.down_bv), w.down_bv.slice_bytes);
+            }
+            ec.last_use[uint32_t(sl)] = ++ecache_clock_;
+            return static_cast<uint8_t*>(ec.base) + uint64_t(sl) * ec.slot_bytes;
+        };
+        std::vector<float> rout32(cfg_.n_experts);
+        f16_rows(mixed_, H, w.ffn_gate_inp, router_all_, cfg_.n_experts);
+        sycl::half* r16 = h_router16_;   // pinned [16, n_experts]
+        const auto trw0 = std::chrono::steady_clock::now();
+        q.memcpy(r16, router_all_, uint64_t(G) * cfg_.n_experts * 2).wait();
+        const auto trw1 = std::chrono::steady_clock::now();
+        t_route_wait += std::chrono::duration<double>(trw1 - trw0).count();
+        std::vector<std::vector<std::pair<uint32_t, float>>> tk(G);
+        for (uint32_t vt = 0; vt < G; ++vt) {
+            for (uint32_t e = 0; e < cfg_.n_experts; ++e) rout32[e] = float(r16[uint64_t(vt) * cfg_.n_experts + e]);
+            route_from_logits(rout32.data(), cfg_.n_experts, NU, tk[vt]);
+        }
+        t_route_host += std::chrono::duration<double>(std::chrono::steady_clock::now() - trw1).count();
+        const bool gate_q8  = w.gate_bv.raw != nullptr;   // per-piece bank dispatch (the mixed-bank layers)
+        const bool down_q51 = w.down_bv.raw != nullptr;
+        const auto tms0 = std::chrono::steady_clock::now();
+        // shared expert first (its kernels run while the misses stream on copyq_)
+        if (w.shg_q8.qs) {
+            quantize_q8_1(q, mixed_, act_q8T_, G * H);
+            gemv_q8_0_soa_q8_batched(q, act_q8T_, w.shg_q8.qs, w.shg_q8.d, moe_gT_, H, SEF, G);
+            gemv_q8_0_soa_q8_batched(q, act_q8T_, w.shu_q8.qs, w.shu_q8.d, moe_uT_, H, SEF, G);
+            swiglu(q, moe_gT_, moe_uT_, moe_hT_, uint64_t(G) * SEF);
+            quantize_q8_1(q, moe_hT_, act_q8T_, G * SEF);
+            gemv_q8_0_soa_q8_batched(q, act_q8T_, w.shd_q8.qs, w.shd_q8.d, xg16_, SEF, H, G);
+        } else {
+            f16_rows(mixed_, H, w.ffn_gate_shexp, moe_gT_, SEF);
+            f16_rows(mixed_, H, w.ffn_up_shexp, moe_uT_, SEF);
+            swiglu(q, moe_gT_, moe_uT_, moe_hT_, uint64_t(G) * SEF);
+            f16_rows(moe_hT_, SEF, w.ffn_down_shexp, xg16_, H);
+        }
+        gemv_fp16_dotrows(q, mixed_, H, w.ffn_gate_inp_shexp, sgateT_, H, G);
+        if (gate_q8) quantize_q8_1s(q, mixed_, act_q8sT_, uint64_t(G) * H);
+        {
+            std::vector<char> seen(cfg_.n_experts, 0);
+            uint32_t uni = 0;
+            for (uint32_t vt = 0; vt < G; ++vt)
+                for (const auto& pr : tk[vt])
+                    if (!seen[pr.first]) { seen[pr.first] = 1; ++uni; }
+            if (uni > ecache_slots_) {
+                block_err_ = "qwen4exp rows: expert union " + std::to_string(uni) + " > ecache slots " +
+                             std::to_string(ecache_slots_) + " (layer " + std::to_string(L) + ")";
+                return;
+            }
+        }
+        const uint64_t misses_before = ecache_misses;
+        std::vector<int16_t> slot_of(cfg_.n_experts, -1);
+        uint32_t P = 0;
+        for (uint32_t vt = 0; vt < G; ++vt) {
+            h_tok_idx_[3u * 16 * NU + vt] = int32_t(tk[vt].size());
+            for (uint32_t k = 0; k < uint32_t(tk[vt].size()); ++k) {
+                const uint32_t e = tk[vt][k].first;
+                h_tok_w_[vt * NU + k] = tk[vt][k].second;
+                if (slot_of[e] < 0)
+                    slot_of[e] = int16_t((ensure_slot_on(copyq_ ? *copyq_ : q, e) - static_cast<uint8_t*>(ec.base)) /
+                                         ec.slot_bytes);
+                h_tok_idx_[3u * P + 0] = int32_t(vt);
+                h_tok_idx_[3u * P + 1] = int32_t(slot_of[e]);
+                h_tok_idx_[3u * P + 2] = int32_t(vt * NU + k);
+                ++P;
+            }
+        }
+        if (misses_before != ecache_misses && copyq_)   // q waits for the copyq_ fills (q drained at the router wait)
+            q.ext_oneapi_submit_barrier({copyq_->ext_oneapi_submit_barrier()});
+        q.memcpy(moe_tok_idx_, h_tok_idx_, (3u * 16 * NU + G) * sizeof(int32_t));
+        q.memcpy(moe_tok_w_, h_tok_w_, uint64_t(G) * NU * sizeof(float));
+        if (!gate_q8) {   // F16 gate/up banks (dequantized at load): the per-pick decode leaves
+            for (uint32_t pk = 0; pk < P; ++pk) {
+                const uint32_t vt = uint32_t(h_tok_idx_[3u * pk + 0]);
+                const uint8_t* slot = static_cast<uint8_t*>(ec.base) + uint64_t(h_tok_idx_[3u * pk + 1]) * ec.slot_bytes;
+                const sycl::half* x = mixed_ + uint64_t(vt) * H;
+                gemv_fp16(q, x, reinterpret_cast<const sycl::half*>(slot + ec.gate_off), moe_gT_ + uint64_t(pk) * EF, H, EF);
+                gemv_fp16(q, x, reinterpret_cast<const sycl::half*>(slot + ec.up_off), moe_uT_ + uint64_t(pk) * EF, H, EF);
+            }
+        } else {
+            gemv_q4_K_q8s_grouped_dual(q, act_q8sT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes, ec.gate_off,
+                                       ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P);
+        }
+        swiglu(q, moe_gT_, moe_uT_, moe_hT_, uint64_t(P) * EF);
+        if (!down_q51) {
+            for (uint32_t pk = 0; pk < P; ++pk) {
+                const uint8_t* slot = static_cast<uint8_t*>(ec.base) + uint64_t(h_tok_idx_[3u * pk + 1]) * ec.slot_bytes;
+                gemv_fp16(q, moe_hT_ + uint64_t(pk) * EF, reinterpret_cast<const sycl::half*>(slot + ec.down_off),
+                          moe_yT_ + uint64_t(h_tok_idx_[3u * pk + 2]) * H, EF, H);
+            }
+        } else {
+            gemv_q5_1_grouped(q, moe_hT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes, ec.down_off, moe_tok_idx_,
+                              moe_yT_, H, EF, H, P);
+        }
+        {   // ordered reduce: each row's picks in k order (the decode body's fp32 add chain)
+            const float* wtab = moe_tok_w_;
+            const int32_t* cnt = moe_tok_idx_ + 3u * 16 * NU;
+            const sycl::half* ys = moe_yT_;
+            float* acc = moe_accT_;
+            const uint32_t NU_ = NU, H_ = H;
+            q.parallel_for(sycl::range<1>(uint64_t(G) * H), [=](sycl::id<1> i) {
+                const uint32_t vt = uint32_t(i / H_);
+                const uint32_t hh = uint32_t(i % H_);
+                float a = 0.f;
+                const int32_t nk = cnt[vt];
+                for (int32_t k = 0; k < nk; ++k)
+                    a += wtab[vt * NU_ + uint32_t(k)] * float(ys[(uint64_t(vt) * NU_ + uint32_t(k)) * H_ + hh]);
+                acc[i] = a;
+            });
+        }
+        t_moe_submit += std::chrono::duration<double>(std::chrono::steady_clock::now() - tms0).count();
+        for (uint32_t vt = 0; vt < G; ++vt)
+            sigmoid_scalar_axpy(q, moe_accT_ + uint64_t(vt) * H, xg16_ + uint64_t(vt) * H, sgateT_ + vt, H);
+        cast_f32_to_f16(q, moe_accT_, blockout_, G * H);
+    }
+    qwen4_hc_combine(q, wide_, blockout_, inj_, G, H, HC);
 }
 
 }  // namespace ie

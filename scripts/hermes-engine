@@ -496,6 +496,7 @@ EXTRA_FLAGS=()
 [ "$SPEC" = on ]        && EXTRA_FLAGS+=(--spec)
 [ "$KVQ" = int8 ]       && EXTRA_FLAGS+=(--int8-kv)
 [ "$PARALLEL" != 1 ]    && EXTRA_FLAGS+=(--parallel "$PARALLEL")
+ENGINE_ENV=()   # reset HERE, before anything is added (it used to sit below and wiped the prompt-cache caps)
 # Bounded prompt cache for agent serving: at long --ctx the cache's default
 # worst case (12 entries x full-depth snapshots) overcommits VRAM — the engine
 # now REFUSES such configs at load (2026-08-26 crash lesson). Default the caps
@@ -504,16 +505,12 @@ if [ "$PARALLEL" != 1 ]; then
   [ -z "${IE_PROMPT_CACHE_MAX_PREFIX:-}" ] && ENGINE_ENV+=(IE_PROMPT_CACHE_MAX_PREFIX="${SLOTCTX/auto/24576}")
   [ -z "${IE_PROMPT_CACHE_MAX_ENTRIES:-}" ] && ENGINE_ENV+=(IE_PROMPT_CACHE_MAX_ENTRIES=4)
 fi
-# Model-spec sampling defaults (generation_config.json) for requests that omit
-# fields — Qwen3.8-27B ships temp 1.0 / top_k 20 / top_p 0.95; serving it at
-# the library defaults (0.7/40) is off-spec (2026-08-26 Ω post-mortem).
-if [ "$ARCH" = qwen35dense ] && [ "$TEMP" = default ]; then
-  ENGINE_ENV+=(IE_SERVE_TEMP=1.0 IE_SERVE_TOP_K=20 IE_SERVE_TOP_P=0.95)
-fi
+# Model-spec sampling for requests that omit fields comes from the engine itself
+# (P4 B20: per model AND per thinking/instruct mode, `ie capabilities` "recommended");
+# an IE_SERVE_* pin here would override the instruct-mode values.
 [ "$SLOTCTX" != auto ]  && EXTRA_FLAGS+=(--slot-ctx "$SLOTCTX")
 [ "$TEMP" != default ]  && EXTRA_FLAGS+=(--temp "$TEMP")
 [ "$PFCHUNK" != auto ]  && EXTRA_FLAGS+=(--prefill-chunk "$PFCHUNK")
-ENGINE_ENV=()
 [ "$PCACHE" = off ] && ENGINE_ENV+=(IE_NO_PROMPT_CACHE=1)
 case "$MODE" in
   tp)        case "$ARCH" in

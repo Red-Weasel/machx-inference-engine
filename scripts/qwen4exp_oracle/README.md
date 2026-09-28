@@ -211,7 +211,7 @@ decoder-layer forward executes:
    the GGUF memmap (90 B → 160 fp32 per row); an embedding lookup is an exact row
    gather, so this changes no math.
 
-## Uncertainties (Pineapple rule)
+## Uncertainties
 
 * `norm_topk_prob=True` is an assumption: the key is absent from config.json and
   configuration_qwen4_exp.py is not on disk.  llama.cpp PR27742 hardcodes

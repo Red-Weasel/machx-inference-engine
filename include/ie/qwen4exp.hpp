@@ -191,7 +191,24 @@ public:
     // v0 attention is EXACT dense attention, which equals QSA only while
     // start_pos + T <= indexer.top_k + compress_ratio - 1 (2051 on the real
     // file) — beyond that forward() refuses honestly (QSA lands next).
-    std::string init_runtime(uint32_t max_ctx, uint32_t max_chunk);
+    // lanes / lane_ctx (P4 B8): request lanes 1..lanes-1 at lane_ctx positions (0 = max_ctx; at most max_ctx), allocated
+    // before the expert cache and taken out of its budget. lanes <= 1 (the default) allocates nothing new.
+    std::string init_runtime(uint32_t max_ctx, uint32_t max_chunk, uint32_t lanes = 1, uint32_t lane_ctx = 0);
+
+    // -- P4 B8: request lanes (docs/qwen4exp/P4_B8_LANES.md) ----------------
+    // A lane is one sequence's state on this stage: the KV of the full-attention layers, the QSA indexer's raw and pooled
+    // keys + blk_done, the DeltaNet state + conv, the PLE conv + history, the prompt-cache snapshot, the vision/M-RoPE
+    // staging and the lane's capacity. Lane 0 is the state init_runtime always allocated; with one lane (the default)
+    // nothing new is allocated and select_lane(0) is a no-op, so the launches are the pre-lane ones. select_lane swaps
+    // the lane's state into the live members (pointers, no copy), so a stage runs one lane at a time; the card pipe gives
+    // each stage its own host thread (Glm5LanePipe). Workspaces and the expert cache are shared (the cache holds
+    // immutable weight copies: numerics never depend on it). Refused with the MTP head and in spec-verify mode.
+    std::string select_lane(uint32_t lane);
+    uint32_t n_lanes() const noexcept { return lanes_.empty() ? 1u : uint32_t(lanes_.size()); }
+    uint32_t lane() const noexcept { return lane_; }
+    uint32_t lane_ctx(uint32_t lane) const noexcept;   // a lane's capacity (positions)
+    uint64_t lane_bytes() const noexcept { return lane_bytes_; }   // ONE extra lane's device bytes here (0 with one lane)
+    uint32_t ecache_slots() const noexcept { return ecache_slots_; }
     std::string forward(const int32_t* tokens_host, uint32_t T, uint32_t start_pos,
                         sycl::half* logits_out);
     // Pipeline stage entry: wide_in_host == nullptr -> embed here (needs
@@ -211,23 +228,82 @@ public:
     // stash leaves the live state untouched; unstash overwrites it and sets
     // the depth markers. MTP state is NOT stashed (parallel serving runs
     // plain decode; refuse spec+parallel at the call site).
-    struct SlotState {
-        std::vector<uint8_t>  kv_k, kv_v;   // [L_full*n_kv][depth*hd] f16 packed
-        std::vector<uint8_t>  idxk;         // [nf][depth*idx_hd] f16 packed
-        std::vector<uint8_t>  blkk;         // [nf][ceil(depth/4)*idx_hd] f32
-        std::vector<uint8_t>  dns, dnc;     // DeltaNet f32 state + f16 conv
-        std::vector<uint8_t>  ple;          // PLE conv f32 (empty if no PLE)
+    // P4 B15: the same state over a byte-buffer type -- std::vector<uint8_t> (SlotState, the callers above, unchanged) or
+    // PinnedBytes (pinned host USM: Flash-Next lanes' shared-prefix store, multi-hundred-MB copies).
+    template <class Buf>
+    struct SlotStateT {
+        Buf  kv_k, kv_v;                    // [L_full*n_kv][depth*hd] f16 packed
+        Buf  idxk;                          // [nf][depth*idx_hd] f16 packed
+        Buf  blkk;                          // [nf][ceil(depth/4)*idx_hd] f32
+        Buf  dns, dnc;                      // DeltaNet f32 state + f16 conv
+        Buf  ple;                           // PLE conv f32 (empty if no PLE)
         PleHistory            hist{};
         std::vector<uint32_t> blk_done;
         uint32_t              depth = 0;
     };
-    std::string stash_slot(SlotState& s, uint32_t depth);
-    std::string unstash_slot(const SlotState& s);
+    using SlotState = SlotStateT<std::vector<uint8_t>>;
+    // Pinned host bytes (sycl::malloc_host in the stage queue's context): resize() keeps the allocation when it is big enough,
+    // false when the allocation failed (data() null then).
+    class PinnedBytes {
+    public:
+        explicit PinnedBytes(sycl::queue* q = nullptr) : q_(q) {}
+        ~PinnedBytes() { release(); }
+        PinnedBytes(const PinnedBytes&) = delete;
+        PinnedBytes& operator=(const PinnedBytes&) = delete;
+        PinnedBytes(PinnedBytes&& o) noexcept : q_(o.q_), p_(o.p_), n_(o.n_), cap_(o.cap_) { o.p_ = nullptr; o.n_ = o.cap_ = 0; }
+        PinnedBytes& operator=(PinnedBytes&& o) noexcept {
+            if (this != &o) { release(); q_ = o.q_; p_ = o.p_; n_ = o.n_; cap_ = o.cap_; o.p_ = nullptr; o.n_ = o.cap_ = 0; }
+            return *this;
+        }
+        void bind(sycl::queue* q) { if (q != q_) { release(); q_ = q; } }
+        bool resize(size_t n) {
+            if (n > cap_) {
+                release();
+                if (!q_) return false;
+                p_ = static_cast<uint8_t*>(sycl::malloc_host(n, *q_));
+                if (!p_) return false;
+                cap_ = n;
+            }
+            n_ = n;
+            return true;
+        }
+        uint8_t*       data() noexcept { return p_; }
+        const uint8_t* data() const noexcept { return p_; }
+        size_t size() const noexcept { return n_; }
+        size_t capacity() const noexcept { return cap_; }
+        bool   empty() const noexcept { return n_ == 0; }
+        void   release() noexcept { if (p_ && q_) sycl::free(p_, *q_); p_ = nullptr; n_ = cap_ = 0; }
+    private:
+        sycl::queue* q_ = nullptr;
+        uint8_t* p_ = nullptr;
+        size_t n_ = 0, cap_ = 0;
+    };
+    using PinnedSlotState = SlotStateT<PinnedBytes>;
+    template <class Buf> std::string stash_slot(SlotStateT<Buf>& s, uint32_t depth);
+    template <class Buf> std::string unstash_slot(const SlotStateT<Buf>& s);
 
     std::string forward_range(const int32_t* tokens_host, uint32_t T,
                               uint32_t start_pos, const float* wide_in_host,
                               float* wide_out_host, sycl::half* logits_out,
                               bool wide_in_device = false);
+
+    // -- P4 B17: row batching over request lanes (~/ds41_work/p60/b17) ------
+    // forward_rows: ONE pass over this stage's blocks for G 1-row steps of G distinct lanes (2..rows_max(); lanes[i] at
+    // position pos[i] > 0, token ids[i]). Row i is meant to be bit-identical to lanes[i]'s forward_range(T = 1) step
+    // (ie-q4e-rows-test --exact gates it): the shared work runs once over the G rows with the T == 1 kernels' row-exact
+    // twins -- int-dot GEMVs through gemv_q8_0_soa_q8_batched, F16 GEMVs through gemv_fp16_rows in <= 8-row chunks, the
+    // HC mixes in <= 4-row chunks (qwen4_hc_mix_v2 changes its grid above 4 rows), the grouped MoE body over the rows'
+    // expert union, the head as one batched GEMV -- and the lane state (conv, DeltaNet recurrence, PLE, the indexer caches,
+    // attention / the QSA chain, KV lengths) runs per row at T = 1 on that lane's own buffers. select_lane is never called:
+    // the live lane stays live. Stage A (layer_lo 0) writes wide_out_host [G, hc, H]; the tail stage reads wide_in_host and
+    // leaves row i's logits at rows_logits() + i * vocab. The caller checks rows_off_reason() once (the route must be the
+    // default T == 1 decode route); a lane with vision staging is refused (--parallel > 1 takes no images).
+    static constexpr uint32_t kMaxRows = 16;
+    std::string forward_rows(const uint32_t* lanes, const int32_t* ids, const uint32_t* pos, uint32_t G,
+                             const float* wide_in_host, float* wide_out_host);
+    std::string rows_off_reason() const;   // "" = forward_rows serves this stage
+    uint32_t    rows_max() const noexcept; // the most rows a group may carry here (the expert cache holds their union)
+    sycl::half* rows_logits() const noexcept { return rows_logits_; }   // tail stage, lanes > 1: [kMaxRows, vocab]
     // Vision (docs/qwen4/16_vision_port.md §4). set_vision stages merged ViT
     // rows (f32 [n_rows, hidden], block-major) that overwrite the embed-gather
     // rows at absolute positions [t0, t0+n_rows) on the head stage. set_mrope
@@ -554,6 +630,51 @@ private:
     float*      qsa_part_ = nullptr;      // [n_q, 16, hd+2] split-K partials
     sycl::half *qsa_gk_ = nullptr, *qsa_gv_ = nullptr;  // gathered KV [2, sel_cap, 256]
     uint32_t    qsa_sel_cap_ = 0;
+
+    // P4 B8 request lanes: the parked state of every lane; the slot of the live lane holds an empty placeholder (its
+    // state is in the live members). Empty with one lane. The workspaces stay sized by lane 0's context, which every
+    // lane's context is at most (max_ctx_ is the live lane's: it strides the KV and the indexer caches).
+    struct LaneState {
+        KvCache       kv;
+        DeltaNetState dn;
+        sycl::half*   idx_kcache = nullptr;
+        float*        blk_keys = nullptr;
+        std::vector<uint32_t> blk_done;
+        float*        ple_conv_state = nullptr;
+        PleHistory    ple_hist{};
+        float*        snap_dn_state = nullptr;
+        sycl::half*   snap_dn_conv = nullptr;
+        float*        snap_ple_conv = nullptr;
+        PleHistory    snap_ple_hist{};
+        std::vector<uint32_t> snap_blk_done;
+        uint32_t      snap_depth = 0;
+        std::vector<VisSpan>    vis_spans;
+        std::vector<sycl::half> vis_rows;
+        std::vector<int32_t>    mrope3;
+        uint32_t      mrope_n = 0;
+        int32_t       mrope_delta = 0;
+        uint32_t      max_ctx = 0;
+    };
+    void swap_live(LaneState& s) noexcept;
+    std::vector<LaneState> lanes_;
+    uint32_t lane_ = 0;
+    uint64_t lane_bytes_ = 0;
+
+    // P4 B17 rows: a lane's state by index (the live members for the live lane, else its parked LaneState) -- no swap.
+    struct LaneRef {
+        KvCache*       kv = nullptr;
+        DeltaNetState* dn = nullptr;
+        sycl::half*    idx_kcache = nullptr;
+        float*         blk_keys = nullptr;
+        std::vector<uint32_t>* blk_done = nullptr;
+        float*         ple_conv = nullptr;
+        PleHistory*    ple_hist = nullptr;
+        uint32_t       max_ctx = 0;
+        bool           vision = false;   // mrope / vision spans staged
+    };
+    LaneRef lane_ref(uint32_t lane) noexcept;
+    void run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, const uint32_t* pos, const int32_t* ids);
+    sycl::half* rows_logits_ = nullptr;   // [kMaxRows, vocab] (tail stage, lanes > 1)
 };
 
 }  // namespace ie

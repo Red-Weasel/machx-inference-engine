@@ -2,12 +2,13 @@
 #include "ie/serve_options.hpp"
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <stdexcept>
 int main() {
     for (auto args : {std::vector<std::string>{"--ctx", "-1"},
             {"--ctx", "1"}, {"--ctx", "8"}, {"--slot-ctx", "8"},
             {"--ctx", "12abc"}, {"--temp", "nan"}, {"--top-p", "0"},
-            {"--parallel", "5"}, {"--prefill-chunk", "0"}, {"--threads", "0"},
+            {"--parallel", "17"}, {"--parallel", "0"}, {"--prefill-chunk", "0"}, {"--threads", "0"},
             {"--slot-ctx", "9000", "--ctx", "8000"}, {"--seed", "-1"},
             {"--stop", ""}, {"--thinking", "maybe"}, {"--unknown"}, {"--temp"},
             {"--reasoning-effort","ultra"}, {"--reasoning-effort"},
@@ -18,6 +19,10 @@ int main() {
         catch (const std::exception&) { rejected = true; }
         assert(rejected);
     }
+    // P4 B14: the cap is 16 (ie::kMaxParallel); the arch refuses a count that does not fit at load, not the parser
+    for (const char* n : {"1", "4", "5", "8", "16"})
+        assert(ie::parse_launch_options({"--parallel", n}).engine.parallel == uint32_t(std::atoi(n)));
+    static_assert(ie::kMaxParallel == 16);
     auto minimal = ie::parse_launch_options({"--ctx", "9", "--slot-ctx", "9"});
     assert(minimal.engine.max_ctx == 9 && minimal.engine.slot_ctx == 9);
     assert(minimal.max_queue == 8);
@@ -43,5 +48,14 @@ int main() {
     assert(p.defaults.stop.size() == 2 && p.defaults.stop[1] == "line\nend");
     assert(!p.defaults.enable_thinking);
     assert(p.defaults.reasoning_effort=="high");
+    // P4 B20: every CLI sampling flag marks its field explicit, so it outranks the recommended sampling
+    assert(p.defaults.sampling_set == ie::oai::kSetAllRecommended);
+    assert(minimal.defaults.sampling_set == 0);
+    auto one = ie::parse_launch_options({"--top-p", "0.5"});
+    assert(one.defaults.sampling_set == ie::oai::kSetTopP);
+    ie::oai::ChatRequest r = one.defaults;
+    const auto rec = ie::recommended_sampling(ie::ModelArch::kMimo26);
+    assert(ie::oai::apply_recommended(r, &*rec) == (ie::oai::kSetAllRecommended & ~ie::oai::kSetTopP));
+    assert(r.sampling.top_p == 0.5f && r.sampling.temperature == 1.0f && r.sampling.top_k == 0);
     std::puts("launch controls validation and propagation passed");
 }

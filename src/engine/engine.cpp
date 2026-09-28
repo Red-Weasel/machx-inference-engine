@@ -5,11 +5,16 @@
 #include "ie/engine.hpp"
 #include "ie/ds41_engine.hpp"
 #include "ie/mimo26_engine.hpp"
+#include "ie/mimo26_host_rules.hpp"  // mimo26_vision_refusal (vision_status_json)
 #include "ie/ds41_vision.hpp"        // kDs41VisMaxTok (vision_status_json)
 #include "../../third_party/nlohmann/json.hpp"
 #include "ie/reasoning.hpp"
 #include <future>
 #include "ie/qwen4exp.hpp"
+#include "ie/q4e_lanes.hpp"
+#include "ie/q35m_lanes.hpp"
+#include "ie/q27_lanes.hpp"
+#include "ie/lanes_serve.hpp"
 #include "ie/glm5next.hpp"
 #include "ie/glm5_server.hpp"
 #include "ie/server_capabilities.hpp"
@@ -124,6 +129,402 @@ struct Q4eBundle {
         if (m.empty() && split) m = B.restore();
         return m;
     }
+    // P4 B8 (docs/qwen4exp/P4_B8_LANES.md): --parallel N > 1 on a split load serves N requests at once on N request lanes
+    // through the shared lanes module (ie/lanes_serve.hpp); null at --parallel 1 (the path above, unchanged).
+    std::unique_ptr<LanesModel> lanes;
+    std::unique_ptr<LanesServe> serve;
+    ~Q4eBundle() {
+        if (serve) serve->shutdown();   // the pipe's stage threads and the serial worker end before the models go
+        serve.reset();
+        lanes.reset();
+    }
+};
+
+// P4 B8: Flash-Next's LanesModel -- the hooks the shared lanes module calls. A lane is one sequence's state on BOTH stage
+// objects (Qwen4ExpModel::select_lane on A and on B). Stage 0 of the card pipe runs A's layers into the lane's host residual,
+// stage 1 runs B's layers and leaves the logits in B.logits(); the done callback samples them on card 1 with the engine's
+// own GPU sampler (the kernels --parallel 1 runs on card 0), so a lane's ids are the serial loop's.
+class Q4eLanesModel final : public LanesModel {
+public:
+    // P4 B17: rows = the pipe groups the decoding lanes' 1-row steps (up to max_group a group; group_cap 0 = AUTO, one group
+    // per card) and a group runs as one card step (Qwen4ExpModel::forward_rows); off: the per-lane pipe (B8), unchanged.
+    Q4eLanesModel(Q4eBundle& b, const Tokenizer& tok, const int32_t* stop_ids, const int32_t* tool_ids,
+                  uint32_t pf_chunk, uint32_t n_lanes, bool rows = false, uint32_t max_group = 1, uint32_t group_cap = 0)
+        : b_(b), tok_(tok), pf_chunk_(pf_chunk), pipeline_(std::getenv("IE_Q4E_NO_PIPELINE") == nullptr),
+          snap_(n_lanes), rows_(rows),
+          pipe_(make_pipe(this, b, n_lanes, q4e_plan_max_rows(pf_chunk, pipeline_), rows, max_group, group_cap)) {
+        stop_[0] = tok.eos_token_id(); stop_[1] = stop_ids[0]; stop_[2] = stop_ids[1];
+        tool_[0] = tool_ids[0]; tool_[1] = tool_ids[1];
+    }
+    ~Q4eLanesModel() override {
+        (void)pipe_.stop();
+        if (rows_) {   // P4 B17: how the decode steps grouped (groups that finished every stage, by size)
+            const std::vector<uint64_t> gs = pipe_.group_sizes();
+            std::string line;
+            for (size_t g = 1; g < gs.size(); ++g)
+                if (gs[g]) line += " " + std::to_string(g) + ":" + std::to_string(gs[g]);
+            std::fprintf(stderr, "[qwen4exp] lane rows: groups by size (rows:count)%s\n", line.empty() ? " none" : line.c_str());
+        }
+        sycl::queue& q = b_.B.queue();
+        try { q.wait(); } catch (...) {}
+        for (void* p : dev_) if (p) sycl::free(p, q);
+    }
+    // Per-lane sampler buffers on card 1 (the pick, the repetition window, the prompt's kept logits).
+    std::string init() {
+        sycl::queue& q = b_.B.queue();
+        const uint32_t n = uint32_t(snap_.size());
+        lg_.assign(n, b_.B.logits());
+        if (rows_) {   // P4 B17: a group's picks, one readback
+            picks_dev_  = sycl::malloc_device<int32_t>(n, q);
+            picks_host_ = sycl::malloc_host<int32_t>(n, q);
+            dev_.insert(dev_.end(), {picks_dev_, picks_host_});
+            if (!picks_dev_ || !picks_host_) return "qwen4exp lanes: group sampler buffers alloc failed";
+        }
+        pick_.resize(n); recent_.resize(n); kept_.resize(n);
+        for (uint32_t i = 0; i < n; ++i) {
+            pick_[i]   = sycl::malloc_device<int32_t>(1, q);
+            recent_[i] = sycl::malloc_device<int32_t>(512, q);
+            kept_[i]   = sycl::malloc_device<sycl::half>(b_.cfg.vocab, q);
+            dev_.insert(dev_.end(), {pick_[i], recent_[i], kept_[i]});
+            if (!pick_[i] || !recent_[i] || !kept_[i]) return "qwen4exp lanes: sampler buffers (card 1) alloc failed";
+        }
+        const uint64_t ww = uint64_t(q4e_plan_max_rows(pf_chunk_, pipeline_)) * b_.cfg.hc_count * b_.cfg.hidden;
+        if (b_.wide.size() < ww) b_.wide.resize(ww);
+        if (b_.wide_b.size() < ww) b_.wide_b.resize(ww);
+        return {};
+    }
+    uint64_t host_bytes() const { return pipe_.host_bytes(); }
+
+    const char* tag() const override { return "q4e lanes"; }
+    uint32_t n_lanes() const override { return uint32_t(snap_.size()); }
+    // the engine's rule: a prompt must be below ctx - 8, and the reply fits in ctx - 8 - prompt
+    uint32_t lane_cap(uint32_t lane) const override { const uint32_t c = b_.A.lane_ctx(lane); return c > 8 ? c - 8 : 0; }
+    uint32_t own_match(uint32_t lane, std::span<const int32_t> ids) const override { return q4e_snap_match(snap_[lane], ids); }
+    bool occupied(uint32_t lane) const override { return !snap_[lane].empty(); }
+    uint32_t last_end(uint32_t lane) const override { return uint32_t(snap_[lane].size()); }
+
+    std::string prefix_prepare(uint32_t lane, const LanesRequest& rq, uint32_t& reused, std::string& source) override {
+        reused = 0;
+        if (auto e = select(lane); !e.empty()) return e;
+        // --parallel 1's rule: restore only when the snapshot's tokens are a STRICT prefix of the prompt (all or nothing)
+        const uint32_t D = q4e_snap_match(snap_[lane], *rq.ids);
+        // P4 B15: a longer SHARED prefix (another lane's, from the host store) is copied in whole: KV rows, indexer caches,
+        // DeltaNet / PLE state -- the lane's own snapshot is void after (its KV rows are overwritten)
+        if (SharedEntry* se = shared_best(*rq.ids, b_.A.lane_ctx(lane)); se && se->a.depth > D) {
+            const auto t0 = std::chrono::steady_clock::now();
+            std::string e = b_.A.unstash_slot(se->a);
+            if (e.empty()) e = b_.B.unstash_slot(se->b);
+            if (e.empty()) {
+                se->tick = ++shared_tick_;
+                reused = se->a.depth; source = "shared";
+                b_.A.drop_snapshot(); b_.B.drop_snapshot();
+                snap_[lane].clear();
+                b_.A.clear_vision(); b_.B.clear_vision();
+                std::fprintf(stderr, "[q4e lanes] lane %u: shared prefix %u restored (%.1f ms)\n", lane, reused,
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                return {};
+            }
+            // a part-copied lane: its own snapshot's KV rows may be overwritten too -- a new sequence
+            std::fprintf(stderr, "[q4e lanes] lane %u shared-prefix restore: %s; full prefill\n", lane, e.c_str());
+            source = "none";
+            b_.A.reset_state(); b_.B.reset_state();
+            b_.A.drop_snapshot(); b_.B.drop_snapshot();
+            snap_[lane].clear();
+            return {};
+        }
+        if (D > 0 && b_.A.snapshot_depth() == D) {
+            if (auto e = b_.rest(); e.empty()) {
+                reused = D; source = "snapshot";
+                b_.A.clear_vision(); b_.B.clear_vision();
+                return {};
+            } else std::fprintf(stderr, "[q4e lanes] lane %u restore: %s\n", lane, e.c_str());
+        }
+        source = "none";
+        b_.A.reset_state(); b_.B.reset_state();   // a new sequence (drops the lane's snapshot)
+        snap_[lane].clear();
+        return {};
+    }
+    // --parallel 1's prefill_to(snap_at), snapshot, prefill_to(T): the pipe's part ends at the snapshot boundary when one is due
+    LanesPlan plan(const LanesRequest& rq, uint32_t reused) override {
+        LanesPlan p;
+        const uint32_t T = uint32_t(rq.ids->size());
+        p.Tp = rq.snap_at > reused ? rq.snap_at : T;
+        // P4 B15: cut at the shared-prefix boundary as --parallel 1 does (prefill_to(share_at), prefill_to(snap_at))
+        q4e_plan_split(reused, p.Tp, rq.share_at, pf_chunk_, pipeline_, p.chunks);
+        if (rq.share_at > reused && rq.share_at < p.Tp) p.mark = rq.share_at;
+        return p;
+    }
+    // P4 B15: the lane's state at pos (== the shared-prefix boundary) into the host store, whole (Qwen4ExpModel::stash_slot into
+    // pinned host memory), restorable into any lane. LRU within IE_Q4E_SHARED_PREFIX_GIB (default 2; 0 = no store).
+    std::string mark(uint32_t lane, const LanesRequest& rq, uint32_t pos) override {
+        if (shared_cap_ == 0) return {};
+        const std::vector<int32_t> pref(rq.ids->begin(), rq.ids->begin() + pos);
+        std::lock_guard<std::mutex> g(shared_mu_);
+        for (auto& e : shared_) if (e->tokens == pref) { e->tick = ++shared_tick_; return {}; }   // (already stored)
+        if (auto e = select(lane); !e.empty()) return e;
+        const auto t0 = std::chrono::steady_clock::now();
+        auto ent = std::make_unique<SharedEntry>();
+        bind(ent->a, &b_.A.queue()); bind(ent->b, &b_.B.queue());
+        std::string e = b_.A.stash_slot(ent->a, pos);
+        if (e.empty()) e = b_.B.stash_slot(ent->b, pos);
+        if (!e.empty()) return "shared prefix " + std::to_string(pos) + ": " + e;
+        ent->tokens = pref; ent->tick = ++shared_tick_; ent->bytes = slot_bytes(ent->a) + slot_bytes(ent->b);
+        if (ent->bytes > shared_cap_)
+            return "shared prefix " + std::to_string(pos) + ": " + std::to_string(ent->bytes >> 20) + " MiB > the store's " +
+                   std::to_string(shared_cap_ >> 20) + " MiB (IE_Q4E_SHARED_PREFIX_GIB); not kept";
+        shared_.push_back(std::move(ent));
+        uint64_t total = 0;
+        for (auto& x : shared_) total += x->bytes;
+        while (total > shared_cap_) {   // evict the least recently used other entry
+            size_t v = 0;
+            for (size_t i = 1; i + 1 < shared_.size(); ++i) if (shared_[i]->tick < shared_[v]->tick) v = i;
+            total -= shared_[v]->bytes;
+            shared_.erase(shared_.begin() + long(v));
+        }
+        std::fprintf(stderr, "[q4e lanes] lane %u: shared prefix %u stored (%.0f MiB pinned, %zu entries, %.0f MiB; %.1f ms)\n", lane, pos,
+                     shared_.back()->bytes / 1048576.0, shared_.size(), total / 1048576.0,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        return {};
+    }
+    uint32_t cache_peek(const LanesRequest& rq) const override {
+        std::lock_guard<std::mutex> g(shared_mu_);
+        uint32_t best = 0;
+        for (const auto& e : shared_)
+            if (q4e_snap_match(e->tokens, *rq.ids) > best) best = uint32_t(e->tokens.size());
+        return best;
+    }
+    std::string prefill_serial(uint32_t lane, const LanesRequest& rq, std::span<const LanesChunk> chunks,
+                               const std::function<bool()>& stop, size_t& done) override {
+        done = 0;
+        if (auto e = select(lane); !e.empty()) return e;
+        return run_chunks(rq.ids->data(), chunks, stop, done);
+    }
+    std::string prompt_end(uint32_t lane, const LanesRequest& rq, uint32_t Tp, uint32_t reused, bool kept) override {
+        if (auto e = select(lane); !e.empty()) return e;
+        const std::vector<int32_t>& ids = *rq.ids;
+        const uint32_t T = uint32_t(ids.size());
+        if (rq.snap_at > reused && Tp == rq.snap_at) {   // --parallel 1's snapshot at the stable conversation depth
+            if (auto e = b_.snap(Tp); e.empty()) snap_[lane].assign(ids.begin(), ids.begin() + Tp);
+            else { snap_[lane].clear(); std::fprintf(stderr, "[q4e lanes] lane %u snapshot: %s\n", lane, e.c_str()); }
+        }
+        if (Tp < T) {
+            std::vector<LanesChunk> rest;
+            q4e_plan_range(Tp, T, pf_chunk_, pipeline_, rest);
+            size_t done = 0;
+            if (auto e = run_chunks(ids.data(), rest, {}, done); !e.empty()) return e;
+            kept = false;
+        }
+        if (!kept) { lg_[lane] = b_.B.logits(); keep_logits(lane); }   // (the serial chunks' logits)
+        return {};
+    }
+    std::string reset_lane(uint32_t lane) override {
+        // the pipe's record first (position 0, a failed step's mark cleared): it touches no device state, and it must happen
+        // even when the model's reset below returns early or throws (the B9 gate's finding 1), or the lane stays unusable
+        const std::string pe = pipe_.reset_lane(lane);
+        try {
+            if (auto e = select(lane); !e.empty()) return e;
+            b_.A.reset_state(); b_.B.reset_state();
+        } catch (const sycl::exception& x) { return x.what(); }
+        snap_[lane].clear();
+        return pe;
+    }
+    int32_t sample(uint32_t lane, bool first, const LanesSampling& sp, std::span<const int32_t> window, uint64_t seed,
+                   std::string& err) override {
+        sycl::queue& q = b_.B.queue();
+        sycl::half* lg = first ? kept_[lane] : lg_[lane];
+        const uint32_t V = b_.cfg.vocab;
+        int32_t pick = 0;
+        try {
+            if (!window.empty()) {
+                q.memcpy(recent_[lane], window.data(), window.size() * sizeof(int32_t));
+                sampling_penalties(q, lg, V, recent_[lane], uint32_t(window.size()), sp.repeat_penalty, sp.presence_penalty,
+                                   sp.frequency_penalty);
+            }
+            sample_softmax_topk_topp(q, lg, pick_[lane], V, sp.temperature, sp.top_k, sp.top_p, sp.min_p, seed);
+            q.memcpy(&pick, pick_[lane], sizeof(pick)).wait();
+        } catch (const sycl::exception& x) { err = x.what(); }
+        return pick;
+    }
+    void keep_logits(uint32_t lane) override {
+        b_.B.queue().memcpy(kept_[lane], lg_[lane], uint64_t(b_.cfg.vocab) * sizeof(sycl::half)).wait();
+    }
+    // P4 B17: a group's ids -- per row sample()'s kernels on that lane's logits row (penalties, then the sampler into the
+    // row's slot), then ONE readback of the G picks through pinned host memory (the crown's B14 sample_rows)
+    std::string sample_rows(std::span<const uint32_t> lanes, std::span<const LanesSampling* const> sp,
+                            std::span<const std::span<const int32_t>> windows, std::span<const uint64_t> seeds,
+                            std::span<int32_t> picks) override {
+        sycl::queue& q = b_.B.queue();
+        const uint32_t G = uint32_t(lanes.size()), V = b_.cfg.vocab;
+        if (!picks_dev_ || G > n_lanes()) return "sample_rows: " + std::to_string(G) + " rows, " + std::to_string(n_lanes()) + " lanes";
+        try {
+            for (uint32_t r = 0; r < G; ++r) {
+                const uint32_t lane = lanes[r];
+                const LanesSampling& s = *sp[r];
+                sycl::half* lg = lg_[lane];
+                if (!windows[r].empty()) {
+                    q.memcpy(recent_[lane], windows[r].data(), windows[r].size() * sizeof(int32_t));
+                    sampling_penalties(q, lg, V, recent_[lane], uint32_t(windows[r].size()), s.repeat_penalty, s.presence_penalty,
+                                       s.frequency_penalty);
+                }
+                sample_softmax_topk_topp(q, lg, picks_dev_ + r, V, s.temperature, s.top_k, s.top_p, s.min_p, seeds[r]);
+            }
+            q.memcpy(picks_host_, picks_dev_, G * sizeof(int32_t)).wait();
+        } catch (const sycl::exception& x) { return x.what(); }
+        for (uint32_t r = 0; r < G; ++r) picks[r] = picks_host_[r];
+        return {};
+    }
+    bool is_stop(int32_t id) const override { return id == stop_[0] || id == stop_[1] || id == stop_[2]; }
+    std::string detok(std::span<const int32_t> out) const override {
+        return tok_.decode(out, /*skip_special=*/true, /*keep_special=*/std::span<const int32_t>(tool_, 2));
+    }
+    std::string pipe_start(DoneFn done) override { return pipe_.start(std::move(done)); }
+    bool        rows() const override { return rows_; }
+    std::string pipe_start_rows(DoneFn done, RowsDoneFn rows_done) override { return pipe_.start(std::move(done), std::move(rows_done)); }
+    std::string pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) override { return pipe_.submit(lane, ids, T, pos0); }
+    std::string pipe_pause() override { return pipe_.pause(); }
+    std::string pipe_resume() override { return pipe_.resume(); }
+    bool        pipe_paused() const override { return pipe_.paused(); }
+    std::string pipe_stop() override { return pipe_.stop(); }
+    std::string pipe_error() const override { return pipe_.error(); }
+    uint32_t    pipe_max_rows() const override { return pipe_.max_rows(); }
+
+private:
+    // The card pipe: the B8 per-lane pipe, or (rows) the same pipe with the rows stage (CardPipe's second constructor; the
+    // group pool's host buffers are made here, at load). A prvalue per branch (CardPipe is neither copied nor moved).
+    static CardPipe make_pipe(Q4eLanesModel* self, const Q4eBundle& b, uint32_t n_lanes, uint32_t max_rows, bool rows,
+                              uint32_t max_group, uint32_t group_cap) {
+        const uint64_t wide_row = uint64_t(b.cfg.hc_count) * b.cfg.hidden;
+        if (!rows)
+            return CardPipe(n_lanes, max_rows, wide_row, 2,
+                            [self](uint32_t s, const Glm5LanePipe::Step& st) { return self->stage(s, st); });
+        return CardPipe(n_lanes, max_rows, wide_row, 2,
+                        [self](uint32_t s, const Glm5LanePipe::Step& st) { return self->stage(s, st); },
+                        [self](uint32_t s, std::span<const Glm5LanePipe::Step> steps, float* gw) {
+                            return self->stage_rows(s, steps, gw);
+                        },
+                        max_group, group_cap);
+    }
+    std::string select(uint32_t lane) {
+        if (auto e = b_.A.select_lane(lane); !e.empty()) return e;
+        return b_.B.select_lane(lane);
+    }
+    // P4 B15: the shared-prefix store (host, pinned; see mark)
+    struct SharedEntry {
+        std::vector<int32_t> tokens;
+        Qwen4ExpModel::PinnedSlotState a, b;   // stage A (card 0) / stage B (card 1)
+        uint64_t tick = 0, bytes = 0;
+    };
+    static void bind(Qwen4ExpModel::PinnedSlotState& s, sycl::queue* q) {
+        for (auto* x : {&s.kv_k, &s.kv_v, &s.idxk, &s.blkk, &s.dns, &s.dnc, &s.ple}) x->bind(q);
+    }
+    static uint64_t slot_bytes(const Qwen4ExpModel::PinnedSlotState& s) {
+        return s.kv_k.capacity() + s.kv_v.capacity() + s.idxk.capacity() + s.blkk.capacity() + s.dns.capacity() + s.dnc.capacity() +
+               s.ple.capacity();
+    }
+    // the deepest stored prefix of ids that fits a lane of `cap` positions (strictly shorter than ids)
+    SharedEntry* shared_best(const std::vector<int32_t>& ids, uint32_t cap) {
+        std::lock_guard<std::mutex> g(shared_mu_);
+        SharedEntry* best = nullptr;
+        for (auto& e : shared_)
+            if (e->tokens.size() < cap && q4e_snap_match(e->tokens, ids) && (!best || e->tokens.size() > best->tokens.size()))
+                best = e.get();
+        return best;
+    }
+    static uint64_t shared_cap_env() {
+        double gib = 2.0;
+        if (const char* v = std::getenv("IE_Q4E_SHARED_PREFIX_GIB")) gib = std::max(0.0, std::atof(v));
+        return uint64_t(gib * 1073741824.0);
+    }
+    std::vector<std::unique_ptr<SharedEntry>> shared_;
+    mutable std::mutex shared_mu_;
+    uint64_t shared_tick_ = 0;
+    uint64_t shared_cap_ = shared_cap_env();
+    // One stage of one lane's step (a stage thread; only this thread touches its stage object while the pipe runs).
+    std::string stage(uint32_t s, const Glm5LanePipe::Step& st) {
+        Qwen4ExpModel& M = s == 0 ? b_.A : b_.B;
+        if (auto e = M.select_lane(st.lane); !e.empty()) return e;
+        if (st.pos0 == 0) M.reset_state();   // a new sequence (the forward's pos 0 rule)
+        std::string e = s == 0 ? M.forward_range(st.ids, st.T, st.pos0, nullptr, st.wide, nullptr)
+                               : M.forward_range(st.ids, st.T, st.pos0, st.wide, nullptr, nullptr);
+        if (!e.empty()) { try { M.queue().wait(); } catch (...) {} }   // nothing of a failed step still reads the lane's buffers
+        else if (s == 1) lg_[st.lane] = M.logits();
+        return e;
+    }
+    // P4 B17: one card's part of a group's step (G >= 2 lanes, one row each); card 1 leaves row r's logits at
+    // rows_logits() + r * vocab, lane steps[r].lane's until its callback ran (the card's next step waits for it)
+    std::string stage_rows(uint32_t s, std::span<const Glm5LanePipe::Step> steps, float* gwide) {
+        const uint32_t G = uint32_t(steps.size());
+        if (G > Qwen4ExpModel::kMaxRows) return "stage_rows: " + std::to_string(G) + " rows";
+        Qwen4ExpModel& M = s == 0 ? b_.A : b_.B;
+        uint32_t lanes[Qwen4ExpModel::kMaxRows], pos[Qwen4ExpModel::kMaxRows];
+        int32_t ids[Qwen4ExpModel::kMaxRows];
+        for (uint32_t r = 0; r < G; ++r) { lanes[r] = steps[r].lane; ids[r] = steps[r].ids[0]; pos[r] = steps[r].pos0; }
+        std::string e;
+        try {
+            e = s == 0 ? M.forward_rows(lanes, ids, pos, G, nullptr, gwide) : M.forward_rows(lanes, ids, pos, G, gwide, nullptr);
+        } catch (const std::exception& x) { e = x.what(); }   // (any throw, then the drain below)
+        if (!e.empty()) { try { M.queue().wait(); } catch (...) {} }
+        else if (s == 1)
+            for (uint32_t r = 0; r < G; ++r) lg_[lanes[r]] = M.rows_logits() + uint64_t(r) * b_.cfg.vocab;
+        return e;
+    }
+    // Chunks on the selected lane, stage B of chunk k beside stage A of chunk k + 1 (Q4eBundle::fwd_pipelined's overlap:
+    // the same launches, bit-identical to serial), `stop` asked before each chunk after the first.
+    std::string run_chunks(const int32_t* ids, std::span<const LanesChunk> ch, const std::function<bool()>& stop, size_t& done) {
+        done = 0;
+        float* wb2[2] = {b_.wide.data(), b_.wide_b.data()};
+        std::future<std::string> bfut;
+        std::string err;
+        size_t k = 0;
+        for (; k < ch.size(); ++k) {
+            if (k > 0 && stop && stop()) break;
+            const auto [p0, n] = ch[k];
+            float* wb = wb2[k & 1];
+            if (auto e = b_.A.forward_range(ids + p0, n, p0, nullptr, wb, nullptr); !e.empty()) { err = "A: " + e; break; }
+            if (bfut.valid()) {
+                if (auto e = bfut.get(); !e.empty()) { err = "B: " + e; break; }
+                ++done;
+            }
+            Qwen4ExpModel* Bp = &b_.B;
+            bfut = std::async(std::launch::async, [Bp, wb, n, p0]() {
+                return Bp->forward_range(nullptr, n, p0, wb, nullptr, nullptr);
+            });
+        }
+        if (bfut.valid()) {
+            const std::string e = bfut.get();
+            if (e.empty()) ++done;
+            else if (err.empty()) err = "B: " + e;
+        }
+        return err;
+    }
+
+    Q4eBundle& b_;
+    const Tokenizer& tok_;
+    uint32_t pf_chunk_;
+    bool pipeline_;
+    std::vector<std::vector<int32_t>> snap_;   // per lane: the tokens of its prompt-cache snapshot (empty = none)
+    bool rows_;
+    CardPipe pipe_;
+    int32_t stop_[3] = {-1, -1, -1};
+    int32_t tool_[2] = {-1, -1};
+    std::vector<int32_t*> pick_, recent_;
+    std::vector<sycl::half*> kept_;
+    std::vector<sycl::half*> lg_;          // [lane] where its last pipe step's logits are (card 1): B.logits() or a rows row
+    int32_t* picks_dev_ = nullptr;         // [n_lanes] a group's picks (card 1; rows only)
+    int32_t* picks_host_ = nullptr;        // [n_lanes] pinned host (rows only)
+    std::vector<void*> dev_;
+};
+
+// P4 B10 (docs/lanes/LANES_SERVE.md): the crown split at --parallel N > 1 -- the shared lanes module over the
+// model's request lanes; the hooks are Q35mLanesModel (defined beside Engine::q35m_lanes_init).
+struct Q35mLanes {
+    std::unique_ptr<LanesModel> lanes;
+    std::unique_ptr<LanesServe> serve;
+    ~Q35mLanes() {
+        if (serve) serve->shutdown();   // the pipe's stage threads and the serial worker end before the hooks go
+        serve.reset();
+        lanes.reset();
+    }
 };
 
 struct Glm5Bundle {
@@ -198,6 +599,10 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                                      std::string& err) {
     if (opts_in.max_ctx < 9 || (opts_in.slot_ctx && opts_in.slot_ctx < 9)) {
         err = "context and nonzero slot context must be at least 9 tokens";
+        return nullptr;
+    }
+    if (opts_in.parallel > kMaxParallel) {
+        err = "parallel " + std::to_string(opts_in.parallel) + " exceeds the engine's " + std::to_string(kMaxParallel);
         return nullptr;
     }
     auto e = std::unique_ptr<Engine>(new Engine());
@@ -432,6 +837,18 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                 else
                     e->spec_ = true;
             }
+            // P4 B18: --parallel N > 1 = N request lanes served by the shared lanes module (lane 0 = the live state at --ctx,
+            // lanes 1..N-1 at --slot-ctx, 0 = 65,536; Engine::q27_lanes_init after the tokenizer). IE_QWEN35_LANES=0 keeps the
+            // joint-step path (slot banks + BatchStepper), and so does --spec (spec_generate runs on the live state, which the
+            // lanes use as lane 0). (--int8-kv with --parallel > 1 is refused at the CLI; init_lanes refuses it too.)
+            const bool q27_lanes = opts.parallel > 1 && !e->spec_ &&
+                                   [] { const char* v = std::getenv("IE_QWEN35_LANES"); return !(v && *v == '0'); }();
+            if (opts.parallel > 1 && !q27_lanes)
+                std::fprintf(stderr, "[qwen35split] --parallel %u: the joint-step path (%s)\n", opts.parallel,
+                             e->spec_ ? "--spec" : "IE_QWEN35_LANES=0");
+            // IE_QWEN35_SHARED_PREFIX=1: the shared-prefix split + snapshot at --parallel 1 AND on the lanes (off: --parallel 1's
+            // prefill as before B18, and the lanes match it)
+            e->q27_share_ = std::getenv("IE_QWEN35_SHARED_PREFIX") && std::string(std::getenv("IE_QWEN35_SHARED_PREFIX")) == "1";
             // --- Load-time VRAM budget check (added after the 2026-08-26
             // desktop crash). This stack has NO free-VRAM query and driver
             // OOM at run time is NOT graceful — it killed the xe driver and
@@ -464,7 +881,8 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                         dnb = dn.state_elems_per_layer() * dn.config().n_layers_linear * 4 +
                               dn.conv_elems_per_layer()  * dn.config().n_layers_linear * 2;
                     }
-                    const uint64_t banks = (n_par > 1) ? n_par * (kv_slot + dnb) : 0;
+                    // (the lanes: n_par - 1 extra, lane 0 is the live state; the joint step: n_par banks)
+                    const uint64_t banks = (n_par > 1) ? (q27_lanes ? n_par - 1 : n_par) * (kv_slot + dnb) : 0;
                     uint64_t cache = 0;
                     if (e->prompt_cache_on_) {
                         const uint64_t ep_tok = std::min<uint64_t>(
@@ -503,7 +921,18 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             // --parallel>1: allocate the per-slot decode banks and spawn the
             // joint-step scheduler (Phase 2b). Bank alloc failure is a clean
             // load-time refusal — shrink --slot-ctx or --parallel to fit.
-            if (opts.parallel > 1) {
+            // P4 B14: --parallel <= kMaxParallel (Engine::load) is what forward_slots batches, so every slot fits one step
+            static_assert(kMaxParallel <= Qwen35SplitModel::kMaxSlots, "--parallel above the 27B split path's batched-step cap");
+            if (q27_lanes) {
+                constexpr uint64_t kReserve = 1536ull << 20;   // per card, left free after the lanes (the crown's pick, not measured)
+                const uint32_t pf = q27_prefill_chunk(opts.max_ctx, std::getenv("IE_QWEN35_PREFILL_CHUNK"));
+                if (auto m = e->qwen35_split_model_.init_lanes(opts.parallel, q27_lane_ctx(opts.slot_ctx, opts.max_ctx), pf, kReserve);
+                    !m.empty()) {
+                    err = "qwen35 split --parallel " + std::to_string(opts.parallel) + ": " + m +
+                          " (IE_QWEN35_LANES=0 serves them through the joint-step path)";
+                    return nullptr;
+                }
+            } else if (opts.parallel > 1) {
                 uint32_t sctx = opts.slot_ctx ? opts.slot_ctx : 65536u;
                 sctx = std::min<uint32_t>(sctx, opts.max_ctx);
                 if (auto m = e->qwen35_split_model_.alloc_slot_banks(opts.parallel, sctx);
@@ -804,10 +1233,29 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             pcfg.max_prefix_len = opts.max_ctx;
             if (const char* s = std::getenv("IE_PROMPT_CACHE_MAX_PREFIX"))
                 if (unsigned v = unsigned(std::atoi(s))) pcfg.max_prefix_len = v;
+            // P4 B15 (B14 gate #8): the entry cap, as the 27B split honours it (default 12). With 12, a server that runs more
+            // than ~6 conversations between a conversation's turns evicts its snapshot (every turn inserts the conversation
+            // depth and, on non-thinking templates, the reply): its follow-up then reports 0 cached. Each entry is VRAM sized
+            // by its depth; nothing budgets it at load (a failed snapshot allocation is skipped), so raise it with care.
+            if (const char* s = std::getenv("IE_PROMPT_CACHE_MAX_ENTRIES"))
+                if (unsigned v = unsigned(std::atoi(s))) pcfg.max_entries = v;
             if (auto m = e->fleet_cache_.init(e->qwen35moe_split_model_, pcfg); !m.empty()) {
                 err = "crown-split prompt-cache: " + m; return nullptr;
             }
             e->prompt_cache_on_ = true;
+        }
+        // P4 B10: --parallel N > 1 = N request lanes on the two cards (lanes 1..N-1 at --slot-ctx, 0 = 32,768), served together
+        // by the lanes module (Engine::q35m_lanes_init, after the tokenizer). IE_Q35MOE_LANES=0 keeps the one-at-a-time path.
+        if (opts.parallel > 1 && [] { const char* v = std::getenv("IE_Q35MOE_LANES"); return !(v && *v == '0'); }()) {
+            constexpr uint64_t kReserve = 1536ull << 20;   // per card, left free after the lanes (a pick, unverified)
+            const uint32_t pf = q35m_prefill_chunk(opts.max_ctx, std::getenv("IE_QWEN36_NO_MOE_ONEDNN"),
+                                                   std::getenv("IE_QWEN36_MOE_ONEDNN"), std::getenv("IE_QWEN35_PREFILL_CHUNK"));
+            if (auto m = e->qwen35moe_split_model_.init_lanes(opts.parallel, q4e_lane_ctx(opts.slot_ctx, opts.max_ctx), pf,
+                                                               kReserve); !m.empty()) {
+                err = "qwen35moe --parallel " + std::to_string(opts.parallel) + ": " + m +
+                      " (IE_Q35MOE_LANES=0 serves the requests one at a time)";
+                return nullptr;
+            }
         }
         vocab = e->qwen35moe_split_model_.config().vocab;
     } else if (e->arch_ == ModelArch::kGlm5Next) {
@@ -954,11 +1402,24 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         }
         e->opts_.prefill_chunk = chunk;
         b->split = opts.n_gpus >= 2;
+        // P4 B8: --parallel N > 1 on two cards = N request lanes per stage (lanes 1..N-1 at --slot-ctx, out of the expert
+        // cache) served by the lanes module. One card, or IE_Q4E_LANES=0, keeps the time-sliced path.
+        const bool lanes_off = [] { const char* v = std::getenv("IE_Q4E_LANES"); return v && *v == '0'; }();
+        const uint32_t n_lanes = (opts.parallel > 1 && b->split && !lanes_off) ? opts.parallel : 1u;
+        const uint32_t lane_ctx = q4e_lane_ctx(opts.slot_ctx, opts.max_ctx);
+        if (n_lanes > 1 && q4e_p2p) {
+            err = "qwen4exp: --parallel " + std::to_string(opts.parallel) + " request lanes run the host handoff; unset IE_P2P "
+                  "(or IE_Q4E_LANES=0 for the time-sliced path)";
+            e->q4e_.reset(); return nullptr;
+        }
+        if (opts.parallel > 1 && n_lanes == 1)
+            std::fprintf(stderr, "[qwen4exp] --parallel %u: time-sliced (%s)\n", opts.parallel,
+                         lanes_off ? "IE_Q4E_LANES=0" : "request lanes need two cards");
         const uint32_t hi = b->split ? b->cfg.n_layers / 2 : b->cfg.n_layers;
         if (auto m = b->A.load(e->alloc_, e->gguf_, b->cfg, 0, 0, hi); !m.empty()) {
             err = "qwen4exp A: " + m; e->q4e_.reset(); return nullptr;
         }
-        if (auto m = b->A.init_runtime(opts.max_ctx, chunk); !m.empty()) {
+        if (auto m = b->A.init_runtime(opts.max_ctx, chunk, n_lanes, lane_ctx); !m.empty()) {
             err = "qwen4exp A runtime: " + m; e->q4e_.reset(); return nullptr;
         }
         if (b->split) {
@@ -973,7 +1434,7 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             if (auto m = b->B.load(b->a1, e->gguf_, b->cfg, 0, hi, b->cfg.n_layers); !m.empty()) {
                 err = "qwen4exp B: " + m; e->q4e_.reset(); return nullptr;
             }
-            if (auto m = b->B.init_runtime(opts.max_ctx, chunk); !m.empty()) {
+            if (auto m = b->B.init_runtime(opts.max_ctx, chunk, n_lanes, lane_ctx); !m.empty()) {
                 err = "qwen4exp B runtime: " + m; e->q4e_.reset(); return nullptr;
             }
             if (b->p2p) b->A.set_wide_peer(b->B.wide_device());
@@ -1328,6 +1789,46 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
     if (e->tool_call_ids_[0] == -1 || e->tool_call_ids_[1] == -1)
         fprintf(stderr, "[ie] warning: model vocab lacks <tool_call> markers;"
                         " tool-call text may lose framing\n");
+    // P4 B8: Flash-Next's request lanes (allocated by init_runtime above) go to the shared lanes module; the stop set and the
+    // tool-call ids it needs are known only here.
+    if (e->q4e_ && e->q4e_->A.n_lanes() > 1) {
+        Q4eBundle& b = *e->q4e_;
+        // P4 B17: rows (the decoding lanes' steps grouped into one card step each) on by default when both stages can serve
+        // them; IE_Q4E_ROWS=0 = the per-lane pipe; IE_Q4E_GROUP_LANES = a fixed group cap (0 / unset = AUTO: one group per
+        // card). A group carries at most min(A, B).rows_max() rows (each stage's expert cache holds the group's union).
+        std::string rows_why = b.A.rows_off_reason();
+        if (!rows_why.empty()) rows_why = "stage A: " + rows_why;
+        else if (std::string wb = b.B.rows_off_reason(); !wb.empty()) rows_why = "stage B: " + wb;
+        const char* rv = std::getenv("IE_Q4E_ROWS");
+        const bool rows = rows_why.empty() && !(rv && std::string(rv) == "0");
+        const uint32_t max_group = std::min(b.A.rows_max(), b.B.rows_max());
+        uint32_t gcap = 0;
+        if (const char* v = std::getenv("IE_Q4E_GROUP_LANES")) gcap = uint32_t(std::clamp(std::atoi(v), 0, int(max_group)));
+        auto lm = std::make_unique<Q4eLanesModel>(b, e->tok_, e->stop_ids_, e->tool_call_ids_, e->opts_.prefill_chunk,
+                                                  b.A.n_lanes(), rows, rows ? max_group : 1u, gcap);
+        if (auto m = lm->init(); !m.empty()) { err = m; return nullptr; }
+        std::fprintf(stderr, "[qwen4exp] %u request lanes (lane 0 ctx %u, lanes 1..%u ctx %u; %.2f + %.2f GiB VRAM per extra "
+                             "lane, host %.2f GiB): ie serve --parallel decodes them together through the card pipe\n",
+                     b.A.n_lanes(), b.A.lane_ctx(0), b.A.n_lanes() - 1, b.A.lane_ctx(1), b.A.lane_bytes() / 1073741824.0,
+                     b.B.lane_bytes() / 1073741824.0, lm->host_bytes() / 1073741824.0);
+        if (rows) std::fprintf(stderr, "[qwen4exp] lane rows ON: decoding lanes' steps grouped, up to %u rows a card step "
+                                       "(%u / %u expert slots/layer), group cap %s (IE_Q4E_ROWS=0 = one lane a step)\n",
+                               max_group, b.A.ecache_slots(), b.B.ecache_slots(),
+                               gcap ? std::to_string(gcap).c_str() : "AUTO (one group per card)");
+        else std::fprintf(stderr, "[qwen4exp] lane rows OFF (%s): one lane a card step\n",
+                          rows_why.empty() ? "IE_Q4E_ROWS=0" : rows_why.c_str());
+        LanesServe::Options so;
+        if (const char* v = std::getenv("IE_Q4E_MIX_CHUNK")) so.mix_chunk = uint32_t(std::max(0, std::atoi(v)));
+        if (const char* v = std::getenv("IE_Q4E_STEP_TRACE")) so.trace = *v == '1';
+        b.lanes = std::move(lm);
+        b.serve = std::make_unique<LanesServe>(*b.lanes, so);
+    }
+    // P4 B10: the crown split's request lanes (allocated in the load branch) go to the shared lanes module.
+    if (e->qwen35moe_split_ && e->qwen35moe_split_model_.n_lanes() > 1)
+        if (auto m = e->q35m_lanes_init(); !m.empty()) { err = m; return nullptr; }
+    // P4 B18: the 27B split's request lanes likewise
+    if (e->qwen35_split_ && e->qwen35_split_model_.n_lanes() > 1)
+        if (auto m = e->q27_lanes_init(); !m.empty()) { err = m; return nullptr; }
     return e;
 }
 
@@ -1859,13 +2360,719 @@ struct HostSlotStash {
 };
 }  // namespace
 
+namespace {
+// P4 B10 (docs/lanes/LANES_SERVE.md): the crown split's LanesModel -- the hooks the shared lanes module calls. A lane
+// is one sequence's KV + DeltaNet state on both cards (Qwen35MoeSplitModel::select_lane). The card pipe's stage 0 runs card 0's
+// layers into the lane's host residual, stage 1 runs card 1's layers and the head (the logits stay on card 1, in the model's
+// logits()); the done callback samples them there with the engine's own GPU sampler and seed rule. The prompt cache is the
+// engine's shared FleetPrefixCache, used exactly as --parallel 1 uses it (restore = fleet_cache_restore into the lane, the
+// snapshot at the stable conversation depth), so a lane's prefill pieces -- and its numerics -- are --parallel 1's.
+class Q35mLanesModel final : public LanesModel {
+public:
+    // P4 B14: rows = the pipe groups the decoding lanes' 1-row steps (up to 16 a group; group_cap 0 = AUTO, one group per
+    // card) and a group runs as one card step (Qwen35MoeSplitModel::forward_stage_rows); off: today's per-lane pipe.
+    Q35mLanesModel(Qwen35MoeSplitModel& m, FleetPrefixCache* cache, const Tokenizer& tok, const int32_t* stop_ids,
+                   const int32_t* tool_ids, uint32_t pf_chunk, bool rows, uint32_t group_cap)
+        : m_(m), cache_(cache), tok_(tok), pf_chunk_(pf_chunk), H_(m.config().hidden), V_(m.config().vocab), rows_(rows),
+          pipe_(m.n_lanes(), pf_chunk, H_ / 2, 2,   // the residual [T, hidden] fp16 = hidden / 2 floats a row
+                [this](uint32_t s, const Glm5LanePipe::Step& st) { return stage(s, st); },
+                [this](uint32_t s, std::span<const Glm5LanePipe::Step> steps, float* gw) { return stage_rows(s, steps, gw); },
+                Qwen35MoeSplitModel::kMaxRows, group_cap) {
+        stop_[0] = tok.eos_token_id(); stop_[1] = stop_ids[0]; stop_[2] = stop_ids[1];
+        tool_[0] = tool_ids[0]; tool_[1] = tool_ids[1];
+    }
+    ~Q35mLanesModel() override {
+        (void)pipe_.stop();
+        if (rows_) {   // P4 B14: how the decode steps grouped (groups that finished every stage, by size)
+            const std::vector<uint64_t> gs = pipe_.group_sizes();
+            std::string line;
+            for (size_t g = 1; g < gs.size(); ++g)
+                if (gs[g]) line += " " + std::to_string(g) + ":" + std::to_string(gs[g]);
+            std::fprintf(stderr, "[qwen35moe] lane rows: groups by size (rows:count)%s\n", line.empty() ? " none" : line.c_str());
+        }
+        sycl::queue& q = hq();
+        try { q.wait(); } catch (...) {}
+        for (void* p : dev_) if (p) sycl::free(p, q);
+    }
+    // Per-lane sampler buffers on card 1 (the pick, the repetition window, the prompt's kept logits) and the serial turn's two
+    // residual buffers.
+    std::string init() {
+        if (H_ % 2) return "qwen35moe lanes: odd hidden size";
+        sycl::queue& q = hq();
+        const uint32_t n = m_.n_lanes();
+        pick_.resize(n); recent_.resize(n); kept_.resize(n);
+        lg_.assign(n, m_.logits());
+        picks_dev_  = sycl::malloc_device<int32_t>(n, q);
+        picks_host_ = sycl::malloc_host<int32_t>(n, q);
+        dev_.insert(dev_.end(), {picks_dev_, picks_host_});
+        if (!picks_dev_ || !picks_host_) return "qwen35moe lanes: group sampler buffers alloc failed";
+        for (uint32_t i = 0; i < n; ++i) {
+            pick_[i]   = sycl::malloc_device<int32_t>(1, q);
+            recent_[i] = sycl::malloc_device<int32_t>(512, q);
+            kept_[i]   = sycl::malloc_device<sycl::half>(V_, q);
+            dev_.insert(dev_.end(), {pick_[i], recent_[i], kept_[i]});
+            if (!pick_[i] || !recent_[i] || !kept_[i]) return "qwen35moe lanes: sampler buffers (card 1) alloc failed";
+        }
+        for (auto& x : xb_) x.resize(uint64_t(pf_chunk_) * H_);
+        return {};
+    }
+    uint64_t host_bytes() const { return pipe_.host_bytes() + 2 * uint64_t(pf_chunk_) * H_ * sizeof(sycl::half); }
+
+    const char* tag() const override { return "q35m lanes"; }
+    uint32_t n_lanes() const override { return m_.n_lanes(); }
+    // the engine's rule: a prompt must be below ctx - 8, and the reply fits in ctx - 8 - prompt
+    uint32_t lane_cap(uint32_t lane) const override { const uint32_t c = m_.lane_ctx(lane); return c > 8 ? c - 8 : 0; }
+    // The prompt cache is shared by every lane (a restore copies into the lane), so no lane's own state serves more than
+    // another's: the choice is the reply room, then the smallest capacity, then the least recently used.
+    uint32_t own_match(uint32_t, std::span<const int32_t>) const override { return 0; }
+    bool occupied(uint32_t) const override { return false; }
+    uint32_t last_end(uint32_t) const override { return 0; }
+
+    std::string prefix_prepare(uint32_t lane, const LanesRequest& rq, uint32_t& reused, std::string& source) override {
+        source.clear();   // (--parallel 1 reports no cache source on this arch)
+        m_.select_lane(lane);
+        reused = cache_ ? fleet_cache_restore(m_, *cache_, *rq.ids, "crown-split-cache") : 0;
+        if (!reused) m_.reset_state();   // a new sequence (a failed restore's half-copied state goes too)
+        return {};
+    }
+    LanesPlan plan(const LanesRequest& rq, uint32_t reused) override {
+        return q35m_plan(uint32_t(rq.ids->size()), rq.snap_at, reused, pf_chunk_, cache_ ? rq.share_at : 0u);
+    }
+    // P4 B15: the shared prefix [0, pos) into the prompt cache (--parallel 1's insert at share_at): any lane restores it
+    // (prefix_prepare's fleet_cache_restore finds the deepest endpoint along a prompt)
+    std::string mark(uint32_t lane, const LanesRequest& rq, uint32_t pos) override {
+        if (!cache_) return {};
+        const auto t0 = std::chrono::steady_clock::now();
+        m_.select_lane(lane);
+        const std::vector<int32_t> pref(rq.ids->begin(), rq.ids->begin() + pos);
+        const std::string e = cache_->insert(m_, pref);
+        std::fprintf(stderr, "[crown-split-cache] lane %u shared prefix %u: %s (%.1f ms)\n", lane, pos, e.empty() ? "inserted" : e.c_str(),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        return e;
+    }
+    // what prefix_prepare's fleet_cache_restore would restore now (its clamp: a DeltaNet model never restores a full-length match)
+    uint32_t cache_peek(const LanesRequest& rq) const override {
+        if (!cache_) return 0;
+        const uint32_t M = cache_->peek_longest_match(*rq.ids);
+        return M < rq.ids->size() ? M : 0u;
+    }
+    std::string prefill_serial(uint32_t lane, const LanesRequest& rq, std::span<const LanesChunk> chunks,
+                               const std::function<bool()>& stop, size_t& done) override {
+        m_.select_lane(lane);
+        return run_chunks(lane, rq.ids->data(), chunks, stop, done);
+    }
+    // --parallel 1's insert at the snapshot boundary (when [reused, snap_at) was prefilled), then the rest of the prompt
+    std::string prompt_end(uint32_t lane, const LanesRequest& rq, uint32_t Tp, uint32_t reused, bool kept) override {
+        m_.select_lane(lane);
+        const std::vector<int32_t>& ids = *rq.ids;
+        const uint32_t T = uint32_t(ids.size());
+        if (cache_ && rq.snap_at > reused && Tp == rq.snap_at) {
+            const std::vector<int32_t> pref(ids.begin(), ids.begin() + Tp);
+            if (auto e = cache_->insert(m_, pref); !e.empty()) std::fprintf(stderr, "[crown-split-cache] insert: %s\n", e.c_str());
+        }
+        if (Tp < T) {
+            std::vector<LanesChunk> rest;
+            q35m_chunks(Tp, T, pf_chunk_, rest);
+            size_t done = 0;
+            if (auto e = run_chunks(lane, ids.data(), rest, {}, done); !e.empty()) return e;
+            kept = false;
+        }
+        if (!kept) { lg_[lane] = m_.logits(); keep_logits(lane); }   // (the serial chunks' logits)
+        return {};
+    }
+    std::string reset_lane(uint32_t lane) override {
+        // the pipe's record first (position 0, a failed step's mark cleared; P4 B9): no device state, and it must happen even
+        // when the model's reset below throws (the B9 gate's finding 1)
+        const std::string pe = pipe_.reset_lane(lane);
+        try {
+            m_.select_lane(lane);
+            m_.reset_state();
+            for (uint32_t d = 0; d < 2; ++d) m_.fleet()->dev(d).queue().wait();
+        } catch (const sycl::exception& x) { return x.what(); }
+        return pe;
+    }
+    // --parallel 1's reply snapshot (the gen-cache endpoint at prompt ++ reply). --parallel 1 forwards every sampled id, the
+    // last one of a "length" reply too; a lane has not forwarded that one yet, so it runs here first (one row, like the
+    // serial loop's step) and the state is then prompt ++ reply exactly.
+    std::string finish(uint32_t lane, const LanesRequest& rq, std::span<const int32_t> out, const std::string&,
+                       uint32_t pos) override {
+        if (!cache_) return {};
+        const auto t0 = std::chrono::steady_clock::now();
+        m_.select_lane(lane);
+        std::vector<int32_t> full(rq.ids->begin(), rq.ids->end());
+        full.insert(full.end(), out.begin(), out.end());
+        if (pos + 1 == full.size()) {
+            const LanesChunk last{pos, 1};
+            size_t done = 0;
+            if (auto e = run_chunks(lane, full.data(), std::span<const LanesChunk>(&last, 1), {}, done); !e.empty())
+                return "reply snapshot: forwarding the last id: " + e;
+            pos += 1;
+        }
+        if (pos != full.size())
+            return "reply snapshot: the lane holds " + std::to_string(pos) + " positions, prompt ++ reply is " + std::to_string(full.size());
+        const std::string e = cache_->insert(m_, full);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (e.empty()) std::fprintf(stderr, "[crown-split-cache] reply snapshot at depth %zu (%.1f ms)\n", full.size(), ms);
+        else           std::fprintf(stderr, "[crown-split-cache] reply snapshot skipped: %s\n", e.c_str());
+        return {};
+    }
+    int32_t sample(uint32_t lane, bool first, const LanesSampling& sp, std::span<const int32_t> window, uint64_t seed,
+                   std::string& err) override {
+        sycl::queue& q = hq();
+        sycl::half* lg = first ? kept_[lane] : lg_[lane];
+        int32_t pick = 0;
+        try {
+            if (!window.empty()) {
+                q.memcpy(recent_[lane], window.data(), window.size() * sizeof(int32_t));
+                sampling_penalties(q, lg, V_, recent_[lane], uint32_t(window.size()), sp.repeat_penalty, sp.presence_penalty,
+                                   sp.frequency_penalty);
+            }
+            sample_softmax_topk_topp(q, lg, pick_[lane], V_, sp.temperature, sp.top_k, sp.top_p, sp.min_p, seed);
+            q.memcpy(&pick, pick_[lane], sizeof(pick)).wait();
+        } catch (const sycl::exception& x) { err = x.what(); }
+        return pick;
+    }
+    void keep_logits(uint32_t lane) override {
+        hq().memcpy(kept_[lane], lg_[lane], uint64_t(V_) * sizeof(sycl::half)).wait();
+    }
+    // P4 B14: a group's ids -- per row sample()'s kernels on that lane's logits row (penalties, then the sampler into the
+    // row's slot), then ONE readback of the G picks through pinned host memory
+    std::string sample_rows(std::span<const uint32_t> lanes, std::span<const LanesSampling* const> sp,
+                            std::span<const std::span<const int32_t>> windows, std::span<const uint64_t> seeds,
+                            std::span<int32_t> picks) override {
+        sycl::queue& q = hq();
+        const uint32_t G = uint32_t(lanes.size());
+        if (G > m_.n_lanes()) return "sample_rows: " + std::to_string(G) + " rows, " + std::to_string(m_.n_lanes()) + " lanes";
+        try {
+            for (uint32_t r = 0; r < G; ++r) {
+                const uint32_t lane = lanes[r];
+                const LanesSampling& s = *sp[r];
+                sycl::half* lg = lg_[lane];
+                if (!windows[r].empty()) {
+                    q.memcpy(recent_[lane], windows[r].data(), windows[r].size() * sizeof(int32_t));
+                    sampling_penalties(q, lg, V_, recent_[lane], uint32_t(windows[r].size()), s.repeat_penalty, s.presence_penalty,
+                                       s.frequency_penalty);
+                }
+                sample_softmax_topk_topp(q, lg, picks_dev_ + r, V_, s.temperature, s.top_k, s.top_p, s.min_p, seeds[r]);
+            }
+            q.memcpy(picks_host_, picks_dev_, G * sizeof(int32_t)).wait();
+        } catch (const sycl::exception& x) { return x.what(); }
+        for (uint32_t r = 0; r < G; ++r) picks[r] = picks_host_[r];
+        return {};
+    }
+    bool is_stop(int32_t id) const override { return id == stop_[0] || id == stop_[1] || id == stop_[2]; }
+    std::string detok(std::span<const int32_t> out) const override {
+        return tok_.decode(out, /*skip_special=*/true, /*keep_special=*/std::span<const int32_t>(tool_, 2));
+    }
+    std::string pipe_start(DoneFn done) override { return pipe_.start(std::move(done)); }
+    bool        rows() const override { return rows_; }
+    std::string pipe_start_rows(DoneFn done, RowsDoneFn rows_done) override { return pipe_.start(std::move(done), std::move(rows_done)); }
+    std::string pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) override { return pipe_.submit(lane, ids, T, pos0); }
+    std::string pipe_pause() override { return pipe_.pause(); }
+    std::string pipe_resume() override { return pipe_.resume(); }
+    bool        pipe_paused() const override { return pipe_.paused(); }
+    std::string pipe_stop() override { return pipe_.stop(); }
+    std::string pipe_error() const override { return pipe_.error(); }
+    uint32_t    pipe_max_rows() const override { return pipe_.max_rows(); }
+
+private:
+    sycl::queue& hq() { return m_.fleet()->dev(m_.head_dev()).queue(); }
+    // One card's part of one lane's step (a stage thread; only this thread touches that card while the pipe runs).
+    std::string stage(uint32_t s, const Glm5LanePipe::Step& st) {
+        std::string e;
+        try { e = m_.forward_stage(s, st.lane, st.ids, st.T, st.pos0, reinterpret_cast<sycl::half*>(st.wide)); }
+        catch (const sycl::exception& x) { e = x.what(); }
+        if (!e.empty()) { try { m_.fleet()->dev(s).queue().wait(); } catch (...) {} }   // nothing of a failed step still runs
+        else if (s == m_.head_dev()) lg_[st.lane] = m_.logits();
+        return e;
+    }
+    // P4 B14: one card's part of a group's step (G >= 2 lanes, one decode row each); card 1 leaves row r's logits at
+    // rows_logits() + r * vocab, lane steps[r].lane's until its callback ran (the card's next step waits for it)
+    std::string stage_rows(uint32_t s, std::span<const Glm5LanePipe::Step> steps, float* gwide) {
+        const uint32_t G = uint32_t(steps.size());
+        if (G > Qwen35MoeSplitModel::kMaxRows) return "stage_rows: " + std::to_string(G) + " rows";
+        uint32_t lanes[Qwen35MoeSplitModel::kMaxRows], pos[Qwen35MoeSplitModel::kMaxRows];
+        int32_t ids[Qwen35MoeSplitModel::kMaxRows];
+        for (uint32_t r = 0; r < G; ++r) { lanes[r] = steps[r].lane; ids[r] = steps[r].ids[0]; pos[r] = steps[r].pos0; }
+        std::string e;
+        try { e = m_.forward_stage_rows(s, std::span<const uint32_t>(lanes, G), ids, pos, reinterpret_cast<sycl::half*>(gwide)); }
+        catch (const std::exception& x) { e = x.what(); }   // (B14 gate #4: any throw, then the drain below)
+        if (!e.empty()) { try { m_.fleet()->dev(s).queue().wait(); } catch (...) {} }
+        else if (s == m_.head_dev())
+            for (uint32_t r = 0; r < G; ++r) lg_[lanes[r]] = m_.rows_logits() + uint64_t(r) * V_;
+        return e;
+    }
+    // Chunks on the lane, card 1 of chunk k beside card 0 of chunk k + 1 (per card the same launches in the same order as
+    // --parallel 1's chunk-by-chunk forward), `stop` asked before each chunk after the first.
+    std::string run_chunks(uint32_t lane, const int32_t* ids, std::span<const LanesChunk> ch, const std::function<bool()>& stop,
+                           size_t& done) {
+        done = 0;
+        sycl::half* wb2[2] = {xb_[0].data(), xb_[1].data()};
+        std::future<std::string> bfut;
+        std::string err;
+        for (size_t k = 0; k < ch.size(); ++k) {
+            if (k > 0 && stop && stop()) break;
+            const uint32_t p0 = ch[k].first, n = ch[k].second;
+            sycl::half* wb = wb2[k & 1];
+            std::string e0;
+            try { e0 = m_.forward_stage(0, lane, ids + p0, n, p0, wb); }
+            catch (const sycl::exception& x) { e0 = x.what(); }
+            if (!e0.empty()) { err = "card 0: " + e0; break; }
+            if (bfut.valid()) {
+                if (auto e = bfut.get(); !e.empty()) { err = "card 1: " + e; break; }
+                ++done;
+            }
+            Qwen35MoeSplitModel* mp = &m_;
+            bfut = std::async(std::launch::async, [mp, lane, wb, n, p0]() -> std::string {
+                try { return mp->forward_stage(1, lane, nullptr, n, p0, wb); }
+                catch (const sycl::exception& x) { return x.what(); }
+            });
+        }
+        if (bfut.valid()) {
+            const std::string e = bfut.get();
+            if (e.empty()) ++done;
+            else if (err.empty()) err = "card 1: " + e;
+        }
+        return err;
+    }
+
+    Qwen35MoeSplitModel& m_;
+    FleetPrefixCache* cache_;   // null = the prompt cache is off
+    const Tokenizer& tok_;
+    uint32_t pf_chunk_, H_, V_;
+    bool rows_;
+    CardPipe pipe_;
+    std::vector<sycl::half> xb_[2];
+    int32_t stop_[3] = {-1, -1, -1};
+    int32_t tool_[2] = {-1, -1};
+    std::vector<int32_t*> pick_, recent_;
+    std::vector<sycl::half*> kept_;
+    std::vector<sycl::half*> lg_;          // [lane] where its last pipe step's logits are (card 1)
+    int32_t* picks_dev_ = nullptr;         // [n_lanes] a group's picks (card 1)
+    int32_t* picks_host_ = nullptr;        // [n_lanes] pinned host
+    std::vector<void*> dev_;
+};
+}  // namespace
+
+std::string Engine::q35m_lanes_init() {
+    Qwen35MoeSplitModel& m = qwen35moe_split_model_;
+    const uint32_t pf = q35m_prefill_chunk(opts_.max_ctx, std::getenv("IE_QWEN36_NO_MOE_ONEDNN"), std::getenv("IE_QWEN36_MOE_ONEDNN"),
+                                           std::getenv("IE_QWEN35_PREFILL_CHUNK"));
+    // P4 B14: rows (the decoding lanes' steps grouped into one card step each) on by default; IE_Q35MOE_ROWS=0 = the per-lane
+    // pipe; IE_Q35MOE_GROUP_LANES = a fixed group cap (0 / unset = AUTO: one group per card)
+    const std::string rows_why = m.rows_off_reason();
+    const char* rv = std::getenv("IE_Q35MOE_ROWS");
+    const bool rows = rows_why.empty() && !(rv && std::string(rv) == "0");
+    uint32_t gcap = 0;
+    if (const char* v = std::getenv("IE_Q35MOE_GROUP_LANES"))
+        gcap = uint32_t(std::clamp(std::atoi(v), 0, int(Qwen35MoeSplitModel::kMaxRows)));
+    auto lm = std::make_unique<Q35mLanesModel>(m, prompt_cache_on_ ? &fleet_cache_ : nullptr, tok_, stop_ids_, tool_call_ids_, pf,
+                                               rows, gcap);
+    if (auto e = lm->init(); !e.empty()) return e;
+    std::fprintf(stderr, "[qwen35moe] %u request lanes (lane 0 ctx %u, lanes 1..%u ctx %u; %.3f + %.3f GiB VRAM per extra lane, "
+                         "prefill pieces of %u rows, host %.2f GiB): ie serve --parallel decodes them together through the card pipe\n",
+                 m.n_lanes(), m.lane_ctx(0), m.n_lanes() - 1, m.lane_ctx(1), m.lane_bytes(0) / 1073741824.0,
+                 m.lane_bytes(1) / 1073741824.0, pf, lm->host_bytes() / 1073741824.0);
+    if (rows) std::fprintf(stderr, "[qwen35moe] lane rows ON: decoding lanes' steps grouped, up to %u rows a card step, group cap %s "
+                                   "(IE_Q35MOE_ROWS=0 = one lane a step)\n", Qwen35MoeSplitModel::kMaxRows,
+                           gcap ? std::to_string(gcap).c_str() : "AUTO (one group per card)");
+    else std::fprintf(stderr, "[qwen35moe] lane rows OFF (%s): one lane a card step\n",
+                      rows_why.empty() ? "IE_Q35MOE_ROWS=0" : rows_why.c_str());
+    LanesServe::Options so;
+    if (const char* v = std::getenv("IE_Q35MOE_MIX_CHUNK")) so.mix_chunk = uint32_t(std::max(0, std::atoi(v)));
+    if (const char* v = std::getenv("IE_Q35MOE_STEP_TRACE")) so.trace = *v == '1';
+    q35m_ = std::make_unique<Q35mLanes>();
+    q35m_->lanes = std::move(lm);
+    q35m_->serve = std::make_unique<LanesServe>(*q35m_->lanes, so);
+    return {};
+}
+
+// P4 B10: the crown split at --parallel N > 1. generate()'s front half as it is at --parallel 1 (the prompt's ids, the context
+// refusal, the sampler's seed, the snapshot boundary), then the request runs on a lane through the shared lanes module instead
+// of the generation gate. The reply snapshot --parallel 1 inserts after a reply (the gen-cache endpoint, when chat() passes
+// reply_cache) is Q35mLanesModel::finish, in a serial turn after the reply.
+GenerateResult Engine::q35m_generate_lanes(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token,
+                                           uint32_t cache_prefix_len, bool reply_cache, uint32_t shared_prefix_len) {
+    GenerateResult res;
+    const auto ids = tok_.encode(prompt, /*allow_special=*/true);
+    res.prompt_tokens = uint32_t(ids.size());
+    const uint32_t budget = opts_.max_ctx - 8;
+    if (ids.size() >= budget) { res.finish_reason = "context_length_exceeded"; return res; }
+    if (ids.empty()) { res.finish_reason = "length"; return res; }
+    LanesRequest rq;
+    rq.ids = &ids;
+    rq.sp.temperature = sp.temperature; rq.sp.top_k = sp.top_k; rq.sp.top_p = sp.top_p; rq.sp.min_p = sp.min_p;
+    rq.sp.presence_penalty = sp.presence_penalty; rq.sp.frequency_penalty = sp.frequency_penalty;
+    rq.sp.repeat_penalty = sp.repeat_penalty; rq.sp.repeat_window = sp.repeat_window;
+    rq.sp.max_tokens = sp.max_tokens; rq.sp.ignore_eos = sp.ignore_eos;
+    rq.rng = sp.seed ? sp.seed : uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+    // --parallel 1's snapshot boundary: the stable conversation depth when the cache is on, else the whole prompt (no insert)
+    rq.snap_at = (prompt_cache_on_ && cache_prefix_len > 0) ? std::min<uint32_t>(cache_prefix_len, uint32_t(ids.size()))
+                                                            : uint32_t(ids.size());
+    // P4 B15: --parallel 1's shared-prefix boundary (the same rule: below the snapshot boundary, the cache on; the 27B only with
+    // IE_QWEN35_SHARED_PREFIX=1, P4 B18)
+    rq.share_at = (q35m_ || q27_share_) ? shared_prefix_boundary(shared_prefix_len, rq.snap_at, prompt_cache_on_) : 0u;
+    // --parallel 1's reply snapshot rule (the gen-cache): the caller asks, the cache is on, IE_NO_GEN_CACHE unset
+    rq.reply_cache = reply_cache && prompt_cache_on_ && std::getenv("IE_NO_GEN_CACHE") == nullptr;
+    if (rq.sp.max_tokens == 0) { res.finish_reason = "length"; return res; }   // --parallel 1: zero steps
+    const LanesResult lr = (q35m_ ? q35m_->serve : q27_->serve)->run(rq, on_token);   // (P4 B18: the 27B's lanes too)
+    res.text = lr.text;
+    res.finish_reason = lr.finish_reason;
+    res.cached_tokens = lr.cached_tokens;
+    res.completion_tokens = lr.completion_tokens;
+    res.prefill_ms = lr.prefill_ms;
+    res.decode_ms = lr.decode_ms;
+    res.cache_source = lr.cache_source;
+    return res;
+}
+
+namespace {
+// P4 B18 (docs/lanes/LANES_SERVE.md): the Qwen3.8-27B split's LanesModel -- the hooks the shared lanes module calls, in place of
+// the slot banks + BatchStepper (IE_QWEN35_LANES=0 keeps those). A lane is one sequence's KV + DeltaNet state on both cards
+// (Qwen35SplitModel::select_lane). The card pipe's stage 0 runs card 0's layers into the lane's host residual, stage 1 runs
+// card 1's layers and the head (the logits stay on card 1); the done callback samples them there with the engine's own GPU
+// sampler and seed rule. The prompt cache is the engine's shared FleetPrefixCache, used exactly as --parallel 1 uses it. Every
+// prefill piece is --parallel 1's (include/ie/q27_lanes.hpp: the pipelined ranges, the kernels of each 1-row piece), so a
+// lane's numerics are --parallel 1's; decode rows run forward_slots' walk (bit-identical to forward(T = 1), Phase 2a).
+class Q27LanesModel final : public LanesModel {
+public:
+    // rows = the pipe groups the decoding lanes' 1-row steps (up to 16 a group; group_cap 0 = AUTO: one group per card, the two
+    // cards pipelined; 16 = every decoding lane in one group, the cards in sequence like the joint step) and a group runs as one
+    // card step (Qwen35SplitModel::forward_stage_rows); off: one lane a card step.
+    Q27LanesModel(Qwen35SplitModel& m, FleetPrefixCache* cache, const Tokenizer& tok, const int32_t* stop_ids, const int32_t* tool_ids,
+                  uint32_t pf_chunk, bool pipeline, bool rows, uint32_t group_cap)
+        : m_(m), cache_(cache), tok_(tok), pf_chunk_(pf_chunk), pipeline_(pipeline), H_(m.config().dense.hidden),
+          V_(m.config().dense.vocab), rows_(rows),
+          pipe_(m.n_lanes(), pf_chunk, H_ / 2, 2,   // the residual [T, hidden] fp16 = hidden / 2 floats a row
+                [this](uint32_t s, const Glm5LanePipe::Step& st) { return stage(s, st); },
+                [this](uint32_t s, std::span<const Glm5LanePipe::Step> steps, float* gw) { return stage_rows(s, steps, gw); },
+                Qwen35SplitModel::kMaxRows, group_cap) {
+        stop_[0] = tok.eos_token_id(); stop_[1] = stop_ids[0]; stop_[2] = stop_ids[1];
+        tool_[0] = tool_ids[0]; tool_[1] = tool_ids[1];
+    }
+    ~Q27LanesModel() override {
+        (void)pipe_.stop();
+        if (rows_) {   // how the decode steps grouped (groups that finished every stage, by size)
+            const std::vector<uint64_t> gs = pipe_.group_sizes();
+            std::string line;
+            for (size_t g = 1; g < gs.size(); ++g)
+                if (gs[g]) line += " " + std::to_string(g) + ":" + std::to_string(gs[g]);
+            std::fprintf(stderr, "[qwen35split] lane rows: groups by size (rows:count)%s\n", line.empty() ? " none" : line.c_str());
+        }
+        sycl::queue& q = hq();
+        try { q.wait(); } catch (...) {}
+        for (void* p : dev_) if (p) sycl::free(p, q);
+    }
+    // Per-lane sampler buffers on card 1 (the pick, the repetition window, the prompt's kept logits), a group's picks, and the
+    // serial turn's two residual buffers.
+    std::string init() {
+        if (H_ % 2) return "qwen35split lanes: odd hidden size";
+        sycl::queue& q = hq();
+        const uint32_t n = m_.n_lanes();
+        pick_.resize(n); recent_.resize(n); kept_.resize(n);
+        lg_.assign(n, m_.logits());
+        picks_dev_  = sycl::malloc_device<int32_t>(n, q);
+        picks_host_ = sycl::malloc_host<int32_t>(n, q);
+        dev_.insert(dev_.end(), {picks_dev_, picks_host_});
+        if (!picks_dev_ || !picks_host_) return "qwen35split lanes: group sampler buffers alloc failed";
+        for (uint32_t i = 0; i < n; ++i) {
+            pick_[i]   = sycl::malloc_device<int32_t>(1, q);
+            recent_[i] = sycl::malloc_device<int32_t>(512, q);
+            kept_[i]   = sycl::malloc_device<sycl::half>(V_, q);
+            dev_.insert(dev_.end(), {pick_[i], recent_[i], kept_[i]});
+            if (!pick_[i] || !recent_[i] || !kept_[i]) return "qwen35split lanes: sampler buffers (card 1) alloc failed";
+        }
+        for (auto& x : xb_) x.resize(uint64_t(pf_chunk_) * H_);
+        return {};
+    }
+    uint64_t host_bytes() const { return pipe_.host_bytes() + 2 * uint64_t(pf_chunk_) * H_ * sizeof(sycl::half); }
+
+    const char* tag() const override { return "q27 lanes"; }
+    uint32_t n_lanes() const override { return m_.n_lanes(); }
+    // the engine's rule: a prompt must be below ctx - 8, and the reply fits in ctx - 8 - prompt
+    uint32_t lane_cap(uint32_t lane) const override { const uint32_t c = m_.lane_ctx(lane); return c > 8 ? c - 8 : 0; }
+    // The prompt cache is shared by every lane (a restore copies into the lane): the choice is the reply room, then the
+    // smallest capacity, then the least recently used.
+    uint32_t own_match(uint32_t, std::span<const int32_t>) const override { return 0; }
+    bool occupied(uint32_t) const override { return false; }
+    uint32_t last_end(uint32_t) const override { return 0; }
+
+    std::string prefix_prepare(uint32_t lane, const LanesRequest& rq, uint32_t& reused, std::string& source) override {
+        source.clear();   // (--parallel 1 reports no cache source on this arch)
+        m_.select_lane(lane);
+        reused = cache_ ? fleet_cache_restore(m_, *cache_, *rq.ids, "27b-split-cache") : 0;
+        if (!reused) m_.reset_state();   // a new sequence (a failed restore's half-copied state goes too)
+        return {};
+    }
+    LanesPlan plan(const LanesRequest& rq, uint32_t reused) override { return q27_plan(ops(rq, reused), reused, uint32_t(rq.ids->size())); }
+    // the shared prefix [0, pos) into the prompt cache (--parallel 1's insert at share_at, IE_QWEN35_SHARED_PREFIX=1)
+    std::string mark(uint32_t lane, const LanesRequest& rq, uint32_t pos) override {
+        if (!cache_) return {};
+        m_.select_lane(lane);
+        return insert(rq, pos, "shared prefix");
+    }
+    uint32_t cache_peek(const LanesRequest& rq) const override {
+        if (!cache_) return 0;
+        const uint32_t M = cache_->peek_longest_match(*rq.ids);
+        return M < rq.ids->size() ? M : 0u;
+    }
+    std::string prefill_serial(uint32_t lane, const LanesRequest& rq, std::span<const LanesChunk> chunks,
+                               const std::function<bool()>& stop, size_t& done) override {
+        m_.select_lane(lane);
+        std::vector<Q27Piece> ps;
+        for (const auto& [p0, n] : chunks) ps.push_back(Q27Piece{p0, n, false});   // (a plan never holds a 1-row pk piece)
+        return run_pieces(lane, rq.ids->data(), ps, stop, done);
+    }
+    // --parallel 1's ops from Tp on: the pieces (a 1-row pipelined one through the prefill kernels) and the inserts
+    std::string prompt_end(uint32_t lane, const LanesRequest& rq, uint32_t Tp, uint32_t reused, bool kept) override {
+        m_.select_lane(lane);
+        bool ran = false;
+        const std::string e = q27_walk_rest(
+            q27_rest(ops(rq, reused), Tp),
+            [&](std::span<const Q27Piece> ps) { size_t done = 0; return run_pieces(lane, rq.ids->data(), ps, {}, done); },
+            [&](const Q27Op& o) { (void)insert(rq, o.at, o.kind == Q27Op::kShared ? "shared prefix" : "snapshot"); },
+            ran);
+        if (!e.empty()) return e;
+        if (ran) kept = false;
+        if (!kept) { lg_[lane] = m_.logits(); keep_logits(lane); }   // (the serial pieces' logits)
+        return {};
+    }
+    std::string reset_lane(uint32_t lane) override {
+        // the pipe's record first (position 0, a failed step's mark cleared): no device state, and it must happen even when
+        // the model's reset below throws
+        const std::string pe = pipe_.reset_lane(lane);
+        try {
+            m_.select_lane(lane);
+            m_.reset_state();
+            for (uint32_t d = 0; d < 2; ++d) m_.fleet()->dev(d).queue().wait();
+        } catch (const sycl::exception& x) { return x.what(); }
+        return pe;
+    }
+    // --parallel 1's reply snapshot (the gen-cache endpoint at prompt ++ reply). --parallel 1 forwards every sampled id, the
+    // last one of a "length" reply too (a 1-row decode step); a lane has not forwarded that one yet, so it runs here first.
+    std::string finish(uint32_t lane, const LanesRequest& rq, std::span<const int32_t> out, const std::string&,
+                       uint32_t pos) override {
+        if (!cache_) return {};
+        const auto t0 = std::chrono::steady_clock::now();
+        m_.select_lane(lane);
+        std::vector<int32_t> full(rq.ids->begin(), rq.ids->end());
+        full.insert(full.end(), out.begin(), out.end());
+        if (pos + 1 == full.size()) {
+            const Q27Piece last{pos, 1, false};
+            size_t done = 0;
+            if (auto e = run_pieces(lane, full.data(), std::span<const Q27Piece>(&last, 1), {}, done); !e.empty())
+                return "reply snapshot: forwarding the last id: " + e;
+            pos += 1;
+        }
+        if (pos != full.size())
+            return "reply snapshot: the lane holds " + std::to_string(pos) + " positions, prompt ++ reply is " + std::to_string(full.size());
+        const std::string e = cache_->insert(m_, full);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (e.empty()) std::fprintf(stderr, "[27b-split-cache] reply snapshot at depth %zu (%.1f ms)\n", full.size(), ms);
+        else           std::fprintf(stderr, "[27b-split-cache] reply snapshot skipped: %s\n", e.c_str());
+        return {};
+    }
+    int32_t sample(uint32_t lane, bool first, const LanesSampling& sp, std::span<const int32_t> window, uint64_t seed,
+                   std::string& err) override {
+        sycl::queue& q = hq();
+        sycl::half* lg = first ? kept_[lane] : lg_[lane];
+        int32_t pick = 0;
+        try {
+            if (!window.empty()) {
+                q.memcpy(recent_[lane], window.data(), window.size() * sizeof(int32_t));
+                sampling_penalties(q, lg, V_, recent_[lane], uint32_t(window.size()), sp.repeat_penalty, sp.presence_penalty,
+                                   sp.frequency_penalty);
+            }
+            sample_softmax_topk_topp(q, lg, pick_[lane], V_, sp.temperature, sp.top_k, sp.top_p, sp.min_p, seed);
+            q.memcpy(&pick, pick_[lane], sizeof(pick)).wait();
+        } catch (const sycl::exception& x) { err = x.what(); }
+        return pick;
+    }
+    void keep_logits(uint32_t lane) override {
+        hq().memcpy(kept_[lane], lg_[lane], uint64_t(V_) * sizeof(sycl::half)).wait();
+    }
+    // a group's ids: per row sample()'s kernels on that lane's logits row, then ONE readback of the G picks (pinned host)
+    std::string sample_rows(std::span<const uint32_t> lanes, std::span<const LanesSampling* const> sp,
+                            std::span<const std::span<const int32_t>> windows, std::span<const uint64_t> seeds,
+                            std::span<int32_t> picks) override {
+        sycl::queue& q = hq();
+        const uint32_t G = uint32_t(lanes.size());
+        if (G > m_.n_lanes()) return "sample_rows: " + std::to_string(G) + " rows, " + std::to_string(m_.n_lanes()) + " lanes";
+        try {
+            for (uint32_t r = 0; r < G; ++r) {
+                const uint32_t lane = lanes[r];
+                const LanesSampling& s = *sp[r];
+                sycl::half* lg = lg_[lane];
+                if (!windows[r].empty()) {
+                    q.memcpy(recent_[lane], windows[r].data(), windows[r].size() * sizeof(int32_t));
+                    sampling_penalties(q, lg, V_, recent_[lane], uint32_t(windows[r].size()), s.repeat_penalty, s.presence_penalty,
+                                       s.frequency_penalty);
+                }
+                sample_softmax_topk_topp(q, lg, picks_dev_ + r, V_, s.temperature, s.top_k, s.top_p, s.min_p, seeds[r]);
+            }
+            q.memcpy(picks_host_, picks_dev_, G * sizeof(int32_t)).wait();
+        } catch (const sycl::exception& x) { return x.what(); }
+        for (uint32_t r = 0; r < G; ++r) picks[r] = picks_host_[r];
+        return {};
+    }
+    bool is_stop(int32_t id) const override { return id == stop_[0] || id == stop_[1] || id == stop_[2]; }
+    std::string detok(std::span<const int32_t> out) const override {
+        return tok_.decode(out, /*skip_special=*/true, /*keep_special=*/std::span<const int32_t>(tool_, 2));
+    }
+    std::string pipe_start(DoneFn done) override { return pipe_.start(std::move(done)); }
+    bool        rows() const override { return rows_; }
+    std::string pipe_start_rows(DoneFn done, RowsDoneFn rows_done) override { return pipe_.start(std::move(done), std::move(rows_done)); }
+    std::string pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) override { return pipe_.submit(lane, ids, T, pos0); }
+    std::string pipe_pause() override { return pipe_.pause(); }
+    std::string pipe_resume() override { return pipe_.resume(); }
+    bool        pipe_paused() const override { return pipe_.paused(); }
+    std::string pipe_stop() override { return pipe_.stop(); }
+    std::string pipe_error() const override { return pipe_.error(); }
+    uint32_t    pipe_max_rows() const override { return pipe_.max_rows(); }
+
+private:
+    sycl::queue& hq() { return m_.fleet()->dev(m_.head_dev()).queue(); }
+    std::vector<Q27Op> ops(const LanesRequest& rq, uint32_t reused) const {
+        return q27_prefill_ops(uint32_t(rq.ids->size()), reused, rq.snap_at, rq.share_at, cache_ != nullptr, pf_chunk_, pipeline_);
+    }
+    // the selected lane's state [0, pos) of rq.ids into the prompt cache (--parallel 1's inserts); logged, never the request's error
+    std::string insert(const LanesRequest& rq, uint32_t pos, const char* what) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::vector<int32_t> pref(rq.ids->begin(), rq.ids->begin() + pos);
+        const std::string e = cache_->insert(m_, pref);
+        std::fprintf(stderr, "[27b-split-cache] %s %u: %s (%.1f ms)\n", what, pos, e.empty() ? "inserted" : e.c_str(),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        return e;
+    }
+    // One card's part of one lane's step (a stage thread; only this thread touches that card while the pipe runs). A 1-row
+    // pipe step is a decode row (the plan keeps 1-row pipelined pieces out of the pipe).
+    std::string stage(uint32_t s, const Glm5LanePipe::Step& st) {
+        std::string e;
+        try { e = m_.forward_stage(s, st.lane, st.ids, st.T, st.pos0, reinterpret_cast<sycl::half*>(st.wide), false); }
+        catch (const std::exception& x) { e = x.what(); }
+        if (!e.empty()) { try { m_.fleet()->dev(s).queue().wait(); } catch (...) {} }   // nothing of a failed step still runs
+        else if (s == m_.head_dev()) lg_[st.lane] = m_.logits();
+        return e;
+    }
+    // one card's part of a group's step (G >= 2 lanes, one decode row each); card 1 leaves row r's logits at rows_logits() +
+    // r * vocab, lane steps[r].lane's until its callback ran (the card's next step waits for it)
+    std::string stage_rows(uint32_t s, std::span<const Glm5LanePipe::Step> steps, float* gwide) {
+        const uint32_t G = uint32_t(steps.size());
+        if (G > Qwen35SplitModel::kMaxRows) return "stage_rows: " + std::to_string(G) + " rows";
+        uint32_t lanes[Qwen35SplitModel::kMaxRows], pos[Qwen35SplitModel::kMaxRows];
+        int32_t ids[Qwen35SplitModel::kMaxRows];
+        for (uint32_t r = 0; r < G; ++r) { lanes[r] = steps[r].lane; ids[r] = steps[r].ids[0]; pos[r] = steps[r].pos0; }
+        std::string e;
+        try { e = m_.forward_stage_rows(s, std::span<const uint32_t>(lanes, G), ids, pos, reinterpret_cast<sycl::half*>(gwide)); }
+        catch (const std::exception& x) { e = x.what(); }
+        if (!e.empty()) { try { m_.fleet()->dev(s).queue().wait(); } catch (...) {} }
+        else if (s == m_.head_dev())
+            for (uint32_t r = 0; r < G; ++r) lg_[lanes[r]] = m_.rows_logits() + uint64_t(r) * V_;
+        return e;
+    }
+    // Pieces on the lane, card 1 of piece k beside card 0 of piece k + 1 (per card the same launches in the same order as
+    // --parallel 1's forward_pipelined), `stop` asked before each piece after the first.
+    std::string run_pieces(uint32_t lane, const int32_t* ids, std::span<const Q27Piece> ps, const std::function<bool()>& stop,
+                           size_t& done) {
+        done = 0;
+        sycl::half* wb2[2] = {xb_[0].data(), xb_[1].data()};
+        std::future<std::string> bfut;
+        std::string err;
+        for (size_t k = 0; k < ps.size(); ++k) {
+            if (k > 0 && stop && stop()) break;
+            const uint32_t p0 = ps[k].pos0, n = ps[k].rows;
+            const bool pk = ps[k].pk;
+            sycl::half* wb = wb2[k & 1];
+            std::string e0;
+            try { e0 = m_.forward_stage(0, lane, ids + p0, n, p0, wb, pk); }
+            catch (const std::exception& x) { e0 = x.what(); }
+            if (!e0.empty()) { err = "card 0: " + e0; break; }
+            if (bfut.valid()) {
+                if (auto e = bfut.get(); !e.empty()) { err = "card 1: " + e; break; }
+                ++done;
+            }
+            Qwen35SplitModel* mp = &m_;
+            bfut = std::async(std::launch::async, [mp, lane, wb, n, p0, pk]() -> std::string {
+                try { return mp->forward_stage(1, lane, nullptr, n, p0, wb, pk); }
+                catch (const std::exception& x) { return x.what(); }
+            });
+        }
+        if (bfut.valid()) {
+            const std::string e = bfut.get();
+            if (e.empty()) ++done;
+            else if (err.empty()) err = "card 1: " + e;
+        }
+        return err;
+    }
+
+    Qwen35SplitModel& m_;
+    FleetPrefixCache* cache_;   // null = the prompt cache is off
+    const Tokenizer& tok_;
+    uint32_t pf_chunk_;
+    bool pipeline_;             // --parallel 1's pipelined prefill (IE_QWEN35_NO_PIPELINE / IE_QWEN35_PIPELINE=0 off)
+    uint32_t H_, V_;
+    bool rows_;
+    CardPipe pipe_;
+    std::vector<sycl::half> xb_[2];
+    int32_t stop_[3] = {-1, -1, -1};
+    int32_t tool_[2] = {-1, -1};
+    std::vector<int32_t*> pick_, recent_;
+    std::vector<sycl::half*> kept_;
+    std::vector<sycl::half*> lg_;          // [lane] where its last step's logits are (card 1)
+    int32_t* picks_dev_ = nullptr;         // [n_lanes] a group's picks (card 1)
+    int32_t* picks_host_ = nullptr;        // [n_lanes] pinned host
+    std::vector<void*> dev_;
+};
+}  // namespace
+
+// P4 B18: the 27B split's lanes (allocated in the load branch) to the shared lanes module. Rows on by default when every
+// projection is Q8_0 (IE_QWEN35_ROWS=0 = one lane a card step); IE_QWEN35_GROUP_LANES = a fixed group cap (0 / unset = AUTO:
+// one group per card, the cards pipelined; 16 = one group of every decoding lane, the cards in sequence).
+std::string Engine::q27_lanes_init() {
+    Qwen35SplitModel& m = qwen35_split_model_;
+    const uint32_t pf = q27_prefill_chunk(opts_.max_ctx, std::getenv("IE_QWEN35_PREFILL_CHUNK"));
+    const bool pipeline = !std::getenv("IE_QWEN35_NO_PIPELINE") &&
+                          !(std::getenv("IE_QWEN35_PIPELINE") && std::atoi(std::getenv("IE_QWEN35_PIPELINE")) == 0);   // (generate's rule)
+    const std::string rows_why = m.rows_off_reason();
+    const char* rv = std::getenv("IE_QWEN35_ROWS");
+    const bool rows = rows_why.empty() && !(rv && std::string(rv) == "0");
+    uint32_t gcap = 0;
+    if (const char* v = std::getenv("IE_QWEN35_GROUP_LANES"))
+        gcap = uint32_t(std::clamp(std::atoi(v), 0, int(Qwen35SplitModel::kMaxRows)));
+    auto lm = std::make_unique<Q27LanesModel>(m, prompt_cache_on_ ? &fleet_cache_ : nullptr, tok_, stop_ids_, tool_call_ids_, pf,
+                                              pipeline, rows, gcap);
+    if (auto e = lm->init(); !e.empty()) return e;
+    std::fprintf(stderr, "[qwen35split] %u request lanes (lane 0 ctx %u, lanes 1..%u ctx %u; %.3f + %.3f GiB VRAM per extra lane, "
+                         "prefill pieces of %u rows, host %.2f GiB): ie serve --parallel decodes them together through the card pipe "
+                         "(IE_QWEN35_LANES=0 = the joint-step path)\n",
+                 m.n_lanes(), m.lane_ctx(0), m.n_lanes() - 1, m.lane_ctx(1), m.lane_bytes(0) / 1073741824.0,
+                 m.lane_bytes(1) / 1073741824.0, pf, lm->host_bytes() / 1073741824.0);
+    if (rows) std::fprintf(stderr, "[qwen35split] lane rows ON: decoding lanes' steps grouped, up to %u rows a card step, group cap %s "
+                                   "(IE_QWEN35_ROWS=0 = one lane a step)\n", Qwen35SplitModel::kMaxRows,
+                           gcap ? std::to_string(gcap).c_str() : "AUTO (one group per card)");
+    else std::fprintf(stderr, "[qwen35split] lane rows OFF (%s): one lane a card step\n",
+                      rows_why.empty() ? "IE_QWEN35_ROWS=0" : rows_why.c_str());
+    if (q27_share_) std::fprintf(stderr, "[qwen35split] shared-prefix cache ON (IE_QWEN35_SHARED_PREFIX=1: --parallel 1 splits its "
+                                         "prefill there too)\n");
+    LanesServe::Options so;
+    if (const char* v = std::getenv("IE_QWEN35_STEP_TRACE")) so.trace = *v == '1';
+    q27_ = std::make_unique<Q35mLanes>();
+    q27_->lanes = std::move(lm);
+    q27_->serve = std::make_unique<LanesServe>(*q27_->lanes, so);
+    return {};
+}
+
 GenerateResult Engine::generate(const std::string& prompt,
                                 const SamplingParams& sp,
                                 const TokenCallback& on_token,
                                 uint32_t cache_prefix_len,
-                                bool reply_cache) {
+                                bool reply_cache,
+                                uint32_t shared_prefix_len) {
     if (arch_ == ModelArch::kDeepSeek41) return ds41_generate(prompt, sp, on_token);
     if (arch_ == ModelArch::kMimo26) return mimo26_generate(prompt, sp, on_token);
+    if (q4e_ && q4e_->serve) return q4e_generate_lanes(prompt, sp, on_token, cache_prefix_len, shared_prefix_len);
+    if (q35m_ && q35m_->serve) return q35m_generate_lanes(prompt, sp, on_token, cache_prefix_len, reply_cache, shared_prefix_len);
+    if (q27_ && q27_->serve) return q35m_generate_lanes(prompt, sp, on_token, cache_prefix_len, reply_cache, shared_prefix_len);   // P4 B18
     GenerateResult res;
     auto& q = alloc_.queue();
     q4e_vis_active_ = false;   // re-armed below iff this request carries images
@@ -2520,6 +3727,12 @@ GenerateResult Engine::generate(const std::string& prompt,
     if (prompt_cache_on_ && arch_ == ModelArch::kDeepSeek4 && ds4_cache_max_prefix_)
         snap_at = std::min<uint32_t>(snap_at, ds4_cache_max_prefix_);
     if (ds4_vis_active_) snap_at = uint32_t(ids.size());   // no snapshot boundary inside a block
+    // P4 B15: the shared-prefix boundary (the system prompt + tools; chat() computes it). The crown split and Flash-Next split
+    // their prefill there exactly as their request lanes do (Q35mLanesModel / Q4eLanesModel::plan), so --parallel 1 and a lane
+    // cut the same pieces; the crown also snapshots it into fleet_cache_ (restorable by any later prompt that extends it).
+    // Other archs ignore it. A vision request: none (image rows cannot be told apart by their ids).
+    const uint32_t share_at = ((qwen35moe_split_ || q4e_ || (qwen35_split_ && q27_share_)) && !q4e_vis_active_ && !ds4_vis_active_)
+        ? shared_prefix_boundary(shared_prefix_len, snap_at, prompt_cache_on_) : 0u;
     uint32_t pos = restored;            // cache restore (if any) already loaded [0..restored)
     // Per-request suspend buffer (host RAM) for gate yields — 27B split only.
     HostSlotStash slot_stash;
@@ -2648,6 +3861,19 @@ GenerateResult Engine::generate(const std::string& prompt,
             }
         }
     };
+    if (share_at > restored) {
+        prefill_to(share_at);
+        if ((qwen35moe_split_ || qwen35_split_) && !pf_abort && slot_err.empty() && pos == share_at) {
+            const auto t_s = std::chrono::steady_clock::now();
+            const std::vector<int32_t> pref(ids.begin(), ids.begin() + share_at);
+            const std::string m = qwen35moe_split_ ? fleet_cache_.insert(qwen35moe_split_model_, pref)
+                                                   : fleet_cache_.insert(qwen35_split_model_, pref);   // (P4 B18, opt-in)
+            std::fprintf(stderr, qwen35moe_split_ ? "[crown-split-cache] shared prefix %u: %s (%.1f ms)\n"
+                                                  : "[27b-split-cache] shared prefix %u: %s (%.1f ms)\n", share_at,
+                         m.empty() ? "inserted" : m.c_str(),
+                         std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_s).count());
+        }
+    }
     prefill_to(snap_at);
     // Snapshot the boundary state (kv_/dn_ or per-card kv_[dev]/dn_[dev] now hold
     // [0..snap_at)) — only if we actually prefilled new tokens up to it (snap_at >
@@ -3219,6 +4445,49 @@ static void ds4_finish_completion(const Tokenizer& tok, GenerateResult& res, boo
     }
 }
 
+// P4 B4 / B6b: /health's lanes block, from the loaded arch (MiMo-V2.6 and DeepSeek-V4.1 at --parallel > 1); "" elsewhere
+std::string Engine::serving_status_json() const {
+    if (ds41_) return ds41_serving_status_json();
+    if (mimo26_) return mimo26_serving_status_json();
+    if (q4e_ && q4e_->serve) return q4e_->serve->status_json();   // P4 B8: Flash-Next's lanes
+    if (q35m_ && q35m_->serve) return q35m_->serve->status_json(); // P4 B10: the crown split's lanes
+    if (q27_ && q27_->serve) return q27_->serve->status_json();    // P4 B18: the 27B split's lanes
+    return {};
+}
+
+// P4 B8 (docs/qwen4exp/P4_B8_LANES.md): Flash-Next at --parallel N > 1 on two cards. generate()'s front half as it is at
+// --parallel 1 (the prompt's ids, the context refusal, the sampler's seed, the snapshot boundary), then the request runs on a
+// lane through the shared lanes module instead of the gate + time-slicing.
+GenerateResult Engine::q4e_generate_lanes(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token,
+                                          uint32_t cache_prefix_len, uint32_t shared_prefix_len) {
+    GenerateResult res;
+    const auto ids = tok_.encode(prompt, /*allow_special=*/true);
+    res.prompt_tokens = uint32_t(ids.size());
+    const uint32_t budget = opts_.max_ctx - 8;
+    if (ids.size() >= budget) { res.finish_reason = "context_length_exceeded"; return res; }
+    if (ids.empty()) { res.finish_reason = "length"; return res; }
+    LanesRequest rq;
+    rq.ids = &ids;
+    rq.sp.temperature = sp.temperature; rq.sp.top_k = sp.top_k; rq.sp.top_p = sp.top_p; rq.sp.min_p = sp.min_p;
+    rq.sp.presence_penalty = sp.presence_penalty; rq.sp.frequency_penalty = sp.frequency_penalty;
+    rq.sp.repeat_penalty = sp.repeat_penalty; rq.sp.repeat_window = sp.repeat_window;
+    rq.sp.max_tokens = sp.max_tokens; rq.sp.ignore_eos = sp.ignore_eos;
+    rq.rng = sp.seed ? sp.seed : uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+    rq.snap_at = cache_prefix_len > 0 ? std::min<uint32_t>(cache_prefix_len, uint32_t(ids.size())) : uint32_t(ids.size());
+    rq.share_at = shared_prefix_boundary(shared_prefix_len, rq.snap_at, prompt_cache_on_);   // P4 B15 (--parallel 1's rule)
+    // (--parallel 1 caps the reply at max_ctx - 8 - prompt; a lane caps it at its own capacity the same way)
+    if (rq.sp.max_tokens == 0) { res.finish_reason = "length"; return res; }   // --parallel 1: zero steps
+    const LanesResult lr = q4e_->serve->run(rq, on_token);
+    res.text = lr.text;
+    res.finish_reason = lr.finish_reason;
+    res.cached_tokens = lr.cached_tokens;
+    res.completion_tokens = lr.completion_tokens;
+    res.prefill_ms = lr.prefill_ms;
+    res.decode_ms = lr.decode_ms;
+    res.cache_source = lr.cache_source;
+    return res;
+}
+
 uint32_t Engine::prompt_cache_slots() const {
     if (mimo26_) return mimo26_prompt_cache_slots();
     if (ds41_) return ds41_prompt_cache_slots();
@@ -3228,20 +4497,24 @@ uint32_t Engine::prompt_cache_slots() const {
 std::string Engine::vision_status_json() const {
     bool ready = false; std::string reason; long tokens = -1;
     switch (arch_) {
-        case ModelArch::kMimo26:
-            if (mimo26_) { ready = mimo26_->vis_ready; reason = ready ? "" : mimo26_->vis_error; tokens = long(mimo26_->image_tokens); }
+        case ModelArch::kMimo26:   // not ready at --parallel > 1 either: the lanes refuse images (mimo26_chat, the same rule)
+            if (mimo26_) {
+                reason = mimo26_vision_refusal(mimo26_->vis_ready, mimo26_->vis_error, uint32_t(mimo26_->serve.lanes.size()));
+                ready = reason.empty(); tokens = long(mimo26_->image_tokens);
+            }
             else reason = "model not loaded";
             break;
         case ModelArch::kDeepSeek41:
             if (ds41_) { ready = ds41_->vis_ready; reason = ready ? "" : ds41_->vis_error; tokens = long(kDs41VisMaxTok); }
             else reason = "model not loaded";
             break;
-        case ModelArch::kDeepSeek4:
-            ready = ds4_vis_ != nullptr;
-            if (!ready) reason = "this deepseek4 load has no vision sidecar (*-Native.safetensors beside the GGUF, or $IE_DS4_VISION)";
+        case ModelArch::kDeepSeek4:   // not ready at --parallel > 1 either: Engine::chat refuses images there (the same rule)
+            reason = ds4_vision_refusal(ds4_vis_ != nullptr, opts_.parallel);
+            ready = reason.empty();
             break;
-        case ModelArch::kQwen4Exp:
-            ready = true;
+        case ModelArch::kQwen4Exp:   // not ready at --parallel > 1: Engine::chat refuses images there (the same rule)
+            reason = q4e_vision_refusal(opts_.parallel);
+            ready = reason.empty();
             break;
         default:
             reason = "this architecture has no vision input";
@@ -3256,6 +4529,12 @@ std::string Engine::reasoning_effort_error(std::string_view effort) const {
     const auto* ct=gguf_.find_kv("tokenizer.chat_template");
     return ie::reasoning_effort_error(reasoning_capabilities(arch_,
         ct && ct->type==GgufValueType::kString?ct->as_string():std::string_view{}),effort);
+}
+
+std::string Engine::gguf_string(std::string_view key) const {
+    if (arch_ == ModelArch::kDeepSeek41 || arch_ == ModelArch::kMimo26) return {};   // no GGUF
+    const auto* ct = gguf_.find_kv(key);
+    return ct && ct->type == GgufValueType::kString ? std::string(ct->as_string()) : std::string();
 }
 
 GenerateResult Engine::chat(std::span<const ChatTurn> turns,
@@ -3275,21 +4554,23 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
     ds4_pending_imgs_.clear();
     bool has_images = false;
     for (const auto& t : turns) has_images |= !t.images.empty();
-    const bool ds4_vision = arch_ == ModelArch::kDeepSeek4 && ds4_vis_ != nullptr;
-    if (has_images && arch_ != ModelArch::kQwen4Exp && !ds4_vision) {
+    if (has_images && arch_ == ModelArch::kDeepSeek4) {
+        if (const std::string why = ds4_vision_refusal(ds4_vis_ != nullptr, opts_.parallel); !why.empty()) {
+            GenerateResult res;
+            res.finish_reason = "error: " + why;
+            return res;
+        }
+    } else if (has_images && arch_ != ModelArch::kQwen4Exp) {
         GenerateResult res;
-        res.finish_reason = arch_ == ModelArch::kDeepSeek4
-            ? "error: this deepseek4 load has no vision sidecar (*-Native.safetensors beside the GGUF, or $IE_DS4_VISION)"
-            : "error: this model has no vision support";
+        res.finish_reason = "error: this model has no vision support";
         return res;
     }
     // Per-request image staging lives in engine members that are written
     // BEFORE the generation gate; with --parallel > 1 two requests could
     // clobber each other's images. Refuse plainly instead of racing.
-    if (has_images && opts_.parallel > 1) {
+    if (const std::string why = has_images ? q4e_vision_refusal(opts_.parallel) : std::string(); !why.empty()) {
         GenerateResult res;
-        res.finish_reason = "error: image inputs need --parallel 1 "
-                            "(per-request image staging is engine-global, not slot-safe)";
+        res.finish_reason = "error: " + why;
         return res;
     }
     if (arch_ == ModelArch::kGlm5Next) {
@@ -3562,12 +4843,27 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
                                                        effort_preamble);
         cache_prefix_len = uint32_t(tok_.encode(stable, /*allow_special=*/true).size());
     }
+    // P4 B15: the SHARED prefix = the leading system turn(s) + the tools block (rendered alone, no generation prompt): what
+    // every conversation with the same system prompt and tools shares. Used only when its tokens are a strict prefix of this
+    // prompt's and it is long enough to be worth a snapshot (IE_SHARED_PREFIX_MIN, default 1024 tokens); IE_SHARED_PREFIX=0 off.
+    uint32_t shared_prefix_len = 0;
+    if (prompt_cache_on_ && !has_images && shared_prefix_enabled(std::getenv("IE_SHARED_PREFIX"))) {
+        size_t n_sys = 0;
+        while (n_sys < render_turns.size() && render_turns[n_sys].role == "system") ++n_sys;
+        if (n_sys > 0 || !tools_json.empty()) {
+            const std::string sys = build_chatml_prompt(render_turns.subspan(0, n_sys), /*add_generation_prompt=*/false,
+                                                        enable_thinking, tools_json, model_has_think, effort_preamble);
+            const auto sys_ids = tok_.encode(sys, /*allow_special=*/true);
+            const auto full_ids = tok_.encode(full, /*allow_special=*/true);
+            shared_prefix_len = shared_prefix_accept(sys_ids, full_ids, shared_prefix_min(std::getenv("IE_SHARED_PREFIX_MIN")));
+        }
+    }
     // Reply snapshots can only hit when the history render of an assistant turn
     // (<|im_start|>assistant\n + content) equals the generation prompt + reply:
     // true for plain ChatML (non-thinking models such as Qwen3-Coder), false for
     // thinking-capable templates, whose generation prompt adds a <think> block
     // (empty when thinking is off) that history never carries.
-    return generate(full, sp, on_token, cache_prefix_len, /*reply_cache=*/!model_has_think);
+    return generate(full, sp, on_token, cache_prefix_len, /*reply_cache=*/!model_has_think, shared_prefix_len);
 }
 
 }  // namespace ie

@@ -23,7 +23,9 @@
 namespace ie {
 // Blocks until SIGTERM/SIGINT or POST /admin/shutdown. Returns non-zero on
 // bind failure. `max_queue` = requests allowed to wait for a generation slot.
+// `root_id` (non-empty when a layout names the server): /v1/models reports it as
+// "root" beside the served name `model_id` (docs/serve_config.md).
 int run_openai_server(Engine& eng, const std::string& model_id,
                       const std::string& host, int port,
-                      uint32_t max_queue = 8);
+                      uint32_t max_queue = 8, const std::string& root_id = "");
 }

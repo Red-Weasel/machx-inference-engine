@@ -29,6 +29,7 @@
 #include "ie/qwen35_dense.hpp"       // MtpHead + Qwen35SpecCheckpoint (spec-decode)
 
 #include <functional>
+#include <span>
 
 #include <sycl/sycl.hpp>
 #include <cstdint>
@@ -57,9 +58,10 @@ public:
     // Per-card state accessors for the multi-GPU FleetPrefixCache (prompt/KV cache).
     // 27B is a DeltaNet+full-attn hybrid (dense FFN), so it snapshots BOTH per-card
     // KvCache and DeltaNetState — identical surface to Qwen3NextModel/crown-split.
+    // With request lanes (P4 B18, below) they are the SELECTED lane's state on that card.
     DeviceFleet*    fleet()                     const noexcept { return fleet_; }
-    KvCache&        kv_cache(uint32_t dev)                     { return kv_[dev]; }
-    DeltaNetState&  dn_state(uint32_t dev)                     { return dn_[dev]; }
+    KvCache&        kv_cache(uint32_t dev)                     { return kv_at(dev); }
+    DeltaNetState&  dn_state(uint32_t dev)                     { return dn_at(dev); }
     bool            dev_has_kv(uint32_t dev)    const          { return kv_[dev].ready(); }
     bool            dev_has_dn(uint32_t dev)    const          { return dn_[dev].ready(); }
     std::vector<uint64_t> device_bytes() const { return dev_bytes_; }
@@ -87,16 +89,55 @@ public:
     // and advanced in bank[slots[i]]. Per-slot logits land at
     // out_logits_host + i*vocab (fp16). Weight GEMMs are row-batched across
     // slots (the spec-verify batched kernels); attention, causal conv, and the
-    // DeltaNet recurrence run per slot against bank state.
+    // DeltaNet recurrence run per slot against bank state. N <= kMaxSlots (the
+    // batched int-dot leaves take 2..16 rows).
+    static constexpr uint32_t kMaxSlots = 16;
     std::string forward_slots(uint32_t N, const int32_t* ids,
                               const uint32_t* positions, const uint32_t* slots,
                               sycl::half* out_logits_host);
+
+    // ---- P4 B18 (docs/lanes/LANES_SERVE.md): request lanes for `ie serve --parallel N` on the two-card split (the shared lanes
+    // module; replaces the slot banks + BatchStepper unless IE_QWEN35_LANES=0). A lane is one sequence's KV + DeltaNet state on
+    // every card; lane 0 is the state load() allocated at --ctx (nothing changes with one lane). init_lanes sizes every card's
+    // workspace for max(max_rows, kMaxRows), then allocates lanes 1..n-1 at lane_ctx positions: refused, with the numbers, when a
+    // card would keep less than reserve_bytes free after them (q35m_lanes_fit). Refuses --int8-kv (the rows path is fp16 KV).
+    std::string init_lanes(uint32_t n_lanes, uint32_t lane_ctx, uint32_t max_rows, uint64_t reserve_bytes);
+    uint32_t    n_lanes() const noexcept { return 1u + uint32_t(lane_kv_.size()); }
+    uint32_t    lane_ctx(uint32_t lane) const noexcept { return lane ? lane_ctx_ : max_ctx_; }
+    uint64_t    lane_bytes(uint32_t dev) const noexcept { return dev < lane_bytes_.size() ? lane_bytes_[dev] : 0; }
+    void        select_lane(uint32_t lane);   // every card: kv_cache/dn_state and the prefill stage act on the lane
+    void        reset_state();                // the selected lane on every card: a new sequence
+    // One card's part of one step of `lane` (a card-pipe stage). Card 0: embeds ids, runs its layers, copies the residual rows
+    // [T, hidden] fp16 out to x_host. Card 1: copies them in, runs its layers and the head: the LAST row's logits land in
+    // logits() (device, card 1). pos0 0 resets the lane on the card first. The layers are --parallel 1's for that piece:
+    // T > 1 or pk = forward_pipelined's prefill walk (stage_card_prefill; forward()'s T > 1 walk is the same launches),
+    // T == 1 and !pk = forward_slots' one-row decode walk (bit-identical to forward(T = 1): the Phase 2a certification).
+    // Touches only that card's objects, so the two cards' stages may run at once on two threads.
+    std::string forward_stage(uint32_t dev, uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, sycl::half* x_host,
+                              bool pk = false);
+    sycl::half* logits() const noexcept { return lane_logits_; }
+    // One card's part of ONE decode step of G = 2..kMaxRows lanes at once (a rows-mode group of the card pipe), one row per lane,
+    // lane i at pos0[i] (never 0). forward_slots' walk with the rows' state addressed by lane (never through cur_): every
+    // weight read once for the G rows; conv, recurrence, alpha/beta and attention per row. Card 1 leaves row i's logits at
+    // rows_logits() + i * vocab.
+    static constexpr uint32_t kMaxRows = 16;
+    std::string forward_stage_rows(uint32_t dev, std::span<const uint32_t> lanes, const int32_t* ids, const uint32_t* pos0,
+                                   sycl::half* x_host);
+    // "" = the rows path's batched int-dot covers every projection (each dense weight and the head Q8_0-SoA, alpha/beta F16);
+    // else why not (the lanes then step one lane at a time).
+    std::string rows_off_reason() const;
+    sycl::half* rows_logits() const noexcept { return rows_logits_; }
+
 private:
     // Per-card layer walk for one group of slots (pure enqueue; used by
     // forward_slots' 2-card group pipeline and its serial fallback).
     std::string stage_card_slots(uint32_t dev, uint32_t T,
                                  const uint32_t* positions,
                                  const uint32_t* slots);
+    // P4 B18: stage_card_slots' walk over any rows' state (row i: kv[i] / dn[i] on this card; kv[i]'s max_ctx is its KV
+    // layout), its projections through sgemv_rows (forward_slots' forced batched int-dot route without the model-wide flag,
+    // so a prefill piece on the other card keeps its own route). stage_card_slots is this walk over the banks.
+    std::string stage_card_rows(uint32_t dev, uint32_t T, const uint32_t* positions, KvCache* const* kv, DeltaNetState* const* dn);
 public:
     uint32_t n_devices() const noexcept { return n_dev_; }
 
@@ -255,6 +296,8 @@ private:
     // dequant-to-fp16 + gemm; non-Q8_0 → dense::gemv_q_T. Runs on dev's queue.
     sycl::event sgemv(uint32_t dev, const sycl::half* A, const SplitW& w,
                       sycl::half* out, uint32_t K, uint32_t N, uint32_t T);
+    // P4 B18: sgemv with its spec-verify route (T 2..16, Q8_0-SoA: the batched int-dot) whatever spec_verify_gemv_ says
+    sycl::event sgemv_rows(uint32_t dev, const sycl::half* A, const SplitW& w, sycl::half* out, uint32_t K, uint32_t N, uint32_t T);
 
     // Enqueue one card's full layer stage for a prefill chunk (no waits/prof/ckpt;
     // used by forward_pipelined — the serial forward keeps its own validated loop).
@@ -263,6 +306,21 @@ private:
     std::string ensure_ws(uint32_t dev, uint32_t max_T);
     void free_ws(uint32_t dev);
     void free_all();
+
+    // P4 B18 request lanes: lanes 1..n-1 ([lane - 1][dev]; lane 0 = kv_/dn_), the lane each card's prefill stage and the
+    // accessors act on, the last lane step's logits and a rows group's on head_dev.
+    std::vector<std::vector<KvCache>>       lane_kv_;
+    std::vector<std::vector<DeltaNetState>> lane_dn_;
+    std::vector<uint32_t>                   cur_;          // [dev] (load: all 0)
+    std::vector<uint64_t>                   lane_bytes_;   // [dev] one extra lane
+    uint32_t    max_ctx_ = 0, lane_ctx_ = 0;
+    sycl::half* lane_logits_ = nullptr;                    // [vocab] on head_dev
+    sycl::half* rows_logits_ = nullptr;                    // [kMaxRows x vocab] on head_dev
+    KvCache&       kv_at(uint32_t dev) { return cur_[dev] ? lane_kv_[cur_[dev] - 1][dev] : kv_[dev]; }
+    DeltaNetState& dn_at(uint32_t dev) { return cur_[dev] ? lane_dn_[cur_[dev] - 1][dev] : dn_[dev]; }
+    KvCache&       lane_kv(uint32_t lane, uint32_t dev) { return lane ? lane_kv_[lane - 1][dev] : kv_[dev]; }
+    DeltaNetState& lane_dn(uint32_t lane, uint32_t dev) { return lane ? lane_dn_[lane - 1][dev] : dn_[dev]; }
+    std::string embed_rows(const int32_t* ids, uint32_t n);   // card 0: n ids -> ws_[embed_dev].x (host ids)
 };
 
 }  // namespace ie

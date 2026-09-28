@@ -475,6 +475,46 @@ add_executable(glm5_memory_policy_test unit/glm5_memory_policy_test.cpp)
 target_include_directories(glm5_memory_policy_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME glm5_memory_policy_test COMMAND glm5_memory_policy_test)
 
+# Host-only (no GPU, no SYCL): GLM-5.3 request lanes (P4 B7, include/ie/glm5_lanes.hpp) -- the card pipe's scheduling with
+# fake stages (order, per-lane residual, overlap, claims, pos0, the error latch, stop from a callback) and the per-lane VRAM
+# arithmetic (glm5_lane_bytes). Does NOT link ie_core.
+add_executable(glm5_lanes_test
+  unit/glm5_lanes_test.cpp
+  ${CMAKE_SOURCE_DIR}/src/model/glm5_lanes.cpp)
+target_include_directories(glm5_lanes_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME glm5_lanes_test COMMAND glm5_lanes_test)
+
+# Host-only (no GPU, no SYCL): the shared lanes module (P4 B8, include/ie/lanes_serve.hpp) with a fake two-stage model --
+# concurrent requests == their solo references, the serial turn, prefill through the pipe beside decoding lanes, the prompt
+# cache, cancel, stop, a stage error's recovery, teardown -- plus Flash-Next's host rules (include/ie/q4e_lanes.hpp) and
+# Glm5LanePipe's set_lane_pos / error. Does NOT link ie_core.
+add_executable(lanes_serve_test
+  unit/lanes_serve_test.cpp
+  ${CMAKE_SOURCE_DIR}/src/engine/lanes_serve.cpp
+  ${CMAKE_SOURCE_DIR}/src/model/glm5_lanes.cpp)
+target_include_directories(lanes_serve_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME lanes_serve_test COMMAND lanes_serve_test)
+
+# Host-only (no GPU, no SYCL): the crown split's request lanes (P4 B10, include/ie/q35m_lanes.hpp) -- the per-lane VRAM
+# arithmetic, the prefill chunk rule, the plan == --parallel 1's prefill loop, and the crown's hooks (a prompt cache shared by
+# every lane) through the shared lanes module with a fake two-stage model against a --parallel 1 reference. No ie_core.
+add_executable(q35m_lanes_test
+  unit/q35m_lanes_test.cpp
+  ${CMAKE_SOURCE_DIR}/src/engine/lanes_serve.cpp
+  ${CMAKE_SOURCE_DIR}/src/model/glm5_lanes.cpp)
+target_include_directories(q35m_lanes_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME q35m_lanes_test COMMAND q35m_lanes_test)
+
+# P4 B18: the Qwen3.8-27B split's request lanes (include/ie/q27_lanes.hpp) -- the prefill ops against --parallel 1's pipelined
+# prefill loop (the kernels of every 1-row piece), the plan / prompt-end split, and the 27B's hooks through the shared lanes module
+# with a fake two-stage model against a --parallel 1 reference, rows on and off. No ie_core.
+add_executable(q27_lanes_test
+  unit/q27_lanes_test.cpp
+  ${CMAKE_SOURCE_DIR}/src/engine/lanes_serve.cpp
+  ${CMAKE_SOURCE_DIR}/src/model/glm5_lanes.cpp)
+target_include_directories(q27_lanes_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME q27_lanes_test COMMAND q27_lanes_test)
+
 add_executable(glm5_server_test unit/glm5_server_test.cpp)
 target_link_libraries(glm5_server_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME glm5_server_test COMMAND glm5_server_test)
@@ -499,6 +539,22 @@ add_test(NAME server_controls_test COMMAND server_controls_test)
 add_executable(serve_options_test unit/serve_options_test.cpp)
 target_link_libraries(serve_options_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME serve_options_test COMMAND serve_options_test)
+
+# Host-only (no GPU): `ie serve --config` layouts, --cards parsing and card numbering (docs/serve_config.md; the doc's
+# JSON examples must parse), and the help coverage derived from the parser's source.
+add_executable(serve_config_test unit/serve_config_test.cpp)
+target_link_libraries(serve_config_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME serve_config_test COMMAND serve_config_test ${CMAKE_SOURCE_DIR}/docs/serve_config.md)
+add_executable(cli_help_test unit/cli_help_test.cpp)
+target_link_libraries(cli_help_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME cli_help_test
+         COMMAND cli_help_test ${CMAKE_SOURCE_DIR}/include/ie/serve_options.hpp ${CMAKE_SOURCE_DIR}/src/cli/main.cpp)
+# Host-only (no GPU, no SYCL): `ie supervise` (ie/supervisor.hpp) -- routing, /health aggregation, SSE passthrough and
+# shutdown ordering against fake `ie serve` children (this binary re-run with --fake-child), and the per-card locks.
+add_executable(supervisor_test unit/supervisor_test.cpp)
+target_link_libraries(supervisor_test PRIVATE ie_supervisor)
+add_test(NAME supervisor_test COMMAND supervisor_test)
+set_tests_properties(supervisor_test PROPERTIES TIMEOUT 300)
 
 # Server admission (bounded wait queue, shutdown, device-fault latch) — host-only.
 add_executable(server_admission_test unit/server_admission_test.cpp)
@@ -733,6 +789,16 @@ set_tests_properties(mimo26_model_test PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(ds41_sampler_test unit/ds41_sampler_test.cpp)
 target_link_libraries(ds41_sampler_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME ds41_sampler_test COMMAND ds41_sampler_test)
+# P4 B6b (docs/deepseek41/P4_B6B_SERVE.md): Ds41Generator::plan_prefill -- run()'s inline plan it replaced, and every plan
+# admissible step by step in the lane pipe. CPU only.
+add_executable(ds41_prefill_plan_test unit/ds41_prefill_plan_test.cpp)
+target_link_libraries(ds41_prefill_plan_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME ds41_prefill_plan_test COMMAND ds41_prefill_plan_test)
+# Host-only (no GPU, no SYCL): the V4.1 serving rules at --parallel > 1 (include/ie/ds41_serve_rules.hpp, P4 B6b) -- the lane
+# choice (MiMo B4's reply room + the continuation preference) and the reply budget. Does NOT link ie_core.
+add_executable(ds41_serve_rules_test unit/ds41_serve_rules_test.cpp)
+target_include_directories(ds41_serve_rules_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME ds41_serve_rules_test COMMAND ds41_serve_rules_test)
 # ie_vitals (docs/mimo26/IE_VITALS.md): sampler entropy / margin vs hand values, the pick unchanged, the window JSON, the parser. CPU only.
 add_executable(ie_vitals_test unit/ie_vitals_test.cpp)
 target_link_libraries(ie_vitals_test PRIVATE ie_core ie_sycl_flags)
@@ -741,6 +807,13 @@ add_executable(mimo26_ops_test unit/mimo26_ops_test.cpp)
 target_link_libraries(mimo26_ops_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME mimo26_ops_test COMMAND mimo26_ops_test)
 set_tests_properties(mimo26_ops_test PROPERTIES SKIP_RETURN_CODE 77)
+# MiMo-V2.6 P4 B3 (docs/mimo26/P4_B3_ROWS.md): batch invariance of a row-batched decode step's shared ops -- M rows vs 1 row, row
+# by row (RMSNorm, FP8 GEMV, router, the tier's per-row expert jobs + scatter bit-identical; the oneDNN o-proj / head reported).
+# Needs an Arc GPU: SKIPs (77) without.
+add_executable(mimo26_rows_test unit/mimo26_rows_test.cpp)
+target_link_libraries(mimo26_rows_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME mimo26_rows_test COMMAND mimo26_rows_test)
+set_tests_properties(mimo26_rows_test PROPERTIES SKIP_RETURN_CODE 77)
 # Host-only (no GPU, no SYCL): MiMo-V2.6 serving rules (docs/mimo26/P7_FIX64_FIX70.md) -- the host slots' ring runs, servable
 # prefix, continuation test and admission policy (#70), and the drafter's fp16 range check (#64). Self-contained TU + the
 # rules' source; does NOT link ie_core.
@@ -749,6 +822,13 @@ add_executable(mimo26_host_rules_test
   ${CMAKE_SOURCE_DIR}/src/model/mimo26_host_rules.cpp)
 target_include_directories(mimo26_host_rules_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME mimo26_host_rules_test COMMAND mimo26_host_rules_test)
+# Host-only (no GPU, no SYCL): MiMo-V2.6 lanes (P4 B1, include/ie/mimo26_lanes.hpp) -- per-lane VRAM arithmetic and the fit
+# refusal, the commit rule, admission and the serial round robin with a mid-run finish / re-admit. Does NOT link ie_core.
+add_executable(mimo26_lanes_test
+  unit/mimo26_lanes_test.cpp
+  ${CMAKE_SOURCE_DIR}/src/model/mimo26_lanes.cpp)
+target_include_directories(mimo26_lanes_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME mimo26_lanes_test COMMAND mimo26_lanes_test)
 # Host-only (no GPU, no SYCL): #48 (docs/deepseek41/103) -- the V4.1 disk prompt cache key (the derivation) and its input
 # list (every listed file exists, the list is closed under #include, and -- nm over ie_core's objects -- every function a
 # listed source calls is defined in a listed or a named-unlisted source). Self-contained TU + the key's source; the

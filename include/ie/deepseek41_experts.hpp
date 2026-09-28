@@ -21,6 +21,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <string>
 #include <vector>
@@ -173,6 +174,15 @@ public:
     // The CPU miss split's cores for THIS tier, set before init (docs/deepseek41/42 step 3: under
     // expert parallel each card's tier gets its own half of the E-cores); empty = the env / default.
     void set_cpu_cores(std::string cores) { cpu_cores_override_ = std::move(cores); }
+    // The CPU leg's PCIe share of the pinned misses at 2..kMaxRows rows (CpuMiss::qstar_multi; IE_DS41_QSTAR_MULTI at init). A
+    // caller whose rows come from SEVERAL sequences (MiMo-V2.6 P4 B3 groups: the rows share almost no experts, so an expert
+    // carries ~1 row and the split is closer to the one-row q*) sets its own share before moe() and restores this one after.
+    float qstar_multi() const { return cpu_.qstar_multi; }
+    void  set_qstar_multi(float v) { cpu_.qstar_multi = std::max(0.f, std::min(1.f, v)); }
+    // The one-row share (CpuMiss::qstar; IE_DS41_QSTAR at init). P4 B19: the lane pipe sets IE_DS41_QSTAR_LANES around a one-row
+    // step while several lanes are in flight (ds41_step_qstar) and restores this one after.
+    float qstar() const { return cpu_.qstar; }
+    void  set_qstar(float v) { cpu_.qstar = std::max(0.f, std::min(1.f, v)); }
     void set_ep_import(std::function<std::string(sycl::queue&, sycl::half* yp, uint32_t rows)> fn) { ep_import_ = std::move(fn); }
     // Phase 18 (docs/deepseek41/46 term 1): called once per moe() on the caller's thread right after the
     // first group's fetch is issued -- work enqueued on the queue there runs under that group's DMAs
@@ -180,7 +190,7 @@ public:
     const std::vector<int32_t>& ep_rows() const { return ep_rows_; }
     sycl::half* packed_yp() const { return static_cast<sycl::half*>(bws_.yp); }
     uint64_t vram_bytes() const { return cache_.device_bytes(); }
-    uint64_t pinned_bytes() const { return arena_.total_bytes(); }
+    uint64_t pinned_bytes() const { return arena_.total_bytes() + cpu_.x_bytes; }   // (+ the CPU leg's pinned activations, B13)
     uint32_t n_static() const { return cache_.static_slots(); }
     uint32_t n_stream() const { return cache_.stream_slots(); }
     uint32_t n_pinned() const { return np_; }
@@ -255,7 +265,12 @@ private:
         const Ds4SlotLayout* lay = nullptr; float limit = 0.f;
         struct Item { const void* slot; uint32_t row, tok; };
         std::vector<Item> work;                               // (arena slot, its packed row, that row's token)
-        std::vector<float> x, scratch, out;                   // host: the activations [max_rows, H]; per row of a run, EF*2 and H
+        // pinned host: the activations [max_rows, H]. Pinned, not a std::vector: NEO 26.35 serves a small device-to-host copy
+        // into pageable memory by CPU reads through the BAR (~0.35 ms for one 16 KiB row, 30x the pinned copy; P4 B13, 2026-09-27)
+        float* x = nullptr;
+        uint64_t x_bytes = 0;                                 // its size (pinned_bytes counts it)
+        std::optional<sycl::context> x_ctx;                   // its context: the destructor frees it when free_storage never ran
+        std::vector<float> scratch, out;                      // host: per row of a run, EF*2 and H
         double work_ms = 0;                                   // the last request's compute time
         sycl::half* h_rows = nullptr;                         // pinned host: the rows, [max_rows * top_k, H] fp16, in work order
         float* h_rows32 = nullptr;                            // the same rows fp32 for a continuation chunk: the XMX route lands fp32

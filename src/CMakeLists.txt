@@ -100,6 +100,7 @@ add_library(ie_core
   model/ds4_vision.cpp
   model/ds41_vision.cpp
   model/glm5next.cpp
+  model/glm5_lanes.cpp
   model/hyv4.cpp
   model/qwen35moe_split.cpp
   model/qwen35_tp.cpp
@@ -131,6 +132,7 @@ add_library(ie_core
   model/mimo26_forward.cpp
   model/mimo26_dflash.cpp
   model/mimo26_host_rules.cpp
+  model/mimo26_lanes.cpp
   model/mimo26_prefix_cache.cpp
   model/mimo26_vision.cpp
   model/mimo26_vision_tower.cpp
@@ -138,6 +140,7 @@ add_library(ie_core
   engine/ds41_engine.cpp
   engine/mimo26_engine.cpp
   engine/glm5_server.cpp
+  engine/lanes_serve.cpp
   server/openai_proto.cpp
   server/capabilities.cpp
   server/idle_spin.cpp
@@ -234,5 +237,13 @@ add_custom_target(ie_ds41_numerics DEPENDS ${IE_DS41_NUMERICS_DIR}/deepseek41_nu
 add_dependencies(ie_core ie_ds41_numerics)
 target_include_directories(ie_core PRIVATE ${IE_DS41_NUMERICS_DIR})
 
-add_executable(ie cli/main.cpp)
-target_link_libraries(ie PRIVATE ie_core ie_sycl_flags)
+# ie supervise (ie/supervisor.hpp): host-only -- no SYCL, no model; tests/unit/supervisor_test.cpp links it alone.
+find_package(Threads REQUIRED)
+add_library(ie_supervisor STATIC server/supervisor.cpp)
+target_include_directories(ie_supervisor PUBLIC ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party)
+target_link_libraries(ie_supervisor PUBLIC Threads::Threads)
+
+add_executable(ie cli/main.cpp cli/card_select.cpp)
+# --cards enumerates Level Zero itself before the SYCL runtime starts (cli/card_select.cpp)
+find_library(IE_ZE_LOADER NAMES ze_loader REQUIRED)
+target_link_libraries(ie PRIVATE ie_core ie_sycl_flags ${IE_ZE_LOADER} ie_supervisor)

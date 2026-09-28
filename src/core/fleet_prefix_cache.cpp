@@ -67,6 +67,18 @@ FleetPrefixCache::LookupResult FleetPrefixCache::find_longest_match(
     return result;
 }
 
+uint32_t FleetPrefixCache::peek_longest_match(const std::vector<int32_t>& tokens) const {
+    const Node* cur = root_.get();
+    uint32_t best = 0;
+    for (size_t i = 0; cur && i < tokens.size(); ++i) {
+        auto it = cur->children.find(tokens[i]);
+        if (it == cur->children.end()) break;
+        cur = it->second.get();
+        if (cur->is_endpoint) best = uint32_t(cur->depth);
+    }
+    return best;
+}
+
 FleetPrefixCache::Node* FleetPrefixCache::lru_endpoint(const Node* exclude) const {
     Node* lru = nullptr;
     uint64_t lru_t = UINT64_MAX;
@@ -87,6 +99,28 @@ void FleetPrefixCache::evict_endpoint(Node* n) {
     n->is_endpoint = false;
     auto it = std::find(endpoints_.begin(), endpoints_.end(), n);
     if (it != endpoints_.end()) endpoints_.erase(it);
+    std::vector<int32_t> path;
+    path.swap(n->path);
+    prune(path);   // (may free n)
+}
+
+void FleetPrefixCache::prune(const std::vector<int32_t>& tokens) {
+    if (!root_) return;
+    std::vector<Node*> chain;   // chain[i] = the node at depth i (chain[0] = root)
+    chain.reserve(tokens.size() + 1);
+    Node* cur = root_.get();
+    chain.push_back(cur);
+    for (int32_t t : tokens) {
+        auto it = cur->children.find(t);
+        if (it == cur->children.end()) break;
+        cur = it->second.get();
+        chain.push_back(cur);
+    }
+    for (size_t d = chain.size() - 1; d > 0; --d) {
+        Node* n = chain[d];
+        if (n->is_endpoint || !n->children.empty() || n == protect_) break;   // (protect_: insert's node being committed)
+        chain[d - 1]->children.erase(tokens[d - 1]);   // frees n
+    }
 }
 
 template <class Model>
@@ -98,7 +132,12 @@ std::string FleetPrefixCache::insert(Model& m,
         return "FleetPrefixCache::insert: tokens.size() exceeds max_prefix_len";
 
     Node* node = walk_or_create(tokens);
+    struct PruneOnFail {   // P4 B15: a failed snapshot leaves no node behind
+        FleetPrefixCache* c; const std::vector<int32_t>& t; bool armed = true;
+        ~PruneOnFail() { if (armed) c->prune(t); }
+    } prune_on_fail{this, tokens};
     if (node->is_endpoint) {
+        prune_on_fail.armed = false;
         // Idempotent: refresh access timestamp, don't re-snapshot.
         ++tick_;
         node->last_access_us = tick_;
@@ -137,15 +176,19 @@ std::string FleetPrefixCache::insert(Model& m,
     }
 
     // Snapshot fully built — now make room and commit.
+    protect_ = node;   // an evicted endpoint deeper along node's path must not prune node itself
     while (endpoints_.size() >= pcfg_.max_entries) {
         Node* victim = lru_endpoint(node);
         if (!victim) break;
         evict_endpoint(victim);
     }
+    protect_ = nullptr;
 
     node->kv = std::move(kv_snap);
     node->dn = std::move(dn_snap);
     node->is_endpoint = true;
+    node->path = tokens;
+    prune_on_fail.armed = false;
     ++tick_;
     node->last_access_us = tick_;
     endpoints_.push_back(node);

@@ -13,5 +13,12 @@ int main() {
     std::string error;
     auto engine=ie::Engine::load("/does/not/exist.gguf",opts,error);
     assert(!engine && error.find("slot")!=error.npos);
+    {   // P4 B14: --parallel above ie::kMaxParallel is refused before any file is opened
+        ie::EngineOptions po;po.parallel=ie::kMaxParallel+1;
+        std::string perr;
+        assert(!ie::Engine::load("/does/not/exist.gguf",po,perr) && perr.find("parallel 17")!=perr.npos && perr.find("16")!=perr.npos);
+        po.parallel=ie::kMaxParallel; perr.clear();
+        assert(!ie::Engine::load("/does/not/exist.gguf",po,perr) && perr.find("parallel")==perr.npos);   // fails later: the file
+    }
     std::cout<<"engine_options_validation_test: OK\n";
 }

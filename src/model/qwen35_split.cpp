@@ -8,6 +8,7 @@
 #include "ie/dequant.hpp"
 #include "ie/kernel_profiler.hpp"   // ie::ps (named-kernel submit)
 #include "ie/ops.hpp"
+#include "ie/q35m_lanes.hpp"       // Q35mLaneShape / q35m_lane_bytes / q35m_lanes_fit (P4 B18 lanes)
 #include "ie/quant_blocks.hpp"
 
 #include "dense_dispatch.hpp"   // dense::upload<T>, dense::upload_quant_dense_auto, dense::gemv_q/gemv_q_T
@@ -201,6 +202,8 @@ Qwen35SplitModel::~Qwen35SplitModel() { free_all(); }
 void Qwen35SplitModel::free_all() {
     if (!fleet_) return;
     free_slot_banks();
+    lane_kv_.clear(); lane_dn_.clear();   // (P4 B18 lanes; their logits buffers are in owned_)
+    lane_logits_ = rows_logits_ = nullptr;
     for (uint32_t d = 0; d < ws_.size(); ++d) free_ws(d);
     ws_.clear();
     for (uint32_t d = 0; d < owned_.size(); ++d)
@@ -398,6 +401,8 @@ std::string Qwen35SplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
         else                      kv_local_[L] = n_full[dev]++;
     }
     dn_.resize(n_dev_); kv_.resize(n_dev_);
+    cur_.assign(n_dev_, 0);   // P4 B18: every card acts on lane 0 (the live state) until select_lane
+    max_ctx_ = max_ctx;
     for (uint32_t dev = 0; dev < n_dev_; ++dev) {
         if (n_lin[dev]) {
             DeltaNetStateConfig dc{};
@@ -1110,6 +1115,31 @@ std::string Qwen35SplitModel::bank_load(uint32_t slot, uint32_t depth) {
 std::string Qwen35SplitModel::stage_card_slots(uint32_t dev, uint32_t T,
                                                const uint32_t* positions,
                                                const uint32_t* slots) {
+    // P4 B18: the walk is stage_card_rows over the slots' banks (a bank's KvCache max_ctx is slot_ctx_: the same KV layout and
+    // attention arguments as before; sgemv_rows under spec_verify_gemv_ is sgemv)
+    if (T == 0 || T > kMaxSlots) return "stage_card_slots: " + std::to_string(T) + " rows";
+    KvCache* kv[kMaxSlots];
+    DeltaNetState* dn[kMaxSlots];
+    for (uint32_t i = 0; i < T; ++i) { kv[i] = &bank_kv_[slots[i]][dev]; dn[i] = &bank_dn_[slots[i]][dev]; }
+    return stage_card_rows(dev, T, positions, kv, dn);
+}
+
+// P4 B18: the batched int-dot route forward_slots forces through spec_verify_gemv_ (sgemv's verify branch), without the
+// model-wide flag: a lane pipe's other card may be running a prefill piece, whose T > 1 sgemv must keep the prefill route.
+sycl::event Qwen35SplitModel::sgemv_rows(uint32_t dev, const sycl::half* A, const SplitW& w, sycl::half* out, uint32_t K,
+                                         uint32_t N, uint32_t T) {
+    if (w.q8_qs && T >= 2 && T <= 16) {
+        auto& q = fleet_->dev(dev).queue();
+        quantize_q8_1(q, A, act_q8_[dev], uint32_t(uint64_t(T) * K));
+        return gemv_q8_0_soa_q8_batched(q, act_q8_[dev], w.q8_qs, w.q8_d, out, K, N, T);
+    }
+    return sgemv(dev, A, w, out, K, N, T);
+}
+
+// P4 B18: stage_card_slots' walk (its body moved here verbatim but for the row state) over any rows' state: row i's conv /
+// DeltaNet state is dn[i], its KV kv[i] (layout and attention bound by kv[i]'s own max_ctx), its position positions[i].
+std::string Qwen35SplitModel::stage_card_rows(uint32_t dev, uint32_t T, const uint32_t* positions, KvCache* const* kv,
+                                              DeltaNetState* const* dn) {
     const DenseConfig& dc = cfg_.dense;
     const uint32_t H     = dc.hidden;
     const uint32_t HD    = dc.head_dim;
@@ -1120,7 +1150,6 @@ std::string Qwen35SplitModel::stage_card_slots(uint32_t dev, uint32_t T,
     const uint32_t rope_n = dc.rope_dim;
     const float    eps   = dc.rms_eps;
     const uint32_t n_layers = cfg_.n_transformer_layers();
-    const uint64_t bank_layer_kv = uint64_t(dc.n_kv_heads) * slot_ctx_ * HD;
     Workspace& w = ws_[dev];
     auto& q = fleet_->dev(dev).queue();
 
@@ -1140,9 +1169,9 @@ std::string Qwen35SplitModel::stage_card_slots(uint32_t dev, uint32_t T,
             const float qscale = 1.0f / sycl::sqrt(float(SHD));
             const uint64_t Vd  = uint64_t(SVH) * SHD;
 
-            sgemv(dev, w.x_normed, w_l.attn_qkv, w.dn_qkv, H, conv_ch, T);
+            sgemv_rows(dev, w.x_normed, w_l.attn_qkv, w.dn_qkv, H, conv_ch, T);
             for (uint32_t i = 0; i < T; ++i) {
-                DeltaNetState& bdn = bank_dn_[slots[i]][dev];
+                DeltaNetState& bdn = *dn[i];
                 sycl::half* conv_state = bdn.conv_state_ptr() +
                     uint64_t(dn_local_[L]) * bdn.conv_elems_per_layer();
                 depthwise_conv1d_causal(q,
@@ -1176,7 +1205,7 @@ std::string Qwen35SplitModel::stage_card_slots(uint32_t dev, uint32_t T,
             compute_g_beta_h16(q, w.dn_alpha_h, w.dn_beta_h, w_l.ssm_a,
                                w_l.ssm_dt_bias, w.dn_g, w.dn_beta, T, SVH);
             for (uint32_t i = 0; i < T; ++i) {
-                DeltaNetState& bdn = bank_dn_[slots[i]][dev];
+                DeltaNetState& bdn = *dn[i];
                 float* state_slot = bdn.state_ptr() +
                     uint64_t(dn_local_[L]) * bdn.state_elems_per_layer();
                 deltanet_recurrence(q,
@@ -1190,11 +1219,11 @@ std::string Qwen35SplitModel::stage_card_slots(uint32_t dev, uint32_t T,
                 gemv_q8_0_soa_q8_batched(q, act_q8_[dev],
                     w_l.attn_gate.q8_qs, w_l.attn_gate.q8_d, w.dn_z, H, SI, T);
             } else {
-                sgemv(dev, w.x_normed, w_l.attn_gate, w.dn_z, H, SI, T);
+                sgemv_rows(dev, w.x_normed, w_l.attn_gate, w.dn_z, H, SI, T);
             }
             gated_rms_norm(q, w.dn_out, w.dn_z, w_l.ssm_norm_fp16, w.dn_qkv,
                            T * SVH, SHD, eps);
-            sgemv(dev, w.dn_qkv, w_l.ssm_out, w.attn_block, SI, H, T);
+            sgemv_rows(dev, w.dn_qkv, w_l.ssm_out, w.attn_block, SI, H, T);
         } else {
             if (T >= 2 && T <= 16 &&
                 w_l.attn_q.q8_qs && w_l.attn_k.q8_qs && w_l.attn_v.q8_qs) {
@@ -1207,10 +1236,10 @@ std::string Qwen35SplitModel::stage_card_slots(uint32_t dev, uint32_t T,
                     w_l.attn_k.q8_qs, w_l.attn_k.q8_d, w.k,
                     w_l.attn_v.q8_qs, w_l.attn_v.q8_d, w.v, H, N_kv, T);
             } else {
-                sgemv(dev, w.x_normed, w_l.attn_q, w.qg, H, N_qg, T);
+                sgemv_rows(dev, w.x_normed, w_l.attn_q, w.qg, H, N_qg, T);
                 split_q_gate_per_head(q, w.qg, w.q, w.gate, T, dc.n_q_heads, HD);
-                sgemv(dev, w.x_normed, w_l.attn_k, w.k, H, N_kv, T);
-                sgemv(dev, w.x_normed, w_l.attn_v, w.v, H, N_kv, T);
+                sgemv_rows(dev, w.x_normed, w_l.attn_k, w.k, H, N_kv, T);
+                sgemv_rows(dev, w.x_normed, w_l.attn_v, w.v, H, N_kv, T);
             }
             rms_norm_f32w(q, w.q, w_l.attn_q_norm, w.q, T * dc.n_q_heads,  HD, eps);
             rms_norm_f32w(q, w.k, w_l.attn_k_norm, w.k, T * dc.n_kv_heads, HD, eps);
@@ -1222,25 +1251,27 @@ std::string Qwen35SplitModel::stage_card_slots(uint32_t dev, uint32_t T,
                 return !e || std::atoi(e) != 0;
             }();
             for (uint32_t i = 0; i < T; ++i) {
-                KvCache& bkv = bank_kv_[slots[i]][dev];
-                sycl::half* kc = bkv.k_ptr() + bank_layer_kv * li;
-                sycl::half* vc = bkv.v_ptr() + bank_layer_kv * li;
+                KvCache& bkv = *kv[i];
+                const uint32_t row_ctx = bkv.config().max_ctx;   // (a bank's is the slot context)
+                const uint64_t row_layer_kv = uint64_t(dc.n_kv_heads) * row_ctx * HD;
+                sycl::half* kc = bkv.k_ptr() + row_layer_kv * li;
+                sycl::half* vc = bkv.v_ptr() + row_layer_kv * li;
                 if (dec_vec)
                     full_attention_fa2_decode_vec(q,
                         w.q + uint64_t(i) * N_q, w.k + uint64_t(i) * N_kv,
                         w.v + uint64_t(i) * N_kv, kc, vc,
                         w.attn_out + uint64_t(i) * N_q, w.attn_partials,
-                        positions[i], dc.n_q_heads, dc.n_kv_heads, HD, slot_ctx_);
+                        positions[i], dc.n_q_heads, dc.n_kv_heads, HD, row_ctx);
                 else
                     full_attention_fa2_decode(q,
                         w.q + uint64_t(i) * N_q, w.k + uint64_t(i) * N_kv,
                         w.v + uint64_t(i) * N_kv, kc, vc,
                         w.attn_out + uint64_t(i) * N_q, w.attn_partials,
-                        positions[i], dc.n_q_heads, dc.n_kv_heads, HD, slot_ctx_);
+                        positions[i], dc.n_q_heads, dc.n_kv_heads, HD, row_ctx);
                 bkv.set_length(li, positions[i] + 1);
             }
             sigmoid_gate(q, w.attn_out, w.gate, w.attn_out, uint64_t(T) * N_q);
-            sgemv(dev, w.attn_out, w_l.attn_output, w.attn_block, N_q, H, T);
+            sgemv_rows(dev, w.attn_out, w_l.attn_output, w.attn_block, N_q, H, T);
         }
 
         residual_add_rms_norm_fused(q, w.x, w.attn_block, w_l.post_attn_norm,
@@ -1253,11 +1284,11 @@ std::string Qwen35SplitModel::stage_card_slots(uint32_t dev, uint32_t T,
                 w_l.ffn_up.q8_qs,   w_l.ffn_up.q8_d,   w.ffn_up,
                 H, F, T);
         } else {
-            sgemv(dev, w.x_normed, w_l.ffn_gate, w.ffn_gate, H, F, T);
-            sgemv(dev, w.x_normed, w_l.ffn_up,   w.ffn_up,   H, F, T);
+            sgemv_rows(dev, w.x_normed, w_l.ffn_gate, w.ffn_gate, H, F, T);
+            sgemv_rows(dev, w.x_normed, w_l.ffn_up,   w.ffn_up,   H, F, T);
         }
         swiglu(q, w.ffn_gate, w.ffn_up, w.ffn_h, uint64_t(T) * F);
-        sgemv(dev, w.ffn_h, w_l.ffn_down, w.attn_block, F, H, T);
+        sgemv_rows(dev, w.ffn_h, w_l.ffn_down, w.attn_block, F, H, T);
         residual_add(q, w.x, w.attn_block, w.x, uint64_t(T) * H);
     }
     return {};
@@ -1269,7 +1300,7 @@ std::string Qwen35SplitModel::forward_slots(uint32_t N, const int32_t* ids,
                                             sycl::half* out_logits_host) {
     if (N == 0)         return "forward_slots: N == 0";
     if (N > n_banks_)   return "forward_slots: N exceeds allocated banks";
-    if (N > 16)         return "forward_slots: N > 16 (batched int-dot leaf cap)";
+    if (N > kMaxSlots)  return "forward_slots: N > 16 (batched int-dot leaf cap)";
     if (!d_slot_logits_) return "forward_slots: banks not allocated";
     for (uint32_t i = 0; i < N; ++i) {
         if (slots[i] >= n_banks_)
@@ -1385,6 +1416,213 @@ std::string Qwen35SplitModel::forward_slots(uint32_t N, const int32_t* ids,
 }
 
 // ===========================================================================
+// P4 B18: REQUEST LANES (docs/lanes/LANES_SERVE.md) -- the shared lanes module's view of the 27B split. A lane is one
+// sequence's KV + DeltaNet state on every card (lane 0 = kv_/dn_). A lane step runs --parallel 1's launches for its piece: a
+// prefill piece forward_pipelined's per-chunk walk (stage_card_prefill on the lane), a decode row forward_slots' walk
+// (stage_card_rows), G decode rows of G lanes forward_slots' batched walk. Nothing here touches the slot banks.
+// ===========================================================================
+std::string Qwen35SplitModel::init_lanes(uint32_t n_lanes, uint32_t lane_ctx, uint32_t max_rows, uint64_t reserve_bytes) {
+    if (n_lanes < 2) return {};
+    if (!fleet_ || n_dev_ != 2 || plan_.embed_dev != 0 || plan_.head_dev != 1)
+        return "request lanes need the two-card plan (embedding on card 0, head on card 1)";
+    if (!lane_kv_.empty()) return "request lanes are already allocated";
+    if (n_lanes > kMaxRows) return "request lanes: " + std::to_string(n_lanes) + " lanes, at most " + std::to_string(kMaxRows);
+    if (lane_ctx < 9 || lane_ctx > max_ctx_)
+        return "lane context " + std::to_string(lane_ctx) + " outside [9, " + std::to_string(max_ctx_) + "]";
+    for (uint32_t dev = 0; dev < n_dev_; ++dev)
+        if (kv_[dev].ready() && kv_[dev].is_int8()) return "request lanes do not support --int8-kv";
+    // the workspace for the largest step first (it only grows): a prefill piece and a whole rows group, so no stage thread
+    // ever grows it mid-pipe (B14 gate #6's rule)
+    if (ws_.size() != n_dev_) ws_.assign(n_dev_, {});
+    for (uint32_t dev = 0; dev < n_dev_; ++dev)
+        if (auto m = ensure_ws(dev, std::max<uint32_t>(max_rows, kMaxRows)); !m.empty()) return m;
+    // and the prefill dequant scratch at its full size (sgemv grows it at a card's first prefill piece: never on a stage
+    // thread mid-pipe, and counted in the free memory below)
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+        uint64_t need = 0;
+        for (uint32_t L = 0; L < layers_.size(); ++L) {
+            if (plan_.dev_of_layer[L] != dev) continue;
+            const LayerW& l = layers_[L];
+            for (const SplitW* w : {&l.ffn_gate, &l.ffn_up, &l.ffn_down, &l.attn_q, &l.attn_k, &l.attn_v, &l.attn_output,
+                                    &l.attn_qkv, &l.attn_gate, &l.ssm_out})
+                if (w->q8_qs) need = std::max<uint64_t>(need, uint64_t(w->K) * w->N);
+        }
+        if (need > prefill_bt_cap_[dev]) {
+            if (prefill_bt_[dev]) fleet_->dev(dev).free(prefill_bt_[dev]);
+            prefill_bt_[dev] = static_cast<sycl::half*>(fleet_->dev(dev).malloc(need * sizeof(sycl::half)));
+            prefill_bt_cap_[dev] = prefill_bt_[dev] ? need : 0;
+            if (!prefill_bt_[dev]) return "request lanes: the prefill dequant scratch alloc failed on card " + std::to_string(dev);
+        }
+    }
+    lane_bytes_.assign(n_dev_, 0);
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+        Q35mLaneShape sh;
+        if (kv_[dev].ready()) {
+            const auto& kc = kv_[dev].config();
+            sh.n_full = kc.n_layers_full; sh.n_kv_heads = kc.n_kv_heads; sh.head_dim = kc.head_dim;
+        }
+        if (dn_[dev].ready()) {
+            const auto& dc = dn_[dev].config();
+            sh.n_lin = dc.n_layers_linear; sh.v_heads = dc.n_v_heads; sh.k_head_dim = dc.k_head_dim; sh.v_head_dim = dc.v_head_dim;
+            sh.conv_channels = dc.conv_channels; sh.conv_kernel = dc.conv_kernel;
+        }
+        lane_bytes_[dev] = q35m_lane_bytes(sh, lane_ctx);
+        const sycl::device dv = fleet_->dev(dev).device();
+        if (!dv.has(sycl::aspect::ext_intel_free_memory)) return "request lanes: card " + std::to_string(dev) + " does not report free memory";
+        const uint64_t free_now = dv.get_info<sycl::ext::intel::info::device::free_memory>();
+        // the logits buffers allocated below (the head card) come out of the free memory before the reserve is kept
+        const uint64_t logits_b = dev == plan_.head_dev ? uint64_t(1 + kMaxRows) * cfg_.dense.vocab * sizeof(sycl::half) : 0ull;
+        if (auto m = q35m_lanes_fit(free_now, lane_bytes_[dev], n_lanes, lane_ctx, reserve_bytes + logits_b, dev); !m.empty()) return m;
+    }
+    lane_ctx_ = lane_ctx;
+    lane_kv_.resize(n_lanes - 1);
+    lane_dn_.resize(n_lanes - 1);
+    for (uint32_t l = 0; l + 1 < n_lanes; ++l) {
+        lane_kv_[l].resize(n_dev_);
+        lane_dn_[l].resize(n_dev_);
+        for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+            uint64_t got = 0;
+            if (kv_[dev].ready()) {
+                KvCacheConfig kc = kv_[dev].config();
+                kc.max_ctx = lane_ctx;
+                if (auto m = lane_kv_[l][dev].init(fleet_->dev(dev), kc); !m.empty())
+                    return "lane " + std::to_string(l + 1) + " kv card " + std::to_string(dev) + ": " + m;
+                got += 2 * lane_kv_[l][dev].bytes_per_layer() * kc.n_layers_full;
+            }
+            if (dn_[dev].ready()) {
+                auto& d = lane_dn_[l][dev];
+                if (auto m = d.init(fleet_->dev(dev), dn_[dev].config()); !m.empty())
+                    return "lane " + std::to_string(l + 1) + " deltanet card " + std::to_string(dev) + ": " + m;
+                got += d.config().n_layers_linear * (d.state_elems_per_layer() * sizeof(float) + d.conv_elems_per_layer() * sizeof(sycl::half));
+            }
+            if (got != lane_bytes_[dev])
+                return "request lanes: internal: card " + std::to_string(dev) + " allocated " + std::to_string(got) +
+                       " bytes per lane, the arithmetic says " + std::to_string(lane_bytes_[dev]);
+        }
+    }
+    auto& hd = fleet_->dev(plan_.head_dev);
+    lane_logits_ = static_cast<sycl::half*>(hd.malloc(uint64_t(cfg_.dense.vocab) * sizeof(sycl::half)));
+    if (!lane_logits_) return "request lanes: logits buffer alloc failed";
+    owned_[plan_.head_dev].push_back(lane_logits_);
+    rows_logits_ = static_cast<sycl::half*>(hd.malloc(uint64_t(kMaxRows) * cfg_.dense.vocab * sizeof(sycl::half)));
+    if (!rows_logits_) return "request lanes: rows logits buffer alloc failed";
+    owned_[plan_.head_dev].push_back(rows_logits_);
+    return {};
+}
+
+void Qwen35SplitModel::select_lane(uint32_t lane) {
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) cur_[dev] = lane;
+}
+
+void Qwen35SplitModel::reset_state() {
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+        if (dn_at(dev).ready()) dn_at(dev).reset(fleet_->dev(dev).queue());
+        if (kv_at(dev).ready()) kv_at(dev).reset();
+    }
+}
+
+// forward() / forward_slots' embedding on the embed card: host ids in, n rows into ws_[embed_dev].x
+std::string Qwen35SplitModel::embed_rows(const int32_t* ids, uint32_t n) {
+    auto& q = fleet_->dev(plan_.embed_dev).queue();
+    Workspace& w = ws_[plan_.embed_dev];
+    if (!w.ids) return "d_ids alloc failed";
+    q.memcpy(w.ids, ids, n * sizeof(int32_t)).wait();
+    const uint32_t H = cfg_.dense.hidden;
+    if (token_embd_dtype_ == DType::kQ4_K)      embedding_lookup_q4k(q, w.ids, token_embd_, w.x, n, H);
+    else if (token_embd_dtype_ == DType::kQ8_0) embedding_lookup_q8_0(q, w.ids, token_embd_, w.x, n, H);
+    else                                        embedding_lookup_q6k(q, w.ids, token_embd_, w.x, n, H);
+    return {};
+}
+
+std::string Qwen35SplitModel::forward_stage(uint32_t dev, uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0,
+                                            sycl::half* x_host, bool pk) {
+    if (T == 0) return "T == 0";
+    if (lane >= n_lanes() || n_dev_ != 2 || dev >= 2 || !lane_logits_) return "forward_stage: no such lane/card (lanes not initialised?)";
+    if (uint64_t(pos0) + T > lane_ctx(lane))
+        return "forward_stage: rows [" + std::to_string(pos0) + ", " + std::to_string(pos0 + T) + ") past lane " +
+               std::to_string(lane) + "'s " + std::to_string(lane_ctx(lane)) + " positions";
+    if (auto m = ensure_ws(dev, T); !m.empty()) return m;
+    cur_[dev] = lane;
+    auto& q = fleet_->dev(dev).queue();
+    Workspace& w = ws_[dev];
+    const uint32_t H = cfg_.dense.hidden;
+    // forward()'s per-card order: positions, the reset at pos 0, the embedding (card 0) or the residual in (card 1), the
+    // layers, then the residual out (card 0) or the head on the last row (card 1)
+    std::vector<int32_t> pos(T);
+    for (uint32_t t = 0; t < T; ++t) pos[t] = int32_t(pos0 + t);
+    q.memcpy(w.positions, pos.data(), T * sizeof(int32_t)).wait();
+    if (pos0 == 0) {
+        if (dn_at(dev).ready()) dn_at(dev).reset(q);
+        if (kv_at(dev).ready()) kv_at(dev).reset();
+    }
+    const uint64_t xb = uint64_t(T) * H * sizeof(sycl::half);
+    if (dev == plan_.embed_dev) { if (auto m = embed_rows(ids, T); !m.empty()) return m; }
+    else q.memcpy(w.x, x_host, xb).wait();
+    if (T > 1 || pk) {
+        stage_card_prefill(dev, T, pos0);
+    } else {
+        KvCache* kv = &kv_at(dev);
+        DeltaNetState* dn = &dn_at(dev);
+        if (auto m = stage_card_rows(dev, 1, &pos0, &kv, &dn); !m.empty()) return m;
+    }
+    if (dev != plan_.head_dev) { q.memcpy(x_host, w.x, xb).wait(); return {}; }
+    rms_norm_f32w(q, w.x + uint64_t(T - 1) * H, output_norm_, w.x_normed, 1, H, cfg_.dense.rms_eps);
+    sgemv(dev, w.x_normed, output_, lane_logits_, H, cfg_.dense.vocab, 1).wait();
+    return {};
+}
+
+std::string Qwen35SplitModel::forward_stage_rows(uint32_t dev, std::span<const uint32_t> lanes, const int32_t* ids,
+                                                 const uint32_t* pos0, sycl::half* x_host) {
+    const uint32_t G = uint32_t(lanes.size());
+    if (G < 2 || G > kMaxRows) return "forward_stage_rows: " + std::to_string(G) + " rows (2.." + std::to_string(kMaxRows) + ")";
+    if (n_dev_ != 2 || dev >= 2 || !rows_logits_) return "forward_stage_rows: no such card (lanes not initialised?)";
+    for (uint32_t i = 0; i < G; ++i) {
+        if (lanes[i] >= n_lanes()) return "forward_stage_rows: no lane " + std::to_string(lanes[i]);
+        if (pos0[i] == 0 || pos0[i] >= lane_ctx(lanes[i]))
+            return "forward_stage_rows: lane " + std::to_string(lanes[i]) + " at " + std::to_string(pos0[i]) + " (a decode row needs 1.." +
+                   std::to_string(lane_ctx(lanes[i]) - 1) + ")";
+        for (uint32_t j = 0; j < i; ++j)
+            if (lanes[j] == lanes[i]) return "forward_stage_rows: lane " + std::to_string(lanes[i]) + " twice";
+    }
+    if (auto m = ensure_ws(dev, G); !m.empty()) return m;
+    auto& q = fleet_->dev(dev).queue();
+    Workspace& w = ws_[dev];
+    const uint32_t H = cfg_.dense.hidden, V = cfg_.dense.vocab;
+    int32_t pos[kMaxRows];
+    for (uint32_t i = 0; i < G; ++i) pos[i] = int32_t(pos0[i]);
+    q.memcpy(w.positions, pos, G * sizeof(int32_t)).wait();
+    const uint64_t xb = uint64_t(G) * H * sizeof(sycl::half);
+    if (dev == plan_.embed_dev) { if (auto m = embed_rows(ids, G); !m.empty()) return m; }
+    else q.memcpy(w.x, x_host, xb).wait();
+    KvCache* kv[kMaxRows];
+    DeltaNetState* dn[kMaxRows];
+    for (uint32_t i = 0; i < G; ++i) { kv[i] = &lane_kv(lanes[i], dev); dn[i] = &lane_dn(lanes[i], dev); }
+    if (auto m = stage_card_rows(dev, G, pos0, kv, dn); !m.empty()) return m;
+    if (dev != plan_.head_dev) { q.memcpy(x_host, w.x, xb).wait(); return {}; }
+    // forward_slots' head: the G rows normalised, the batched lm_head
+    rms_norm_f32w(q, w.x, output_norm_, w.x_normed, G, H, cfg_.dense.rms_eps);
+    sgemv_rows(dev, w.x_normed, output_, rows_logits_, H, V, G).wait();
+    return {};
+}
+
+std::string Qwen35SplitModel::rows_off_reason() const {
+    if (lane_kv_.empty() || !rows_logits_) return "the request lanes are not initialised";
+    if (!output_.q8_qs) return "the head is not Q8_0";
+    // a projection that is not Q8_0-SoA would run its G rows through the prefill GEMM (another rounding than one row's GEMV)
+    for (uint32_t L = 0; L < layers_.size(); ++L) {
+        const LayerW& l = layers_[L];
+        const std::string at = " (layer " + std::to_string(L) + ")";
+        if (l.is_linear) {
+            if (!l.attn_qkv.q8_qs || !l.attn_gate.q8_qs || !l.ssm_out.q8_qs) return "a DeltaNet projection is not Q8_0" + at;
+        } else if (!l.attn_q.q8_qs || !l.attn_k.q8_qs || !l.attn_v.q8_qs || !l.attn_output.q8_qs) {
+            return "an attention projection is not Q8_0" + at;
+        }
+        if (!l.ffn_gate.q8_qs || !l.ffn_up.q8_qs || !l.ffn_down.q8_qs) return "an FFN projection is not Q8_0" + at;
+    }
+    return {};
+}
+
+// ===========================================================================
 // PIPELINED PREFILL (2 cards): the serial layer-split leaves each card idle
 // while the other computes. For prefill, chunk c+1's card-0 pass can overlap
 // chunk c's card-1 pass (each card's in-order queue serializes ITS chunks; the
@@ -1407,7 +1645,7 @@ void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t sta
     const uint32_t n_layers = cfg_.n_transformer_layers();
     const uint32_t n_kv = dc.n_kv_heads;
     const uint64_t per_layer_kv =
-        uint64_t(n_kv) * (kv_[dev].ready() ? kv_[dev].config().max_ctx : 0u) * HD;
+        uint64_t(n_kv) * (kv_at(dev).ready() ? kv_at(dev).config().max_ctx : 0u) * HD;
 
     for (uint32_t L = 0; L < n_layers; ++L) {
         if (plan_.dev_of_layer[L] != dev) continue;
@@ -1423,8 +1661,8 @@ void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t sta
             const uint32_t rep = SVH / SKH;
             const float qscale = 1.0f / sycl::sqrt(float(SHD));
             sgemv(dev, w.x_normed, w_l.attn_qkv, w.dn_qkv, H, conv_ch, T);
-            sycl::half* conv_state = dn_[dev].conv_state_ptr() +
-                uint64_t(dn_local_[L]) * dn_[dev].conv_elems_per_layer();
+            sycl::half* conv_state = dn_at(dev).conv_state_ptr() +
+                uint64_t(dn_local_[L]) * dn_at(dev).conv_elems_per_layer();
             depthwise_conv1d_causal(q, w.dn_qkv, w_l.ssm_conv1d_fp16, conv_state,
                                     w.dn_conv, T, conv_ch, cfg_.ssm_conv_kernel);
             cast_qkv_split_fp16_to_fp32(q, w.dn_conv, w.dn_qpre, w.dn_kpre, w.dn_vpre, T, kw, SI);
@@ -1439,8 +1677,8 @@ void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t sta
             extract_cols(q, w.dn_beta64,  w.dn_beta_h,  T, SVH, SVHp);
             compute_g_beta_h16(q, w.dn_alpha_h, w.dn_beta_h, w_l.ssm_a, w_l.ssm_dt_bias,
                                w.dn_g, w.dn_beta, T, SVH);
-            float* state_layer = dn_[dev].state_ptr() +
-                uint64_t(dn_local_[L]) * dn_[dev].state_elems_per_layer();
+            float* state_layer = dn_at(dev).state_ptr() +
+                uint64_t(dn_local_[L]) * dn_at(dev).state_elems_per_layer();
             deltanet_recurrence(q, w.dn_qrep, w.dn_krep, w.dn_vpre, w.dn_g, w.dn_beta,
                                 state_layer, w.dn_out, /*B=*/1, T, SVH, SHD, SHD);
             sgemv(dev, w.x_normed, w_l.attn_gate, w.dn_z, H, SI, T);
@@ -1456,7 +1694,7 @@ void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t sta
             rms_norm_f32w(q, w.k, w_l.attn_k_norm, w.k, T * dc.n_kv_heads, HD, eps);
             rope_partial(q, w.q, w.positions, w.q, T, dc.n_q_heads,  HD, rope_n, dc.rope_theta);
             rope_partial(q, w.k, w.positions, w.k, T, dc.n_kv_heads, HD, rope_n, dc.rope_theta);
-            auto& kvc = kv_[dev];
+            auto& kvc = kv_at(dev);
             const uint32_t li = kv_local_[L];
             sycl::half* kc = kvc.k_ptr() + per_layer_kv * li;
             sycl::half* vc = kvc.v_ptr() + per_layer_kv * li;

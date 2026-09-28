@@ -5,6 +5,11 @@
 #include "ie/preflight.hpp"
 #include "ie/gguf.hpp"
 #include "ie/serve_options.hpp"
+#include "ie/serve_config.hpp"
+#include "ie/card_select.hpp"
+#include "ie/card_lock.hpp"
+#include "ie/supervisor.hpp"
+#include "ie/cli_help.hpp"
 #include "ie/server_capabilities.hpp"
 #include <cstdio>
 #include <cstdlib>
@@ -19,10 +24,8 @@ const char* USAGE =
   "usage: ie <run|serve> <model.gguf> [--ctx N] [--port P] [--host H] [--gpus N]\n"
   "                                [--prefill-chunk N] [--spec] [--parallel N] [--temp F]\n"
   "                                [--vram-reserve-gib F]\n"
-  "                                (--parallel N = 1..4 concurrent generations; >1\n"
-  "                                 interleaves requests on the 27B 2-GPU split path\n"
-  "                                 via host-staged slot switching, other archs run\n"
-  "                                 whole generations in FIFO turns. Default 1.\n"
+  "                                (--parallel N = 1..16 concurrent generations, default 1;\n"
+  "                                 what >1 does depends on the arch: `ie serve --help`.\n"
   "                                 Not yet compatible with --int8-kv.)\n"
   "                                (--max-queue N = requests allowed to WAIT for a generation\n"
   "                                 slot; beyond that the server answers HTTP 429 at once.\n"
@@ -71,13 +74,6 @@ const char* USAGE =
   "                                (convert an AWQ/GPTQ/EXL3 checkpoint to GGUF;\n"
   "                                 the ref supplies tokenizer KVs of the family)\n";
 
-std::string model_id_from(const std::string& path) {
-    const auto s = path.find_last_of("/\\");
-    const auto base = path.substr(s == std::string::npos ? 0 : s + 1);
-    const auto e = base.rfind(".gguf");
-    return e == std::string::npos ? base : base.substr(0, e);
-}
-
 // ie lands in build/src/, ie-bench in build/tools/.  Prefer the sibling
 // build path (resolved via the invoked argv[0]); fall back to PATH.
 std::string find_ie_bench(const char* argv0) {
@@ -119,6 +115,107 @@ int main(int argc, char** argv) {
     // An explicit GLIBC_TUNABLES wins.
     if (cmd == "serve" && !std::getenv("GLIBC_TUNABLES")) mallopt(M_MMAP_THRESHOLD, 256 * 1024);
 
+    // Help: printed before anything is parsed or loaded. `ie pull --help` stays with the ie-pull helper.
+    if (cmd == "--help" || cmd == "-h" || cmd == "help") {
+        if (argc < 3) { std::fputs(ie::cli_help_overview(), stdout); return 0; }
+        const std::string topic = argv[2];
+        const std::string h = ie::cli_help(topic == "--help" || topic == "-h" ? "help" : topic);
+        if (h.empty()) {
+            std::fprintf(stderr, "ie help: unknown command '%s'\n\n%s", argv[2], ie::cli_help_overview());
+            return 2;
+        }
+        std::fputs(h.c_str(), stdout);
+        return 0;
+    }
+    if (cmd != "pull" && !ie::cli_help(cmd).empty() &&
+        ie::cli_wants_help(std::vector<std::string>(argv + 2, argv + argc))) {
+        std::fputs(ie::cli_help(cmd).c_str(), stdout);
+        return 0;
+    }
+
+    // ie cards -- the GPUs --cards numbers (Level Zero only; nothing is loaded).
+    if (cmd == "cards") {
+        if (argc > 2) { std::fputs("usage: ie cards\n", stderr); return 2; }
+        std::vector<ie::LevelZeroGpu> gpus;
+        if (auto e = ie::enumerate_level_zero_gpus(gpus); !e.empty()) {
+            std::fprintf(stderr, "cards: %s\n", e.c_str()); return 1;
+        }
+        const auto cards = ie::cards_of(gpus);
+        for (size_t i = 0; i < cards.size(); ++i)
+            std::printf("card %zu  %s  %s  (level_zero:%u)\n", i, cards[i].pci.c_str(), cards[i].name.c_str(), cards[i].index);
+        for (const auto& g : gpus)
+            if (g.integrated)
+                std::printf("-       %s  %s  (level_zero:%u, integrated: not a card)\n", g.pci.c_str(), g.name.c_str(), g.index);
+        return 0;
+    }
+
+    // ie supervise --config <layout.json> [--host H] [--port P]: every server of the layout as its own `ie serve`
+    // child behind one routing endpoint (ie/supervisor.hpp, docs/serve_config.md "Supervisor").
+    if (cmd == "supervise") {
+        std::string config_path, host;
+        int port = 0;
+        std::vector<ie::sup::ServerSpec> specs;
+        ie::sup::Options so;
+        try {
+            for (int i = 2; i < argc; ++i) {
+                const std::string a = argv[i];
+                if (i + 1 >= argc) throw std::runtime_error(a + " requires a value (usage: ie supervise --config <layout.json> [--host H] [--port P])");
+                const std::string v = argv[++i];
+                if (a == "--config") config_path = v;
+                else if (a == "--host") host = v;
+                else if (a == "--port") {
+                    const auto opts = ie::parse_launch_options({"--port", v});   // the same range check as serve
+                    port = opts.port;
+                } else throw std::runtime_error("unknown option: " + a + " (usage: ie supervise --config <layout.json> [--host H] [--port P])");
+            }
+            if (config_path.empty()) throw std::runtime_error("--config <layout.json> is required");
+            const std::string abs_config = std::filesystem::absolute(config_path).string();
+            const ie::ServeConfig layout = ie::load_serve_config(abs_config);
+            std::error_code ec;
+            const std::string self = std::filesystem::read_symlink("/proc/self/exe", ec).string();
+            if (self.empty()) throw std::runtime_error("cannot resolve this executable (/proc/self/exe)");
+            so.host = !host.empty() ? host : !layout.front_host.empty() ? layout.front_host : "127.0.0.1";
+            so.port = port ? port : layout.front_port ? layout.front_port : 11435;
+            for (size_t i = 0; i < layout.servers.size(); ++i) {
+                const auto& s = layout.servers[i];
+                const std::string where = "servers[" + std::to_string(i) + "]";
+                if (s.name.empty()) throw std::runtime_error(where + ": `ie supervise` needs a \"name\" for every server");
+                if (s.model.empty()) throw std::runtime_error(where + " (" + s.name + "): \"model\" is required");
+                if (s.launch.cards.empty()) throw std::runtime_error(where + " (" + s.name + "): `ie supervise` needs \"cards\" for every server");
+                const std::string& h = s.launch.host;
+                ie::sup::ServerSpec sp;
+                sp.connect_host.clear();
+                // Reached over loopback (its /admin/shutdown answers loopback only): a wildcard bind through
+                // 127.0.0.1 / ::1, a loopback bind at its own address.
+                for (const auto& a : ie::bind_addresses(h)) {
+                    if (a == "0.0.0.0") sp.connect_host = "127.0.0.1";
+                    else if (a == "::") sp.connect_host = "::1";
+                    else if (a.rfind("127.", 0) == 0 || a == "::1") sp.connect_host = a;
+                    else continue;
+                    break;
+                }
+                if (sp.connect_host.empty())
+                    throw std::runtime_error(where + " (" + s.name + "): host " + h + " is not reachable over loopback; "
+                                             "the supervisor stops each server through its loopback-only /admin/shutdown");
+                if (s.launch.port == so.port && ie::binds_overlap(so.host, h))
+                    throw std::runtime_error(where + " (" + s.name + "): port " + std::to_string(so.port) +
+                                             " is the front endpoint's port; give the server its own");
+                sp.name = s.name;
+                sp.model_id = ie::model_id_from_path(s.model);
+                sp.port = s.launch.port;
+                sp.cards = s.launch.cards;
+                sp.argv = {self, "serve", "--config", abs_config, "--server", s.name};
+                sp.restart_on_failure = s.restart_on_failure;
+                sp.slots = s.launch.engine.parallel + s.launch.max_queue;
+                if (s.name == layout.default_server) so.default_index = int(i);
+                specs.push_back(std::move(sp));
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "ie supervise: %s\n", e.what()); return 2;
+        }
+        return ie::sup::run_supervisor(specs, so);
+    }
+
     if (cmd == "capabilities") {
         if (argc > 3) { std::fputs("usage: ie capabilities [model.gguf]\n", stderr); return 2; }
         try { std::cout << ie::server_capabilities_json(argc == 3 ? argv[2] : "") << '\n'; }
@@ -144,12 +241,76 @@ int main(int argc, char** argv) {
         return std::system(c.c_str());
     }
 
-    if (argc < 3) { std::fputs(USAGE, stderr); return 2; }
-    const std::string model_path = argv[2];
+    // --config <layout.json> (docs/serve_config.md): the layout's flags, then the command line's. Without --config
+    // the arguments are parsed exactly as before.
+    const std::vector<std::string> rest(argv + 2, argv + argc);
+    bool has_config = false;
+    for (size_t i = 0; i < rest.size(); ++i) {
+        if (rest[i] == "--config") { has_config = true; break; }
+        if (rest[i].rfind("--", 0) == 0 && !ie::launch_flag_is_boolean(rest[i])) ++i;   // skip the flag's value
+    }
+    std::string model_path;
+    std::string served_name;   // the layout's "name": what /v1/models reports (only when a layout names the server)
     ie::LaunchOptions launch;
-    try { launch = ie::parse_launch_options(std::vector<std::string>(argv + 3, argv + argc)); }
-    catch (const std::exception& e) {
-        std::fprintf(stderr, "invalid options: %s\n", e.what()); return 2;
+    if (!has_config) {
+        if (argc < 3) { std::fputs(USAGE, stderr); return 2; }
+        model_path = argv[2];
+        try { launch = ie::parse_launch_options(std::vector<std::string>(argv + 3, argv + argc)); }
+        catch (const std::exception& e) {
+            std::fprintf(stderr, "invalid options: %s\n", e.what()); return 2;
+        }
+    } else {
+        try {
+            std::string config_path, server_name;
+            std::vector<std::string> cli;
+            size_t i = 0;
+            if (rest[0].rfind("-", 0) != 0) model_path = rest[i++];   // an explicit <model> overrides the layout's
+            for (; i < rest.size(); ++i) {
+                if (rest[i] == "--config") {
+                    if (i + 1 >= rest.size()) throw std::runtime_error("--config requires a value");
+                    if (!config_path.empty()) throw std::runtime_error("--config given twice");
+                    config_path = rest[++i];
+                    continue;
+                }
+                if (rest[i] == "--server") {   // one server of a multi-server layout (how `ie supervise` starts each)
+                    if (i + 1 >= rest.size()) throw std::runtime_error("--server requires a value");
+                    server_name = rest[++i];
+                    continue;
+                }
+                cli.push_back(rest[i]);
+                if (rest[i].rfind("--", 0) == 0 && !ie::launch_flag_is_boolean(rest[i]) && i + 1 < rest.size())
+                    cli.push_back(rest[++i]);
+            }
+            const ie::ServeConfig layout = ie::load_serve_config(config_path);
+            const ie::ServeConfigServer& srv =
+                server_name.empty() ? ie::single_server(layout) : ie::named_server(layout, server_name);
+            served_name = srv.name;
+            if (model_path.empty()) model_path = srv.model;
+            if (model_path.empty())
+                throw std::runtime_error("no model: pass <model> or set \"model\" in " + config_path);
+            const auto env_set = ie::apply_config_env(srv.env);   // before parsing: the IE_SERVE_* defaults are read there
+            launch = ie::parse_launch_options(ie::merge_launch_args(srv.args, cli));
+            std::string names;
+            for (const auto& n : env_set) names += " " + n;
+            std::fprintf(stderr, "[ie] layout %s: server \"%s\", model %s%s%s\n", config_path.c_str(),
+                         srv.name.c_str(), model_path.c_str(), names.empty() ? "" : ", env", names.c_str());
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "invalid options: %s\n", e.what()); return 2;
+        }
+    }
+    // --cards: pin this process to the chosen physical cards before anything starts the SYCL runtime (ie/card_select.hpp).
+    // serve/run also take the cards' locks (ie/card_lock.hpp): one engine process per card.
+    ie::CardLocks card_locks;
+    if (!launch.cards.empty() && (cmd == "serve" || cmd == "run")) {
+        if (auto e = ie::acquire_card_locks(launch.cards, card_locks); !e.empty()) {
+            std::fprintf(stderr, "%s\n", e.c_str()); return 2;
+        }
+    }
+    if (!launch.cards.empty()) {
+        std::vector<std::string> pcis;
+        std::string e = ie::apply_card_selection(launch.cards, pcis);
+        if (e.empty()) e = ie::verify_card_selection(pcis);
+        if (!e.empty()) { std::fprintf(stderr, "%s\n", e.c_str()); return 2; }
     }
     auto& opts = launch.engine;
     const auto& host = launch.host;
@@ -214,8 +375,9 @@ int main(int argc, char** argv) {
     if (!eng) { std::fprintf(stderr, "load failed: %s\n", err.c_str()); return 1; }
 
     if (cmd == "serve")
-        return ie::run_openai_server(*eng, model_id_from(model_path), host, port,
-                                     launch.max_queue);
+        return ie::run_openai_server(*eng, served_name.empty() ? ie::model_id_from_path(model_path) : served_name,
+                                     host, port, launch.max_queue,
+                                     served_name.empty() ? std::string() : ie::model_id_from_path(model_path));
 
     // cmd == "run"
     std::vector<ie::ChatTurn> turns;

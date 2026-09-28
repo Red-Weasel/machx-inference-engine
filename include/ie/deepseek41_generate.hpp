@@ -15,6 +15,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace ie {
@@ -70,9 +71,31 @@ struct Ds41GenStats {
     struct StageAcc { uint32_t steps = 0; double att = 0, fpre = 0, moe = 0, grp = 0, join = 0, mmg = 0, tail = 0, shd = 0, lay = 0, cpu_ms = 0, cpu_w = 0, bp = 0, bm = 0, sta = 0, pin = 0, mmx = 0, sh = 0, cpu = 0, wall = 0, prep = 0, head = 0, sample = 0, emit = 0, mm_fill = 0, mm_pack = 0, mm_read = 0, mm_perm = 0, spawn = 0, mprep = 0; } stages;
 };
 
+// P4 B6b (docs/deepseek41/P4_B6B_SERVE.md): how a prompt is prefilled -- the chunks, where they end, and what runs one token
+// at a time after them. Shared by run() and the lanes' serving path, so a lane prefills a prompt with exactly the launches
+// --parallel 1 uses (the same chunk ends = the same checkpoints and the same bits).
+struct Ds41PrefillPlan {
+    uint32_t Tp = 0;                                    // the planned end: T, or T - 1 when the prompt ends in a think tag (Phase 57)
+    std::vector<std::pair<uint32_t, uint32_t>> chunks;  // (pos0, T) in order, contiguous from the reused positions
+    uint32_t tail = 0;                                  // where the chunks end: positions [tail, T) run one token at a time
+    uint32_t persist_at = 0;                            // Phase 47: the first user message's start, the disk entry's end (0 = none)
+};
+struct Ds41LookupPolicy { bool on = false; uint32_t k = 7, min_match = 12; };   // Phase 58 (docs/deepseek41/97)
+
 class Ds41Generator {
 public:
     Ds41Generator(Ds41Forward& fwd, const Tokenizer& tok) : fwd_(fwd), tok_(tok) {}
+    // P4 B6b: the pieces of run() the lanes' serving path (src/engine/ds41_engine.cpp) shares.
+    // The prefill plan. `planned` (the prefix cache on, no speculation): Phase 46/47's chunks from `reused` in pieces of at
+    // most `cap` rows whose ends include the first and the last user message's start (`user_tok`), never leaving 2..8 rows
+    // before such an end, then the rows up to T one at a time -- with Phase 57's end one token early when the prompt ends in
+    // `think_tok` / `think_end_tok`. Not planned (reused must be 0): the even prefix in chunks of `cap`, the rest one row at a
+    // time (run()'s non-speculative branch).
+    static Ds41PrefillPlan plan_prefill(const std::vector<int32_t>& ids, uint32_t reused, uint32_t cap, bool planned,
+                                        int32_t user_tok, int32_t think_tok, int32_t think_end_tok);
+    static Ds41LookupPolicy lookup_policy();                                         // IE_DS41_LOOKUP, _K, _MIN (read once)
+    static bool repeating(const std::vector<int32_t>& out_ids, uint32_t n_gen);      // the reply became one short pattern
+    static size_t utf8_complete_prefix(const std::string& b);                        // the longest prefix ending on a complete UTF-8 sequence
     // Generates up to `max_new` tokens after `prompt_ids`; `on_piece` receives the text as it
     // becomes complete UTF-8 (return false to stop); `out_ids` gets the generated ids (the
     // stopping eos excluded). Returns "" or a diagnostic (also in st.stop_reason = "error").

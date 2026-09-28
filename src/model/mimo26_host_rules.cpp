@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <tuple>
 
 namespace ie {
 
@@ -68,6 +69,27 @@ bool mimo26_prompt_snapshot(uint32_t P, uint32_t hi, uint32_t ring, uint32_t win
     if (uint64_t(s0) + ring > max_ctx) return false;
     hi_syn = s0 + ring;
     return true;
+}
+
+int mimo26_choose_lane(const std::vector<Mimo26LaneView>& lanes, uint32_t prompt, uint32_t budget, uint32_t min_tokens) {
+    const uint32_t want = budget ? budget : UINT32_MAX;
+    int best = -1;
+    std::tuple<int, int, uint32_t, int, uint32_t, uint64_t> bestk;   // (short of room, big match, ~match, occupied, cap, tick): smallest wins
+    for (size_t i = 0; i < lanes.size(); ++i) {
+        const Mimo26LaneView& l = lanes[i];
+        if (!l.idle || l.cap <= prompt) continue;
+        const bool roomy = l.cap - prompt >= std::min(want, l.cap / 4);
+        const bool big = l.match >= min_tokens;
+        const auto key = std::make_tuple(roomy ? 0 : 1, big ? -1 : 0, big ? ~l.match : 0u, l.occupied ? 1 : 0, l.cap, l.tick);
+        if (best < 0 || key < bestk) { best = int(i); bestk = key; }
+    }
+    return best;
+}
+
+std::string mimo26_vision_refusal(bool tower_ready, const std::string& tower_error, uint32_t n_lanes) {
+    if (!tower_ready) return tower_error;
+    if (n_lanes > 1) return "images are served at --parallel 1 only (P4 B4)";
+    return {};
 }
 
 size_t mimo26_first_non_f16(const float* x, size_t n) {

@@ -23,7 +23,7 @@ pinned host banks (q* = m * B_PCIe / B_host; glm5next.cpp ~3360-3420, src/ops/cp
 Q4_K/Q5_K and DS4 experts are MXFP4 (planes qs [N][K/2] nibbles + e [N][K/32] e8m0 scales; every expert of this
 card's half is pinned in the host arena: "256 of 256 experts/layer pinned").
 
-## Arithmetic (pre-registered expectation, Pineapple until measured)
+## Arithmetic (pre-registered expectation, unverified until measured)
 Per card per token: 59 misses x 6.69 MB = 395 MB over PCIe at ~27 GB/s = 14.6 ms. Host DRAM ~50 GB/s (measured
 49 GB/s P-cores) shared by both cards' CPU shares. q* = B_PCIe / (B_PCIe + B_host) per link with both links live:
 CPU takes ~48% of misses in bandwidth terms if the CPU GEMV runs at DRAM speed — which it will not (dequant + FMA on

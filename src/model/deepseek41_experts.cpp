@@ -229,7 +229,13 @@ std::string ds41_slot_pack_pread(const Ds4SlotLayout& lay, const SafetensorsMode
 // The persistent threads end here too, not only in free_storage(): an owner that never calls free_resident() (a tool
 // returning on an error) destroyed the readers' condition variables while the threads still waited on them, and
 // pthread_cond_destroy blocked forever (2026-09-18, docs/deepseek41/97). Both stops are no-ops once free_storage ran.
-Ds41ExpertTier::~Ds41ExpertTier() { mm_reader_stop(); cpu_stop(); }
+Ds41ExpertTier::~Ds41ExpertTier() {
+    mm_reader_stop(); cpu_stop();
+    // B13 gate finding: cpu_.x was a std::vector (freed with the tier); pinned now, so free it here when free_storage did not
+    if (cpu_.x && cpu_.x_ctx) { try { sycl::free(cpu_.x, *cpu_.x_ctx); } catch (const std::exception& e) {
+        std::fprintf(stderr, "[ds41 tier] freeing the CPU leg's pinned activations failed: %s\n", e.what()); } }
+    cpu_.x = nullptr;
+}
 
 void Ds41ExpertTier::free_storage(sycl::queue& q) {
     mm_reader_stop();
@@ -240,6 +246,7 @@ void Ds41ExpertTier::free_storage(sycl::queue& q) {
         std::fprintf(stderr, "[ds41 tier] DMA queue drain failed on free_storage: %s\n", e.what());
     } }
     cpu_stop(); if (cpu_.h_rows) { sycl::free(cpu_.h_rows, q); cpu_.h_rows = nullptr; }
+    if (cpu_.x) { sycl::free(cpu_.x, q); cpu_.x = nullptr; cpu_.x_bytes = 0; cpu_.x_ctx.reset(); }
     if (cpu_.h_rows32) { sycl::free(cpu_.h_rows32, q); cpu_.h_rows32 = nullptr; }
     if (bws_.max_tokens) ds4_expert_batch_ws_free(q, bws_);
     if (row_shift_) { sycl::free(row_shift_, q); row_shift_ = nullptr; }
@@ -459,7 +466,12 @@ void Ds41ExpertTier::cpu_start(sycl::queue& q) {
         i = j + 1;
     }
     cpu_.nthreads = int(cpu_.cores.size());
-    cpu_.lay = &lay_; cpu_.x.assign(size_t(cpu_.max_rows()) * H_, 0.f); cpu_.scratch.assign(size_t(kCpuExpertRows) * 2 * EF_, 0.f); cpu_.out.assign(size_t(kCpuExpertRows) * H_, 0.f);
+    if (cpu_.x) { sycl::free(cpu_.x, q); cpu_.x = nullptr; cpu_.x_bytes = 0; }   // (a second start: no leak)
+    cpu_.x = sycl::malloc_host<float>(size_t(cpu_.max_rows()) * H_, q);
+    if (cpu_.x) { cpu_.x_bytes = uint64_t(cpu_.max_rows()) * H_ * 4; cpu_.x_ctx = q.get_context(); }
+    if (!cpu_.x) { cpu_.on = false; std::fprintf(stderr, "[ds41 tier] CPU miss path OFF: the pinned activation staging (%zu MiB) could not be allocated\n", size_t(cpu_.max_rows()) * H_ * 4 >> 20); return; }
+    std::fill_n(cpu_.x, size_t(cpu_.max_rows()) * H_, 0.f);
+    cpu_.lay = &lay_; cpu_.scratch.assign(size_t(kCpuExpertRows) * 2 * EF_, 0.f); cpu_.out.assign(size_t(kCpuExpertRows) * H_, 0.f);
     cpu_.h_rows = sycl::malloc_host<sycl::half>(size_t(cpu_.max_rows()) * TK_ * H_, q);
     if (cpu_.cont_rows > CpuMiss::kMaxRows || src_.fp32_out)   // fp32_out: decode rows land fp32 too
         cpu_.h_rows32 = sycl::malloc_host<float>(size_t(std::max(cpu_.cont_rows, CpuMiss::kMaxRows)) * TK_ * H_, q);
@@ -544,10 +556,10 @@ void Ds41ExpertTier::cpu_run() {
             size_t j = i + 1;
             while (j < cpu_.work.size() && j - i < kCpuExpertRows && cpu_.work[j].slot == cpu_.work[i].slot) ++j;
             const uint32_t R = uint32_t(j - i);
-            if (R == 1) cpu_expert_mxfp4(cpu_.work[i].slot, *cpu_.lay, cpu_.x.data() + size_t(cpu_.work[i].tok) * H_, cpu_.scratch.data(), cpu_.out.data(), cpu_.limit, cpu_.nthreads);
+            if (R == 1) cpu_expert_mxfp4(cpu_.work[i].slot, *cpu_.lay, cpu_.x + size_t(cpu_.work[i].tok) * H_, cpu_.scratch.data(), cpu_.out.data(), cpu_.limit, cpu_.nthreads);
             else {
                 const float* xs[kCpuExpertRows];
-                for (uint32_t r = 0; r < R; ++r) xs[r] = cpu_.x.data() + size_t(cpu_.work[i + r].tok) * H_;
+                for (uint32_t r = 0; r < R; ++r) xs[r] = cpu_.x + size_t(cpu_.work[i + r].tok) * H_;
                 cpu_expert_mxfp4_rows(cpu_.work[i].slot, *cpu_.lay, xs, R, cpu_.scratch.data(), cpu_.out.data(), cpu_.limit, cpu_.nthreads);
             }
             for (uint32_t r = 0; r < R; ++r, ++i_row) {
@@ -643,7 +655,7 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
                 occ.erase(std::find(occ.begin(), occ.end(), e));
             }
             cpu_.limit = swiglu_limit;
-            q.memcpy(cpu_.x.data(), x, size_t(T) * H * 4).wait();      // the activations, host side
+            q.memcpy(cpu_.x, x, size_t(T) * H * 4).wait();      // the activations, host side
             cpu_.f32 = T > CpuMiss::kMaxRows || src_.fp32_out;   // the rows the XMX route's fp32 scatter reads
             if (cpu_.f32 && !cpu_.h_rows32) return "tier: the CPU leg has no fp32 row staging";
             { std::lock_guard<std::mutex> lk(cpu_.mu); cpu_.pending = true; cpu_.done = false; }

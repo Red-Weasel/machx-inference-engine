@@ -68,6 +68,8 @@ public:
     // Walk the trie along `tokens`; return the deepest endpoint along the prefix.
     // {0, nullptr, nullptr} if none. Refreshes the matched endpoint's LRU stamp.
     LookupResult find_longest_match(const std::vector<int32_t>& tokens);
+    // P4 B15: the depth find_longest_match would return, without touching the LRU stamps (host-only, const).
+    uint32_t peek_longest_match(const std::vector<int32_t>& tokens) const;
 
     // Snapshot the model's CURRENT per-card state at depth tokens.size() and store
     // it as a new endpoint. LRU-evicts at capacity. No-op if an endpoint already
@@ -87,11 +89,16 @@ private:
         DnVec    dn;                  // [dev] (null per-card if that card has no DN)
         uint64_t depth          = 0;
         uint64_t last_access_us = 0;
+        std::vector<int32_t> path;    // an endpoint's tokens (P4 B15: an eviction prunes its trie branch)
     };
 
     Node* walk_or_create(const std::vector<int32_t>& tokens);
     Node* lru_endpoint(const Node* exclude = nullptr) const;
     void  evict_endpoint(Node* n);
+    // P4 B15: drop the trie nodes along `tokens` that no longer lead to an endpoint (deepest first). Without it every insert
+    // left depth-many nodes behind after its endpoint was evicted (or its snapshot failed): host memory grew with every
+    // unique conversation (~0.3 MiB a request at 1.5K tokens, measured on the crown; B15 j15).
+    void  prune(const std::vector<int32_t>& tokens);
 
     DeviceFleet*           fleet_ = nullptr;
     uint32_t               n_dev_ = 0;
@@ -100,6 +107,7 @@ private:
     std::unique_ptr<Node>  root_;
     std::vector<Node*>     endpoints_;  // flat list for O(N) LRU scan
     uint64_t               tick_ = 0;   // monotonic logical clock for LRU
+    const Node*            protect_ = nullptr;   // P4 B15: prune never frees this node (insert's, while it evicts)
 };
 
 }  // namespace ie

@@ -2,6 +2,7 @@
 // OpenAI-compatible server.  No GPU, no engine dependency: unit-testable.
 #pragma once
 #include "ie/engine.hpp"
+#include "ie/recommended_sampling.hpp"
 #include "ie/tokenizer.hpp"
 #include "ie/vitals.hpp"
 #include <string>
@@ -24,7 +25,24 @@ struct ChatRequest {
     std::string tools_json;   // raw OpenAI `tools` array (dumped); empty = none
     std::vector<std::string> stop;   // OpenAI `stop`: up to 4 sequences, empty = none
     std::string error;        // non-empty => 400 with this message
+    // P4 B20: the recommended-sampling fields given explicitly -- by the request or by the CLI/env server defaults
+    // (kSet* bits). apply_recommended fills only the others.
+    uint32_t sampling_set = 0;
 };
+
+enum : uint32_t {
+    kSetTemperature = 1u << 0, kSetTopP = 1u << 1, kSetTopK = 1u << 2, kSetMinP = 1u << 3,
+    kSetPresence = 1u << 4, kSetRepeat = 1u << 5,
+    kSetAllRecommended = (1u << 6) - 1,
+};
+
+// P4 B20: fill the fields of r.sampling that neither the request nor the CLI/env set from `rec`'s row for the
+// request's actual mode (r.enable_thinking). Resolution: request > CLI/env > recommendation > library default.
+// A temperature of 0 set explicitly (greedy) takes nothing from the recommendation, so greedy output is unchanged.
+// Returns the kSet* bits it filled (0 = nothing; rec == nullptr = no recommendation for this model).
+uint32_t apply_recommended(ChatRequest& r, const Recommendation* rec);
+// "temperature 1 top_p 0.95 ..." of r.sampling's recommended fields, for the server log.
+std::string sampling_summary(const SamplingParams& sp);
 
 // Immutable startup defaults; configure before accepting HTTP requests.
 // Environment reader throws for invalid IE_SERVE_* numeric values.
@@ -34,6 +52,11 @@ void configure_server_defaults(const ChatRequest& defaults);
 // Parse /v1/chat/completions body. Maps: messages[] -> turns,
 // temperature/top_p/top_k/max_tokens/seed/stream -> fields.
 ChatRequest parse_chat_request(const std::string& body);
+
+// A request with images on a load whose vision status (Engine::vision_status_json, the "vision" of /props) says
+// "ready": false: the message to refuse it with, "image input: <reason>" -- the server answers 400 before admission,
+// so a stream is refused before its 200 goes out. "" = no images, or the load takes them.
+std::string image_refusal(const ChatRequest& r, const std::string& vision_status_json);
 
 // Non-streaming response body.
 std::string chat_completion_json(const std::string& model,
@@ -77,7 +100,8 @@ std::string chat_chunk_sse_usage(const std::string& model, const std::string& id
                                  uint32_t completion_tokens,
                                  uint32_t cached_tokens = 0);
 
-std::string models_json(const std::string& model_id);
+// root (non-empty only for a layout-named server): the underlying model id.
+std::string models_json(const std::string& model_id, const std::string& root = "");
 
 // ie_vitals (docs/mimo26/IE_VITALS.md). `frame` is one SSE frame "data: {...}\n\n"; the result carries one more
 // top-level member "key": value_json (a chunk-level extension, like `timings`).

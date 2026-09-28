@@ -56,6 +56,9 @@ struct Ds4Bundle;
 // layer-split pipeline). Defined in engine.cpp; non-null only on that path.
 struct Q4eBundle;
 struct Glm5Bundle;
+// The crown split's (kQwen35Moe, Qwen35MoeSplitModel) request lanes at --parallel N > 1 (P4 B10): the lanes module and the
+// arch's hooks. Defined in engine.cpp; non-null only there.
+struct Q35mLanes;
 // DeepSeek-V4.1-Flash (kDeepSeek41): a model DIRECTORY (safetensors), the resident two-card
 // runtime, the tokenizer.json tokenizer and the V4.1 prompt format. src/engine/ds41_engine.cpp.
 struct Ds41Bundle;
@@ -139,13 +142,17 @@ struct SamplingParams {
                                         // (MiMo-V2.6) records per-token diagnostics here; never read back by it
 };
 
+// The largest --parallel (EngineOptions::parallel) the engine admits (P4 B14): each arch's own load-time check then refuses a
+// lane count that does not fit, with the numbers. The 27B split path's forward_slots has the same cap (Qwen35SplitModel::kMaxSlots).
+inline constexpr uint32_t kMaxParallel = 16;
+
 struct EngineOptions {
     uint32_t max_ctx       = 8192;
     uint32_t cpu_threads   = 0; // 0 preserves the model CPU expert team default
     bool     int8_kv       = false;
     uint32_t prefill_chunk = 256;    // hard cap per docs/known_bugs.md
     uint32_t n_gpus        = 1;      // >1 → tensor-parallel split (dense archs only)
-    uint32_t parallel      = 1;      // concurrent generations the engine admits (1-4).
+    uint32_t parallel      = 1;      // concurrent generations the engine admits (1-16).
                                      // >1 → generations run under the internal FIFO
                                      // gate; on the 27B split path decode is BATCHED
                                      // (joint-step scheduler over per-slot state
@@ -222,6 +229,11 @@ public:
     // full-length ones; the memory floor can keep fewer). Arches not surveyed report 1. Served at /props as
     // "prompt_cache_slots"; clients decide whether side requests are cheap.
     uint32_t prompt_cache_slots() const;
+    // P4 B4 (docs/mimo26/P4_B4_SERVE.md) and P4 B6b (docs/deepseek41/P4_B6B_SERVE.md): the lanes' serving state for /health --
+    // {"lanes_active": N, "decoding": n, "tokens": committed ids, "step_ms": x, "rows_per_step": y, "turns", "paused_ms", then
+    // MiMo-V2.6's "gate_ms_*" and "draft_*" (B4, B5) or DeepSeek-V4.1's "handovers"} on those two arches at --parallel > 1; "" for every
+    // other arch and at --parallel 1 (/health unchanged). Dispatches to the loaded arch's own (engine.cpp).
+    std::string serving_status_json() const;
     // Crown-arch (qwen35moe) config view; meaningless when arch() is dense.
     const QwenConfig& config()    const noexcept { return model_.config(); }
     ModelArch arch()    const noexcept { return arch_; }
@@ -267,7 +279,12 @@ public:
                             const SamplingParams& sp,
                             const TokenCallback& on_token = {},
                             uint32_t cache_prefix_len = 0,
-                            bool reply_cache = false);
+                            bool reply_cache = false,
+                            uint32_t shared_prefix_len = 0);
+    // P4 B15: shared_prefix_len = the conversation-independent prefix (the system prompt + tools, from the chat template;
+    // chat() sets it when the prompt cache is on, it is >= IE_SHARED_PREFIX_MIN tokens and IE_SHARED_PREFIX != 0). The crown
+    // split and Flash-Next split their prefill there (at --parallel 1 and on the lanes alike, so the two agree); the crown
+    // snapshots it into its prompt cache and Flash-Next's lanes into their shared host store, restorable into any lane.
 
     // `tools_json`: raw OpenAI `tools` array; empty = no tools (template
     // output byte-identical to the pre-tools behavior).
@@ -279,6 +296,9 @@ public:
                         std::string_view reasoning_effort = {});
     // Metadata-only admission validation; safe before sending HTTP/SSE headers.
     std::string reasoning_effort_error(std::string_view effort) const;
+    // A string GGUF key's value ("" when absent, not a string, or for the directory-loaded DeepSeek-V4.1 / MiMo-V2.6):
+    // what recommended_sampling keys its rows on (P4 B20: the chat template, general.name, the base model's repo).
+    std::string gguf_string(std::string_view key) const;
 
 private:
     Engine() = default;
@@ -487,6 +507,8 @@ private:
     std::string    ds41_load(const std::string& dir);
     uint32_t ds41_prompt_cache_slots() const;
     uint32_t mimo26_prompt_cache_slots() const;
+    std::string ds41_serving_status_json() const;     // serving_status_json on DeepSeek-V4.1 (src/engine/ds41_engine.cpp, P4 B6b)
+    std::string mimo26_serving_status_json() const;   // serving_status_json on MiMo-V2.6 (src/engine/mimo26_engine.cpp, P4 B4)
     GenerateResult ds41_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
                             bool enable_thinking, std::string_view tools_json, std::string_view reasoning_effort);
     GenerateResult ds41_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token);
@@ -497,6 +519,16 @@ private:
     GenerateResult mimo26_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token);
     // qwen4exp forward, defined in engine.cpp (Q4eBundle is incomplete here).
     sycl::event q4e_forward(sycl::queue& q, const int32_t* ids, uint32_t T, uint32_t pos);
+    // P4 B8: Flash-Next at --parallel N > 1 on two cards -- the request on a lane of the shared lanes module (engine.cpp).
+    GenerateResult q4e_generate_lanes(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token,
+                                      uint32_t cache_prefix_len, uint32_t shared_prefix_len = 0);
+    // P4 B10: the crown split at --parallel N > 1 -- the lanes module over the model's request lanes (engine.cpp).
+    std::string    q35m_lanes_init();
+    // P4 B18: the 27B split at --parallel N > 1 -- the lanes module over Qwen35SplitModel's request lanes (engine.cpp,
+    // Q27LanesModel); requests run through q35m_generate_lanes (the same front half)
+    std::string    q27_lanes_init();
+    GenerateResult q35m_generate_lanes(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token,
+                                       uint32_t cache_prefix_len, bool reply_cache, uint32_t shared_prefix_len = 0);
     sycl::event glm5_forward(sycl::queue& q, const int32_t* ids, uint32_t T, uint32_t pos);
     GgufReader      gguf_;
     DeviceAllocator alloc_;
@@ -545,6 +577,13 @@ private:
     // run once per device. Declared AFTER next_model_/fleet_ so it destructs FIRST,
     // freeing its per-card snapshots while the fleet allocators are still alive.
     FleetPrefixCache fleet_cache_;
+    // P4 B10: the crown split's request lanes (--parallel N > 1). Declared after the model and fleet_cache_ so it destructs
+    // FIRST: its pipe and serial worker stop before the state they drive goes.
+    std::unique_ptr<Q35mLanes> q35m_;
+    // P4 B18: the 27B split's request lanes (--parallel N > 1 unless IE_QWEN35_LANES=0 / --spec / --int8-kv); the same ordering
+    // rule as q35m_. q27_share_: IE_QWEN35_SHARED_PREFIX=1 (the shared-prefix split and snapshot, --parallel 1 AND the lanes).
+    std::unique_ptr<Q35mLanes> q27_;
+    bool q27_share_ = false;
     // DeepSeek-V4-Flash. Owns the bound model (which points into gguf_'s mmap),
     // the per-card runtimes, their pinned host arena and their VRAM expert cache.
     // Declared HERE, after every fleet member and long after gguf_, so it

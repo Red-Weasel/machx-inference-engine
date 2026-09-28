@@ -6,6 +6,7 @@
 
 #include <limits>
 #include <mutex>
+#include <stdexcept>
 #include <unordered_map>
 #include "ie/kernel_profiler.hpp"
 
@@ -440,6 +441,95 @@ sycl::event moe_build_pack_decode(sycl::queue& q,
                 sorted_idx[kk]     = 0;
                 tk_to_packed[kk]   = int32_t(kk);
                 weights_packed[kk] = topk_w[kk];
+            }
+        });
+    });
+}
+
+// P4 B14 phase 1b: moe_router's T == 1 route for n_rows rows at once (the crown's row-batched decode step). The fused T > 1
+// kernel sums the router dot in another order than the T == 1 two-stage route, so a row it routes can differ from that row's
+// one-token routing (seen end to end on the crown: batch != solo). Here every row runs EXACTLY the T == 1 kernels' work-item
+// mapping -- stage 1 one 64-lane WG per (row, expert) dot, stage 2 one 256-lane WG per row -- so row r's ids and weights are
+// moe_router(x + r * hidden, ..., 1, ...)'s bit for bit. Only the Qwen3.6 router shape (256 experts, top-8), 1..16 rows.
+sycl::event moe_router_rows(sycl::queue& q, const sycl::half* x, const float* W_gate, int32_t* topk_idx, sycl::half* topk_w,
+                            uint32_t n_rows, uint32_t hidden, uint32_t n_experts, uint32_t k,
+                            const std::vector<sycl::event>& deps) {
+    constexpr uint32_t kMaxRows = 16, WG = 256;
+    if (n_experts != 256 || k != 8 || n_rows == 0 || n_rows > kMaxRows)
+        throw std::runtime_error("moe_router_rows: 256 experts, top-8, 1..16 rows only");
+    static std::unordered_map<sycl::device, float*> bufs;   // per device (see moe_router's T == 1 scratch)
+    static std::mutex mu;
+    float* lb;
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        float*& slot = bufs[q.get_device()];
+        if (!slot) slot = sycl::malloc_device<float>(256 * kMaxRows, q);
+        lb = slot;
+    }
+    ie::ps(q, "moe_router_rows_dot", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        constexpr uint32_t LWG = 64;
+        h.parallel_for(sycl::nd_range<1>(uint64_t(n_rows) * 256 * LWG, LWG),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+            const uint32_t g   = uint32_t(it.get_group(0));
+            const uint32_t r   = g / 256u, e = g % 256u;
+            const uint32_t lid = uint32_t(it.get_local_id(0));
+            const auto* wv4 = reinterpret_cast<const sycl::vec<float, 4>*>(W_gate + uint64_t(e) * hidden);
+            const auto* xv4 = reinterpret_cast<const sycl::vec<sycl::half, 4>*>(x + uint64_t(r) * hidden);
+            float p = 0.f;
+            for (uint32_t hh = lid; hh < hidden / 4; hh += LWG) {
+                const auto w4 = wv4[hh];
+                const auto x4 = xv4[hh];
+                p += w4[0] * float(x4[0]) + w4[1] * float(x4[1]) +
+                     w4[2] * float(x4[2]) + w4[3] * float(x4[3]);
+            }
+            p = sycl::reduce_over_group(it.get_group(), p, sycl::plus<float>());
+            if (lid == 0) lb[uint64_t(r) * 256 + e] = p;
+        });
+    });
+    return ie::ps(q, "moe_router_rows_top8", [&](sycl::handler& h) {
+        sycl::local_accessor<int32_t, 1> idx_slm(8, h);
+        sycl::local_accessor<float, 1>   w_slm(8, h);
+        h.parallel_for(sycl::nd_range<1>(uint64_t(n_rows) * WG, WG), [=](sycl::nd_item<1> it) {
+            const uint32_t r   = uint32_t(it.get_group(0));
+            const uint32_t lid = uint32_t(it.get_local_id(0));
+            const uint32_t e   = lid;
+            auto grp = it.get_group();
+            const float logit = lb[uint64_t(r) * 256 + e];
+
+            float m = sycl::reduce_over_group(grp, logit, sycl::maximum<float>());
+            const float ev = sycl::native::exp(logit - m);
+            const float s  = sycl::reduce_over_group(grp, ev, sycl::plus<float>());
+            const float p  = ev / s;
+
+            bool live = true;
+            for (uint32_t kk = 0; kk < 8; ++kk) {
+                const uint64_t my_key = live ? ((uint64_t(sycl::bit_cast<uint32_t>(p)) << 32) | e) : 0ull;
+                const uint64_t win = sycl::reduce_over_group(grp, my_key, sycl::maximum<uint64_t>());
+                const uint32_t win_e = uint32_t(win & 0xFFFFFFFFu);
+                if (e == win_e) {
+                    live = false;
+                    idx_slm[kk] = int32_t(e);
+                    w_slm[kk]   = sycl::bit_cast<float>(uint32_t(win >> 32));
+                }
+            }
+            sycl::group_barrier(grp);
+            if (lid == 0) {
+                float ren = 0.f;
+                for (uint32_t kk = 0; kk < 8; ++kk) ren += w_slm[kk];
+                const float inv = 1.0f / ren;
+                for (uint32_t kk = 0; kk < 8; ++kk) w_slm[kk] *= inv;
+                for (uint32_t i = 0; i + 1 < 8; ++i)
+                    for (uint32_t j = 0; j + 1 + i < 8; ++j)
+                        if (idx_slm[j] > idx_slm[j + 1]) {
+                            int32_t ti = idx_slm[j]; idx_slm[j] = idx_slm[j + 1]; idx_slm[j + 1] = ti;
+                            float   tw = w_slm[j];   w_slm[j]   = w_slm[j + 1];   w_slm[j + 1]   = tw;
+                        }
+            }
+            sycl::group_barrier(grp);
+            if (lid < 8) {
+                topk_idx[uint64_t(r) * 8 + lid] = idx_slm[lid];
+                topk_w[uint64_t(r) * 8 + lid]   = sycl::half(w_slm[lid]);
             }
         });
     });

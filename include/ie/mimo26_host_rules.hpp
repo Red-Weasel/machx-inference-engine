@@ -5,6 +5,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace ie {
@@ -61,6 +62,22 @@ Mimo26Admit mimo26_plan_admit(const std::vector<Mimo26SlotCost>& slots, uint64_t
 bool mimo26_prompt_snapshot(uint32_t P, uint32_t hi, uint32_t ring, uint32_t window, uint32_t margin, uint32_t max_ctx,
                             uint32_t& s0, uint32_t& hi_syn);
 
+// P4 B4 (docs/mimo26/P4_B4_SERVE.md): the lane for a prompt at --parallel > 1, among the IDLE lanes it fits (prompt < cap).
+// First the lanes that leave its reply room, cap - prompt >= min(budget, cap / 4): the request's whole max_tokens, or a
+// quarter of the lane when the budget is larger. A window-sized budget (Dream sends window - prompt) and the server's default
+// (16,384) would otherwise send every request to the biggest lane. Only when no idle lane leaves that room, the others: the
+// reply is then cut at the lane's room. Within either set: the lane whose state serves the most of the prompt (`match`) when
+// that is at least `min_tokens`; then an empty lane; then the smallest capacity (short prompts leave the big lane to long
+// ones); then the least recently released (the smaller `tick`); then the lower index. budget 0 = unlimited.
+// Returns the lane's index, or -1 when no idle lane fits the prompt.
+struct Mimo26LaneView { bool idle = false, occupied = false; uint32_t cap = 0, match = 0; uint64_t tick = 0; };
+int mimo26_choose_lane(const std::vector<Mimo26LaneView>& lanes, uint32_t prompt, uint32_t budget, uint32_t min_tokens);
+
+// Why this load refuses image requests, "" when it takes them: the tower's own reason (`tower_error`) when it is not staged,
+// else "images are served at --parallel 1 only (P4 B4)" with more than one lane (the lane pipe runs text positions only).
+// Engine::vision_status_json (/props "vision") and mimo26_chat's refusal both come from here, so they cannot disagree.
+std::string mimo26_vision_refusal(bool tower_ready, const std::string& tower_error, uint32_t n_lanes);
+
 // The first element of x[0, n) that fp16 cannot hold -- NaN, +-inf, or a magnitude that rounds (to nearest even) to inf,
 // i.e. >= 65520 -- or n when every element fits. Bit tests, not float compares: the host code builds under icpx's default
 // fast fp model, where compares against NaN / inf may be folded away.
@@ -71,5 +88,22 @@ size_t mimo26_first_non_f16(const float* x, size_t n);
 struct Mimo26Scan { uint64_t non_finite = 0; int64_t first_bad = -1; float max_abs = 0.f; int64_t max_at = -1; };
 Mimo26Scan mimo26_scan_f32(const float* x, size_t n);
 Mimo26Scan mimo26_scan_f16(const uint16_t* x, size_t n);
+
+// P4 B16 (docs/mimo26/P4_B16_ADAPTIVE_DRAFT.md): adaptive drafting at --parallel > 1. Whether the lanes draft -- and feed the
+// drafter's context on their decode steps -- while `n_dec` lanes decode: a lone lane always does (B4's rule, the --parallel 1
+// shape); with two or more, only while n_dec < max_lanes (IE_MIMO26_DFLASH_MAX_LANES). At and above it every lane takes plain
+// one-row steps and skips the drafter's context feed. max_lanes 0 = no cap (the B5 budget alone decides); 1 or 2 = only a lone
+// lane drafts. The B14 A-B-A (N = 16: 24.2 tok/s drafting, 29.1 without; N = 8 equal) puts the crossover at N ~ 5-8.
+// p4-rel (2026-09-27, --parallel 16 --slot-ctx 32768, same session): cap 5 measured 20.3 tok/s at N=8 vs 22.0 with no cap, and
+// 24.7 at N=16 (HEAD drafting on 24.2, drafting off 29.1): the cap does not recover drafting-off's throughput (the drafter's
+// VRAM stays taken from the tier) and loses 8 % at N=8. Default 0 = no cap (B5 behaviour); IE_MIMO26_DFLASH_MAX_LANES=5 opts in.
+inline constexpr uint32_t kMimo26DraftMaxLanesTested = 5;   // the rule's host tests use the B16 value
+inline constexpr uint32_t kMimo26DraftMaxLanesDefault = 0;
+
+// P4 B16 (~/ds41_work/p60/mimo_ident/ANALYSIS.md): the prefix cache's reuse floor -- a servable prefix L below min_reuse counts
+// as 0 (the prompt prefills from position 0). min_reuse 0 = every L as it is (--parallel 1). "Too short to keep is too short
+// to reuse": states under min_tokens are never kept in host slots either.
+inline uint32_t mimo26_reuse_floor(uint32_t L, uint32_t min_reuse) { return L >= min_reuse ? L : 0u; }
+inline bool mimo26_lanes_draft(uint32_t n_dec, uint32_t max_lanes) { return n_dec <= 1 || max_lanes == 0 || n_dec < max_lanes; }
 
 }  // namespace ie

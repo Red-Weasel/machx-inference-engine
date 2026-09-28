@@ -49,17 +49,20 @@ struct Ds41pcFile {
 }  // namespace
 
 std::string Ds41Forward::set_prefix_cache(bool on, const PrefixCacheOptions& o) {
+    if (piping()) return "set_prefix_cache: the lane pipe is running (its stages capture into the lanes' checkpoint pools)";   // P4 B6a
     // tear down whatever exists first (also the path free_resident takes)
     pc_join_writer();
     pc_disk_.clear();
     {
         std::lock_guard<std::mutex> lk(pc_mu_);
-        for (size_t ci = 0; ci < pc_pool_.size() && ci < cards_.size(); ++ci) {
-            if (cards_[ci]->q) cards_[ci]->q->wait();
-            for (float* b : pc_pool_[ci]) if (b) sycl::free(b, *cards_[ci]->q);
-            if (ci < pc_bounce_.size() && pc_bounce_[ci]) sycl::free(pc_bounce_[ci], *cards_[ci]->q);
+        for (size_t ci = 0; ci < cards_.size(); ++ci) if (cards_[ci]->q) cards_[ci]->q->wait();
+        for (auto& ln : lanes_) {   // P4 B6a: every lane's live checkpoints and pool blocks
+            for (size_t ci = 0; ci < ln.pc_pool.size() && ci < cards_.size(); ++ci)
+                for (float* b : ln.pc_pool[ci]) if (b) sycl::free(b, *cards_[ci]->q);
+            ln.pc_pool.clear(); ln.pc_ckpts.clear();
         }
-        pc_pool_.clear(); pc_bounce_.clear(); pc_block_.clear(); pc_off_.clear(); pc_ckpts_.clear();
+        for (size_t ci = 0; ci < pc_bounce_.size() && ci < cards_.size(); ++ci) if (pc_bounce_[ci]) sycl::free(pc_bounce_[ci], *cards_[ci]->q);
+        pc_bounce_.clear(); pc_block_.clear(); pc_off_.clear();
         pc_slots_.clear(); pc_slot_bytes_ = 0; pc_bounce_n_ = 0; pc_on_ = false;
     }
     if (!on) return {};
@@ -79,7 +82,8 @@ std::string Ds41Forward::set_prefix_cache(bool on, const PrefixCacheOptions& o) 
     if (const char* v = std::getenv("IE_DS41_CACHE_KEEP_FREE_GIB"))
         if (const double g = std::atof(v); g >= 0.0)
             pc_opt_.keep_free = uint64_t(g * 1073741824.0);
-    pc_pool_.assign(cards_.size(), {}); pc_off_.assign(cards_.size(), std::vector<uint64_t>(c.n_layers, 0));
+    for (auto& ln : lanes_) ln.pc_pool.assign(cards_.size(), {});
+    pc_off_.assign(cards_.size(), std::vector<uint64_t>(c.n_layers, 0));
     pc_block_.assign(cards_.size(), 0); pc_bounce_.assign(cards_.size(), nullptr);
     for (size_t ci = 0; ci < cards_.size(); ++ci) {
         Card& card = *cards_[ci];
@@ -90,16 +94,17 @@ std::string Ds41Forward::set_prefix_cache(bool on, const PrefixCacheOptions& o) 
             if (k.is_kv_source && k.compress_ratio > 1) off += 2ull * k.compress_ratio * HD;
         }
         pc_block_[ci] = off;
-        for (uint32_t b = 0; b < o.checkpoints; ++b) {
-            float* p = sycl::malloc_host<float>(off, *card.q);
-            if (!p) { pc_on_ = true; return "set_prefix_cache: pinned checkpoint block alloc failed"; }
-            pc_pool_[ci].push_back(p);
-        }
+        for (auto& ln : lanes_)   // P4 B6a: one pool per lane (a lane's checkpoints are its own; the host slots stay shared)
+            for (uint32_t b = 0; b < o.checkpoints; ++b) {
+                float* p = sycl::malloc_host<float>(off, *card.q);
+                if (!p) { pc_on_ = true; return "set_prefix_cache: pinned checkpoint block alloc failed"; }
+                ln.pc_pool[ci].push_back(p);
+            }
         pc_bounce_[ci] = sycl::malloc_host<float>(kBounceFloats, *card.q);
         if (!pc_bounce_[ci]) return "set_prefix_cache: pinned bounce alloc failed";
     }
     pc_bounce_n_ = kBounceFloats;
-    pc_ckpts_.assign(o.checkpoints, PcCkpt{});
+    for (auto& ln : lanes_) ln.pc_ckpts.assign(o.checkpoints, PcCkpt{});
     pc_on_ = true;
     uint32_t disk_other = 0;
     if (!o.disk_dir.empty()) {
@@ -120,44 +125,45 @@ std::string Ds41Forward::set_prefix_cache(bool on, const PrefixCacheOptions& o) 
         std::error_code ec; std::filesystem::create_directories(o.disk_dir, ec);
         lk.unlock(); disk_other = pc_disk_scan(); lk.lock();
     }
-    uint64_t pinned = 0; for (size_t ci = 0; ci < cards_.size(); ++ci) pinned += pc_block_[ci] * o.checkpoints * 4 + kBounceFloats * 4;
-    std::fprintf(stderr, "[ds41 prefix cache] on: %u checkpoints (%.1f MiB pinned with the bounces), host slots up to %.1f GiB, disk %s\n",
-                 o.checkpoints, double(pinned) / 1048576.0, double(o.host_budget) / 1073741824.0,
+    uint64_t pinned = 0; for (size_t ci = 0; ci < cards_.size(); ++ci) pinned += pc_block_[ci] * o.checkpoints * 4 * lanes_.size() + kBounceFloats * 4;
+    std::fprintf(stderr, "[ds41 prefix cache] on: %u checkpoints%s (%.1f MiB pinned with the bounces), host slots up to %.1f GiB, disk %s\n",
+                 o.checkpoints, lanes_.size() > 1 ? (" per lane x " + std::to_string(lanes_.size()) + " lanes").c_str() : "", double(pinned) / 1048576.0, double(o.host_budget) / 1073741824.0,
                  o.disk_dir.empty() ? "off" : (o.disk_dir + " (" + std::to_string(pc_disk_.size()) + " entries for numerics " +
                                                ds41_numerics_fingerprint(kDs41NumericsManifest) + "; " + std::to_string(disk_other) +
                                                " written under another key ignored)").c_str());
     return {};
 }
 
-void Ds41Forward::pc_clear_live() {
+void Ds41Forward::pc_clear_live(uint32_t lane) {
     std::lock_guard<std::mutex> lk(pc_mu_);
-    for (auto& e : pc_ckpts_) e = PcCkpt{};
+    if (lane < lanes_.size()) for (auto& e : lanes_[lane].pc_ckpts) e = PcCkpt{};
 }
 
-void Ds41Forward::pc_capture(size_t ci, uint32_t pos) {
+void Ds41Forward::pc_capture(uint32_t lane, size_t ci, uint32_t pos) {
     std::lock_guard<std::mutex> lk(pc_mu_);
-    if (!pc_on_ || ci >= cards_.size() || pc_ckpts_.empty()) return;
+    if (!pc_on_ || ci >= cards_.size() || lane >= lanes_.size() || lanes_[lane].pc_ckpts.empty()) return;
+    auto& ckpts = lanes_[lane].pc_ckpts;   // P4 B6a: the lane's own checkpoints (two lanes' cards capture at once in the pipe)
     const uint32_t all = (1u << cards_.size()) - 1u;
     int idx = -1;
-    for (size_t i = 0; i < pc_ckpts_.size(); ++i) if (pc_ckpts_[i].used && pc_ckpts_[i].pos == pos) { idx = int(i); break; }
+    for (size_t i = 0; i < ckpts.size(); ++i) if (ckpts[i].used && ckpts[i].pos == pos) { idx = int(i); break; }
     if (ci == 0) {
         // card 0 opens the entry (it runs every chunk first); a re-capture at the same position starts over
-        if (idx < 0) for (size_t i = 0; i < pc_ckpts_.size(); ++i) if (!pc_ckpts_[i].used) { idx = int(i); break; }
+        if (idx < 0) for (size_t i = 0; i < ckpts.size(); ++i) if (!ckpts[i].used) { idx = int(i); break; }
         if (idx < 0) {   // evict the LOWEST complete position: the checkpoints near the head are the ones a next turn needs
-            for (size_t i = 0; i < pc_ckpts_.size(); ++i)
-                if (pc_ckpts_[i].cards_done == all && (idx < 0 || pc_ckpts_[i].pos < pc_ckpts_[size_t(idx)].pos)) idx = int(i);
+            for (size_t i = 0; i < ckpts.size(); ++i)
+                if (ckpts[i].cards_done == all && (idx < 0 || ckpts[i].pos < ckpts[size_t(idx)].pos)) idx = int(i);
             if (idx < 0) return;   // every entry still being written by a lagging card: skip this one
         }
-        auto& e = pc_ckpts_[size_t(idx)];
+        auto& e = ckpts[size_t(idx)];
         e = PcCkpt{}; e.used = true; e.pos = pos; e.tick = ++pc_tick_;
         e.nc.assign(m_->config().n_layers, 0); e.part_valid.assign(m_->config().n_layers, 0);
     } else if (idx < 0) return;   // card 0 never opened it (evicted, or the cache was cleared meanwhile)
-    auto& e = pc_ckpts_[size_t(idx)];
+    auto& e = ckpts[size_t(idx)];
     Card& card = *cards_[ci]; sycl::queue& q = *card.q;
     const auto& c = m_->config(); const uint64_t WIN = c.window_size, HD = c.head_dim;
-    float* blk = pc_pool_[ci][size_t(idx)];
+    float* blk = lanes_[lane].pc_pool[ci][size_t(idx)];
     for (uint32_t L = card.L0; L < card.L1; ++L) {
-        const auto& st = card.state[L]; const auto& k = m_->layers()[L].kind;
+        const auto& st = card.state[lane][L]; const auto& k = m_->layers()[L].kind;
         e.nc[L] = st.nc; e.part_valid[L] = st.part_valid ? 1 : 0;
         const uint64_t off = pc_off_[ci][L];
         q.memcpy(blk + off, st.win_kv, WIN * HD * 4);
@@ -172,7 +178,8 @@ void Ds41Forward::pc_capture(size_t ci, uint32_t pos) {
 
 std::string Ds41Forward::prefix_checkpoint() {
     if (!pc_on_) return {};
-    for (size_t ci = 0; ci < cards_.size(); ++ci) pc_capture(ci, n_pos_);
+    if (piping()) return "prefix_checkpoint: the lane pipe is running";
+    for (size_t ci = 0; ci < cards_.size(); ++ci) pc_capture(lane_, ci, lanes_[lane_].n_pos);
     for (auto& cp : cards_) cp->q->wait_and_throw();
     return {};
 }
@@ -181,9 +188,9 @@ std::string Ds41Forward::pc_restore_live(const PcCkpt& e, size_t index) {
     const auto& c = m_->config(); const uint64_t WIN = c.window_size, HD = c.head_dim;
     for (size_t ci = 0; ci < cards_.size(); ++ci) {
         Card& card = *cards_[ci]; sycl::queue& q = *card.q;
-        const float* blk = pc_pool_[ci][index];
+        const float* blk = lanes_[lane_].pc_pool[ci][index];
         for (uint32_t L = card.L0; L < card.L1; ++L) {
-            auto& st = card.state[L]; const auto& k = m_->layers()[L].kind;
+            auto& st = card.state[lane_][L]; const auto& k = m_->layers()[L].kind;
             const uint64_t off = pc_off_[ci][L];
             q.memcpy(st.win_kv, blk + off, WIN * HD * 4);
             if (k.is_kv_source && k.compress_ratio > 1) {
@@ -200,20 +207,21 @@ std::string Ds41Forward::pc_restore_live(const PcCkpt& e, size_t index) {
 
 std::string Ds41Forward::pc_save_live_to_slot(bool& saved) {
     saved = false;
-    if (n_pos_ < pc_opt_.min_slot_tokens || all_ids_.size() < n_pos_) return {};
+    Lane& S = lanes_[lane_];   // the active lane's conversation (P4 B6a)
+    if (S.n_pos < pc_opt_.min_slot_tokens || S.all_ids.size() < S.n_pos) return {};
     const auto t0 = std::chrono::steady_clock::now();
     for (auto& cp : cards_) cp->q->wait_and_throw();
     const auto& c = m_->config(); const uint64_t WIN = c.window_size, HD = c.head_dim, IHD = c.index_head_dim;
     const uint32_t all = (1u << cards_.size()) - 1u;
     std::vector<size_t> keep;   // the live checkpoints worth carrying, ascending
-    for (size_t i = 0; i < pc_ckpts_.size(); ++i) if (pc_ckpts_[i].used && pc_ckpts_[i].cards_done == all && pc_ckpts_[i].pos < n_pos_) keep.push_back(i);
-    std::sort(keep.begin(), keep.end(), [&](size_t a, size_t b) { return pc_ckpts_[a].pos < pc_ckpts_[b].pos; });
+    for (size_t i = 0; i < S.pc_ckpts.size(); ++i) if (S.pc_ckpts[i].used && S.pc_ckpts[i].cards_done == all && S.pc_ckpts[i].pos < S.n_pos) keep.push_back(i);
+    std::sort(keep.begin(), keep.end(), [&](size_t a, size_t b) { return S.pc_ckpts[a].pos < S.pc_ckpts[b].pos; });
     uint64_t block_all = 0; for (uint64_t b : pc_block_) block_all += b;
     uint64_t lat = 0;
     for (size_t ci = 0; ci < cards_.size(); ++ci)
         for (uint32_t L = cards_[ci]->L0; L < cards_[ci]->L1; ++L)
-            if (m_->layers()[L].kind.is_kv_source) lat += uint64_t(cards_[ci]->state[L].nc) * (HD + IHD);
-    const uint64_t bytes = (uint64_t(keep.size() + 1) * block_all + lat) * 4 + uint64_t(n_pos_) * 4;
+            if (m_->layers()[L].kind.is_kv_source) lat += uint64_t(cards_[ci]->state[lane_][L].nc) * (HD + IHD);
+    const uint64_t bytes = (uint64_t(keep.size() + 1) * block_all + lat) * 4 + uint64_t(S.n_pos) * 4;
     if (bytes > pc_opt_.host_budget) return {};
     while (!pc_slots_.empty() && pc_slot_bytes_ + bytes > pc_opt_.host_budget) {   // LRU
         auto it = std::min_element(pc_slots_.begin(), pc_slots_.end(), [](const PcSlot& a, const PcSlot& b) { return a.tick < b.tick; });
@@ -229,20 +237,20 @@ std::string Ds41Forward::pc_save_live_to_slot(bool& saved) {
                      double(pc_opt_.keep_free) / 1073741824.0);
         return {};
     }
-    PcSlot s; s.ids.assign(all_ids_.begin(), all_ids_.begin() + n_pos_);
+    PcSlot s; s.ids.assign(S.all_ids.begin(), S.all_ids.begin() + S.n_pos);
     for (size_t i : keep) {
-        s.ckpts.push_back(pc_ckpts_[i]);
+        s.ckpts.push_back(S.pc_ckpts[i]);
         s.ring.emplace_back(cards_.size());
-        for (size_t ci = 0; ci < cards_.size(); ++ci) s.ring.back()[ci].assign(pc_pool_[ci][i], pc_pool_[ci][i] + pc_block_[ci]);
+        for (size_t ci = 0; ci < cards_.size(); ++ci) s.ring.back()[ci].assign(S.pc_pool[ci][i], S.pc_pool[ci][i] + pc_block_[ci]);
     }
     // the live position itself: its rings exist only on the devices right now
-    PcCkpt live; live.used = true; live.pos = n_pos_; live.cards_done = all; live.nc.assign(c.n_layers, 0); live.part_valid.assign(c.n_layers, 0);
+    PcCkpt live; live.used = true; live.pos = S.n_pos; live.cards_done = all; live.nc.assign(c.n_layers, 0); live.part_valid.assign(c.n_layers, 0);
     s.ring.emplace_back(cards_.size()); s.lat.assign(cards_.size(), std::vector<std::vector<float>>(c.n_layers));
     for (size_t ci = 0; ci < cards_.size(); ++ci) {
         Card& card = *cards_[ci]; sycl::queue& q = *card.q; float* bb = pc_bounce_[ci];
         auto& ring = s.ring.back()[ci]; ring.assign(pc_block_[ci], 0.f);
         for (uint32_t L = card.L0; L < card.L1; ++L) {
-            const auto& st = card.state[L]; const auto& k = m_->layers()[L].kind;
+            const auto& st = card.state[lane_][L]; const auto& k = m_->layers()[L].kind;
             live.nc[L] = st.nc; live.part_valid[L] = st.part_valid ? 1 : 0;
             const uint64_t off = pc_off_[ci][L];
             q.memcpy(bb, st.win_kv, WIN * HD * 4).wait(); std::memcpy(ring.data() + off, bb, WIN * HD * 4);
@@ -268,20 +276,24 @@ std::string Ds41Forward::pc_save_live_to_slot(bool& saved) {
     pc_slot_bytes_ += bytes; pc_slots_.push_back(std::move(s));
     pc_save_ms_ = ds41pc_ms(t0); saved = true;
     std::fprintf(stderr, "[ds41 prefix cache] kept the live conversation (%u tokens, %zu checkpoints, %.1f MiB) in a host slot in %.0f ms; %zu slots, %.2f GiB\n",
-                 n_pos_, pc_slots_.back().ckpts.size(), double(bytes) / 1048576.0, pc_save_ms_, pc_slots_.size(), double(pc_slot_bytes_) / 1073741824.0);
+                 S.n_pos, pc_slots_.back().ckpts.size(), double(bytes) / 1048576.0, pc_save_ms_, pc_slots_.size(), double(pc_slot_bytes_) / 1073741824.0);
     return {};
 }
 
 std::string Ds41Forward::pc_load_slot(PcSlot& s, size_t k) {
     const auto t0 = std::chrono::steady_clock::now();
     const auto& c = m_->config(); const uint64_t WIN = c.window_size, HD = c.head_dim, IHD = c.index_head_dim;
+    Lane& S = lanes_[lane_];   // the slot lands in the active lane (P4 B6a: any lane may take any slot)
     const PcCkpt& e = s.ckpts[k]; const PcCkpt& last = s.ckpts.back();
+    // P4 B6b (the B6a gate's finding): lanes differ in capacity, and a slot kept from a bigger lane may hold more positions
+    // than this lane's latent / index-key buffers -- refused before any copy (as pc_load_disk does), never written past them
+    if (!pc_ckpt_fits(e, S.cap)) return "the host slot's checkpoint at " + std::to_string(e.pos) + " exceeds this lane's capacity " + std::to_string(S.cap);
     for (size_t ci = 0; ci < cards_.size(); ++ci) {
         Card& card = *cards_[ci]; sycl::queue& q = *card.q; float* bb = pc_bounce_[ci];
         q.wait_and_throw();
         const auto& ring = s.ring[k][ci];
         for (uint32_t L = card.L0; L < card.L1; ++L) {
-            auto& st = card.state[L]; const auto& kind = m_->layers()[L].kind;
+            auto& st = card.state[lane_][L]; const auto& kind = m_->layers()[L].kind;
             const uint64_t off = pc_off_[ci][L];
             std::memcpy(bb, ring.data() + off, WIN * HD * 4); q.memcpy(st.win_kv, bb, WIN * HD * 4).wait();
             if (kind.is_kv_source && kind.compress_ratio > 1) {
@@ -303,15 +315,15 @@ std::string Ds41Forward::pc_load_slot(PcSlot& s, size_t k) {
             st.nc = e.nc[L]; st.part_valid = e.part_valid[L] != 0;
         }
     }
-    n_pos_ = e.pos; all_ids_.assign(s.ids.begin(), s.ids.begin() + e.pos);
+    S.n_pos = e.pos; S.all_ids.assign(s.ids.begin(), s.ids.begin() + e.pos);
     // the slot's checkpoints at or below the restored position become the live ones again (the highest first)
     {
         std::lock_guard<std::mutex> lk(pc_mu_);
-        for (auto& x : pc_ckpts_) x = PcCkpt{};
+        for (auto& x : S.pc_ckpts) x = PcCkpt{};
         size_t b = 0;
-        for (size_t j = k + 1; j-- > 0 && b < pc_ckpts_.size(); ) {
-            pc_ckpts_[b] = s.ckpts[j]; pc_ckpts_[b].tick = ++pc_tick_;
-            for (size_t ci = 0; ci < cards_.size(); ++ci) std::memcpy(pc_pool_[ci][b], s.ring[j][ci].data(), pc_block_[ci] * 4);
+        for (size_t j = k + 1; j-- > 0 && b < S.pc_ckpts.size(); ) {
+            S.pc_ckpts[b] = s.ckpts[j]; S.pc_ckpts[b].tick = ++pc_tick_;
+            for (size_t ci = 0; ci < cards_.size(); ++ci) std::memcpy(S.pc_pool[ci][b], s.ring[j][ci].data(), pc_block_[ci] * 4);
             ++b;
         }
     }
@@ -319,20 +331,35 @@ std::string Ds41Forward::pc_load_slot(PcSlot& s, size_t k) {
     return {};
 }
 
+uint32_t Ds41Forward::prefix_servable(uint32_t lane, const std::vector<int32_t>& ids) {
+    if (!pc_on_ || lane >= lanes_.size() || ids.size() < 2) return 0;
+    const Lane& S = lanes_[lane];
+    const uint32_t all = (1u << cards_.size()) - 1u;
+    const size_t limit = ids.size() - 1, L_live = ds41pc_lcp(S.all_ids, ids);   // prefix_prepare's live-state rule, read only
+    uint32_t best = 0;
+    if (S.n_pos > 0 && S.all_ids.size() == S.n_pos && S.n_pos <= L_live && S.n_pos <= limit) best = S.n_pos;
+    std::lock_guard<std::mutex> lk(pc_mu_);
+    for (const auto& e : S.pc_ckpts)
+        if (e.used && e.cards_done == all && e.pos <= S.n_pos && e.pos <= L_live && e.pos <= limit && e.pos > best) best = e.pos;
+    return best;
+}
+
 std::string Ds41Forward::prefix_prepare(const std::vector<int32_t>& ids, uint32_t& reused, std::string* source) {
     reused = 0; if (source) *source = "none";
     if (!pc_on_ || ids.size() < 2) return {};
+    if (piping()) return "prefix_prepare: the lane pipe is running";
+    Lane& S = lanes_[lane_];   // the active lane's live state (P4 B6a)
     const auto t0 = std::chrono::steady_clock::now();
     for (auto& cp : cards_) cp->q->wait_and_throw();       // in-flight checkpoint copies land first
     const uint32_t all = (1u << cards_.size()) - 1u;
     const size_t limit = ids.size() - 1;                    // the last prompt token is always run: its logits are needed
     // the live state: its own position, or its best checkpoint inside the shared prefix
-    const size_t L_live = ds41pc_lcp(all_ids_, ids);
+    const size_t L_live = ds41pc_lcp(S.all_ids, ids);
     uint32_t best_live = 0; int live_idx = -2;
-    if (n_pos_ > 0 && all_ids_.size() == n_pos_ && n_pos_ <= L_live && n_pos_ <= limit) { best_live = n_pos_; live_idx = -1; }
-    for (size_t i = 0; i < pc_ckpts_.size(); ++i) {
-        const auto& e = pc_ckpts_[i];
-        if (e.used && e.cards_done == all && e.pos <= n_pos_ && e.pos <= L_live && e.pos <= limit && e.pos > best_live) { best_live = e.pos; live_idx = int(i); }
+    if (S.n_pos > 0 && S.all_ids.size() == S.n_pos && S.n_pos <= L_live && S.n_pos <= limit) { best_live = S.n_pos; live_idx = -1; }
+    for (size_t i = 0; i < S.pc_ckpts.size(); ++i) {
+        const auto& e = S.pc_ckpts[i];
+        if (e.used && e.cards_done == all && e.pos <= S.n_pos && e.pos <= L_live && e.pos <= limit && e.pos > best_live) { best_live = e.pos; live_idx = int(i); }
     }
     // the host slots
     uint32_t best_slot = 0; size_t si = 0, sk = 0;
@@ -340,7 +367,7 @@ std::string Ds41Forward::prefix_prepare(const std::vector<int32_t>& ids, uint32_
         const size_t Ls = ds41pc_lcp(pc_slots_[s].ids, ids);
         for (size_t k = 0; k < pc_slots_[s].ckpts.size(); ++k) {
             const uint32_t p = pc_slots_[s].ckpts[k].pos;
-            if (p <= Ls && p <= limit && p > best_slot) { best_slot = p; si = s; sk = k; }
+            if (p <= Ls && p <= limit && p > best_slot && pc_ckpt_fits(pc_slots_[s].ckpts[k], S.cap)) { best_slot = p; si = s; sk = k; }   // (P4 B6b: fits this lane)
         }
     }
     // the disk entries: usable when the prompt holds an entry's whole prefix
@@ -348,7 +375,7 @@ std::string Ds41Forward::prefix_prepare(const std::vector<int32_t>& ids, uint32_
     {
         std::lock_guard<std::mutex> lk(pc_mu_);
         for (const auto& x : pc_disk_)
-            if (x.ids.size() <= limit && x.ids.size() > d.ids.size() && ds41pc_lcp(x.ids, ids) == x.ids.size()) d = x;
+            if (x.ids.size() <= limit && x.ids.size() <= S.cap && x.ids.size() > d.ids.size() && ds41pc_lcp(x.ids, ids) == x.ids.size()) d = x;
     }
     const uint32_t disk_pos = uint32_t(d.ids.size());
     bool saved = false;
@@ -372,23 +399,23 @@ std::string Ds41Forward::prefix_prepare(const std::vector<int32_t>& ids, uint32_
         // client that does not echo reasoning_content truncates the generated reasoning every turn; saving that tail
         // would copy the whole conversation to host each turn and evict other conversations' slots for nothing.
         bool prompt_above = false;
-        for (const auto& x : pc_ckpts_) if (x.used && x.cards_done == all && x.pos >= best_live + pc_opt_.min_slot_tokens) prompt_above = true;
+        for (const auto& x : S.pc_ckpts) if (x.used && x.cards_done == all && x.pos >= best_live + pc_opt_.min_slot_tokens) prompt_above = true;
         if (prompt_above) if (auto e = pc_save_live_to_slot(saved); !e.empty()) return e;
         if (live_idx >= 0) {
-            const PcCkpt e = pc_ckpts_[size_t(live_idx)];
+            const PcCkpt e = S.pc_ckpts[size_t(live_idx)];
             if (auto err = pc_restore_live(e, size_t(live_idx)); !err.empty()) return err;
-            n_pos_ = e.pos;
+            S.n_pos = e.pos;
         }
-        all_ids_.resize(best_live);
+        S.all_ids.resize(best_live);
         reused = best_live; if (source) *source = live_idx == -1 ? "live" : "checkpoint";
         std::lock_guard<std::mutex> lk(pc_mu_);
-        for (auto& x : pc_ckpts_) if (x.used && x.pos > best_live) x = PcCkpt{};   // their latents are about to be rewritten
+        for (auto& x : S.pc_ckpts) if (x.used && x.pos > best_live) x = PcCkpt{};   // their latents are about to be rewritten
         pc_restore_ms_ = ds41pc_ms(t0);
     } else {
         // nothing shared: the caller's pos0 = 0 prefill will reset the state -- keep this conversation if it is worth it
         if (auto e = pc_save_live_to_slot(saved); !e.empty()) return e;
     }
-    snap_valid_ = false;
+    S.snap_valid = false;
     return {};
 }
 
@@ -419,19 +446,21 @@ uint32_t Ds41Forward::pc_disk_scan() {
 }
 
 std::string Ds41Forward::prefix_persist(uint32_t pos) {
-    if (!pc_on_ || pc_opt_.disk_dir.empty() || pos < pc_opt_.min_disk_tokens || all_ids_.size() < pos) return {};
-    std::vector<int32_t> ids(all_ids_.begin(), all_ids_.begin() + pos);
+    Lane& S = lanes_[lane_];   // the active lane (P4 B6a)
+    if (!pc_on_ || pc_opt_.disk_dir.empty() || pos < pc_opt_.min_disk_tokens || S.all_ids.size() < pos) return {};
+    if (piping()) return "prefix_persist: the lane pipe is running";
+    std::vector<int32_t> ids(S.all_ids.begin(), S.all_ids.begin() + pos);
     const uint32_t all = (1u << cards_.size()) - 1u;
     int idx = -1;
     {
         std::lock_guard<std::mutex> lk(pc_mu_);
         for (const auto& d : pc_disk_) if (d.ids == ids) { std::error_code ec; std::filesystem::last_write_time(d.path, std::filesystem::file_time_type::clock::now(), ec); return {}; }
-        for (size_t i = 0; i < pc_ckpts_.size(); ++i) if (pc_ckpts_[i].used && pc_ckpts_[i].cards_done == all && pc_ckpts_[i].pos == pos) { idx = int(i); break; }
+        for (size_t i = 0; i < S.pc_ckpts.size(); ++i) if (S.pc_ckpts[i].used && S.pc_ckpts[i].cards_done == all && S.pc_ckpts[i].pos == pos) { idx = int(i); break; }
     }
     if (idx < 0) return {};
     const auto t0 = std::chrono::steady_clock::now();
     for (auto& cp : cards_) cp->q->wait_and_throw();
-    const PcCkpt e = pc_ckpts_[size_t(idx)];
+    const PcCkpt e = S.pc_ckpts[size_t(idx)];
     const auto& c = m_->config(); const uint64_t WIN = c.window_size, HD = c.head_dim, IHD = c.index_head_dim;
     // the payload, built in memory now: the rings from the pinned checkpoint block, the latents from the devices (valid
     // only until the state rolls below pos)
@@ -448,9 +477,9 @@ std::string Ds41Forward::prefix_persist(uint32_t pos) {
     uint64_t at = 0;
     for (size_t ci = 0; ci < cards_.size(); ++ci) {
         Card& card = *cards_[ci]; sycl::queue& q = *card.q; float* bb = pc_bounce_[ci];
-        const float* blk = pc_pool_[ci][size_t(idx)];
+        const float* blk = S.pc_pool[ci][size_t(idx)];
         for (uint32_t L = card.L0; L < card.L1; ++L) {
-            const auto& k = m_->layers()[L].kind; const auto& st = card.state[L];
+            const auto& k = m_->layers()[L].kind; const auto& st = card.state[lane_][L];
             const uint64_t off = pc_off_[ci][L];
             std::memcpy(body.data() + at, blk + off, WIN * HD * 4); at += WIN * HD;
             if (k.is_kv_source && k.compress_ratio > 1) { std::memcpy(body.data() + at, blk + off + WIN * HD, 2 * k.compress_ratio * HD * 4); at += 2ull * k.compress_ratio * HD; }
@@ -524,18 +553,19 @@ std::string Ds41Forward::pc_load_disk(const PcDisk& d) {
     if (!f.r(&nl, 4) || nl != c.n_layers) return "layer count mismatch";
     PcCkpt e; e.used = true; e.pos = n; e.cards_done = (1u << cards_.size()) - 1u; e.nc.resize(nl); e.part_valid.resize(nl);
     if (!f.r(e.nc.data(), size_t(nl) * 4) || !f.r(e.part_valid.data(), nl)) return "truncated counts";
-    for (uint32_t L = 0; L < nl; ++L) if (e.nc[L] > cap_pos_) return "a latent count exceeds this runtime's capacity";
+    Lane& S = lanes_[lane_];   // the entry lands in the active lane (P4 B6a)
+    if (n > S.cap || !pc_ckpt_fits(e, S.cap)) return "a latent count exceeds this lane's capacity";
     for (auto& cp : cards_) cp->q->wait_and_throw();
     // the one checkpoint the entry holds becomes pool block 0 on every card
     {
         std::lock_guard<std::mutex> lk(pc_mu_);
-        for (auto& x : pc_ckpts_) x = PcCkpt{};
+        for (auto& x : S.pc_ckpts) x = PcCkpt{};
     }
     for (size_t ci = 0; ci < cards_.size(); ++ci) {
-        Card& card = *cards_[ci]; sycl::queue& q = *card.q; float* bb = pc_bounce_[ci]; float* blk = pc_pool_[ci][0];
+        Card& card = *cards_[ci]; sycl::queue& q = *card.q; float* bb = pc_bounce_[ci]; float* blk = S.pc_pool[ci][0];
         // the file holds the layers in model order, and the cards' ranges are contiguous and ascending
         for (uint32_t L = card.L0; L < card.L1; ++L) {
-            auto& st = card.state[L]; const auto& k = m_->layers()[L].kind;
+            auto& st = card.state[lane_][L]; const auto& k = m_->layers()[L].kind;
             const uint64_t off = pc_off_[ci][L];
             if (!f.r(blk + off, WIN * HD * 4)) return "truncated ring";
             q.memcpy(st.win_kv, blk + off, WIN * HD * 4);
@@ -559,10 +589,10 @@ std::string Ds41Forward::pc_load_disk(const PcDisk& d) {
         }
         q.wait_and_throw();
     }
-    n_pos_ = n; all_ids_ = ids;
+    S.n_pos = n; S.all_ids = ids;
     {
         std::lock_guard<std::mutex> lk(pc_mu_);
-        pc_ckpts_[0] = e; pc_ckpts_[0].tick = ++pc_tick_;
+        S.pc_ckpts[0] = e; S.pc_ckpts[0].tick = ++pc_tick_;
     }
     std::error_code ec; std::filesystem::last_write_time(d.path, std::filesystem::file_time_type::clock::now(), ec);
     pc_restore_ms_ = ds41pc_ms(t0);
@@ -573,7 +603,7 @@ std::string Ds41Forward::pc_load_disk(const PcDisk& d) {
 Ds41Forward::PrefixCacheStats Ds41Forward::prefix_cache_stats() const {
     PrefixCacheStats s;
     const uint32_t all = cards_.empty() ? 0u : (1u << cards_.size()) - 1u;
-    for (const auto& e : pc_ckpts_) if (e.used && e.cards_done == all) ++s.checkpoints;
+    for (const auto& e : lanes_[lane_].pc_ckpts) if (e.used && e.cards_done == all) ++s.checkpoints;   // (the active lane's)
     s.host_slots = uint32_t(pc_slots_.size()); s.host_bytes = pc_slot_bytes_;
     s.last_restore_ms = pc_restore_ms_; s.last_save_ms = pc_save_ms_;
     return s;

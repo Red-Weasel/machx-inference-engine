@@ -1442,6 +1442,12 @@ sycl::event moe_router(sycl::queue& q,
                        uint32_t n_experts, uint32_t k,
                        const std::vector<sycl::event>& deps = {});
 
+// P4 B14: moe_router's T == 1 route for 1..16 rows at once: row r's ids / weights == moe_router(x + r * hidden, ..., 1, ...)'s
+// bit for bit (the fused T > 1 kernel sums in another order). 256 experts, top-8 only (throws otherwise).
+sycl::event moe_router_rows(sycl::queue& q, const sycl::half* x, const float* W_gate, int32_t* topk_idx, sycl::half* topk_w,
+                            uint32_t n_rows, uint32_t hidden, uint32_t n_experts, uint32_t k,
+                            const std::vector<sycl::event>& deps = {});
+
 // On-device softmax + top-K from logits ALREADY on device (generalized
 // moe_router stage 2; arbitrary E≤1024, arbitrary K). topk_idx ascending,
 // topk_w renormalized. One WG = E lanes.

@@ -15,8 +15,10 @@ namespace {
 // splitmix64: a seeded stream of uniforms for the multinomial draw
 inline uint64_t next_u64(uint64_t& s) { uint64_t z = (s += 0x9E3779B97F4A7C15ull); z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull; z = (z ^ (z >> 27)) * 0x94D049BB133111EBull; return z ^ (z >> 31); }
 inline double uniform01(uint64_t& s) { return double(next_u64(s) >> 11) * (1.0 / 9007199254740992.0); }
+}  // namespace
+
 // the longest prefix of `b` that ends on a complete UTF-8 sequence
-size_t utf8_complete_prefix(const std::string& b) {
+size_t Ds41Generator::utf8_complete_prefix(const std::string& b) {
     if (b.empty()) return 0;
     size_t i = b.size();
     // walk back over up to 3 continuation bytes to the leader of the last sequence
@@ -30,7 +32,108 @@ size_t utf8_complete_prefix(const std::string& b) {
     return have >= need ? b.size() : i - 1;           // the sequence is complete, or hold it back
 }
 
-}  // namespace
+// A reply that has become one short pattern repeated is finished, whatever it says next: live
+// (2026-09-19) a corrupted image encode made the model emit one word 11,584 times, 14 minutes of
+// decoding. 1,024 tokens in, every 64th, the last 512 are checked for a period of at most 16.
+bool Ds41Generator::repeating(const std::vector<int32_t>& out_ids, uint32_t n_gen) {
+    constexpr uint32_t kMin = 1024, kWindow = 512, kMaxPeriod = 16;
+    if (n_gen < kMin || n_gen % 64) return false;
+    const size_t n = out_ids.size();
+    if (n < size_t(kWindow) + kMaxPeriod) return false;
+    for (uint32_t p = 1; p <= kMaxPeriod; ++p) {
+        bool same = true;
+        for (size_t i = n - kWindow; i < n && same; ++i) same = out_ids[i] == out_ids[i - p];
+        if (same) return true;
+    }
+    return false;
+}
+
+// Phase 58 (docs/deepseek41/97): prompt-lookup speculation. IE_DS41_LOOKUP=1 turns it on; IE_DS41_LOOKUP_K caps the
+// drafts per pass (rows = 1 + K <= kDs41MaxDecodeRows), IE_DS41_LOOKUP_MIN is the copy length a draft needs.
+Ds41LookupPolicy Ds41Generator::lookup_policy() {
+    static const Ds41LookupPolicy lp = [] {
+        Ds41LookupPolicy p;
+        if (const char* v = std::getenv("IE_DS41_LOOKUP")) p.on = std::string(v) == "1";
+        if (const char* v = std::getenv("IE_DS41_LOOKUP_K")) p.k = uint32_t(std::max(1, std::min(int(kDs41MaxDecodeRows) - 1, std::atoi(v))));
+        if (const char* v = std::getenv("IE_DS41_LOOKUP_MIN")) p.min_match = uint32_t(std::max(2, std::atoi(v)));
+        if (p.on) std::fprintf(stderr, "[ds41 lookup] prompt-lookup speculation ON: up to %u drafts per pass, a copy of >= %u tokens\n", p.k, p.min_match);
+        return p;
+    }();
+    return lp;
+}
+
+Ds41PrefillPlan Ds41Generator::plan_prefill(const std::vector<int32_t>& prompt_ids, uint32_t reused, uint32_t cap, bool planned,
+                                            int32_t user_tok, int32_t think_tok, int32_t think_end_tok) {
+    Ds41PrefillPlan pl;
+    const uint32_t T = uint32_t(prompt_ids.size());
+    uint32_t persist_at = 0;
+    // Phase 57 (docs/deepseek41/96): a chat prompt ends `<｜Assistant｜><think>` (or `</think>`), and the NEXT turn renders
+    // this same assistant turn with the other tag -- the two prompts part ways at T - 1, so the checkpoint at T below is
+    // never reusable and every turn fell back to the last user message's start (re-running the whole message: with an
+    // image, its encode and hundreds of tokens). The plan ends one token early, a checkpoint is taken there, and the tag
+    // runs as a one-row step.
+    uint32_t Tp = T;
+    if (planned && T >= 4) {
+        const int32_t last = prompt_ids[T - 1];
+        if (last >= 0 && (last == think_tok || last == think_end_tok)) Tp = T - 1;
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> chunks;
+    uint32_t off = reused;
+    if (planned) {
+        // Phase 46/47: with the cache on, the prompt runs from `reused` (0 = a fresh prefill) in chunks whose boundaries
+        // include where the FIRST and the LAST user message begin (a special token, so a token boundary in every
+        // rendering): the first is the system prompt + tools shared by every conversation of a client, the last the point
+        // a regenerated or edited reply resumes from. Chunks of `cap`, never leaving 2..8 rows before a boundary (a chunk
+        // shortened to leave 9), a pos0 = 0 chunk of even length (a prefill's T is a multiple of the ratio-2 groups), a
+        // remainder of 1..8 rows at the very end fed one token at a time. A continuation may start at an odd position.
+        std::vector<uint32_t> cuts;
+        if (const int32_t u = user_tok; u >= 0) {
+            const auto f = std::find(prompt_ids.begin(), prompt_ids.end(), u);
+            const auto l = std::find(prompt_ids.rbegin(), prompt_ids.rend(), u);
+            const uint32_t first = f != prompt_ids.end() ? uint32_t(f - prompt_ids.begin()) : 0u;
+            const uint32_t lastu = l != prompt_ids.rend() ? uint32_t(prompt_ids.size() - 1 - size_t(l - prompt_ids.rbegin())) : 0u;
+            uint32_t prev = reused;
+            for (uint32_t h : {first, lastu}) {
+                const bool is_first = h == first;
+                if (reused == 0) h &= ~1u;                         // a pos0 = 0 chunk ending here must have even length
+                if (h == 0 || h <= prev + 16 || h + 1 >= Tp) continue;
+                if (is_first) persist_at = h;
+                cuts.push_back(h); prev = h;
+            }
+        }
+        cuts.push_back(Tp);
+        for (const uint32_t end : cuts) {
+            const bool last = end == Tp;
+            while (end - off > (off == 0 ? 0u : kDs41MaxDecodeRows)) {
+                uint32_t t = std::min(cap, end - off);
+                uint32_t rest = end - off - t;
+                if (rest >= 1 && rest <= kDs41MaxDecodeRows && t > 2 * (kDs41MaxDecodeRows + 1)) { t -= kDs41MaxDecodeRows + 1 - rest; rest = end - off - t; }
+                if (off == 0 && (t & 1u)) { if (t == 1) break; --t; }
+                if (off == 0 && !last && end - off - t >= 1 && end - off - t <= kDs41MaxDecodeRows) t -= 2;   // keep the boundary a chunk end
+                chunks.push_back({off, t}); off += t;
+            }
+            if (!last && off != end) { chunks.clear(); cuts.clear(); break; }   // cannot land on this boundary: plain plan below
+        }
+        if (cuts.empty()) {                                        // the plain plan (no boundaries), from `reused`
+            persist_at = 0; off = reused;
+            while (Tp - off > (off == 0 ? 0u : kDs41MaxDecodeRows)) {
+                uint32_t t = std::min(cap, Tp - off); const uint32_t rest = Tp - off - t;
+                if (rest >= 1 && rest <= kDs41MaxDecodeRows && t > 2 * (kDs41MaxDecodeRows + 1)) t -= kDs41MaxDecodeRows + 1 - rest;
+                if (off == 0 && (t & 1u)) { if (t == 1) break; --t; }
+                chunks.push_back({off, t}); off += t;
+            }
+        }
+    } else {
+        // run()'s non-speculative branch without the cache: the even prefix in chunks of `cap` from 0 (a remainder of
+        // 1..8 rows past the first chunk is a decode-sized gap, fed one token at a time), then the odd tail
+        const uint32_t Te = T & ~1u;
+        off = 0;
+        if (Te > cap) { for (; off < Te; ) { const uint32_t t = std::min(cap, Te - off); if (off > 0 && t <= kDs41MaxDecodeRows) break; chunks.push_back({off, t}); off += t; } }
+        else { chunks.push_back({0, Te}); off = Te; }
+    }
+    pl.Tp = Tp; pl.chunks = std::move(chunks); pl.tail = off; pl.persist_at = persist_at;
+    return pl;
+}
 
 int32_t Ds41Generator::sample(std::vector<float>& lg, const std::vector<int32_t>& recent, const Ds41SampleParams& sp, uint64_t& rng,
                               Ds41SampleStats* stats) {
@@ -99,21 +202,8 @@ struct Ds41Emitter {
     Ds41Emitter(const Tokenizer& t, const std::vector<std::string>& s, const std::function<bool(std::string_view)>& cb,
                 std::vector<int32_t>& o, std::vector<int32_t>& r, Ds41GenStats& stats)
         : tok(t), stops(s), on_piece(cb), out_ids(o), recent(r), st(stats) { for (const auto& x : stops) longest_stop = std::max(longest_stop, x.size()); }
-    // A reply that has become one short pattern repeated is finished, whatever it says next: live
-    // (2026-09-19) a corrupted image encode made the model emit one word 11,584 times, 14 minutes of
-    // decoding. 1,024 tokens in, every 64th, the last 512 are checked for a period of at most 16.
-    bool repeating() const {
-        constexpr uint32_t kMin = 1024, kWindow = 512, kMaxPeriod = 16;
-        if (st.n_gen < kMin || st.n_gen % 64) return false;
-        const size_t n = out_ids.size();
-        if (n < size_t(kWindow) + kMaxPeriod) return false;
-        for (uint32_t p = 1; p <= kMaxPeriod; ++p) {
-            bool same = true;
-            for (size_t i = n - kWindow; i < n && same; ++i) same = out_ids[i] == out_ids[i - p];
-            if (same) return true;
-        }
-        return false;
-    }
+    // A reply that has become one short pattern repeated is finished, whatever it says next (Ds41Generator::repeating)
+    bool repeating() const { return Ds41Generator::repeating(out_ids, st.n_gen); }
     bool push(int32_t id) {                                       // false: the run ended (st.stop_reason set)
         if (id == tok.eos_token_id()) { st.stop_reason = "eos"; return false; }
         out_ids.push_back(id); recent.push_back(id); ++st.n_gen;
@@ -129,7 +219,7 @@ struct Ds41Emitter {
         else if (warm_mark && st.n_gen > warm_mark) { st.warm_decode_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - warm_t0).count(); st.warm_n = st.n_gen - warm_mark; }
         if (repeating()) { st.stop_reason = "repetition"; return false; }
         pending += tok.decode(std::span<const int32_t>(&id, 1), /*skip_special=*/false);
-        const size_t n = utf8_complete_prefix(pending);
+        const size_t n = Ds41Generator::utf8_complete_prefix(pending);
         if (n) {
             std::string piece = pending.substr(0, n); pending.erase(0, n);
             bool stopped = false;
@@ -187,62 +277,15 @@ std::string Ds41Generator::run(const std::vector<int32_t>& prompt_ids, uint32_t 
     static const bool pipe_prefill = [] { const char* v = std::getenv("IE_DS41_PIPE_PREFILL"); return !(v && *v && std::string(v) == "0"); }();
     uint32_t persist_at = 0;                                       // Phase 47: the system prefix's aligned end, for the disk
     const bool planned = fwd_.prefix_cache() && !spec;
-    // Phase 57 (docs/deepseek41/96): a chat prompt ends `<｜Assistant｜><think>` (or `</think>`), and the NEXT turn renders
-    // this same assistant turn with the other tag -- the two prompts part ways at T - 1, so the checkpoint at T below is
-    // never reusable and every turn fell back to the last user message's start (re-running the whole message: with an
-    // image, its encode and hundreds of tokens). The plan ends one token early, a checkpoint is taken there, and the tag
-    // runs as a one-row step.
+    // Phase 46/47/57: the plan (Ds41Generator::plan_prefill, shared with the lanes' serving path since P4 B6b): the chunks
+    // from `reused` with ends at the first and the last user message's start, then the rows up to T one at a time; the
+    // planned end Tp is one token early when the prompt ends in a think tag, and a checkpoint is taken there.
     uint32_t Tp = T;
-    if (planned && T >= 4) {
-        const int32_t last = prompt_ids[T - 1];
-        if (last >= 0 && (last == tok_.find_token("<think>") || last == tok_.find_token("</think>"))) Tp = T - 1;
-    }
     if (planned) {
-        // Phase 46/47: with the cache on, the prompt runs from `reused` (0 = a fresh prefill) in chunks whose boundaries
-        // include where the FIRST and the LAST user message begin (a special token, so a token boundary in every
-        // rendering): the first is the system prompt + tools shared by every conversation of a client, the last the point
-        // a regenerated or edited reply resumes from. Chunks of `cap`, never leaving 2..8 rows before a boundary (a chunk
-        // shortened to leave 9), a pos0 = 0 chunk of even length (a prefill's T is a multiple of the ratio-2 groups), a
-        // remainder of 1..8 rows at the very end fed one token at a time. A continuation may start at an odd position.
-        std::vector<uint32_t> cuts;
-        if (const int32_t u = tok_.find_token("<｜User｜>"); u >= 0) {
-            const auto f = std::find(prompt_ids.begin(), prompt_ids.end(), u);
-            const auto l = std::find(prompt_ids.rbegin(), prompt_ids.rend(), u);
-            const uint32_t first = f != prompt_ids.end() ? uint32_t(f - prompt_ids.begin()) : 0u;
-            const uint32_t lastu = l != prompt_ids.rend() ? uint32_t(prompt_ids.size() - 1 - size_t(l - prompt_ids.rbegin())) : 0u;
-            uint32_t prev = reused;
-            for (uint32_t h : {first, lastu}) {
-                const bool is_first = h == first;
-                if (reused == 0) h &= ~1u;                         // a pos0 = 0 chunk ending here must have even length
-                if (h == 0 || h <= prev + 16 || h + 1 >= Tp) continue;
-                if (is_first) persist_at = h;
-                cuts.push_back(h); prev = h;
-            }
-        }
-        cuts.push_back(Tp);
-        std::vector<std::pair<uint32_t, uint32_t>> chunks;
-        uint32_t off = reused;
-        for (const uint32_t end : cuts) {
-            const bool last = end == Tp;
-            while (end - off > (off == 0 ? 0u : kDs41MaxDecodeRows)) {
-                uint32_t t = std::min(cap, end - off);
-                uint32_t rest = end - off - t;
-                if (rest >= 1 && rest <= kDs41MaxDecodeRows && t > 2 * (kDs41MaxDecodeRows + 1)) { t -= kDs41MaxDecodeRows + 1 - rest; rest = end - off - t; }
-                if (off == 0 && (t & 1u)) { if (t == 1) break; --t; }
-                if (off == 0 && !last && end - off - t >= 1 && end - off - t <= kDs41MaxDecodeRows) t -= 2;   // keep the boundary a chunk end
-                chunks.push_back({off, t}); off += t;
-            }
-            if (!last && off != end) { chunks.clear(); cuts.clear(); break; }   // cannot land on this boundary: plain plan below
-        }
-        if (cuts.empty()) {                                        // the plain plan (no boundaries), from `reused`
-            persist_at = 0; off = reused;
-            while (Tp - off > (off == 0 ? 0u : kDs41MaxDecodeRows)) {
-                uint32_t t = std::min(cap, Tp - off); const uint32_t rest = Tp - off - t;
-                if (rest >= 1 && rest <= kDs41MaxDecodeRows && t > 2 * (kDs41MaxDecodeRows + 1)) t -= kDs41MaxDecodeRows + 1 - rest;
-                if (off == 0 && (t & 1u)) { if (t == 1) break; --t; }
-                chunks.push_back({off, t}); off += t;
-            }
-        }
+        const Ds41PrefillPlan pl = plan_prefill(prompt_ids, reused, cap, true, tok_.find_token("<｜User｜>"), tok_.find_token("<think>"), tok_.find_token("</think>"));
+        const auto& chunks = pl.chunks;
+        uint32_t off = pl.tail;
+        Tp = pl.Tp; persist_at = pl.persist_at;
         if (chunks.size() > 1 && pipe_prefill && fwd_.pipelined_admissible()) {
             if (auto e = fwd_.forward_pipelined(prompt_ids.data(), chunks, logits); !e.empty()) { st.stop_reason = "error"; return "prefill from " + std::to_string(reused) + " (pipelined): " + e; }
         } else for (const auto& [p0, t] : chunks)
@@ -308,17 +351,8 @@ std::string Ds41Generator::run(const std::vector<int32_t>& prompt_ids, uint32_t 
     uint64_t rng = sp.seed ? sp.seed : 0x2545F4914F6CDD1Dull;
     Ds41Emitter em(tok_, stops, on_piece, out_ids, recent, st); em.warm_mark = warm_mark_;
     const auto t1 = std::chrono::steady_clock::now();
-    // Phase 58 (docs/deepseek41/97): prompt-lookup speculation. IE_DS41_LOOKUP=1 turns it on; IE_DS41_LOOKUP_K caps the
-    // drafts per pass (rows = 1 + K <= kDs41MaxDecodeRows), IE_DS41_LOOKUP_MIN is the copy length a draft needs.
-    struct LookupPolicy { bool on = false; uint32_t k = 7, min_match = 12; };
-    static const LookupPolicy lp = [] {
-        LookupPolicy p;
-        if (const char* v = std::getenv("IE_DS41_LOOKUP")) p.on = std::string(v) == "1";
-        if (const char* v = std::getenv("IE_DS41_LOOKUP_K")) p.k = uint32_t(std::max(1, std::min(int(kDs41MaxDecodeRows) - 1, std::atoi(v))));
-        if (const char* v = std::getenv("IE_DS41_LOOKUP_MIN")) p.min_match = uint32_t(std::max(2, std::atoi(v)));
-        if (p.on) std::fprintf(stderr, "[ds41 lookup] prompt-lookup speculation ON: up to %u drafts per pass, a copy of >= %u tokens\n", p.k, p.min_match);
-        return p;
-    }();
+    // Phase 58 (docs/deepseek41/97): prompt-lookup speculation (the policy: Ds41Generator::lookup_policy)
+    const Ds41LookupPolicy lp = lookup_policy();
     const bool lookup_on = lookup_ < 0 ? lp.on : lookup_ == 1;
     if (!spec && lookup_on) {
         // The caches hold 0 .. pos-1; `id` is sampled and not yet fed. A pass drafts d (a copy from the context), feeds

@@ -254,6 +254,41 @@ public:
     void        reset_state();
     sycl::half* logits() const noexcept { return logits_; }
 
+    // -- P4 B7: request lanes (docs/glm53/P4_B7_LANES.md) ------------------
+    // A LANE is one sequence's state on this stage: the KDA scan + conv state
+    // (dn_), the MLA latent cache, the DSA pooled keys and the open pool's
+    // rolls, and the depth (kv_len_). Lane 0 is what init_runtime has always
+    // allocated, so ONE lane (the default) is the pre-lane model, launch for
+    // launch. Extra lanes (set_seq_lanes, before init_runtime) are allocated
+    // after the workspaces and before the expert cache, and their bytes come
+    // OUT OF the cache budget: the stage's VRAM stays what one lane takes.
+    // select_lane swaps a lane's state into the live members (pointers, no
+    // copy), so a stage runs one lane at a time; a card pipe gives each stage
+    // its own host thread (Glm5LanePipe, ie/glm5_lanes.hpp). Lanes are
+    // refused with the MTP kit and expert-parallel decode (per-model state).
+    void set_seq_lanes(uint32_t n, uint32_t lane_ctx) noexcept {
+        seq_lanes_req_ = n ? n : 1; seq_lane_ctx_ = lane_ctx;
+    }
+    std::string select_lane(uint32_t lane);
+    uint32_t n_lanes() const noexcept { return seq_lanes_.empty() ? 1u : uint32_t(seq_lanes_.size()); }
+    uint32_t lane() const noexcept { return seq_lane_; }
+    uint32_t lane_ctx(uint32_t lane) const noexcept;   // a lane's capacity (positions)
+    uint32_t lane_pos(uint32_t lane) const noexcept;   // a lane's depth
+    uint64_t lane_bytes() const noexcept { return lane_bytes_; }   // ONE extra lane's device bytes here (0 with one lane)
+    // One stage of one lane's step -- the body the serial lanes and the card
+    // pipe both run: select the lane, reset it when pos0 == 0 (a new
+    // sequence, as the engine resets at pos 0), forward_range, and on the
+    // tail stage copy the fp16 logits [vocab] into `logits_host`. On an error
+    // this stage's queue is drained before returning, so nothing of the
+    // failed step still reads the caller's host buffers.
+    std::string lane_stage(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0,
+                           const float* wide_in, float* wide_out, sycl::half* logits_host);
+    // Why this stage cannot run under a card pipe ("" = it can): the MTP kit,
+    // expert-parallel decode or spec verify (per-model state), or a serial-only
+    // diagnostic (IE_QUEUE_PROFILING, IE_G5_DUMP_WIDE/_MOE, IE_G5_NAN_PROBE,
+    // IE_G5_TRACE_FIRST).
+    std::string pipe_refusal() const;
+
     // -- MTP / NextN draft head (spec decode; tail stage only) --------------
     // The GGUF's blk.45 is a full MLA+MoE decoder block WITHOUT hyper-
     // connections plus the nextn fusion tensors. Neither llama.cpp nor
@@ -464,6 +499,23 @@ private:
     uint32_t n_sel_ = 0;                  // index_topk + kpool - 1
     uint32_t select_k_ = 0;               // index_topk / kpool
     bool sparse_ = false;                 // max_ctx_ > n_sel_
+    // P4 B7 request lanes: the parked state of every lane; the slot of the
+    // live lane holds an empty placeholder (its state is in the live members:
+    // dn_, lat_cache_, pool_key_, idx_kroll_/groll_, max_ctx_, n_pools_,
+    // kv_len_). Empty with one lane. The workspaces stay sized by lane 0's
+    // context, which every lane's context is at most.
+    struct SeqLane {
+        DeltaNetState dn;
+        sycl::half* lat = nullptr;
+        sycl::half* pool_key = nullptr;
+        sycl::half* kroll = nullptr;
+        sycl::half* groll = nullptr;
+        uint32_t ctx = 0, n_pools = 0, kv_len = 0;
+    };
+    std::vector<SeqLane> seq_lanes_;
+    uint32_t seq_lane_ = 0, seq_lanes_req_ = 1, seq_lane_ctx_ = 0;
+    uint64_t lane_bytes_ = 0;
+    void swap_live_(SeqLane& s) noexcept;
     // indexer score workspace is [strip, n_pools] — never [max_chunk, n_pools]
     static constexpr uint32_t kIdxStrip = 64;
     std::vector<ECache> ecache_;             // one per MoE layer (empty: dense)

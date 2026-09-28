@@ -2,6 +2,7 @@
 #include "ie/openai_proto.hpp"
 #include "nlohmann/json.hpp"
 #include <cassert>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 using nlohmann::json;
@@ -290,6 +291,11 @@ int main() {
 
     auto models = json::parse(ie::oai::models_json("qwen"));
     assert(models["object"] == "list" && models["data"][0]["id"] == "qwen");
+    assert(!models["data"][0].contains("root"));   // unnamed server: unchanged
+    assert(ie::oai::models_json("qwen") ==
+           R"({"data":[{"id":"qwen","object":"model","owned_by":"local"}],"object":"list"})");
+    auto named = json::parse(ie::oai::models_json("coder", "Qwen3-Coder-Q4_K_M"));   // layout-named server
+    assert(named["data"][0]["id"] == "coder" && named["data"][0]["root"] == "Qwen3-Coder-Q4_K_M");
     std::puts("openai_proto_test: all OK");
 
     // ---- docs/deepseek4/72 Phase L: `stop`, reasoning_content, engine-parsed tool_calls ----
@@ -362,6 +368,147 @@ int main() {
         assert(ej2["error"]["type"] == "server_error" && !ej2["error"].contains("code"));
         auto ej3 = json::parse(ie::oai::error_json(std::string("bad \xff byte")));
         assert(ej3["error"]["message"].is_string());
+    }
+
+    // image_refusal (P4 follow-up): images on a load whose vision status (/props "vision") is not ready are refused with
+    // its reason (the server's 400); a text request, or a load that takes images, goes ahead.
+    {
+        const std::string lanes = R"J({"ready":false,"reason":"images are served at --parallel 1 only (P4 B4)","image_tokens":2048})J";
+        const std::string ready = R"({"ready":true,"reason":"","image_tokens":2048})";
+        assert(ie::oai::image_refusal(img, lanes) == "image input: images are served at --parallel 1 only (P4 B4)");
+        assert(ie::oai::image_refusal(img, ready).empty());
+        assert(ie::oai::image_refusal(r, lanes).empty());   // no images: whatever the load
+        assert(ie::oai::image_refusal(img, R"({"ready":false,"reason":"this architecture has no vision input"})") ==
+               "image input: this architecture has no vision input");
+        auto earlier = ie::oai::parse_chat_request(R"({"messages":[
+          {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgo="}}]},
+          {"role":"assistant","content":"a square"},{"role":"user","content":"which colour?"}]})");
+        assert(earlier.error.empty() && ie::oai::image_refusal(earlier, lanes) ==
+               "image input: images are served at --parallel 1 only (P4 B4)");   // an image in an earlier turn counts
+    }
+
+    {   // P4 B20: recommended sampling per model and mode; resolution request > CLI/env > recommendation > library
+        using ie::ModelArch;
+        namespace o = ie::oai;
+        const std::string q38 = "<think> reasoning_effort Reasoning effort is set to xhigh.";
+        const auto q27 = ie::recommended_sampling(ModelArch::kQwen35Dense, q38);
+        assert(q27 && std::string(q27->model) == "Qwen3.8-27B" && q27->instruct && q27->effort.size() == 3);
+        assert(!ie::recommended_sampling(ModelArch::kQwen35Dense, "<think> no effort sentence"));   // not the Qwen3.8 template
+        assert(!ie::recommended_sampling(ModelArch::kQwen35Moe, "plain instruct"));
+        assert(!ie::recommended_sampling(ModelArch::kDeepSeek4) && !ie::recommended_sampling(ModelArch::kLlama3));
+        auto req = [](const std::string& extra) {
+            return o::parse_chat_request(R"({"messages":[{"role":"user","content":"u"}])" + extra + "}");
+        };
+        auto near = [](float a, double b) { return std::fabs(double(a) - b) < 1e-6; };
+        auto is = [&](const ie::SamplingParams& s, double t, double tp, uint32_t k, double mp, double pres, double rep) {
+            return near(s.temperature, t) && near(s.top_p, tp) && s.top_k == k && near(s.min_p, mp) &&
+                   near(s.presence_penalty, pres) && near(s.repeat_penalty, rep);
+        };
+        auto same = [](const ie::SamplingParams& x, const ie::SamplingParams& y) {   // every field, bit for bit
+            return x.temperature == y.temperature && x.top_k == y.top_k && x.top_p == y.top_p && x.min_p == y.min_p &&
+                   x.presence_penalty == y.presence_penalty && x.frequency_penalty == y.frequency_penalty &&
+                   x.repeat_penalty == y.repeat_penalty && x.repeat_window == y.repeat_window && x.seed == y.seed &&
+                   x.max_tokens == y.max_tokens && x.ignore_eos == y.ignore_eos;
+        };
+        // omitted everything, thinking (the server default) -> the thinking row
+        auto a = req("");
+        assert(a.error.empty() && a.sampling_set == 0 && a.enable_thinking);
+        assert(o::apply_recommended(a, &*q27) == o::kSetAllRecommended);
+        assert(is(a.sampling, 1.0, 0.95, 20, 0, 0, 1.0) && near(a.sampling.frequency_penalty, 0));
+        assert(a.sampling.max_tokens == 12345);   // max_tokens is not a recommended field (IE_SERVE_MAX_TOKENS above)
+        // enable_thinking:false -> the instruct row, per request
+        auto b = req(R"(,"enable_thinking":false)");
+        o::apply_recommended(b, &*q27);
+        assert(is(b.sampling, 0.7, 0.80, 20, 0, 1.5, 1.0));
+        // chat_template_kwargs (the Qwen card's form) == top-level
+        auto c = req(R"(,"chat_template_kwargs":{"enable_thinking":false,"reasoning_effort":"low","other":1})");
+        assert(c.error.empty() && !c.enable_thinking && c.reasoning_effort == "low");
+        o::apply_recommended(c, &*q27);
+        assert(is(c.sampling, 0.7, 0.80, 20, 0, 1.5, 1.0));
+        auto c2 = req(R"(,"enable_thinking":true,"reasoning_effort":"medium","chat_template_kwargs":{"enable_thinking":false,"reasoning_effort":"low"})");
+        assert(c2.error.empty() && c2.enable_thinking && c2.reasoning_effort == "medium");   // top-level wins
+        assert(!req(R"(,"chat_template_kwargs":{"enable_thinking":"no"})").error.empty());
+        assert(!req(R"(,"chat_template_kwargs":{"reasoning_effort":"ultra"})").error.empty());
+        assert(!req(R"(,"chat_template_kwargs":[1])").error.empty());
+        assert(req(R"(,"chat_template_kwargs":null)").error.empty());
+        // an explicit request value wins; only the omitted fields are filled
+        auto d = req(R"(,"temperature":0.2,"presence_penalty":0.5)");
+        assert(d.sampling_set == (o::kSetTemperature | o::kSetPresence));
+        assert(o::apply_recommended(d, &*q27) == (o::kSetAllRecommended & ~(o::kSetTemperature | o::kSetPresence)));
+        assert(is(d.sampling, 0.2, 0.95, 20, 0, 0.5, 1.0));
+        auto d2 = req(R"(,"repetition_penalty":1.1,"enable_thinking":false)");
+        o::apply_recommended(d2, &*q27);
+        assert(is(d2.sampling, 0.7, 0.80, 20, 0, 1.5, 1.1));
+        // greedy (explicit temperature 0): nothing from the recommendation -- byte-identical to before B20
+        auto g = req(R"(,"temperature":0,"enable_thinking":false)");
+        const ie::SamplingParams before = g.sampling;
+        assert(o::apply_recommended(g, &*q27) == 0);
+        assert(same(before, g.sampling));
+        // every recommended field explicit: nothing filled
+        auto all = req(R"(,"temperature":0.9,"top_p":0.5,"top_k":7,"min_p":0.01,"presence_penalty":0.3,"repeat_penalty":1.2)");
+        const ie::SamplingParams all_before = all.sampling;
+        assert(all.sampling_set == o::kSetAllRecommended && o::apply_recommended(all, &*q27) == 0);
+        assert(same(all_before, all.sampling));
+        // no recommendation (another model): the library defaults stay
+        auto n = req("");
+        assert(o::apply_recommended(n, nullptr) == 0 && is(n.sampling, 0.7, 0.95, 40, 0, 0, 1.0));
+        // env (IE_SERVE_*) outranks the recommendation, a request outranks env
+        setenv("IE_SERVE_TEMP", "0.3", 1); setenv("IE_SERVE_TOP_K", "5", 1);
+        auto e = req("");
+        assert(e.sampling_set == (o::kSetTemperature | o::kSetTopK));
+        o::apply_recommended(e, &*q27);
+        assert(is(e.sampling, 0.3, 0.95, 5, 0, 0, 1.0));
+        auto e2 = req(R"(,"top_k":9)");
+        o::apply_recommended(e2, &*q27);
+        assert(e2.sampling.top_k == 9 && near(e2.sampling.temperature, 0.3));
+        setenv("IE_SERVE_TEMP", "0", 1);   // a greedy server default: nothing from the recommendation either
+        auto e3 = req("");
+        assert(o::apply_recommended(e3, &*q27) == 0 && e3.sampling.top_k == 5 && near(e3.sampling.top_p, 0.95));
+        unsetenv("IE_SERVE_TEMP"); unsetenv("IE_SERVE_TOP_K");
+        // the other rows (PLAN.md section 1 values; owner decisions 2026-09-28)
+        const auto fn = ie::recommended_sampling(ModelArch::kQwen4Exp, q38);
+        assert(fn && std::string(fn->model) == "Qwen3.8-Flash-Next");
+        // the 35B-A3B distill by name only (Dream's carded_model): its template equals the plain Qwen3.6-35B-A3B's
+        const std::string q36 = "https://huggingface.co/Qwen/Qwen3.6-35B-A3B";
+        const auto moe = ie::recommended_sampling(ModelArch::kQwen35Moe, "<think> enable_thinking", "Ours", q36);
+        assert(moe && std::string(moe->model) == "Qwen3.8-35B-A3B-Distill");
+        assert(ie::recommended_sampling(ModelArch::kQwen35Moe, "<think>", "Qwen3.8 35B_A3B--Distill Q8"));   // name normalised
+        assert(!ie::recommended_sampling(ModelArch::kQwen35Moe, "<think>", "Qwen_Qwen3.6 35B A3B", q36));  // the plain base
+        assert(!ie::recommended_sampling(ModelArch::kQwen35Moe, "<think>", "Ours", "https://huggingface.co/other/x"));
+        assert(!ie::recommended_sampling(ModelArch::kQwen35Moe, "<think>", "Ours"));
+        assert(!ie::recommended_sampling(ModelArch::kQwen35Moe, "plain instruct", "Ours", q36));          // needs <think>
+        assert(!ie::recommended_sampling(ModelArch::kQwen35Moe, "<think>"));
+        // GLM by name ("GLM 5.3 Flash" -> glm-5.3-flash); another glm5next gets nothing
+        assert(!ie::recommended_sampling(ModelArch::kGlm5Next, "<think>"));
+        assert(!ie::recommended_sampling(ModelArch::kGlm5Next, "<think>", "GLM 5.2 Flash"));
+        // Qwen3.8 by template only (the name does not matter), as in Dream
+        assert(ie::recommended_sampling(ModelArch::kQwen35Dense, q38, "anything"));
+        assert(ie::recommended_name_key("GLM 5.3_Flash") == "glm-5.3-flash");
+        auto m1 = req(""); o::apply_recommended(m1, &*moe); assert(is(m1.sampling, 0.6, 0.95, 20, 0, 0, 1.0));
+        auto m2 = req(R"(,"enable_thinking":false)"); o::apply_recommended(m2, &*moe); assert(is(m2.sampling, 0.7, 0.80, 20, 0, 1.5, 1.0));
+        assert(moe->effort.empty() && moe->max_output == 16384);
+        const auto glm = ie::recommended_sampling(ModelArch::kGlm5Next, "<think>", "GLM 5.3 Flash");
+        assert(glm && !glm->instruct && glm->effort.size() == 3 && std::string(glm->effort[0].level) == "max");
+        auto g1 = req(R"(,"enable_thinking":false)"); o::apply_recommended(g1, &*glm);   // no official off mode: the one set
+        assert(is(g1.sampling, 1.0, 0.95, 0, 0, 0, 1.0));
+        for (ModelArch ar : {ModelArch::kMimo26, ModelArch::kDeepSeek41}) {
+            const auto r = ie::recommended_sampling(ar);
+            assert(r && r->instruct && r->context == 1048576);
+            for (const char* x : {"", R"(,"enable_thinking":false)"}) {
+                auto s = req(x); o::apply_recommended(s, &*r); assert(is(s.sampling, 1.0, 0.95, 0, 0, 0, 1.0));
+            }
+        }
+        assert(ie::recommended_sampling(ModelArch::kDeepSeek41)->max_output == 262144);
+        // penalties the DS4.1 / MiMo host sampler drops: a WARNING (served anyway), none elsewhere or at 0
+        ie::SamplingParams sp; sp.presence_penalty = 1.5f;
+        assert(ie::dropped_penalty_warning(ModelArch::kMimo26, sp).find("IGNORED") != std::string::npos);
+        assert(ie::dropped_penalty_warning(ModelArch::kDeepSeek41, sp).find("DeepSeek-V4.1") != std::string::npos);
+        assert(ie::dropped_penalty_warning(ModelArch::kQwen35Dense, sp).empty());
+        sp.presence_penalty = 0; sp.frequency_penalty = 0.3f;
+        assert(!ie::dropped_penalty_warning(ModelArch::kMimo26, sp).empty());
+        sp.frequency_penalty = 0;
+        assert(ie::dropped_penalty_warning(ModelArch::kMimo26, sp).empty());
+        assert(o::sampling_summary(a.sampling).rfind("temperature 1 top_p 0.95 top_k 20", 0) == 0);
     }
 
     return 0;

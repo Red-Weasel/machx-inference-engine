@@ -69,6 +69,14 @@ public:
     void set_reference_form(bool on) { ref_form_ = on; }
     uint64_t vram_bytes() const { return bytes_; }
     void free_all();
+    // P4 B1 lanes (include/ie/mimo26_lanes.hpp): one context ring per lane, each with its own bookkeeping. add_lanes(n) after
+    // init() -- and before the target forward's init, so the rings' VRAM comes out of its auto static tier -- allocates rings
+    // for lanes 1..n-1 (lane 0 is the ring init allocated); select_lane(l) makes every later call read and write lane l's.
+    std::string add_lanes(uint32_t n);
+    std::string select_lane(uint32_t lane);
+    uint32_t lane() const { return lane_; }
+    uint32_t n_lanes() const { return uint32_t(lanes_.size()); }
+    uint64_t lane_bytes() const { return uint64_t(cfg_.n_layers) * 2 * cfg_.n_kv * R_ * cfg_.head_dim * 2; }   // one lane's ring
 
 private:
     struct Layer {
@@ -96,6 +104,10 @@ private:
     bool ref_form_ = false;
     std::vector<void*> owned_;
     uint64_t bytes_ = 0;
+    // P4 B1 lanes: each lane's bookkeeping and ring pointers per layer {kc, vc}; the active lane's live in ctx_* / hi_ / L_[].kc,vc
+    struct LaneCtx { uint32_t ctx_end = 0, ctx_lo = 0, hi = 0; std::vector<std::pair<sycl::half*, sycl::half*>> kv; };
+    std::vector<LaneCtx> lanes_;
+    uint32_t lane_ = 0;
 };
 
 }  // namespace ie

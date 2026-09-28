@@ -25,6 +25,19 @@ inline uint64_t glm5_runtime_reserve(const Glm5NextConfig& c, uint32_t ctx,
         8ull*c.indexer_n_heads*c.indexer_head_dim+32ull*c.n_experts_used;
     return (1ull<<30)+state+latent+index+mt*per_row;
 }
+// P4 B7: the device bytes ONE extra request lane takes on stage [lo, hi) at `ctx` positions -- what
+// Glm5NextModel::init_runtime allocates per lane: the KDA scan (fp32) + conv (f16) state, the MLA latents,
+// and when the stage runs the DSA indexer (`sparse`: its context is above the selection width) the pooled
+// keys and the open pool's key/gate rolls.
+inline uint64_t glm5_lane_bytes(const Glm5NextConfig& c, uint32_t ctx, uint32_t lo, uint32_t hi, bool sparse) {
+    uint64_t full=0, linear=0;
+    for (uint32_t l=lo;l<hi;++l) (c.is_full_attn(l)?full:linear)++;
+    const uint64_t di=uint64_t(c.n_q_heads)*c.kda_head_dim;
+    const uint64_t kda=std::max<uint64_t>(1,linear)*(di*c.kda_head_dim*4+3*di*(c.conv_kernel-1)*2);
+    const uint64_t kp=std::max(1u,c.indexer_kpool);
+    const uint64_t idx=sparse?full*((uint64_t(ctx)+kp-1)/kp)*c.indexer_head_dim*2+2*full*kp*c.indexer_head_dim*2:0;
+    return kda+full*uint64_t(ctx)*c.kv_lora_rank*2+idx;
+}
 inline bool glm5_residency_fits(uint64_t weights,uint64_t runtime,uint64_t cache,uint64_t available) {
     return weights<=available && runtime<=available-weights && cache<=available-weights-runtime;
 }

@@ -29,6 +29,7 @@
 
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -80,7 +81,16 @@ constexpr uint32_t kDs41RopeSlots = 40;
 
 class Ds41Forward {
 public:
-    ~Ds41Forward() { if (pc_writer_.joinable()) pc_writer_.join(); for (auto& cp : cards_) { ep_thread_stop(*cp); free_state(*cp); } }   // the decode state outlives no owner
+    // the decode state outlives no owner. P4 B6a: every card drained before anything is freed (MiMo B2 gate note 6; the pipe's
+    // rollback copies are enqueued unwaited, and a forward that failed part-way leaves its launches queued) -- free_resident
+    // does the same; this is the path of an owner that returns early without it.
+    ~Ds41Forward() {
+        pipe_stop();   // (a no-op without stage threads; P4 B6b: a paused pipe is stopped too)
+        if (pc_writer_.joinable()) pc_writer_.join();
+        for (auto& cp : cards_) ep_thread_stop(*cp);
+        for (auto& cp : cards_) if (cp->state_ready && cp->q) { try { cp->q->wait(); } catch (...) {} }
+        for (auto& cp : cards_) free_state(*cp);
+    }
     // `tables` must be loaded (engram). "" on success. STREAMING mode: every layer's weights are
     // uploaded and freed per forward (Phase 7's verified loop), all on one card.
     std::string init(sycl::queue& q, const DeepSeek41Model& m, const Ds41EngramTables& tables);
@@ -124,6 +134,13 @@ public:
         // 2 = the control arm (the same machinery, the other cards' tiers empty). 0 = off; the env
         // IE_DS41_EP=1|control sets it when the option is 0. Needs two cards; refused with the CPU split.
         uint32_t expert_parallel = 0;
+        // P4 B6a (docs/deepseek41/P4_B6A_LANES.md): LANES -- sequences with their own decode state (every layer's window
+        // ring, the kv sources' latents and index keys, the ratio-2 halves and their counts, the rollback snapshots, the
+        // positions, the engram look-back, the vision spans, the prefix cache's live checkpoints), one active at a time on
+        // the serial API (select_lane) or one per card in the pipe (pipe_*). Lane 0 holds max_tokens positions and is the
+        // pre-lane forward byte for byte; lanes 1..lanes-1 hold lane_ctx positions each (0 = max_tokens). Every lane's state
+        // is allocated with lane 0's, BEFORE the static tier is sized, so its VRAM comes out of that tier. 1 = today.
+        uint32_t lanes = 1, lane_ctx = 32768;
     };
     std::string init_resident(const std::vector<sycl::queue*>& qs, const DeepSeek41Model& m, const Ds41EngramTables& tables,
                               const std::vector<std::vector<uint32_t>>& ranking, const ResidentOptions& opt);
@@ -184,8 +201,64 @@ public:
     // construction. `chunks` are (pos0, T) in order and contiguous, the first at 0 or at n_pos(); every T is a prefill
     // (pos0 == 0) or a continuation (T > kDs41MaxDecodeRows; IE_DS41_CONT=0 refuses those). Refused -- the caller runs forward() per
     // chunk instead -- with expert parallel, the drafter capture, or a single card. `logits` is the last chunk's.
-    std::string forward_pipelined(const int32_t* ids, const std::vector<std::pair<uint32_t, uint32_t>>& chunks, std::vector<float>& logits);
-    bool pipelined_admissible() const { return cards_.size() >= 2 && !ep_ && !capture_main_hidden_ && resident_; }
+    // P4 B6b (docs/deepseek41/P4_B6B_SERVE.md): `stop` (optional) is asked before every chunk after the first; true = the
+    // first stage starts no more chunks, the ones already started finish, and the call returns "" with `*n_done` (optional)
+    // the chunks that ran (all of them when it never stops). The state then holds exactly those chunks, as if the call had
+    // been given only them.
+    std::string forward_pipelined(const int32_t* ids, const std::vector<std::pair<uint32_t, uint32_t>>& chunks, std::vector<float>& logits,
+                                  const std::function<bool()>& stop = {}, size_t* n_done = nullptr);
+    bool pipelined_admissible() const { return cards_.size() >= 2 && !ep_ && !capture_main_hidden_ && resident_ && !piping(); }
+
+    // P4 B6a (docs/deepseek41/P4_B6A_LANES.md) -- LANES, the serial API: the lane every later call reads and writes -- forward,
+    // reset_state, rollback_to, n_pos, capacity, all_ids, the vision spans and provider, the prefix cache's live state -- until
+    // the next select_lane. One lane (the default) never switches: lane 0 is the pre-lane forward. Refused while the pipe runs.
+    std::string select_lane(uint32_t lane);
+    uint32_t lane() const { return lane_; }
+    uint32_t n_lanes() const { return uint32_t(lanes_.size()); }
+    uint32_t lane_capacity(uint32_t lane) const { return lane < lanes_.size() ? lanes_[lane].cap : 0; }
+    uint64_t lane_bytes(uint32_t card) const { return card < lane_bytes_.size() ? lane_bytes_[card] : 0; }   // ONE extra lane's device state on that card
+    // P4 B6a -- the CARD PIPE. One host thread per card ("stage"): while card 0 runs a step of lane B, card 1 runs the rest of
+    // lane A's. Each lane has at most one step in flight, and its step runs exactly the launches forward() issues for it, on
+    // that lane's state and the card's own scratch (a card runs one lane at a time), so with the CPU expert leg off a lane's
+    // logits are the serial ones bit for bit. Steps admitted per lane: a prefill (pos0 == 0, T a multiple of every compress
+    // ratio), a continuation chunk, a one-row step and -- with set_multi_row_decode(true) -- a 2..kDs41MaxDecodeRows-row
+    // verify step (all_rows = every row's logits; the callback then rolls the lane back with pipe_rollback). pipe_submit
+    // queues a step for a lane (T <= forward_capacity() rows at pos0 == lane_pos(lane), the ids copied; from any thread;
+    // image positions are serial-only); when its last stage finishes the lane's positions are committed and done(lane,
+    // logits) runs ON THE LAST CARD'S STAGE THREAD -- it may submit that lane's next step (once), roll it back, or reset it.
+    // Rules (MiMo B2/B3): a lane stays in flight through its done callback and only the callback's thread may submit it
+    // again meanwhile; a callback that keeps resubmitting blocks pipe_stop (it waits for no step in flight); pipe_stop from a
+    // callback deadlocks; after a stage error every pipe_submit is refused with it until pipe_stop, which returns it. While
+    // the pipe runs forward(), forward_pipelined(), select_lane(), rollback_to() and the prefix-cache calls (set_prefix_cache
+    // included) are refused, and reset_state() and the set_* switches must not be called (pipe_reset_lane resets a lane);
+    // expert parallel, the drafter capture and IE_DS41_DUMP_ROUTING are refused at pipe_start.
+    using PipeDone = std::function<void(uint32_t lane, const std::vector<float>& logits)>;
+    std::string pipe_start(PipeDone done);
+    std::string pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool all_rows);
+    std::string pipe_reset_lane(uint32_t lane);                  // an idle lane (or the callback's own) forgets its sequence
+    std::string pipe_rollback(uint32_t lane, uint32_t n_pos);    // rollback_to for a lane, from its done callback only
+    std::string pipe_stop();   // from a running or a paused pipe; a no-op without one
+    // P4 B6b (docs/deepseek41/P4_B6B_SERVE.md; MiMo B4's pause): a PAUSED pipe keeps its stage threads -- and with them their
+    // OpenMP teams (the engram gather) and oneDNN state: a stage thread that ran an OpenMP region and exits leaves its team
+    // behind (the adca570 leak), so serving must not stop and restart the pipe at every serial turn -- but takes no steps, and
+    // the serial API (forward, forward_pipelined, select_lane, rollback_to, the prefix-cache calls) works again on the active
+    // lane, as after pipe_stop. pipe_pause waits until no step is in flight (the caller's callbacks must have stopped
+    // resubmitting) and returns a stage error without clearing it (pipe_stop is then the way out); pipe_resume takes steps
+    // again. piping() is false while paused, and pipe_submit is refused.
+    std::string pipe_pause();
+    std::string pipe_resume();
+    bool        pipe_paused() const { return !stage_th_.empty() && ppaused_; }
+    std::string pipe_error();   // the first stage error while the pipe runs ("" = none); pipe_stop returns and clears it
+    bool        piping() const { return !stage_th_.empty() && !ppaused_; }
+    uint32_t    lane_pos(uint32_t lane) const { return lane < lanes_.size() ? lanes_[lane].n_pos : 0; }
+    // Per lane and card, the decode steps (T <= kDs41MaxDecodeRows) since the last reset: what the tier did with the pinned
+    // experts (how many a stream slot already held -- lanes sharing a card share its stream slots). Serial path and pipe alike.
+    // P4 B19: + the CPU leg's wall (cpu_ms, dispatch to join) and its worker's compute (cpu_work_ms), and the bytes moved to VRAM
+    // for the pinned misses (PCIe) and the mmap tier -- the host side of a lane's expert traffic
+    struct LaneTierStats { uint64_t steps = 0, rows = 0, experts_static = 0, experts_pinned = 0, stream_hits = 0, experts_cpu = 0, experts_mmap = 0; double moe_ms = 0;
+                           double cpu_ms = 0, cpu_work_ms = 0; uint64_t bytes_pinned = 0, bytes_mmap = 0; };
+    const LaneTierStats& lane_tier_stats(uint32_t lane, uint32_t card) const { return lane_tier_[lane][card]; }
+    void reset_lane_tier_stats() { for (auto& v : lane_tier_) for (auto& s : v) s = {}; }
 
     // Phase 46 (docs/deepseek41/86): the PREFIX CACHE. The state at a position P is the latent / index-key caches'
     // first nc(P) rows (append-only: later positions never rewrite them), each layer's 128-slot window ring and the
@@ -218,6 +291,10 @@ public:
     // state is untouched (the caller's pos0 = 0 prefill resets it). `source` says where it came from ("live",
     // "checkpoint", "host slot", "none").
     std::string prefix_prepare(const std::vector<int32_t>& ids, uint32_t& reused, std::string* source = nullptr);
+    // P4 B6b: how many positions of `ids` lane `lane`'s OWN state would serve -- its live position or one of its complete
+    // checkpoints, by prefix_prepare's rule for the live state (host slots and disk entries are shared by every lane and
+    // not counted). Reads only; for an idle lane (no step in flight), e.g. with the pipe paused. 0 with the cache off.
+    uint32_t prefix_servable(uint32_t lane, const std::vector<int32_t>& ids);
     // A checkpoint at the current n_pos() on every card (synchronous) -- the generator takes one when a prompt is done.
     std::string prefix_checkpoint();
     struct PrefixCacheStats { uint32_t checkpoints = 0, host_slots = 0; uint64_t host_bytes = 0; double last_restore_ms = 0, last_save_ms = 0; };
@@ -226,8 +303,8 @@ public:
     // The latents are read from the devices now (they are only valid until the state rolls below pos); the file is
     // written on a background thread. "" also when disk entries are off or pos is too short.
     std::string prefix_persist(uint32_t pos);
-    uint32_t n_pos() const { return n_pos_; }
-    uint32_t capacity() const { return cap_pos_; }   // the position capacity (ResidentOptions::max_tokens)
+    uint32_t n_pos() const { return lanes_[lane_].n_pos; }          // (the active lane)
+    uint32_t capacity() const { return lanes_[lane_].cap; }   // the active lane's position capacity (lane 0: ResidentOptions::max_tokens)
     // Phase 24: the largest T one forward call may carry. A caller with a longer prompt feeds it in pieces of
     // this size (the generator does) -- it is NOT the context, which is capacity().
     uint32_t forward_capacity() const { return fwd_cap_; }
@@ -276,7 +353,7 @@ public:
     // the capture costs a synchronous D2H + a host mean at the three target layers on every forward (gate P1 finding 7):
     // on only when a drafter consumes it (the generator sets it with a drafter attached; the drafter tests set it)
     void set_capture_main_hidden(bool on) { capture_main_hidden_ = on; }
-    const std::vector<int32_t>& all_ids() const { return all_ids_; }        // the sequence the caches hold (gate P3 finding 3)
+    const std::vector<int32_t>& all_ids() const { return lanes_[lane_].all_ids; }        // the sequence the active lane's caches hold (gate P3 finding 3)
     // Vision (Phase 56, docs/deepseek41/95). An image position carries a NEGATIVE id, unique per image and slot: the
     // prefix cache's match, the engram's dead-token rule, the image router bias and the splice all read it off the id.
     // Its stream row comes from a span given here, not from the embedding table: rows [n, hidden] f32 for the absolute
@@ -285,8 +362,8 @@ public:
     // An image position no span covers asks the provider: `row` [hidden] for absolute position `pos`, "" on success.
     // The engine encodes an image on its first row, so an image the prefix cache already holds is never encoded.
     using VisionProvider = std::function<std::string(uint32_t pos, const float*& row)>;
-    void set_vision_provider(VisionProvider p) { vis_provider_ = std::move(p); }
-    void clear_vision() { vis_spans_.clear(); vis_provider_ = nullptr; }
+    void set_vision_provider(VisionProvider p) { lanes_[lane_].vis_provider = std::move(p); }   // (the active lane's request)
+    void clear_vision() { lanes_[lane_].vis_spans.clear(); lanes_[lane_].vis_provider = nullptr; }
     // the last forward's time outside the layer loop: host prep (engram hashes + table gathers +
     // embed) and the tail (collapse, norm, head, logits to the host), ms
     double prep_ms() const { return prep_ms_; }
@@ -317,7 +394,7 @@ private:
     struct Card {
         sycl::queue*   q = nullptr;
         uint32_t       L0 = 0, L1 = 0;
-        bool           snaps_ready = false;       // P3's rollback snapshots exist (allocated at the first T >= 2 decode step)
+        std::vector<uint8_t> snaps_ready;         // [lane]: P3's rollback snapshots exist (allocated at the lane's first T >= 2 decode step)
         Ds41DenseCache cache;
         Ds41ExpertTier tier;
         Ds41ExpertTier ctl_tier;                  // the control arm's empty tier over every layer (expert_parallel == 2)
@@ -327,7 +404,7 @@ private:
         float* ep_x = nullptr; float* ep_hx = nullptr;
         sycl::half* ep_ypc = nullptr; sycl::half* ep_hyc = nullptr; int32_t* ep_rows = nullptr;
         double ep_ms = 0;                         // the last remote moe wall on this card
-        std::vector<LayerState> state;            // [n_layers], only [L0, L1) allocated
+        std::vector<std::vector<LayerState>> state;   // [lane][n_layers], only [L0, L1) allocated (P4 B6a: one set per lane)
         // the caches a consumer layer at the top of this card reads when the source sits on an
         // earlier card: the previous card's source state, imported through the host
         float* imp_ckv = nullptr; float* imp_ik = nullptr;
@@ -352,17 +429,23 @@ private:
         std::vector<float> hh, hpm, imp_ckv, imp_ik; std::vector<int32_t> sh_topk;
         uint32_t T_carry = 0, off_carry = 0, bounce_nc = 0; bool bounce_topk = false;
     };
-    struct Stage { size_t card_first = 0, card_last = 0; StageCarry* in = nullptr; StageCarry* out = nullptr; };
+    // P4 B6a: a stage names the LANE it runs (-1 = the active lane: forward_pipelined's chunks) and whether every row's
+    // logits are wanted (-1 = !logits_last_only_; the pipe carries it per step, since two lanes' steps may differ)
+    // P4 B19: `busy` = the lanes in flight when the pipe's stage took this step (0 off the lane pipe), for ds41_step_qstar
+    struct Stage { size_t card_first = 0, card_last = 0; StageCarry* in = nullptr; StageCarry* out = nullptr; int lane = -1; int all_rows = -1; uint32_t busy = 0; };
     std::string forward_impl(const int32_t* ids, uint32_t T, uint32_t pos0, std::vector<float>& logits,
                              const Probe& probe, const std::vector<std::vector<int32_t>>* expected_routing,
                              const std::vector<std::vector<float>>* expected_weights, bool force_routing,
                              const std::vector<std::vector<float>>* expected_gap, const Stage* stage);
     void        ep_thread_stop(Card& card);
-    std::string ensure_state(Card& card);
-    // P3's rollback snapshots, allocated on the first multi-row step only (gate P4: they are ~0.7 MiB of permanent
+    std::string ensure_state(Card& card);   // every lane's state on the card (lane 0 at max_tokens, the others at lane_ctx)
+    // P3's rollback snapshots, allocated on a lane's first multi-row step only (gate P4: they are ~0.7 MiB of permanent
     // per-card state otherwise, which the forward test's "state returns to start" bar caught)
-    std::string ensure_snapshots(Card& card);
+    std::string ensure_snapshots(Card& card, uint32_t lane);
     void        free_state(Card& card);
+    void        reset_lane(uint32_t lane);                                       // reset_state for one lane
+    std::string rollback_lane_to(uint32_t lane, uint32_t n_pos, bool wait);     // rollback_to for one lane (the pipe: no queue wait)
+    void        stage_loop(size_t s);                                            // the pipe's per-card thread
 
     std::vector<std::unique_ptr<Card>> cards_;
     uint32_t                  ep_ = 0;             // ResidentOptions::expert_parallel as resolved at init
@@ -372,21 +455,18 @@ private:
     uint64_t                  head_bytes_ = 0;
     bool                      cand_noop_ = true;
     bool                      resident_ = false;
-    uint32_t                  cap_pos_ = 2048;    // position capacity of the state (max_tokens)
+    uint32_t                  cap_pos_ = 2048;    // position capacity of lane 0's state (max_tokens); the other lanes hold lane_ctx_
+    uint32_t                  lane_ctx_ = 0;
     uint32_t                  fwd_cap_ = 2048;    // Phase 24: the largest T one forward may carry (max_forward_tokens)
-    uint32_t                  n_pos_ = 0;
     double                    prep_ms_ = 0, head_ms_ = 0;
     int32_t                   rope_off_ = 0;
     bool                      nocausal_diag_ = false;
     bool                      noring_diag_ = false;
-    uint32_t                  snap_pos0_ = 0, snap_T_ = 0; bool snap_valid_ = false;   // P3: the last multi-row step's snapshot
     bool                      logits_last_only_ = false;
     bool                      multi_rows_ = false;
     bool                      bounded_replay_ = true;
-    std::vector<int32_t>      all_ids_;           // the sequence so far (engram look-back)
+    float                     qstar_lanes_ = -1.f;   // P4 B19: IE_DS41_QSTAR_LANES (< 0 = unset: the tier's q* for every step)
     struct VisSpan { uint32_t pos0 = 0, n = 0; std::vector<float> rows; };
-    std::vector<VisSpan>      vis_spans_;         // image rows for positions whose id is negative
-    VisionProvider            vis_provider_;
     bool capture_main_hidden_ = false;
     std::vector<std::vector<int64_t>> last_hashes_;
     std::vector<std::vector<uint64_t>> profile_;   // [layer][expert] selection counts
@@ -402,16 +482,19 @@ private:
     // `lat[card][layer]` the latents then the index keys for nc at the slot's LAST checkpoint (its live position).
     struct PcSlot { std::vector<int32_t> ids; std::vector<PcCkpt> ckpts; std::vector<std::vector<std::vector<float>>> ring;
                     std::vector<std::vector<std::vector<float>>> lat; uint64_t bytes = 0, tick = 0; };
-    void        pc_capture(size_t ci, uint32_t pos);            // enqueue card ci's rings into the checkpoint at pos
-    std::string pc_restore_live(const PcCkpt& c, size_t index); // rings back from pool block `index`, nc truncated
+    void        pc_capture(uint32_t lane, size_t ci, uint32_t pos);   // enqueue card ci's rings of `lane` into its checkpoint at pos
+    std::string pc_restore_live(const PcCkpt& c, size_t index); // rings back from pool block `index`, nc truncated (the active lane)
     std::string pc_save_live_to_slot(bool& saved);              // the live conversation -> a host slot
     std::string pc_load_slot(PcSlot& slot, size_t ckpt);        // a host slot -> the live state, at that checkpoint
-    void        pc_clear_live();                                // the live state's checkpoints dropped (a reset)
+    // P4 B6b: a checkpoint a lane of `cap` positions can hold -- its position and every layer's latent count within the lane's
+    // buffers (lanes differ in capacity; a slot or a disk entry may come from a bigger one)
+    static bool pc_ckpt_fits(const PcCkpt& c, uint32_t cap) { if (c.pos > cap) return false; for (uint32_t n : c.nc) if (n > cap) return false; return true; }
+    void        pc_clear_live(uint32_t lane);                   // the lane's live checkpoints dropped (a reset)
     bool                      pc_on_ = false;
     PrefixCacheOptions        pc_opt_;
     std::mutex                pc_mu_;
-    std::vector<PcCkpt>       pc_ckpts_;                   // pool-indexed, pc_opt_.checkpoints entries
-    std::vector<std::vector<float*>> pc_pool_;             // [card][block] pinned host, pc_block_[card] floats each
+    // P4 B6a: the live checkpoints (pool-indexed, pc_opt_.checkpoints entries) and their pinned pool blocks ([card][block],
+    // pc_block_[card] floats each) are PER LANE (Lane::pc_ckpts / pc_pool); the host slots and the disk entries are shared
     std::vector<uint64_t>     pc_block_;                   // floats per block, per card
     std::vector<std::vector<uint64_t>> pc_off_;            // [card][model layer] offset of the layer's ring in the block
     std::vector<float*>       pc_bounce_; uint64_t pc_bounce_n_ = 0;   // [card] pinned bounce for slot latents
@@ -426,6 +509,35 @@ private:
     uint32_t    pc_disk_scan();                     // the index of this key's entries; returns how many carry another key
     std::string pc_load_disk(const PcDisk& d);      // a disk entry -> the live state at its position
     void        pc_join_writer() { if (pc_writer_.joinable()) pc_writer_.join(); }
+
+    // ---- P4 B6a: lanes (docs/deepseek41/P4_B6A_LANES.md) ----
+    // One sequence's host-side state; its device state is Card::state[lane] on every card. Lane 0 is the pre-lane forward.
+    struct Lane {
+        uint32_t cap = 0;                               // position capacity (lane 0: cap_pos_; the others: lane_ctx_)
+        uint32_t n_pos = 0;
+        std::vector<int32_t> all_ids;                   // the sequence so far (the engram look-back)
+        uint32_t snap_pos0 = 0, snap_T = 0; bool snap_valid = false;   // P3: the last multi-row step's snapshot
+        std::vector<VisSpan> vis_spans;                 // image rows for positions whose id is negative
+        VisionProvider       vis_provider;
+        std::vector<PcCkpt>  pc_ckpts;                  // Phase 46: the live checkpoints
+        std::vector<std::vector<float*>> pc_pool;       // [card][block] pinned host
+        // the pipe: the step in flight -- its ids (copied at pipe_submit), rows, position, the logits it wants, the host carry
+        // between the cards, and its logits; the claim (check-and-set under pmu_, held through the done callback: only the
+        // callback's thread may resubmit the lane meanwhile, once -- in_cb / cb_tid / resub)
+        std::vector<int32_t> ids; uint32_t T = 0, pos0 = 0; bool all_rows = false;
+        StageCarry carry; std::vector<float> logits;
+        bool in_flight = false, in_cb = false, resub = false; std::thread::id cb_tid;
+    };
+    std::vector<Lane>         lanes_;
+    uint32_t                  lane_ = 0;             // the serial API's active lane
+    std::vector<uint64_t>     lane_bytes_;           // per card: one extra lane's device state (0 with one lane)
+    std::vector<std::vector<LaneTierStats>> lane_tier_;   // [lane][card]
+    // the pipe: stage s pops lanes from pq_[s]; one mutex for the queues, the claims, the in-flight count and the first error
+    std::vector<std::thread>  stage_th_;
+    std::vector<std::deque<uint32_t>> pq_;
+    std::mutex                pmu_; std::condition_variable pcv_;
+    uint32_t                  pbusy_ = 0; bool pstop_ = false, ppaused_ = false; std::string perr_;
+    PipeDone                  pdone_;
 };
 
 }  // namespace ie

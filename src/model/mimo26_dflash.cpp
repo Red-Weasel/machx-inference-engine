@@ -74,6 +74,7 @@ Mimo26DFlash::~Mimo26DFlash() { free_all(); }
 void Mimo26DFlash::free_all() {
     if (q_) { q_->wait(); for (void* p : owned_) sycl::free(p, *q_); }
     owned_.clear(); bytes_ = 0; L_.clear();
+    lanes_.clear(); lane_ = 0;
 }
 
 template <class T> T* Mimo26DFlash::dev(size_t n) {
@@ -155,6 +156,40 @@ std::string Mimo26DFlash::init(sycl::queue& q, const uint8_t* embed_bf16, uint32
         return "dflash: workspace allocation failed";
     q.wait();
     reset();
+    lanes_.assign(1, LaneCtx{});
+    for (const auto& y : L_) lanes_[0].kv.push_back({y.kc, y.vc});
+    lane_ = 0;
+    return {};
+}
+
+std::string Mimo26DFlash::add_lanes(uint32_t n) {
+    if (!q_ || L_.empty() || lanes_.empty()) return "dflash: not initialised";
+    if (lane_ != 0 || lanes_.size() != 1) return "dflash: add_lanes once, on lane 0";
+    const size_t ring = size_t(cfg_.n_kv) * R_ * cfg_.head_dim;
+    for (uint32_t l = 1; l < n; ++l) {
+        LaneCtx lc;
+        for (uint32_t k = 0; k < cfg_.n_layers; ++k) {
+            sycl::half* kc = dev<sycl::half>(ring);
+            sycl::half* vc = dev<sycl::half>(ring);
+            if (!kc || !vc) return "dflash: lane " + std::to_string(l) + ": ring allocation failed";
+            q_->memset(kc, 0, ring * 2); q_->memset(vc, 0, ring * 2);
+            lc.kv.push_back({kc, vc});
+        }
+        lanes_.push_back(std::move(lc));
+    }
+    q_->wait();
+    return {};
+}
+
+std::string Mimo26DFlash::select_lane(uint32_t l) {
+    if (l >= lanes_.size()) return "dflash: select_lane: lane " + std::to_string(l) + " of " + std::to_string(lanes_.size());
+    if (l == lane_) return {};
+    LaneCtx& cur = lanes_[lane_];
+    cur.ctx_end = ctx_end_; cur.ctx_lo = ctx_lo_; cur.hi = hi_;
+    const LaneCtx& nx = lanes_[l];
+    for (size_t k = 0; k < L_.size(); ++k) { L_[k].kc = nx.kv[k].first; L_[k].vc = nx.kv[k].second; }
+    ctx_end_ = nx.ctx_end; ctx_lo_ = nx.ctx_lo; hi_ = nx.hi;
+    lane_ = l;
     return {};
 }
 

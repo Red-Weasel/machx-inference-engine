@@ -13,6 +13,7 @@
 #include "ie/deepseek4_ops.hpp"
 #include "ie/kernel_profiler.hpp"
 #include "ie/deepseek41_upload.hpp"
+#include "ie/ds41_serve_rules.hpp"
 #include "ie/expert_stream.hpp"
 #include "ie/ops.hpp"
 
@@ -45,6 +46,8 @@ std::string Ds41Forward::init(sycl::queue& q, const DeepSeek41Model& m, const Ds
     cards_.push_back(std::make_unique<Card>());
     cards_[0]->q = &q; cards_[0]->L0 = 0; cards_[0]->L1 = m.config().n_layers;
     resident_ = false;
+    lanes_.assign(1, Lane{}); lanes_[0].cap = cap_pos_; lane_ = 0;   // P4 B6a: streaming mode has the one lane (init_resident re-sizes)
+    lane_bytes_.assign(1, 0); lane_tier_.assign(1, std::vector<LaneTierStats>(1));
     reset_state();
     return {};
 }
@@ -80,6 +83,13 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
     if (fwd_cap_ < cap_pos_)
         std::fprintf(stderr, "[ds41 forward] one forward carries at most %u tokens (the context holds %u): the expert batch workspace and the EP staging are sized for %u, the KV for %u\n",
                      fwd_cap_, cap_pos_, fwd_cap_, cap_pos_);
+    // P4 B6a: the lanes -- lane 0 at the context, the others at lane_ctx (capped by it); their device state is allocated in
+    // ensure_state below, before the static tier is sized, so it comes out of that tier
+    const uint32_t n_lanes = std::max(1u, opt.lanes);
+    lane_ctx_ = std::min(cap_pos_, opt.lane_ctx ? opt.lane_ctx : cap_pos_);
+    lanes_.assign(n_lanes, Lane{}); lane_ = 0;
+    for (uint32_t l = 0; l < n_lanes; ++l) lanes_[l].cap = l == 0 ? cap_pos_ : lane_ctx_;
+    lane_bytes_.assign(qs.size(), 0); lane_tier_.assign(n_lanes, std::vector<LaneTierStats>(qs.size()));
     cards_.clear();
     for (size_t i = 0; i < qs.size(); ++i) {
         cards_.push_back(std::make_unique<Card>());
@@ -192,9 +202,14 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
             const uint64_t for_experts = free_now > reserve ? free_now - reserve : 0;
             const uint64_t per_slot_all_layers = uint64_t(tnL) * lay.bytes;     // one slot in every layer of THIS tier
             const uint32_t experts_here = ep_ == 1 ? (c.n_routed_experts - ci + n_cards - 1) / n_cards : c.n_routed_experts;
-            const uint32_t slots = uint32_t(std::min<uint64_t>(experts_here, for_experts / per_slot_all_layers));
-            if (slots <= stream) return "init_resident: VRAM left for experts (" + std::to_string(for_experts >> 20) + " MiB) gives " +
-                                        std::to_string(slots) + " slots/layer, not enough for the stream partition";
+            const uint32_t slots = ds41_static_slots(for_experts, per_slot_all_layers, experts_here);
+            const uint32_t extra = uint32_t(lanes_.size() - 1);
+            if (auto e = ds41_static_refusal(slots, stream, for_experts, extra, lane_bytes_[ci], lane_ctx_); !e.empty()) return e;
+            if (extra)   // P4 B14: what the lanes cost this card's static tier, never silent
+                std::fprintf(stderr, "[ds41 forward] card %zu: the %u extra lane(s) take %.0f MiB = %u static slots/layer (%u -> %u; the rest stream)\n",
+                             ci, extra, double(lane_bytes_[ci] * extra) / 1048576.0,
+                             ds41_static_slots(for_experts + lane_bytes_[ci] * extra, per_slot_all_layers, experts_here) - slots,
+                             ds41_static_slots(for_experts + lane_bytes_[ci] * extra, per_slot_all_layers, experts_here) - stream, slots - stream);
             n_static = slots - stream;
             const uint64_t host_cap = ep_ == 1 ? pin_cap / n_cards : pin_cap * nL / c.n_layers;   // this card's share of the pinned tier
             n_pinned = uint32_t(std::min<uint64_t>(experts_here - n_static, host_cap / per_slot_all_layers));
@@ -258,6 +273,18 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
         }
     g_ds4_attn_split_fixed64 = true;   // DSpark P2: the T-row step's attention combine is the one-row step's (bit-identical)
     if (ep_) std::fprintf(stderr, "[ds41 forward] expert parallel %s on %u cards\n", ep_ == 2 ? "CONTROL ARM (the machinery, no parallelism)" : "ON (parity share of every layer's experts per card)", n_cards);
+    if (lanes_.size() > 1) {
+        std::fprintf(stderr, "[ds41 forward] lanes: %zu (lane 0 at ctx %u, lanes 1-%zu at ctx %u); one extra lane's device state per card:", lanes_.size(), cap_pos_, lanes_.size() - 1, lane_ctx_);
+        for (size_t ci = 0; ci < cards_.size(); ++ci) std::fprintf(stderr, " %.1f MiB", double(lane_bytes_[ci]) / 1048576.0);
+        std::fprintf(stderr, " (out of the static tier)\n");
+    }
+    // P4 B19: the PCIe share of a one-row lane-pipe step while >= 2 lanes are in flight (ds41_step_qstar); unset = the tier's q*
+    qstar_lanes_ = -1.f;
+    if (const char* v = std::getenv("IE_DS41_QSTAR_LANES"); v && *v && lanes_.size() > 1) {
+        qstar_lanes_ = std::max(0.f, std::min(1.f, float(std::atof(v))));
+        std::fprintf(stderr, "[ds41 forward] IE_DS41_QSTAR_LANES %.2f: a one-row pipe step with >= 2 lanes in flight sends that share of its pinned misses over PCIe "
+                             "(the CPU leg's q* otherwise)\n", qstar_lanes_);
+    }
     resident_ = true;
     return {};
 }
@@ -267,19 +294,27 @@ std::string Ds41Forward::ensure_state(Card& card) {
     const auto& c = m_->config();
     sycl::queue& q = *card.q;
     const uint32_t HD = c.head_dim, IHD = c.index_head_dim, WIN = c.window_size;
-    card.state.assign(c.n_layers, LayerState{});
-    auto alloc = [&](size_t n) -> float* { float* p = sycl::malloc_device<float>(n, q); if (p) q.memset(p, 0, n * 4); return p; };
-    for (uint32_t L = card.L0; L < card.L1; ++L) {
-        auto& st = card.state[L]; const auto& k = m_->layers()[L].kind;
-        if (!(st.win_kv = alloc(size_t(WIN) * HD))) return "state: window ring alloc failed";
-        if (k.is_kv_source) {
-            if (!(st.comp_kv = alloc(size_t(cap_pos_) * HD))) return "state: latent cache alloc failed";
-            if (!(st.idx_k = alloc(size_t(cap_pos_) * IHD))) return "state: index key cache alloc failed";
-            if (k.compress_ratio > 1) {
-                if (!(st.part_kv = alloc(size_t(k.compress_ratio) * HD)) || !(st.part_gate = alloc(size_t(k.compress_ratio) * HD)))
-                    return "state: partial group alloc failed";
+    // P4 B6a: one set per lane, each at its lane's capacity (lane 0: the context; lanes 1..: lane_ctx_); the bytes of lane 1's
+    // set are what one extra lane costs this card (lane_bytes_)
+    card.state.assign(lanes_.size(), std::vector<LayerState>(c.n_layers));
+    card.snaps_ready.assign(lanes_.size(), 0);
+    uint64_t bytes = 0;
+    auto alloc = [&](size_t n) -> float* { float* p = sycl::malloc_device<float>(n, q); if (p) { q.memset(p, 0, n * 4); bytes += n * 4; } return p; };
+    for (uint32_t l = 0; l < lanes_.size(); ++l) {
+        const uint32_t cap = lanes_[l].cap; bytes = 0;
+        for (uint32_t L = card.L0; L < card.L1; ++L) {
+            auto& st = card.state[l][L]; const auto& k = m_->layers()[L].kind;
+            if (!(st.win_kv = alloc(size_t(WIN) * HD))) return "state: window ring alloc failed";
+            if (k.is_kv_source) {
+                if (!(st.comp_kv = alloc(size_t(cap) * HD))) return "state: latent cache alloc failed";
+                if (!(st.idx_k = alloc(size_t(cap) * IHD))) return "state: index key cache alloc failed";
+                if (k.compress_ratio > 1) {
+                    if (!(st.part_kv = alloc(size_t(k.compress_ratio) * HD)) || !(st.part_gate = alloc(size_t(k.compress_ratio) * HD)))
+                        return "state: partial group alloc failed";
+                }
             }
         }
+        if (l == 1) for (size_t ci = 0; ci < cards_.size(); ++ci) if (cards_[ci].get() == &card && ci < lane_bytes_.size()) lane_bytes_[ci] = bytes;
     }
     if (!(card.imp_ckv = alloc(size_t(cap_pos_) * HD)) || !(card.imp_ik = alloc(size_t(cap_pos_) * IHD))) return "state: import alloc failed";
     // Phase 18 (docs/deepseek41/46 term 2): the two RoPE inv_freq tables resident (the host's
@@ -303,13 +338,14 @@ std::string Ds41Forward::ensure_state(Card& card) {
 
 // P3 (docs/deepseek41/56): the rollback snapshots -- what a T-row step overwrites. Allocated the first time such a
 // step runs (gate P4: an engine that never speculates should hold none of it), freed with the rest of the state.
-std::string Ds41Forward::ensure_snapshots(Card& card) {
-    if (card.snaps_ready) return {};
+std::string Ds41Forward::ensure_snapshots(Card& card, uint32_t lane) {
+    if (lane >= card.snaps_ready.size()) return "state: no lane " + std::to_string(lane);
+    if (card.snaps_ready[lane]) return {};
     const auto& c = m_->config(); const uint32_t HD = c.head_dim;
     sycl::queue& q = *card.q;
     auto alloc = [&](size_t n) -> float* { float* p = sycl::malloc_device<float>(n, q); if (p) q.memset(p, 0, n * 4); return p; };
     for (uint32_t L = card.L0; L < card.L1; ++L) {
-        auto& st = card.state[L]; const auto& k = m_->layers()[L].kind;
+        auto& st = card.state[lane][L]; const auto& k = m_->layers()[L].kind;
         if (!st.snap_ring && !(st.snap_ring = alloc(size_t(kDs41MaxDecodeRows) * HD))) return "state: ring snapshot alloc failed";
         if (k.is_kv_source && k.compress_ratio > 1 && !st.snap_ckv) {
             if (!(st.snap_ckv = alloc(size_t(kDs41MaxDecodeRows) * HD)) || !(st.snap_cg = alloc(size_t(kDs41MaxDecodeRows) * HD)) ||
@@ -317,19 +353,19 @@ std::string Ds41Forward::ensure_snapshots(Card& card) {
         }
     }
     q.wait_and_throw();
-    card.snaps_ready = true;
+    card.snaps_ready[lane] = 1;
     return {};
 }
 
 void Ds41Forward::free_state(Card& card) {
     if (!card.state_ready) return;
     sycl::queue& q = *card.q;
-    for (auto& st : card.state) {
+    for (auto& lst : card.state) for (auto& st : lst) {
         for (float* p : {st.win_kv, st.comp_kv, st.idx_k, st.part_kv, st.part_gate, st.snap_ring, st.snap_ckv, st.snap_cg, st.snap_part_kv, st.snap_part_gate}) if (p) sycl::free(p, q);
         st = LayerState{};
     }
     if (card.imp_ckv) sycl::free(card.imp_ckv, q); if (card.imp_ik) sycl::free(card.imp_ik, q);
-    card.imp_ckv = nullptr; card.imp_ik = nullptr; card.snaps_ready = false;
+    card.imp_ckv = nullptr; card.imp_ik = nullptr; card.snaps_ready.clear();
     for (auto& lst : card.dec_scratch) for (auto& [p, n] : lst) sycl::free(p, q);
     card.dec_scratch.clear(); card.dec_cursor.clear();
     for (void* p : {static_cast<void*>(card.rope_inv), static_cast<void*>(card.rope_pos), static_cast<void*>(card.rope_hpos),
@@ -338,10 +374,16 @@ void Ds41Forward::free_state(Card& card) {
     card.state_ready = false;
 }
 
-void Ds41Forward::reset_state() {
-    for (auto& cp : cards_) for (auto& st : cp->state) { st.nc = 0; st.part_valid = false; }
-    n_pos_ = 0; all_ids_.clear();
-    pc_clear_live();   // Phase 46: every live checkpoint's latents are about to be rewritten
+void Ds41Forward::reset_state() { reset_lane(lane_); }
+
+// P4 B6a: one lane's state forgotten -- its counts on every card (host fields; the device buffers are rewritten before they are
+// read), its positions, its look-back, its rollback snapshot and its live checkpoints. In the pipe a stage calls this for the
+// lane whose fresh prefill it starts: that lane has no other step in flight, so no other stage touches its state meanwhile.
+void Ds41Forward::reset_lane(uint32_t lane) {
+    for (auto& cp : cards_) if (lane < cp->state.size()) for (auto& st : cp->state[lane]) { st.nc = 0; st.part_valid = false; }
+    Lane& S = lanes_[lane];
+    S.n_pos = 0; S.all_ids.clear(); S.snap_valid = false;
+    pc_clear_live(lane);   // Phase 46: every live checkpoint's latents are about to be rewritten
 }
 
 std::string Ds41Forward::read_state(uint32_t L, std::vector<float>& win, std::vector<float>& comp, std::vector<float>& idxk, uint32_t& nc) const {
@@ -349,7 +391,7 @@ std::string Ds41Forward::read_state(uint32_t L, std::vector<float>& win, std::ve
     for (const auto& cp : cards_) {
         if (L < cp->L0 || L >= cp->L1) continue;
         if (!cp->state_ready) return "read_state: no state yet";
-        const auto& st = cp->state[L]; sycl::queue& q = *cp->q;
+        const auto& st = cp->state[lane_][L]; sycl::queue& q = *cp->q;
         win.assign(size_t(c.window_size) * c.head_dim, 0.f);
         q.memcpy(win.data(), st.win_kv, win.size() * 4).wait();
         nc = st.nc; comp.clear(); idxk.clear();
@@ -378,6 +420,8 @@ void Ds41Forward::free_resident() {
     // 2026-09-14 (once from hard-aborted test processes, once from Dream's shutdown mid-reply).
     // The helpers are stopped first so nothing new is submitted, then every queue is drained; a
     // teardown drain reports async errors instead of throwing, because there is nothing left to save.
+    // P4 B6a: the pipe's stage threads first of all (pipe_stop waits until no step is in flight). P4 B6b: running or paused.
+    if (const std::string e = pipe_stop(); !e.empty()) std::fprintf(stderr, "[ds41 forward] teardown: the pipe ended with: %s\n", e.c_str());
     for (auto& cp : cards_) ep_thread_stop(*cp);
     for (auto& cp : cards_) if (cp->q) {
         try { cp->q->wait_and_throw(); }
@@ -431,13 +475,27 @@ std::string Ds41Forward::write_profile(const std::string& path, const std::strin
 
 void Ds41Forward::set_vision_span(uint32_t pos0, std::vector<float> rows) {
     VisSpan sp; sp.pos0 = pos0; sp.n = uint32_t(rows.size() / m_->config().dim); sp.rows = std::move(rows);
-    vis_spans_.push_back(std::move(sp));
+    lanes_[lane_].vis_spans.push_back(std::move(sp));
 }
+
+std::string Ds41Forward::select_lane(uint32_t lane) {
+    if (lane >= lanes_.size()) return "select_lane: lane " + std::to_string(lane) + " of " + std::to_string(lanes_.size());
+    if (piping()) return "select_lane: the pipe is running";
+    lane_ = lane;
+    return {};
+}
+
+namespace {
+// the decode regimes' switches, read once (forward_impl and pipe_submit judge a step by the same rule)
+bool ds41_decode_multi_env() { static const bool v = [] { const char* e = std::getenv("IE_DS41_DECODE_MULTI"); return e && *e && std::string(e) != "0"; }(); return v; }   // DSpark P2, opt-in until its gate
+bool ds41_cont_env() { static const bool v = [] { const char* e = std::getenv("IE_DS41_CONT"); return !(e && *e && std::string(e) == "0"); }(); return v; }             // Phase 24 step 2, ON since 2026-09-16
+}  // namespace
 
 std::string Ds41Forward::forward(const int32_t* ids, uint32_t T, uint32_t pos0, std::vector<float>& logits_out,
                                  const Probe& probe, const std::vector<std::vector<int32_t>>* expected,
                                  const std::vector<std::vector<float>>* expected_w, bool force_routing,
                                  const std::vector<std::vector<float>>* expected_gap) {
+    if (piping()) return "forward: the lane pipe is running (pipe_submit)";
     // Phase 46: a call that fails or throws part-way may have appended latents / written rings on some layers without
     // committing n_pos -- with the prefix cache on, that live state must never be reused, so it is dropped
     try {
@@ -459,6 +517,11 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
     if (stage && (probe || expected || force_routing)) return "forward: a pipeline stage takes no probe or expected routing";
     if (stage && (card_first >= card_last || card_last > cards_.size() || !first_stage != bool(stage->in) || !last_stage != bool(stage->out)))
         return "forward: malformed pipeline stage";
+    // P4 B6a: the LANE this call runs -- the stage's (the pipe), else the active one -- and whether every row's logits are wanted
+    if (stage && stage->lane >= 0 && size_t(stage->lane) >= lanes_.size()) return "forward: no lane " + std::to_string(stage->lane);
+    const uint32_t lane = stage && stage->lane >= 0 ? uint32_t(stage->lane) : lane_;
+    Lane& S = lanes_[lane];
+    const bool last_only = stage && stage->all_rows >= 0 ? stage->all_rows == 0 : logits_last_only_;
     const auto& m = *m_;
     const auto& c = m.config();
     const uint32_t H = c.dim, HC = c.hc_mult, QR = c.q_lora_rank, HD = c.head_dim, NH = c.n_heads;
@@ -479,9 +542,9 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
         for (uint32_t L = 0; L < c.n_layers; ++L)
             if (const uint32_t r = m.layers()[L].kind.compress_ratio; r > 1 && T % r != 0)
                 return "forward: a prefill's T must be a multiple of every compress_ratio (a partial group at the prompt's end is decode's, not yet admitted)";
-        if (first_stage) reset_state();   // a later stage never resets: the first stage did, and runs the next chunk on its cards meanwhile
+        if (first_stage) reset_lane(lane);   // a later stage never resets: the first stage did, and runs the next chunk on its cards meanwhile
     } else {
-        static const bool multi = [] { const char* v = std::getenv("IE_DS41_DECODE_MULTI"); return v && *v && std::string(v) != "0"; }();   // DSpark P2, opt-in until its gate
+        const bool multi = ds41_decode_multi_env();   // DSpark P2, opt-in until its gate
         // Phase 24 step 2 (docs/deepseek41/65): a PREFILL CONTINUATION -- T > the DSpark row cap at pos0 > 0, so a long
         // prompt can be fed in chunks. The compressor, the latent append and every position table were already written
         // general in T and pos0 for P2's T-row decode; what a chunk needs beyond them is its window keys as a dense
@@ -489,11 +552,11 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
         // Phase 24 step 2: DEFAULT ON since 2026-09-16 -- the server never set the opt-in, so every chat prompt longer than
         // one 2,048-token forward (any request carrying Dream's tool schemas) was refused at its second chunk.
         // IE_DS41_CONT=0 is the kill switch.
-        static const bool cont_on = [] { const char* v = std::getenv("IE_DS41_CONT"); return !(v && *v && std::string(v) == "0"); }();
+        const bool cont_on = ds41_cont_env();
         if (T != 1 && !((multi || multi_rows_) && T >= 2 && T <= kDs41MaxDecodeRows) && !(cont_on && T > kDs41MaxDecodeRows)) return "forward: at pos0 > 0 only single-token steps are admitted (T == 1; up to " + std::to_string(kDs41MaxDecodeRows) + " with IE_DS41_DECODE_MULTI=1)";
-        if (!stage && pos0 != n_pos_) return "forward: step at pos0 " + std::to_string(pos0) + " but the state holds " + std::to_string(n_pos_) + " positions";   // forward_pipelined checks the whole chunk list up front
+        if (!stage && pos0 != S.n_pos) return "forward: step at pos0 " + std::to_string(pos0) + " but the state holds " + std::to_string(S.n_pos) + " positions";   // forward_pipelined / pipe_submit check the position up front
     }
-    if (pos0 + T > cap_pos_) return "forward: position " + std::to_string(pos0 + T) + " exceeds the state's capacity " + std::to_string(cap_pos_) + " (max_tokens)";
+    if (pos0 + T > S.cap) return "forward: position " + std::to_string(pos0 + T) + " exceeds the lane's capacity " + std::to_string(S.cap) + (lane ? " (lane_ctx)" : " (max_tokens)");
     if (T > fwd_cap_) return "forward: " + std::to_string(T) + " tokens in one call exceeds this runtime's per-forward limit " + std::to_string(fwd_cap_) +
                              " (the context holds " + std::to_string(cap_pos_) + "; a longer prompt must be fed in chunks of at most that, which Phase 24 step 2 admits -- or raise IE_DS41_MAX_FWD and pay the scratch in VRAM)";
     // Decoder SWA Bounded Replay: the decoder half over the last `WIN` prompt tokens only (docs/27)
@@ -524,19 +587,20 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
         if (m.layers()[L].kind.is_kv_source) return "forward: bounded replay needs every kv source at or below the first decoder layer (layer " + std::to_string(L) + " is one)";
     // the head runs over the segment, so the logits would come back with 128 rows instead of T --
     // refused rather than handed to a caller indexing row T-1
-    if (replay && !logits_last_only_) return "forward: bounded replay needs set_logits_last_only(true) (the head sees the 128-row segment)";
+    if (replay && !last_only) return "forward: bounded replay needs set_logits_last_only(true) (the head sees the 128-row segment)";
     uint32_t T_carry = T;                 // the rows the next card receives: T, or the segment after the transition
     uint32_t off_carry = 0;               // ... and those rows' offset into the prompt (0 until a replay transition)
-    if (stage && T >= 2 && T <= kDs41MaxDecodeRows) return "forward: a pipeline stage carries no multi-row decode step";
     if (!stage) for (auto& cp : cards_) if (auto e = ensure_state(*cp); !e.empty()) return e;   // forward_pipelined ensures every card's before any stage starts
-    if (T >= 2 && T <= kDs41MaxDecodeRows && pos0 > 0)                                  // P3, on first use (never for a continuation)
-        for (auto& cp : cards_) if (auto e = ensure_snapshots(*cp); !e.empty()) return e;
+    // P3, on first use (never for a continuation). P4 B6a: a stage allocates its own cards' only -- in the pipe another
+    // card's stage thread is running another lane on that card, and it allocates its own at its first multi-row step.
+    if (T >= 2 && T <= kDs41MaxDecodeRows && pos0 > 0)
+        for (size_t ci = card_first; ci < card_last; ++ci) if (auto e = ensure_snapshots(*cards_[ci], lane); !e.empty()) return e;
     // the sequence the engram look-back reads: extended for this call's hashes, committed with
-    // n_pos_ only on success (Phase 9 gate, finding 12: an errored step must not desync it).
+    // n_pos only on success (Phase 9 gate, finding 12: an errored step must not desync it).
     // Phase 43: only the first stage owns it -- a later stage never reads it, and it is being extended meanwhile.
-    const size_t ids_before = first_stage ? all_ids_.size() : 0;
-    if (first_stage) all_ids_.insert(all_ids_.end(), ids, ids + T);
-    struct RollBack { std::vector<int32_t>& v; size_t n; bool ok = false; ~RollBack() { if (!ok) v.resize(n); } } ids_guard{all_ids_, ids_before, !first_stage};
+    const size_t ids_before = first_stage ? S.all_ids.size() : 0;
+    if (first_stage) S.all_ids.insert(S.all_ids.end(), ids, ids + T);
+    struct RollBack { std::vector<int32_t>& v; size_t n; bool ok = false; ~RollBack() { if (!ok) v.resize(n); } } ids_guard{S.all_ids, ids_before, !first_stage};
     if (!first_stage)
         for (uint32_t Le : tb_->layer_ids) if (Le >= cards_[card_first]->L0) return "forward: a later pipeline stage holds an engram layer (" + std::to_string(Le) + "); its host prep is the first stage's";
 
@@ -553,9 +617,9 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
             hash.resize(size_t(T) * ENC);
             ds41_engram_hash(*tb_, ids, T, uint32_t(li), hash.data());
         } else {
-            const uint32_t n = uint32_t(all_ids_.size()), nw = std::min(n, tb_->max_ngram_size - 1 + T);   // the look-back plus this step's T rows
+            const uint32_t n = uint32_t(S.all_ids.size()), nw = std::min(n, tb_->max_ngram_size - 1 + T);   // the look-back plus this step's T rows
             std::vector<int64_t> hw(size_t(nw) * ENC);
-            ds41_engram_hash(*tb_, all_ids_.data() + (n - nw), nw, uint32_t(li), hw.data());
+            ds41_engram_hash(*tb_, S.all_ids.data() + (n - nw), nw, uint32_t(li), hw.data());
             hash.assign(hw.end() - std::ptrdiff_t(size_t(T) * ENC), hw.end());                    // the last T rows
         }
         last_hashes_[li] = hash;
@@ -574,8 +638,8 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
             const float* vrow = nullptr;                       // an image position: the tower's row, not the table's
             if (ids[t] < 0) {
                 const uint32_t p = pos0 + t;
-                for (const auto& sp : vis_spans_) if (p >= sp.pos0 && p - sp.pos0 < sp.n) { vrow = sp.rows.data() + size_t(p - sp.pos0) * H; break; }
-                if (!vrow && vis_provider_) { if (std::string ve = vis_provider_(p, vrow); !ve.empty()) return "forward: vision: " + ve; }
+                for (const auto& sp : S.vis_spans) if (p >= sp.pos0 && p - sp.pos0 < sp.n) { vrow = sp.rows.data() + size_t(p - sp.pos0) * H; break; }
+                if (!vrow && S.vis_provider) { if (std::string ve = S.vis_provider(p, vrow); !ve.empty()) return "forward: vision: " + ve; }
                 if (!vrow) return "forward: position " + std::to_string(p) + " is an image position and no vision span covers it";
             }
             for (uint32_t d = 0; d < H; ++d) {
@@ -609,7 +673,7 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
     if (first_stage) prep_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_prep).count();
 
     // ---- one card's layer range -------------------------------------------------------------
-    auto run_card = [&](Card& card) -> std::string {
+    auto run_card = [&](Card& card, const size_t ci) -> std::string {
     sycl::queue& q = *card.q;
     // the oneDNN projections named for the kernel profiler (oneDNN submits internally, so ie::ps
     // cannot wrap them; the event is pushed instead -- inert unless a tool set ie::g_profiler)
@@ -767,7 +831,7 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
     // 256 they are 768 MB regardless of the chunk size. Re-ordering nothing, this must be bit-identical.
     static const uint32_t strip_w = [] { const char* v = std::getenv("IE_DS41_STRIP"); const long n = v && *v ? std::atol(v) : 256; return n > 0 ? uint32_t(n) : 0u; }();
     const uint32_t STRIP = strip_w ? std::min(strip_w, T) : T;          // 0 disables striping (the kill switch)
-    const size_t NCMAX = decode ? std::min<size_t>(cap_pos_, size_t(pos0) + T) : size_t(T);
+    const size_t NCMAX = decode ? std::min<size_t>(S.cap, size_t(pos0) + T) : size_t(T);
     const size_t NKVMAX = cont ? size_t(WIN) + size_t(T) + NCMAX : decode ? size_t(WIN) + NCMAX : size_t(T) + NCMAX;
     sycl::half *x16 = S16(size_t(T) * H), *t16 = S16(size_t(T) * TW), *lat16 = S16(size_t(T) * HD);
     float *qr = S32(size_t(T) * QR), *qrn = S32(size_t(T) * QR), *qq = S32(size_t(T) * QH);
@@ -838,7 +902,7 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
         }
         const auto& Lw = m.layers()[L];
         const auto& k = Lw.kind;
-        auto& st = card.state[L];
+        auto& st = card.state[lane][L];   // the lane's state on this card (P4 B6a)
         TR("layer start", L);
         layer_dense_bytes = 0;
         std::vector<void*> lw;                                  // this layer's device weights
@@ -852,7 +916,7 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
             const Ds41LayerDense* rdt = resident_ ? card.cache.layer(L) : nullptr;
             if (resident_ && !rdt) return "resident: layer " + std::to_string(L) + " is not in the dense cache";
             if (k.compress_ratio != 1) return "layer " + std::to_string(L) + ": bounded replay expects a ratio-1 source at the decoder's first layer";
-            if (st.nc + Tl > cap_pos_) return "layer " + std::to_string(L) + ": latent cache full";
+            if (st.nc + Tl > S.cap) return "layer " + std::to_string(L) + ": latent cache full";
             float* n_at_t = rdt ? rdt->n_at : (float*)keep(bf16_32(Lw.attn_norm));
             sycl::half* w_ckv_t = rdt ? rdt->comp_wkv : (sycl::half*)keep(bf16_16(Lw.comp_wkv));
             float* n_c_t = rdt ? rdt->n_c : (float*)keep(bf16_32(Lw.comp_norm));
@@ -1058,7 +1122,7 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
                     n_new = n_pairs;
                 }
                 if (n_new) {
-                    if (st.nc + n_new > cap_pos_) return "layer " + std::to_string(L) + ": latent cache full";
+                    if (st.nc + n_new > S.cap) return "layer " + std::to_string(L) + ": latent cache full";
                     sycl::half* w_ik = rd ? rd->idx_wk : (sycl::half*)keep(bf16_16(Lw.idx_wk)); float* n_ik = rd ? rd->n_ik : (float*)keep(bf16_32(Lw.idx_k_norm));
                     float* dst_k = st.idx_k + size_t(st.nc) * IHD; float* dst_c = st.comp_kv + size_t(st.nc) * HD;
                     to16(latent, lat16, size_t(n_new) * HD);
@@ -1434,6 +1498,10 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
             // docs/48 P0: the routing per decode step and layer, each selected expert with its tier (0 static / 1 pinned / 2 mmap)
             static FILE* rdump = [] { const char* v = std::getenv("IE_DS41_DUMP_ROUTING"); return v && *v ? std::fopen(v, "a") : nullptr; }();
             if (rdump && decode) { std::fprintf(rdump, "%u %u", pos0, L); for (uint32_t k2 = 0; k2 < TK; ++k2) std::fprintf(rdump, " %d:%u", h_idx[k2], expert_tier(L, uint32_t(h_idx[k2]))); std::fputc('\n', rdump); }
+            // P4 B19: a one-row lane-pipe step with other lanes in flight may split its misses at IE_DS41_QSTAR_LANES; the tier's
+            // own q* is back on every exit (a stage error keeps the pipe's later steps and the serial path on it)
+            struct QstarRestore { Ds41ExpertTier& t; float q; ~QstarRestore() { t.set_qstar(q); } } qstar_restore{card.tier, card.tier.qstar()};
+            card.tier.set_qstar(ds41_step_qstar(qstar_restore.q, qstar_lanes_, decode ? Tl : 0u, stage ? stage->busy : 0u));
             const std::string own = card.tier.moe(q, L, xfn, h_idx.data(), h_w.data(), Tl, moe, c.swiglu_limit);
             card.tier.set_ep_import({}); card.tier.set_pre_groups({});
             for (auto& t : helpers) t.join(); wait_posted();
@@ -1447,6 +1515,12 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
             stats_[L].moe_prep_ms = ts.ms_prep; stats_[L].moe_mmap_ms = ts.ms_mmap; stats_[L].moe_mmap_pack_ms = ts.ms_mmap_pack; stats_[L].moe_groups_ms = ts.ms_groups;
             stats_[L].moe_mmap_read_ms = ts.ms_mmap_read; stats_[L].moe_mmap_permute_ms = ts.ms_mmap_permute; stats_[L].moe_mmap_group_ms = ts.ms_mmap_group; stats_[L].moe_tail_ms = ts.ms_tail; stats_[L].moe_spawn_ms = ts.ms_spawn; stats_[L].moe_join_ms = ts.ms_join;
             stats_[L].experts_uploaded = ts.experts_mmap; stats_[L].expert_bytes = ts.bytes_mmap_to_vram; stats_[L].experts_mmap_file = ts.experts_mmap_file;
+            if (decode && T <= kDs41MaxDecodeRows) {   // P4 B6a: the lane's own decode-step counters on this card
+                LaneTierStats& lt = lane_tier_[lane][ci];
+                lt.experts_static += ts.experts_static; lt.experts_pinned += ts.experts_pinned; lt.stream_hits += ts.stream_hits;
+                lt.experts_cpu += ts.experts_cpu; lt.experts_mmap += ts.experts_mmap; lt.moe_ms += ts.ms;
+                lt.cpu_ms += ts.ms_cpu; lt.cpu_work_ms += ts.ms_cpu_work; lt.bytes_pinned += ts.bytes_pinned_to_vram; lt.bytes_mmap += ts.bytes_mmap_to_vram;   // P4 B19
+            }
             if (ep_) {   // the other cards' tiers: counts summed in, walls kept apart, the owner/remote split recorded
                 stats_[L].experts_owner = ts.experts_static + ts.experts_pinned + ts.experts_mmap; stats_[L].miss_owner = ts.experts_pinned - ts.stream_hits;
                 for (const auto& cp : cards_) {
@@ -1514,7 +1588,7 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
             // prefill dequantises it into the cache's fp16 scratch)
             const Ds41Fp8Mat* h8 = resident_ && card.cache.head_fp8().w ? &card.cache.head_fp8() : nullptr;
             sycl::half* w_head = h8 ? nullptr : resident_ ? const_cast<sycl::half*>(card.cache.head()) : bf16_16(m.lm_head);   // [V, H]
-            const uint32_t TL = logits_last_only_ ? 1u : Tl, t0r = Tl - TL;     // the rows the caller asked for
+            const uint32_t TL = last_only ? 1u : Tl, t0r = Tl - TL;     // the rows the caller asked for
             float* lg = f32(size_t(TL) * V);
             to16(xn, x16, size_t(Tl) * H);
             if (h8 && TL == 1) W(gemv_fp8_e4m3_f16_tagged(q, x16 + size_t(t0r) * H, h8->w, h8->s, lg, H, V, "ds41_head_fp8"));
@@ -1548,14 +1622,14 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
     }
     if (!resident_) ds4_expert_ws_free(q, ws);
     for (void* p : scratch) sycl::free(p, q);
-    // Phase 46: a prefill chunk's end is a prefix-cache checkpoint for this card (its rings copied after its launches)
-    if (pc_on_ && T > kDs41MaxDecodeRows)
-        for (size_t ci = 0; ci < cards_.size(); ++ci) if (cards_[ci].get() == &card) { pc_capture(ci, pos0 + T); break; }
+    if (decode && T <= kDs41MaxDecodeRows) { LaneTierStats& lt = lane_tier_[lane][ci]; ++lt.steps; lt.rows += T; }
+    // Phase 46: a prefill chunk's end is a prefix-cache checkpoint of this lane for this card (its rings copied after its launches)
+    if (pc_on_ && T > kDs41MaxDecodeRows) pc_capture(lane, ci, pos0 + T);
     return {};
     };   // run_card
 
     for (size_t ci = card_first; ci < card_last; ++ci)
-        if (auto e = run_card(*cards_[ci]); !e.empty()) return e;
+        if (auto e = run_card(*cards_[ci], ci); !e.empty()) return e;
     ids_guard.ok = true;
     if (!last_stage) {    // Phase 43: hand the boundary to the next stage; the positions are committed by the last one
         StageCarry& out = *stage->out;
@@ -1563,8 +1637,8 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
         out.T_carry = T_carry; out.off_carry = off_carry; out.bounce_nc = bounce_nc; out.bounce_topk = bounce_topk;
         return {};
     }
-    n_pos_ = pos0 + T;
-    snap_pos0_ = pos0; snap_T_ = T; snap_valid_ = decode && T >= 2;   // P3
+    S.n_pos = pos0 + T;
+    S.snap_pos0 = pos0; S.snap_T = T; S.snap_valid = decode && T >= 2;   // P3
     return {};
 }
 
@@ -1572,12 +1646,14 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
 // thread; stage c on its own thread, fed through a one-slot mailbox, so card c-1 is at most one finished chunk ahead of
 // card c. Every stage calls forward_impl on its card with the chunk's (ids, T, pos0) -- the same launches in the same
 // order as forward(), on state no other stage touches (per-card KV, tiers, scratch; stats_ per layer).
-std::string Ds41Forward::forward_pipelined(const int32_t* ids, const std::vector<std::pair<uint32_t, uint32_t>>& chunks, std::vector<float>& logits_out) {
-    if (!pipelined_admissible()) return "forward_pipelined: needs resident mode on 2+ cards, no expert parallel, no drafter capture";
+std::string Ds41Forward::forward_pipelined(const int32_t* ids, const std::vector<std::pair<uint32_t, uint32_t>>& chunks, std::vector<float>& logits_out,
+                                           const std::function<bool()>& stop, size_t* n_done) {
+    if (n_done) *n_done = 0;
+    if (!pipelined_admissible()) return "forward_pipelined: needs resident mode on 2+ cards, no expert parallel, no drafter capture, no lane pipe running";
     if (chunks.empty()) return {};
     const size_t NS = cards_.size(), NK = chunks.size();
     uint32_t p = chunks[0].first;
-    if (p != 0 && p != n_pos_) return "forward_pipelined: the first chunk starts at " + std::to_string(p) + " but the state holds " + std::to_string(n_pos_) + " positions";
+    if (p != 0 && p != lanes_[lane_].n_pos) return "forward_pipelined: the first chunk starts at " + std::to_string(p) + " but the state holds " + std::to_string(lanes_[lane_].n_pos) + " positions";
     for (const auto& [pos0, T] : chunks) {
         if (pos0 != p) return "forward_pipelined: chunk at " + std::to_string(pos0) + " is not contiguous (expected " + std::to_string(p) + ")";
         if (pos0 > 0 && T <= kDs41MaxDecodeRows) return "forward_pipelined: a chunk of " + std::to_string(T) + " rows at " + std::to_string(pos0) + " is a decode step; run it with forward()";
@@ -1589,6 +1665,7 @@ std::string Ds41Forward::forward_pipelined(const int32_t* ids, const std::vector
     std::vector<std::unique_ptr<Mailbox>> box(NS);                    // box[s]: stage s's input (s >= 1)
     for (auto& b : box) b = std::make_unique<Mailbox>();
     std::atomic<bool> abort{false};
+    std::atomic<size_t> nk_run{NK};   // P4 B6b: the chunks this call runs -- fewer when `stop` ends it early (the first stage decides)
     std::vector<std::string> err(NS);
     auto wake_all = [&] { for (auto& b : box) { std::lock_guard<std::mutex> lk(b->mu); } for (auto& b : box) b->cv.notify_all(); };
     // IE_DS41_PIPE_TRACE=1: each stage's busy time and its waits (for the previous stage's carry / for the next stage to
@@ -1600,12 +1677,15 @@ std::string Ds41Forward::forward_pipelined(const int32_t* ids, const std::vector
         StageCarry in, out;
         std::vector<float> scratch_logits;
         for (size_t k = 0; k < NK; ++k) {
+            // P4 B6b: the first stage asks `stop` before every chunk after the first; a later stage ends at the count it set
+            if (s == 0 && k > 0 && stop && stop()) { nk_run.store(k); wake_all(); return; }
+            if (k >= nk_run.load()) return;
             if (s > 0) {
                 const auto tw = std::chrono::steady_clock::now();
                 Mailbox& b = *box[s];
                 std::unique_lock<std::mutex> lk(b.mu);
-                b.cv.wait(lk, [&] { return b.full || abort.load(); });
-                if (!b.full) return;                                       // aborted upstream
+                b.cv.wait(lk, [&] { return b.full || abort.load() || k >= nk_run.load(); });
+                if (!b.full) return;                                       // aborted upstream, or stopped before chunk k
                 in = std::move(b.carry); b.full = false;
                 lk.unlock(); b.cv.notify_all();
                 in_ms[s] += ms_from(tw);
@@ -1641,17 +1721,27 @@ std::string Ds41Forward::forward_pipelined(const int32_t* ids, const std::vector
             std::fprintf(stderr, "[ds41 pipe] stage %zu (card %zu): busy %.2f s, waiting for its input %.2f s, for the next stage %.2f s, over %zu chunks\n",
                          s, s, busy_ms[s] / 1e3, in_ms[s] / 1e3, out_ms[s] / 1e3, NK);
     for (const auto& e : err) if (!e.empty()) { if (pc_on_) reset_state(); return "forward_pipelined: " + e; }   // Phase 46: see forward()
+    if (n_done) *n_done = nk_run.load();
     return {};
 }
 
 std::string Ds41Forward::rollback_to(uint32_t n_pos) {
-    if (!snap_valid_) return "rollback_to: no multi-row step to roll back";
-    if (n_pos < snap_pos0_ || n_pos > snap_pos0_ + snap_T_) return "rollback_to: " + std::to_string(n_pos) + " is outside the last step [" + std::to_string(snap_pos0_) + ", " + std::to_string(snap_pos0_ + snap_T_) + "]";
-    const auto& c = m_->config(); const uint32_t HD = c.head_dim, WIN = c.window_size, T = snap_T_, L = n_pos - snap_pos0_, pos0 = snap_pos0_;
+    if (piping()) return "rollback_to: the lane pipe is running (pipe_rollback)";
+    return rollback_lane_to(lane_, n_pos, true);
+}
+
+// P4 B6a: `wait` = drain each card's queue after its restores (the serial path). The pipe's callback (the last card's stage
+// thread) skips it: the restores only touch this lane's state, the in-order queues run them before anything this lane
+// submits later, and a wait on the other card's queue would stall behind the lane that card is running.
+std::string Ds41Forward::rollback_lane_to(uint32_t lane, uint32_t n_pos, bool wait) {
+    Lane& S = lanes_[lane];
+    if (!S.snap_valid) return "rollback_to: no multi-row step to roll back";
+    if (n_pos < S.snap_pos0 || n_pos > S.snap_pos0 + S.snap_T) return "rollback_to: " + std::to_string(n_pos) + " is outside the last step [" + std::to_string(S.snap_pos0) + ", " + std::to_string(S.snap_pos0 + S.snap_T) + "]";
+    const auto& c = m_->config(); const uint32_t HD = c.head_dim, WIN = c.window_size, T = S.snap_T, L = n_pos - S.snap_pos0, pos0 = S.snap_pos0;
     for (auto& cp : cards_) {
         Card& card = *cp; sycl::queue& q = *card.q;
         for (uint32_t Ly = card.L0; Ly < card.L1; ++Ly) {
-            auto& st = card.state[Ly]; const auto& k = m_->layers()[Ly].kind;
+            auto& st = card.state[lane][Ly]; const auto& k = m_->layers()[Ly].kind;
             if (!noring_diag_)                                                     // the evicted keys back into the slots of the rows not accepted
                 for (uint32_t r = L; r < T; ++r) q.memcpy(st.win_kv + size_t((pos0 + r) % WIN) * HD, st.snap_ring + size_t(r) * HD, size_t(HD) * 4);
             if (k.is_kv_source) {
@@ -1667,10 +1757,185 @@ std::string Ds41Forward::rollback_to(uint32_t n_pos) {
                 }
             }
         }
-        q.wait_and_throw();
+        if (wait) q.wait_and_throw();
     }
-    all_ids_.resize(n_pos); n_pos_ = n_pos; snap_valid_ = false;
+    S.all_ids.resize(n_pos); S.n_pos = n_pos; S.snap_valid = false;
     return {};
+}
+
+// ---- P4 B6a: the card pipe (docs/deepseek41/P4_B6A_LANES.md) ---------------------------------------------------------------
+// forward_pipelined made persistent: one stage thread per card fed by a queue of lanes, each lane at most one step in flight,
+// every step a forward_impl on that stage's card with the lane named (its state, its host carry, its logits). MiMo B2/B3's
+// hazard rules: the claim is check-and-set under pmu_ and held through the done callback; errors latch; every card is
+// drained before anything is freed (free_resident stops the pipe first).
+
+std::string Ds41Forward::pipe_start(PipeDone done) {
+    if (!resident_ || cards_.size() < 2) return "pipe_start: needs resident mode on 2+ cards";
+    if (ep_) return "pipe_start: refused with expert parallel";
+    if (capture_main_hidden_) return "pipe_start: refused with the drafter capture";
+    if (!stage_th_.empty()) return ppaused_ ? "pipe_start: the pipe is paused (pipe_resume)" : "pipe_start: already running";
+    if (const char* v = std::getenv("IE_DS41_DUMP_ROUTING"); v && *v) return "pipe_start: IE_DS41_DUMP_ROUTING is serial-only";
+    for (auto& cp : cards_) if (auto e = ensure_state(*cp); !e.empty()) return e;
+    for (auto& ln : lanes_) { ln.in_flight = false; ln.in_cb = false; ln.resub = false; }
+    pq_.assign(cards_.size(), {});
+    pbusy_ = 0; pstop_ = false; ppaused_ = false; perr_.clear(); pdone_ = std::move(done);
+    for (size_t s = 0; s < cards_.size(); ++s)
+        stage_th_.emplace_back([this, s] {
+            kmp_set_blocktime(0);   // the stage's OpenMP team (the engram gather) must not spin beside the CPU expert legs (docs/35)
+            stage_loop(s);
+        });
+    return {};
+}
+
+std::string Ds41Forward::pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool all_rows) {
+    if (!piping()) return "pipe_submit: the pipe is not running";
+    if (lane >= lanes_.size()) return "pipe_submit: lane " + std::to_string(lane) + " of " + std::to_string(lanes_.size());
+    Lane& ln = lanes_[lane];
+    // claim the lane (check-and-set under the lock): an idle lane from any thread; a lane inside its done callback only from
+    // that callback's thread, once
+    bool fresh = false;
+    {
+        std::lock_guard<std::mutex> lk(pmu_);
+        if (!perr_.empty()) return "pipe_submit: a stage failed: " + perr_;
+        if (pstop_) return "pipe_submit: the pipe is stopping";   // a step queued now would find a stage thread already gone
+        if (ppaused_) return "pipe_submit: the pipe is paused";    // P4 B6b: (piping() above is read unlocked) the serial API owns the cards
+        if (ln.in_flight) {
+            if (!ln.in_cb || ln.cb_tid != std::this_thread::get_id()) return "pipe_submit: lane " + std::to_string(lane) + " has a step in flight";
+            if (ln.resub) return "pipe_submit: lane " + std::to_string(lane) + " was already resubmitted from its callback";
+        } else { ln.in_flight = true; ++pbusy_; fresh = true; }
+    }
+    auto unclaim = [&](std::string e) {   // a refused step gives a fresh claim back (a callback's lane stays in flight until it returns)
+        if (fresh) { std::lock_guard<std::mutex> lk(pmu_); ln.in_flight = false; --pbusy_; }
+        return e;
+    };
+    if (T == 0 || T > fwd_cap_) return unclaim("pipe_submit: T " + std::to_string(T) + " is not in 1.." + std::to_string(fwd_cap_) + " (forward_capacity)");
+    if (pos0 != ln.n_pos) return unclaim("pipe_submit: lane " + std::to_string(lane) + ": pos0 " + std::to_string(pos0) + " != its n_pos " + std::to_string(ln.n_pos));
+    if (pos0 + T > ln.cap) return unclaim("pipe_submit: lane " + std::to_string(lane) + ": position " + std::to_string(pos0 + T) + " exceeds its capacity " + std::to_string(ln.cap));
+    if (pos0 == 0) {   // forward_impl's regimes, judged here so a bad step never latches a stage error
+        for (uint32_t L = 0; L < m_->config().n_layers; ++L)
+            if (const uint32_t r = m_->layers()[L].kind.compress_ratio; r > 1 && T % r != 0) return unclaim("pipe_submit: a prefill's T must be a multiple of every compress_ratio");
+    } else if (T != 1 && !((ds41_decode_multi_env() || multi_rows_) && T >= 2 && T <= kDs41MaxDecodeRows) && !(ds41_cont_env() && T > kDs41MaxDecodeRows))
+        return unclaim("pipe_submit: at pos0 > 0 a step is one row, 2.." + std::to_string(kDs41MaxDecodeRows) + " rows with set_multi_row_decode(true), or a continuation chunk");
+    for (uint32_t t = 0; t < T; ++t) if (ids[t] < 0) return unclaim("pipe_submit: image positions are serial-only (forward)");
+    ln.ids.assign(ids, ids + T); ln.T = T; ln.pos0 = pos0; ln.all_rows = all_rows;
+    {
+        std::lock_guard<std::mutex> lk(pmu_);
+        if (!fresh) ln.resub = true;   // the callback's resubmit: the lane's in-flight count carries over
+        pq_[0].push_back(lane);
+    }
+    pcv_.notify_all();
+    return {};
+}
+
+std::string Ds41Forward::pipe_reset_lane(uint32_t lane) {
+    if (lane >= lanes_.size()) return "pipe_reset_lane: lane " + std::to_string(lane) + " of " + std::to_string(lanes_.size());
+    {
+        std::lock_guard<std::mutex> lk(pmu_);
+        const Lane& ln = lanes_[lane];   // an idle lane, or -- from its own done callback -- the lane whose sequence just ended
+        if (ln.in_flight && !(ln.in_cb && ln.cb_tid == std::this_thread::get_id() && !ln.resub))
+            return "pipe_reset_lane: lane " + std::to_string(lane) + " has a step in flight";
+    }
+    reset_lane(lane);
+    return {};
+}
+
+std::string Ds41Forward::pipe_rollback(uint32_t lane, uint32_t n_pos) {
+    if (!piping()) return "pipe_rollback: the pipe is not running (rollback_to)";
+    if (lane >= lanes_.size()) return "pipe_rollback: lane " + std::to_string(lane) + " of " + std::to_string(lanes_.size());
+    {
+        std::lock_guard<std::mutex> lk(pmu_);
+        const Lane& ln = lanes_[lane];
+        if (!(ln.in_flight && ln.in_cb && ln.cb_tid == std::this_thread::get_id() && !ln.resub))
+            return "pipe_rollback: lane " + std::to_string(lane) + " may be rolled back from its own done callback only, before its next step";
+    }
+    return rollback_lane_to(lane, n_pos, false);
+}
+
+void Ds41Forward::stage_loop(size_t s) {
+    const bool last = s + 1 == cards_.size();
+    for (;;) {
+        uint32_t l = 0, busy = 0;
+        {
+            std::unique_lock<std::mutex> lk(pmu_);
+            pcv_.wait(lk, [&] { return pstop_ || !pq_[s].empty(); });
+            if (pq_[s].empty()) return;                     // stopped (pipe_stop waits for no step in flight first)
+            l = pq_[s].front(); pq_[s].pop_front();
+            busy = pbusy_;                                  // P4 B19: the lanes in flight as this card takes the step
+        }
+        Lane& ln = lanes_[l];
+        Stage st{s, s + 1, s > 0 ? &ln.carry : nullptr, s + 1 < cards_.size() ? &ln.carry : nullptr, int(l), ln.all_rows ? 1 : 0, busy};
+        std::string e;
+        try { e = forward_impl(ln.ids.data(), ln.T, ln.pos0, ln.logits, {}, nullptr, nullptr, false, nullptr, &st); }
+        catch (const std::exception& ex) { e = std::string("threw: ") + ex.what(); }   // a stage thread must not terminate the process
+        catch (...) { e = "threw a non-std exception"; }
+        if (!e.empty()) {
+            {
+                std::lock_guard<std::mutex> lk(pmu_);
+                if (perr_.empty()) perr_ = "lane " + std::to_string(l) + " at " + std::to_string(ln.pos0) + " (" + std::to_string(ln.T) + " rows), card " + std::to_string(s) + ": " + e;
+                ln.in_flight = false; --pbusy_;
+            }
+            pcv_.notify_all();
+            continue;
+        }
+        if (!last) {
+            { std::lock_guard<std::mutex> lk(pmu_); pq_[s + 1].push_back(l); }
+            pcv_.notify_all();
+            continue;
+        }
+        // the last stage committed the lane's positions inside forward_impl; the lane stays in flight through its callback,
+        // and only this thread may submit it again meanwhile, so nothing rewrites the logits the callback reads
+        { std::lock_guard<std::mutex> lk(pmu_); ln.in_cb = true; ln.resub = false; ln.cb_tid = std::this_thread::get_id(); }
+        std::string ce;
+        if (pdone_) {
+            try { pdone_(l, ln.logits); }
+            catch (const std::exception& ex) { ce = std::string("done callback threw: ") + ex.what(); }
+            catch (...) { ce = "done callback threw a non-std exception"; }
+        }
+        {
+            std::lock_guard<std::mutex> lk(pmu_);
+            if (!ce.empty() && perr_.empty()) perr_ = "lane " + std::to_string(l) + ": " + ce;
+            ln.in_cb = false;
+            if (!ln.resub) { ln.in_flight = false; --pbusy_; }   // resubmitted: its in-flight count carries over to the next step
+            ln.resub = false;
+        }
+        pcv_.notify_all();
+    }
+}
+
+std::string Ds41Forward::pipe_stop() {
+    if (stage_th_.empty()) return {};   // P4 B6b: running or paused
+    {
+        std::unique_lock<std::mutex> lk(pmu_);
+        pcv_.wait(lk, [&] { return pbusy_ == 0; });
+        pstop_ = true;
+    }
+    pcv_.notify_all();
+    for (auto& t : stage_th_) t.join();
+    stage_th_.clear(); pq_.clear(); pdone_ = nullptr; ppaused_ = false;
+    std::string e; std::swap(e, perr_);
+    return e;
+}
+
+// P4 B6b (docs/deepseek41/P4_B6B_SERVE.md): pause / resume keep the stage threads. The lanes' positions live in lanes_ in both
+// states (the serial API reads the active lane's), so nothing moves between the pipe and the serial members here.
+std::string Ds41Forward::pipe_pause() {
+    if (stage_th_.empty()) return "pipe_pause: the pipe is not running";
+    std::unique_lock<std::mutex> lk(pmu_);
+    pcv_.wait(lk, [&] { return pbusy_ == 0; });   // (the caller's callbacks park their lanes instead of resubmitting)
+    ppaused_ = true;
+    return perr_;
+}
+
+std::string Ds41Forward::pipe_resume() {
+    if (stage_th_.empty()) return "pipe_resume: the pipe is not running";
+    std::lock_guard<std::mutex> lk(pmu_);
+    ppaused_ = false;
+    return {};
+}
+
+std::string Ds41Forward::pipe_error() {
+    std::lock_guard<std::mutex> lk(pmu_);
+    return perr_;
 }
 
 }  // namespace ie

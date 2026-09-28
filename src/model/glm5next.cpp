@@ -498,6 +498,7 @@ void Glm5NextModel::free_all() {
     if (pf_pred_pin_) { sycl::free(pf_pred_pin_, alloc_->queue()); pf_pred_pin_ = nullptr; }
     if (ep_xstage_) { sycl::free(ep_xstage_, alloc_->queue()); ep_xstage_ = nullptr; }
     if (ep_rstage_) { sycl::free(ep_rstage_, alloc_->queue()); ep_rstage_ = nullptr; }
+    seq_lanes_.clear();   // the extra lanes' KDA states (their other buffers are in owned_); queues drained above
     owned_.clear();
     layers_.clear();
     alloc_ = nullptr;
@@ -1950,6 +1951,57 @@ std::string Glm5NextModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk) {
     ok = ok && sv_ci_;
     if (!ok) return "glm5next init_runtime: device alloc failed";
 
+    // ---- P4 B7 request lanes (see the header) ------------------------------
+    // Lanes 1..n-1 get their own KDA state, latent cache and (with the DSA
+    // indexer) pooled keys + open-pool rolls at seq_lane_ctx_ positions;
+    // lane 0 is the state allocated above. Their bytes are taken out of the
+    // expert-cache budget below, so the stage's VRAM total does not move.
+    seq_lanes_.clear();
+    seq_lane_ = 0;
+    lane_bytes_ = 0;
+    if (seq_lanes_req_ > 1) {
+        if (mtp_loaded())
+            return "glm5next init_runtime: request lanes with the MTP kit loaded (spec decode, pipedraft) are not supported";
+        if (std::getenv("IE_G5_EP_DECODE"))
+            return "glm5next init_runtime: request lanes with expert-parallel decode (IE_G5_EP_DECODE) are not supported";
+        const uint32_t lc = seq_lane_ctx_ ? seq_lane_ctx_ : max_ctx;
+        // the indexer's score workspace and every [MT, ...] buffer are sized
+        // by lane 0's context: a lane may hold at most that many positions
+        if (lc > max_ctx)
+            return "glm5next init_runtime: lane context " + std::to_string(lc) +
+                   " exceeds the stage context " + std::to_string(max_ctx);
+        const uint32_t KP = cfg_.indexer_kpool, IHD = cfg_.indexer_head_dim;
+        const uint32_t np = (lc + KP - 1) / KP;
+        dev_alloc_tag("seq lanes");
+        seq_lanes_.resize(seq_lanes_req_);
+        for (uint32_t l = 1; l < seq_lanes_req_; ++l) {
+            SeqLane& s = seq_lanes_[l];
+            if (auto e = s.dn.init(*alloc_, dc); !e.empty())
+                return "glm5next init_runtime: lane " + std::to_string(l) + ": " + e;
+            s.dn.reset(alloc_->queue());   // a lane starts empty
+            uint64_t b = uint64_t(dc.n_layers_linear) *
+                         (dn_.state_elems_per_layer() * 4 + dn_.conv_elems_per_layer() * 2);
+            s.lat = static_cast<sycl::half*>(dev(uint64_t(n_full) * lc * LAT * 2));
+            b += uint64_t(n_full) * lc * LAT * 2;
+            if (sparse_) {
+                s.pool_key = static_cast<sycl::half*>(dev(uint64_t(n_full) * np * IHD * 2));
+                s.kroll    = static_cast<sycl::half*>(dev(uint64_t(n_full) * KP * IHD * 2));
+                s.groll    = static_cast<sycl::half*>(dev(uint64_t(n_full) * KP * IHD * 2));
+                b += uint64_t(n_full) * np * IHD * 2 + 2 * uint64_t(n_full) * KP * IHD * 2;
+            }
+            if (!s.lat || (sparse_ && (!s.pool_key || !s.kroll || !s.groll)))
+                return "glm5next init_runtime: lane " + std::to_string(l) + " device alloc failed";
+            s.ctx = lc; s.n_pools = np; s.kv_len = 0;
+            lane_bytes_ = b;
+        }
+        std::fprintf(stderr,
+                     "[glm5next] request lanes: %u on stage [%u, %u) (lane 0 ctx %u, lanes 1..%u ctx %u); "
+                     "one extra lane %.1f MiB, %.1f MiB in all, taken from the expert cache\n",
+                     seq_lanes_req_, layer_lo_, layer_hi_, max_ctx, seq_lanes_req_ - 1, lc,
+                     double(lane_bytes_) / 1048576.0,
+                     double(lane_bytes_) * (seq_lanes_req_ - 1) / 1048576.0);
+    }
+
     // Per-layer LRU expert slot cache. Budget from IE_G5_ECACHE_MB (default
     // 10 GiB); slots split evenly across the MoE layers, floored at top_k so
     // one token's routing always fits, disabled below that.
@@ -1957,6 +2009,14 @@ std::string Glm5NextModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk) {
         uint64_t budget = 10240ull << 20;
         if (const char* v = std::getenv("IE_G5_ECACHE_MB")) budget = uint64_t(std::atoll(v)) << 20;
         if (server_memory_) budget = server_cache_bytes_;
+        // P4 B7: the extra request lanes' bytes come out of the cache
+        if (const uint64_t lanes_extra = lane_bytes_ * (seq_lanes_.empty() ? 0 : seq_lanes_.size() - 1)) {
+            if (lanes_extra >= budget)
+                return "glm5next init_runtime: " + std::to_string(seq_lanes_.size() - 1) + " extra lane(s) need " +
+                       std::to_string(lanes_extra >> 20) + " MiB, more than the expert-cache budget of " +
+                       std::to_string(budget >> 20) + " MiB -- fewer lanes or a smaller lane context";
+            budget -= lanes_extra;
+        }
         // EP decode: half the VRAM budget goes to this card's half-caches for
         // the PEER's layers (allocated later by ep_enable) — shrink ours now.
         if (std::getenv("IE_G5_EP_DECODE")) budget /= 2;
@@ -2512,6 +2572,75 @@ void Glm5NextModel::reset_state() {
     dn_.reset(q);
     kv_len_ = 0;
     q.wait();
+}
+
+// ---- P4 B7 request lanes ----------------------------------------------------
+
+void Glm5NextModel::swap_live_(SeqLane& s) noexcept {
+    std::swap(dn_, s.dn);
+    std::swap(lat_cache_, s.lat);
+    std::swap(pool_key_, s.pool_key);
+    std::swap(idx_kroll_, s.kroll);
+    std::swap(idx_groll_, s.groll);
+    std::swap(max_ctx_, s.ctx);
+    std::swap(n_pools_, s.n_pools);
+    std::swap(kv_len_, s.kv_len);
+}
+
+std::string Glm5NextModel::select_lane(uint32_t lane) {
+    if (lane == seq_lane_) return {};
+    if (lane >= n_lanes())
+        return "glm5next select_lane: lane " + std::to_string(lane) + " of " + std::to_string(n_lanes());
+    if (spec_verify_) return "glm5next select_lane: spec verify is per model, not per lane";
+    swap_live_(seq_lanes_[seq_lane_]);   // park the live lane (its slot held the placeholder)
+    swap_live_(seq_lanes_[lane]);        // bring the lane in (its slot now holds the placeholder)
+    seq_lane_ = lane;
+    return {};
+}
+
+uint32_t Glm5NextModel::lane_ctx(uint32_t lane) const noexcept {
+    if (lane == seq_lane_) return max_ctx_;
+    return lane < seq_lanes_.size() ? seq_lanes_[lane].ctx : 0;
+}
+
+uint32_t Glm5NextModel::lane_pos(uint32_t lane) const noexcept {
+    if (lane == seq_lane_) return kv_len_;
+    return lane < seq_lanes_.size() ? seq_lanes_[lane].kv_len : 0;
+}
+
+std::string Glm5NextModel::lane_stage(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0,
+                                      const float* wide_in, float* wide_out, sycl::half* logits_host) {
+    if (!alloc_) return "glm5next lane_stage: not loaded";
+    std::string e;
+    try {
+        e = select_lane(lane);
+        if (e.empty() && pos0 == 0) reset_state();   // a new sequence on this lane
+        if (e.empty()) e = forward_range(ids, T, pos0, wide_in, wide_out, nullptr);
+        if (e.empty() && logits_host) {
+            if (wide_out) e = "glm5next lane_stage: the logits come from the tail stage";
+            else alloc_->queue().memcpy(logits_host, logits_, uint64_t(cfg_.vocab) * 2).wait();
+        }
+    } catch (const std::exception& ex) {
+        e = std::string("glm5next lane_stage threw: ") + ex.what();
+    } catch (...) {
+        e = "glm5next lane_stage threw a non-std exception";
+    }
+    if (!e.empty()) {
+        // an error return can leave this step's kernels and copies queued
+        // (they read the caller's wide/ids buffers): drain before handing back
+        try { alloc_->queue().wait(); } catch (...) {}
+    }
+    return e;
+}
+
+std::string Glm5NextModel::pipe_refusal() const {
+    if (mtp_loaded()) return "the MTP kit is loaded (spec decode and pipedraft keep per-model state)";
+    if (ep_peer_) return "expert-parallel decode is on (a stage would drive its peer's card)";
+    if (spec_verify_) return "spec verify is on";
+    for (const char* k : {"IE_QUEUE_PROFILING", "IE_G5_DUMP_WIDE", "IE_G5_DUMP_MOE", "IE_G5_NAN_PROBE",
+                          "IE_G5_TRACE_FIRST"})
+        if (std::getenv(k)) return std::string(k) + " is a serial-only diagnostic";
+    return {};
 }
 
 void Glm5NextModel::mm(const sycl::half* A, const Glm5DW& W, uint32_t T,

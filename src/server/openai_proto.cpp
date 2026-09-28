@@ -3,6 +3,7 @@
 #include "nlohmann/json.hpp"
 
 #include <cctype>
+#include <cstdio>
 #include <cstdlib>
 #include <cmath>
 #include <optional>
@@ -141,7 +142,27 @@ static ChatRequest parse_chat_request_impl(const std::string& body, ChatRequest 
         out.reasoning_effort=j["reasoning_effort"].get<std::string>();
         if(!known_reasoning_effort(out.reasoning_effort))throw std::runtime_error("unknown reasoning_effort level");
     }
+    // P4 B20: chat_template_kwargs (the Qwen cards' form: {"enable_thinking": false}, {"reasoning_effort": "low"}) --
+    // aliases of the top-level fields; a top-level field wins where both are given. Other keys are ignored.
+    if (j.contains("chat_template_kwargs") && !j["chat_template_kwargs"].is_null()) {
+        const auto& kw = j["chat_template_kwargs"];
+        if (!kw.is_object()) throw std::runtime_error("chat_template_kwargs must be an object");
+        if (kw.contains("enable_thinking") && !j.contains("enable_thinking")) {
+            if (!kw["enable_thinking"].is_boolean()) throw std::runtime_error("chat_template_kwargs.enable_thinking must be a boolean");
+            out.enable_thinking = kw["enable_thinking"].get<bool>();
+        }
+        if (kw.contains("reasoning_effort") && !kw["reasoning_effort"].is_null() &&
+            !(j.contains("reasoning_effort") && !j["reasoning_effort"].is_null())) {
+            if (!kw["reasoning_effort"].is_string()) throw std::runtime_error("chat_template_kwargs.reasoning_effort must be a string");
+            out.reasoning_effort = kw["reasoning_effort"].get<std::string>();
+            if (!known_reasoning_effort(out.reasoning_effort)) throw std::runtime_error("unknown reasoning_effort level");
+        }
+    }
     auto& sp = out.sampling;
+    for (auto [key, bit] : {std::pair{"temperature", kSetTemperature}, {"top_p", kSetTopP}, {"top_k", kSetTopK},
+                            {"min_p", kSetMinP}, {"presence_penalty", kSetPresence},
+                            {"repetition_penalty", kSetRepeat}, {"repeat_penalty", kSetRepeat}})
+        if (j.contains(key)) out.sampling_set |= bit;
     number(j, "temperature", sp.temperature, 0, 2);
     number(j, "top_p", sp.top_p, 0, 1, true);
     sp.top_k = uint32_t(integer(j, "top_k", sp.top_k, 1024));
@@ -300,6 +321,29 @@ ChatRequest server_defaults_from_environment() {
     return out;
 }
 
+uint32_t apply_recommended(ChatRequest& r, const Recommendation* rec) {
+    if (!rec) return 0;
+    auto& sp = r.sampling;
+    if ((r.sampling_set & kSetTemperature) && sp.temperature == 0.f) return 0;   // greedy: exactly as before B20
+    const RecommendedMode& m = recommended_mode(*rec, r.enable_thinking);
+    const uint32_t fill = kSetAllRecommended & ~r.sampling_set;
+    if (fill & kSetTemperature) sp.temperature = float(m.temperature);
+    if (fill & kSetTopP)        sp.top_p = float(m.top_p);
+    if (fill & kSetTopK)        sp.top_k = m.top_k;
+    if (fill & kSetMinP)        sp.min_p = float(m.min_p);
+    if (fill & kSetPresence)    sp.presence_penalty = float(m.presence_penalty);
+    if (fill & kSetRepeat)      sp.repeat_penalty = float(m.repeat_penalty);
+    return fill;
+}
+
+std::string sampling_summary(const SamplingParams& sp) {
+    char b[192];
+    std::snprintf(b, sizeof b, "temperature %g top_p %g top_k %u min_p %g presence_penalty %g frequency_penalty %g repeat_penalty %g",
+                  double(sp.temperature), double(sp.top_p), sp.top_k, double(sp.min_p), double(sp.presence_penalty),
+                  double(sp.frequency_penalty), double(sp.repeat_penalty));
+    return b;
+}
+
 void configure_server_defaults(const ChatRequest& defaults) {
     configured_defaults = defaults; // called once before HTTP worker threads start
 }
@@ -312,6 +356,15 @@ ChatRequest parse_chat_request(const std::string& body) {
         ChatRequest out; out.error = std::string("invalid request setting: ") + e.what();
         return out;
     }
+}
+
+std::string image_refusal(const ChatRequest& r, const std::string& vision_status_json) {
+    bool images = false;
+    for (const auto& t : r.turns) images |= !t.images.empty();
+    if (!images) return {};
+    const json v = json::parse(vision_status_json, nullptr, /*allow_exceptions=*/false);
+    if (!v.is_object() || v.value("ready", true)) return {};
+    return "image input: " + v.value("reason", std::string());
 }
 
 
@@ -632,10 +685,10 @@ std::string vitals_summary_json(const VitalsWindow& w, const GenerateResult& r) 
     return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
-std::string models_json(const std::string& model_id) {
-    return json{{"object", "list"},
-                {"data", json::array({{{"id", model_id}, {"object", "model"},
-                                       {"owned_by", "local"}}})}}.dump();
+std::string models_json(const std::string& model_id, const std::string& root) {
+    json m{{"id", model_id}, {"object", "model"}, {"owned_by", "local"}};
+    if (!root.empty()) m["root"] = root;
+    return json{{"object", "list"}, {"data", json::array({m})}}.dump();
 }
 
 std::string error_json(std::string_view message, std::string_view type,

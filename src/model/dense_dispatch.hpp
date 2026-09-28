@@ -36,6 +36,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -788,8 +789,10 @@ inline sycl::event gemv_q_i8(sycl::queue& q, const sycl::half* x,
 // P-B (multi-GPU): the gemv_q_T prefill scratch (dequant→gemm) must be PER
 // DEVICE — a process-global static buffer allocated on the first device and then
 // touched by a kernel on a second device faults it (UR_RESULT_ERROR_DEVICE_LOST).
-// Keyed by the queue's device; host runs one generation at a time so no lock is
-// needed. Single-GPU is unchanged (one entry, same grow-on-demand behavior).
+// Keyed by the queue's device. The registry is locked (P4 B10: the crown split's
+// request lanes run the two cards' stages on two threads at once); each entry is
+// then used only by its own device's thread. Single-GPU is unchanged (one entry,
+// same grow-on-demand behavior).
 struct GemvPrefillScratch {
     sycl::half* bt = nullptr; uint64_t bt_cap = 0;   // [K,N] dequanted weight
     float*      c  = nullptr; uint64_t c_cap  = 0;   // [T+8,N] fp32 gemm output
@@ -799,7 +802,9 @@ inline GemvPrefillScratch& gemv_prefill_scratch(sycl::queue& q) {
     // Heap-allocated entries → stable addresses across cache growth. Leaked at
     // process exit (process-lifetime scratch, like the statics it replaces).
     static std::vector<std::pair<sycl::device, GemvPrefillScratch*>> cache;
+    static std::mutex mu;
     const sycl::device d = q.get_device();
+    std::lock_guard<std::mutex> lk(mu);
     for (auto& e : cache) if (e.first == d) return *e.second;
     cache.emplace_back(d, new GemvPrefillScratch{});
     return *cache.back().second;

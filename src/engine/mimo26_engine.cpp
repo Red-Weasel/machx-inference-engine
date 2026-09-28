@@ -355,6 +355,12 @@ std::string Engine::mimo26_load(const std::string& dir) {
     Mimo26Options mo;
     mo.max_ctx = opts_.max_ctx;
     mo.max_tokens = std::min<uint32_t>(2048, opts_.max_ctx);
+    // P4 B4 (docs/mimo26/P4_B4_SERVE.md): --parallel N > 1 = N lanes. Lane 0 keeps --ctx; lanes 1..N-1 get --slot-ctx positions
+    // each (0 = 32,768, capped at --ctx). Their caches come out of the auto static tier, and the forward's init refuses, with
+    // the numbers, when they do not fit (the load-time refusal). --parallel 1 is the pre-lane engine, byte for byte.
+    const uint32_t n_lanes = std::max<uint32_t>(1, opts_.parallel);
+    const uint32_t lane_ctx = n_lanes > 1 ? std::min<uint32_t>(opts_.max_ctx, opts_.slot_ctx ? opts_.slot_ctx : 32768u) : 0u;
+    mo.lanes = n_lanes; mo.lane_ctx = lane_ctx;
     // the static expert tier: sized from each card's free VRAM (P4 lever 2: -11 % per decode token vs a fixed 48 on
     // held-out chat, PPL within noise); IE_MIMO26_STATIC=N pins a count
     mo.n_static = 0;
@@ -383,6 +389,7 @@ std::string Engine::mimo26_load(const std::string& dir) {
         if (auto e = b->dflash->init(*b->qs.back(), b->model.embed.w->data, b->model.config().vocab_size, b->dflash->config().window); !e.empty())
             return "mimo_v2 " + e;
         b->dflash_k = std::min(b->dflash_k, b->dflash->config().block - 1);
+        if (n_lanes > 1) if (auto e = b->dflash->add_lanes(n_lanes); !e.empty()) return "mimo_v2 dflash lanes: " + e;   // (B1: one context ring per lane)
     }
     // P6.2: the vision tower, staged in pinned host memory BEFORE the forward sizes its tiers (the pinned budget then sees
     // it, and the auto static tier on the first card leaves the encode block free). Nothing of it stays on a card between
@@ -424,6 +431,11 @@ std::string Engine::mimo26_load(const std::string& dir) {
         if (const char* g = std::getenv("IE_MIMO26_PROMPT_CACHE_GIB"); g && *g) co.budget = uint64_t(std::max(0.0, std::atof(g)) * 1073741824.0);
         if (const char* g = std::getenv("IE_MIMO26_CACHE_KEEP_FREE_GIB"); g && *g) co.keep_free = uint64_t(std::max(0.0, std::atof(g)) * 1073741824.0);
         if (!b->prefix_reuse) co.budget = 0;
+        // P4 B16: at --parallel > 1 a reuse under min_tokens counts as none (batch == solo: the prefill split no longer depends
+        // on which short prefix a lane happened to hold); --parallel 1 reuses any length, as before
+        if (n_lanes > 1) co.min_reuse = co.min_tokens;
+        if (co.min_reuse && b->prefix_reuse)
+            std::fprintf(stderr, "[mimo26] lanes: a prompt reuses a lane's state or a host slot only for %u or more tokens (below that it prefills from 0)\n", co.min_reuse);
         if (auto e = b->cache.init(b->fwd, b->dflash.get(), co); !e.empty()) return "mimo_v2 host slots: " + e;
         if (b->cache.slots_on())
             std::fprintf(stderr, "[mimo26] host slots ON: up to %.1f GiB of other conversations in host RAM, kept above %.1f GiB MemAvailable "
@@ -437,8 +449,44 @@ std::string Engine::mimo26_load(const std::string& dir) {
     // IE_MIMO26_LOOKUP=1 forces it on (a copy then takes priority over the drafter), =0 off
     b->lookup = !b->dflash;
     if (const char* v = std::getenv("IE_MIMO26_LOOKUP"); v && *v) b->lookup = std::string(v) != "0";
+    if (n_lanes > 1 && b->lookup) { b->lookup = false; std::fprintf(stderr, "[mimo26] prompt-lookup speculation is --parallel 1 only: off\n"); }
     std::fprintf(stderr, "[mimo26] prompt-lookup speculation %s (a copy of >= 12 context tokens verified up to %u rows at a time; IE_MIMO26_LOOKUP=1 on, =0 off)\n",
                  b->lookup ? "ON" : "off", Mimo26Forward::kDecodeRows);
+    if (n_lanes > 1) {   // P4 B4: the lanes' serving state (Mimo26Serve); the pipe starts with the first request
+        b->serve.lanes.resize(n_lanes);
+        for (uint32_t l = 0; l < n_lanes; ++l) b->serve.lanes[l].cap = l == 0 ? opts_.max_ctx : lane_ctx;
+        if (const char* v = std::getenv("IE_MIMO26_MIX_CHUNK"); v && *v) b->serve.mix_chunk = uint32_t(std::max(1L, std::atol(v)));
+        b->serve.mix_chunk = std::min(b->serve.mix_chunk, b->fwd.max_tokens());
+        // P4 B5 (docs/mimo26/P4_B5_DRAFT_BUDGET.md): the draft budget -- rows per group step shared by the lanes' anchors and drafts
+        // while several lanes decode (0 = the B4 rule: plain rows); the acceptance weighting; the pipe's lanes per group (0 = AUTO)
+        b->serve.draft_budget = kMimo26DraftBudgetDefault;
+        if (const char* v = std::getenv("IE_MIMO26_DRAFT_BUDGET"); v && *v) b->serve.draft_budget = uint32_t(std::max(0L, std::atol(v)));
+        if (b->serve.draft_budget > Mimo26Forward::kDecodeRows)
+            return "mimo_v2: IE_MIMO26_DRAFT_BUDGET " + std::to_string(b->serve.draft_budget) + " exceeds a group step's " + std::to_string(Mimo26Forward::kDecodeRows) + " rows";
+        if (const char* v = std::getenv("IE_MIMO26_DRAFT_WEIGHT"); v && *v) b->serve.draft_weight = *v == '1';
+        if (const char* v = std::getenv("IE_MIMO26_GROUP_LANES"); v && *v) b->serve.group_lanes = uint32_t(std::max(0L, std::atol(v)));
+        if (!b->dflash) b->serve.draft_budget = 0;
+        // P4 B16 (docs/mimo26/P4_B16_ADAPTIVE_DRAFT.md): adaptive drafting -- at and above this many decoding lanes, plain rows
+        // and no drafter context feeds (0 = no cap: the B5 budget alone)
+        b->serve.draft_max_lanes = kMimo26DraftMaxLanesDefault;
+        if (const char* v = std::getenv("IE_MIMO26_DFLASH_MAX_LANES"); v && *v) b->serve.draft_max_lanes = uint32_t(std::max(0L, std::atol(v)));
+        std::fprintf(stderr, "[mimo26] lanes: %u (lane 0 %u positions, lanes 1..%u %u each; --slot-ctx); requests decode together through the lane pipe, "
+                             "a prefill chunk is %u rows while another lane is busy (IE_MIMO26_MIX_CHUNK) and %u alone; the DFlash drafter drafts for a lane "
+                             "alone as at --parallel 1, and with several decoding %s (docs/mimo26/P4_B4_SERVE.md, P4_B5_DRAFT_BUDGET.md)\n",
+                     n_lanes, opts_.max_ctx, n_lanes - 1, lane_ctx, b->serve.mix_chunk, b->fwd.max_tokens(),
+                     !b->dflash ? "(no drafter)"
+                     : !b->serve.draft_budget ? "not at all: plain rows (IE_MIMO26_DRAFT_BUDGET=0, the B4 rule)"
+                     : b->serve.draft_weight ? "within a budget of rows per group step (IE_MIMO26_DRAFT_BUDGET), split by each lane's acceptance (IE_MIMO26_DRAFT_WEIGHT=1)"
+                                             : "within a budget of rows per group step (IE_MIMO26_DRAFT_BUDGET), an even share per lane");
+        if (b->serve.draft_budget) std::fprintf(stderr, "[mimo26] draft budget %u rows per group step\n", b->serve.draft_budget);
+        if (b->dflash) {
+            if (b->serve.draft_max_lanes)
+                std::fprintf(stderr, "[mimo26] adaptive drafting: with %u or more lanes decoding no lane drafts or feeds the drafter's context "
+                                     "(IE_MIMO26_DFLASH_MAX_LANES; 0 = no cap)\n", std::max<uint32_t>(2, b->serve.draft_max_lanes));
+            else std::fprintf(stderr, "[mimo26] adaptive drafting off (the default; IE_MIMO26_DFLASH_MAX_LANES=5 turns it on): the lanes draft at any count within the budget\n");
+        }
+        if (b->serve.group_lanes) std::fprintf(stderr, "[mimo26] %u lane(s) per group step (IE_MIMO26_GROUP_LANES; 0 = the pipe's AUTO)\n", b->serve.group_lanes);
+    }
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     std::string res = "{\"arch\":\"mimo_v2\",\"cards\":" + std::to_string(devs.size()) + ",\"capacity\":" + std::to_string(opts_.max_ctx) +
                       ",\"load_s\":" + std::to_string(int(s)) + ",\"vram_gb\":[";
@@ -450,7 +498,6 @@ std::string Engine::mimo26_load(const std::string& dir) {
     for (size_t c = 0; c < devs.size(); ++c) std::fprintf(stderr, " %u/%u", b->fwd.card_static(c), b->fwd.card_pinned(c));
     std::fprintf(stderr, "\n");
     arch_ = ModelArch::kMimo26;
-    opts_.parallel = 1;
     mimo26_ = std::move(b);
     return {};
 }
@@ -674,7 +721,526 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
     return r;
 }
 
+// ---- P4 B4: several requests at once on the lanes (docs/mimo26/P4_B4_SERVE.md) --------------------------------------------
+// --parallel N > 1. mimo26_run_ids above stays the --parallel 1 engine, byte for byte. Here every request owns one lane; the
+// lane pipe (Mimo26Forward::pipe_*, B2/B3) runs the steps -- decode groups of up to kDecodeRows rows across lanes, a prefill
+// chunk alone; the pipe's done callback, on the last card's stage thread (serve_done), samples the lane's rows on the host,
+// commits ids to the lane's outbox and submits the lane's next step; the request thread takes the SERIAL TURN (the pipe
+// stopped) for the prefix step and the prompt-end snapshot, and otherwise only consumes its outbox. Drafter rule: a lane drafts
+// with DFlash exactly as at --parallel 1 while it is the ONLY lane decoding (B4); with two or more decoding, the draft budget
+// (P4 B5, docs/mimo26/P4_B5_DRAFT_BUDGET.md) shares a group step's rows between the lanes' anchors and their drafts -- budget 0
+// is B4's plain one-row steps. Prompt-lookup speculation and images stay --parallel 1 only.
+using SLane = Mimo26Serve::Lane;
+using SPhase = Mimo26Serve::Lane::Phase;
+
+double serve_ms(std::chrono::steady_clock::time_point t0) { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+uint32_t serve_busy(const Mimo26Serve& s) { uint32_t n = 0; for (const auto& l : s.lanes) n += l.busy; return n; }
+uint32_t serve_decoding(const Mimo26Serve& s) { uint32_t n = 0; for (const auto& l : s.lanes) n += l.busy && l.phase == SPhase::kDecode; return n; }
+
+// The lane's request ends: `finish` unless one is set; `lost` = its device state is unusable and is cleared at the release
+void serve_end(Mimo26Serve& s, SLane& l, const std::string& finish, bool lost) {
+    if (l.finish.empty()) l.finish = finish;
+    l.lost = l.lost || lost; l.phase = SPhase::kDone; l.parked = false; l.next = -1;
+    s.cv.notify_all();
+}
+
+// A sampled id into the lane -- the serial path's emit rule: an eos id (unless ignore_eos) ends the lane with "stop" and is not
+// committed; otherwise it goes to the outbox (with the stats of the sample that produced it, for ie_vitals) and the repetition
+// window, and the lane ends with "length" at max_new. True while the lane goes on.
+bool serve_commit(Mimo26Bundle& b, SLane& l, int32_t id, const Ds41SampleStats& st) {
+    if (!l.ignore_eos && std::find(b.eos.begin(), b.eos.end(), id) != b.eos.end()) { l.finish = "stop"; return false; }
+    ++l.n_new; ++b.serve.tokens;
+    l.outbox.push_back({id, st.has_H, st.H, st.margin});
+    l.recent.push_back(id);
+    if (l.recent.size() > 512) l.recent.erase(l.recent.begin());
+    if (l.n_new >= l.max_new) { l.finish = "length"; return false; }
+    return true;
+}
+
+// (diagnostic, P4 B5 gate c) IE_MIMO26_GAP_LOG=1: every sampled row's pick and the row's top three raw logits, by lane and by the
+// position the row predicts -- a divergence between two served runs of one prompt is then read against the first run's own gaps
+// (the teacher-forced scans' near-tie rule: the other pick in the first run's top 3, within 0.75 of its top logit)
+bool serve_gap_on() { static const bool on = [] { const char* v = std::getenv("IE_MIMO26_GAP_LOG"); return v && *v == '1'; }(); return on; }
+void serve_gap_log(uint32_t li, uint32_t pos, const float* row, uint32_t V, int32_t pick) {
+    if (V < 3) return;
+    uint32_t t[3] = {0, 1, 2};
+    std::sort(t, t + 3, [&](uint32_t a, uint32_t b) { return row[a] > row[b]; });
+    for (uint32_t i = 3; i < V; ++i) {
+        if (row[i] > row[t[0]]) { t[2] = t[1]; t[1] = t[0]; t[0] = i; }
+        else if (row[i] > row[t[1]]) { t[2] = t[1]; t[1] = i; }
+        else if (row[i] > row[t[2]]) t[2] = i;
+    }
+    std::fprintf(stderr, "[mimo26 gap] lane %u pos %u pick %d top1 %u %.6f top2 %u %.6f top3 %u %.6f\n", li, pos, pick, t[0], double(row[t[0]]),
+                 t[1], double(row[t[1]]), t[2], double(row[t[2]]));
+}
+
+// #64 on a lane: a drafter fault costs the drafter, not the request (the lane's target caches are intact)
+void serve_df_fail(Mimo26Bundle& b, SLane& l, uint32_t li, const std::string& what) {
+    std::fprintf(stderr, "[mimo26 dflash] lane %u: drafter fault after %u tokens: %s -- drafting off for the rest of this request, the lane's drafter context reset\n",
+                 li, l.n_new, what.c_str());
+    l.df_on = false; l.df_reason = what;
+    if (b.dflash && b.dflash->select_lane(li).empty()) b.dflash->reset();
+}
+
+// The drafter's context follows every step of a lane: the step's exported rows [p0, p0 + n), `stride` rows per layer. The
+// caller's thread owns the drafter (the last card's stage thread inside the callback; the request thread with the pipe stopped).
+void serve_df_ctx(Mimo26Bundle& b, SLane& l, uint32_t li, const float* feats, uint32_t n, uint32_t p0, uint32_t stride) {
+    if (!l.df_on || !b.dflash || !n) return;
+    // IE_MIMO26_DF_FEED=0: a lane's decode steps feed the drafter's context only while the lane is the one decoding (the feed is a
+    // drafter GEMV on the last card per lane per step); when the lane is alone again, its context restarts at that position (the
+    // drafter's gap rule: fewer accepted drafts at first, never a wrong token). Default 1: every step of every lane feeds it.
+    // With a draft budget (B5) the lanes draft while several decode, so their contexts always follow.
+    static const bool feed_always = [] { const char* v = std::getenv("IE_MIMO26_DF_FEED"); return !(v && *v == '0'); }();
+    if (!feed_always && !b.serve.draft_budget && l.phase == SPhase::kDecode && serve_decoding(b.serve) > 1) return;
+    // P4 B16: with IE_MIMO26_DFLASH_MAX_LANES lanes decoding or more no lane drafts, so a decode step does not feed the context
+    // either; the lane is marked (df_gap) and drafts nothing until a later step's feed restarts its context there (the gap rule)
+    if (l.phase == SPhase::kDecode && !mimo26_lanes_draft(serve_decoding(b.serve), b.serve.draft_max_lanes)) {
+        l.df_gap = true; ++b.serve.df_feed_skipped;
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string e = b.dflash->select_lane(li);
+    if (e.empty()) { try { e = b.dflash->add_context(feats, n, p0, stride); } catch (const std::exception& x) { e = std::string("dflash: ") + x.what(); } }
+    if (!e.empty()) serve_df_fail(b, l, li, e);
+    else l.df_gap = false;
+    l.dfctx_ms += serve_ms(t0);
+}
+
+// P4 B5: the drafts lane li offers in its next step while n_dec >= 2 lanes decode, within the draft budget (rows per group step).
+// The groups hold the pipe's lanes per group g (IE_MIMO26_GROUP_LANES, else its AUTO: ceil(decoding / cards)). Even (the default):
+// every lane floor(budget / g) rows -- its anchor and the rest drafts. Weighted (IE_MIMO26_DRAFT_WEIGHT=1), inside a done callback:
+// the rows of the group being answered (its lanes' even shares, at most the budget) less what its earlier lanes resubmitted, split
+// between this lane and the group's later lanes by their acceptance (mimo26_draft_k_weighted) -- so rows a lane's drafter cut
+// leaves go to the lanes after it, and every group stays within the budget. Outside a callback (a turn's release) the even share.
+uint32_t serve_draft_k(Mimo26Bundle& b, const SLane& l, uint32_t li, uint32_t n_dec) {
+    const Mimo26Serve& s = b.serve;
+    const uint32_t nc = std::max<uint32_t>(1, uint32_t(b.fwd.n_cards()));
+    const uint32_t g = s.group_lanes ? s.group_lanes : std::max<uint32_t>(1, (n_dec + nc - 1) / nc);
+    const uint32_t even = mimo26_draft_k_even(s.draft_budget, g, b.dflash_k);
+    if (!s.draft_weight) return even;
+    const std::vector<uint32_t>& G = b.fwd.pipe_cb_lanes();
+    const auto it = std::find(G.begin(), G.end(), li);
+    if (it == G.end()) return even;
+    const uint32_t total = std::min<uint32_t>(s.draft_budget, (s.draft_budget / g) * uint32_t(G.size()));
+    uint32_t pool = total > s.cb_used ? total - s.cb_used : 0;
+    std::vector<double> acc{mimo26_draft_acc(l.acc_kept, l.acc_miss)};
+    for (auto j = it + 1; j != G.end(); ++j) {   // the group's later lanes that will resubmit (their callbacks run next)
+        const SLane& o = s.lanes[*j];
+        if (!o.busy || o.phase != SPhase::kDecode || o.want_stop) continue;
+        if (o.df_on && !o.df_gap) acc.push_back(mimo26_draft_acc(o.acc_kept, o.acc_miss));
+        else if (pool) --pool;                   // (a lane without its drafter keeps its anchor row only)
+    }
+    return mimo26_draft_k_weighted(pool, acc.data(), uint32_t(acc.size()), b.dflash_k);
+}
+
+// The lane's next decode step: its next id, plus the DFlash drafts -- while it is the only lane decoding exactly as at --parallel 1
+// (the B4 rule: dflash_k drafts), and while several decode the draft budget's share (P4 B5; budget 0: none, the B4 rule)
+void serve_prepare_decode(Mimo26Bundle& b, SLane& l, uint32_t li) {
+    Mimo26Serve& s = b.serve;
+    l.rows.assign(1, l.next);
+    if (!l.df_on || !b.dflash || l.df_gap) return;   // (B16: a skipped feed -- no drafts until the context is fed again)
+    const uint32_t n_dec = serve_decoding(s);
+    uint32_t k = b.dflash_k;
+    if (n_dec != 1) {
+        if (!s.draft_budget || !mimo26_lanes_draft(n_dec, s.draft_max_lanes)) return;   // (B16: adaptive drafting)
+        if (!(k = serve_draft_k(b, l, li, n_dec))) return;
+    }
+    std::vector<int32_t> d;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::string e = b.dflash->select_lane(li);
+    if (e.empty()) { try { e = b.dflash->draft(l.next, k, d, b.dflash_minp); } catch (const std::exception& x) { e = std::string("dflash: ") + x.what(); } }
+    const double ms = serve_ms(t0);
+    l.draft_ms += ms; s.df_ms += ms; ++s.df_calls;
+    if (n_dec != 1) { ++s.df_shared; ++l.shared_passes; }
+    if (!e.empty()) { serve_df_fail(b, l, li, e); return; }
+    if (d.size() > l.max_new - l.n_new) d.resize(l.max_new - l.n_new);
+    l.rows.insert(l.rows.end(), d.begin(), d.end());
+}
+
+// The lane's step into the running pipe (mu held): its decode rows, or its next prefill chunk -- mix_chunk rows while another
+// lane is busy or a request waits for the turn (the design's v1 mixing rule: one chunk, one decode step, in turns), else the
+// forward's full chunk. mix_chunk defaults to the full chunk (no cap; the 512-row cap measured worse, docs/mimo26/P4_B4_SERVE.md).
+// A refused submit ends the request (the pipe refuses everything after a stage error).
+void serve_submit(Mimo26Bundle& b, SLane& l, uint32_t li) {
+    Mimo26Serve& s = b.serve;
+    l.parked = false; l.t_sub = std::chrono::steady_clock::now();
+    std::string e;
+    if (l.phase == SPhase::kPrefill) {
+        const uint32_t left = uint32_t(l.prompt.size()) - l.prefill_at;
+        const uint32_t cap = (serve_busy(s) > 1 || s.turn_waiters) ? s.mix_chunk : b.fwd.max_tokens();
+        l.pend = std::min(left, cap); ++l.chunks;
+        e = b.fwd.pipe_submit(li, l.prompt.data() + l.prefill_at, l.pend, l.prefill_at, false);
+    } else {
+        l.pend = 0;
+        e = b.fwd.pipe_submit(li, l.rows.data(), uint32_t(l.rows.size()), b.fwd.lane_pos(li), l.rows.size() > 1);
+    }
+    if (!e.empty()) serve_end(s, l, "error: mimo_v2 lane " + std::to_string(li) + ": " + e, true);
+}
+
+// The pipe's done callback (the last card's stage thread): a prefill chunk landed, or a decode step's rows are sampled here.
+void serve_done(Mimo26Bundle& b, uint32_t li, const std::vector<float>& logits, const float* feats, uint32_t frows) {
+    Mimo26Serve& s = b.serve;
+    std::lock_guard<std::mutex> lk(s.mu);
+    SLane& l = s.lanes[li];
+    const std::vector<uint32_t>& G = b.fwd.pipe_cb_lanes();   // (B5) the group this step ran in
+    if (s.draft_weight && (G.empty() || G.front() == li)) s.cb_used = 0;   // (weighted) a new group: none of its rows resubmitted yet
+    if (!l.busy || l.phase == SPhase::kDone) return;
+    const auto t_cb = std::chrono::steady_clock::now();
+    struct CbTime { SLane& l; std::chrono::steady_clock::time_point t0; ~CbTime() { l.cb_ms += serve_ms(t0); } } cb_time{l, t_cb};
+    const double step = serve_ms(l.t_sub);
+    // (diagnostic) IE_MIMO26_STEP_TRACE=1: every step's time, submit to callback, and how long after the pipe's latest start or
+    // resume it landed -- the step times around the serial turns (docs/mimo26/P4_B4_SERVE.md)
+    static const bool trace = [] { const char* v = std::getenv("IE_MIMO26_STEP_TRACE"); return v && *v == '1'; }();
+    if (trace) std::fprintf(stderr, "[mimo26 step] lane %u %s %zu row(s) %.1f ms, %.0f ms into pipe run %llu, %u decoding\n", li,
+                            l.phase == SPhase::kPrefill ? "prefill" : "decode", l.phase == SPhase::kPrefill ? size_t(l.pend) : l.rows.size(), step,
+                            serve_ms(s.run_t0), (unsigned long long)s.runs, serve_decoding(s));
+    if (l.phase == SPhase::kPrefill) {
+        const uint32_t n = l.pend, at0 = l.prefill_at;
+        serve_df_ctx(b, l, li, feats, frows, at0 + n - frows, frows);
+        l.live.insert(l.live.end(), l.prompt.begin() + at0, l.prompt.begin() + at0 + n);
+        l.prefill_at += n;
+        if (l.prefill_at < l.prompt.size()) {
+            if (l.want_stop) serve_end(s, l, "abort", false);           // the client left during the prompt
+            else if (s.pause || s.stopping) l.parked = true;
+            else serve_submit(b, l, li);
+            s.cv.notify_all();                                          // (the request thread's liveness probe)
+            return;
+        }
+        l.first_logits = logits;                                        // the prompt's last row, sampled under the turn
+        l.phase = SPhase::kPromptReady;
+        s.cv.notify_all();
+        return;
+    }
+    // a decode step: rows[0] is the lane's anchor (committed already), rows[1..] its drafts; row r's sample judges draft r + 1
+    // (the serial verify loop, exact speculative sampling for a one-hot draft)
+    const uint32_t T = uint32_t(l.rows.size()), V = b.model.config().vocab_size;
+    const uint32_t pos = b.fwd.lane_pos(li) - T;
+    ++s.steps; ++l.steps;
+    if (G.size() > 1) ++s.grouped_steps;
+    s.step_ms = s.steps == 1 ? step : 0.9 * s.step_ms + 0.1 * step;
+    s.rows_per_step = s.steps == 1 ? T : 0.9 * s.rows_per_step + 0.1 * T;
+    uint32_t acc = 0; int32_t nxt = -1; bool ended = false, drop_last = false, rejected = false;
+    Ds41SampleStats st;
+    const auto t_samp = std::chrono::steady_clock::now();   // (diagnostic: the verify loop alone -- the scan, the row copy, the sampler)
+    for (uint32_t r = 0; r < T; ++r) {
+        const float* row = logits.data() + size_t(r) * V;
+        if (const Mimo26Scan sc = mimo26_scan_f32(row, V); sc.non_finite) {   // #74: a target fault -- never sampled from; the caches may hold it
+            std::fprintf(stderr, "[mimo26] lane %u decode: %llu of %u logits non-finite at position %u -- not sampled; the request fails and the lane's caches are cleared%s%s\n",
+                         li, (unsigned long long)sc.non_finite, V, pos + r, l.df_reason.empty() ? "" : "; earlier the drafter refused: ", l.df_reason.c_str());
+            serve_end(s, l, "error: mimo_v2 decode: non-finite logits at position " + std::to_string(pos + r) + (l.df_reason.empty() ? std::string() : " (earlier: " + l.df_reason + ")"), true);
+            return;
+        }
+        l.scratch.assign(row, row + V);
+        const int32_t a = Ds41Generator::sample_row(l.scratch.data(), V, l.recent, l.sp, l.rng, l.vitals ? &st : nullptr);
+        if (serve_gap_on()) serve_gap_log(li, pos + r + 1, row, V, a);
+        if (r + 1 == T || a != l.rows[r + 1]) { nxt = a; rejected = r + 1 < T; break; }
+        ++acc;
+        if (!serve_commit(b, l, a, st)) { ended = true; drop_last = l.finish == "stop"; break; }   // an eos row is not part of the context
+    }
+    l.samp_ms += serve_ms(t_samp);
+    const uint32_t keep = 1 + acc - (drop_last ? 1u : 0u);              // the rows of the anchor and the accepted drafts
+    if (keep < T) if (auto e = b.fwd.pipe_rewind_lane(li, pos + keep); !e.empty()) { serve_end(s, l, "error: mimo_v2 lane " + std::to_string(li) + ": " + e, true); return; }
+    if (keep) serve_df_ctx(b, l, li, feats, keep, pos, frows);
+    l.live.insert(l.live.end(), l.rows.begin(), l.rows.begin() + keep);
+    if (T > 1) {
+        ++l.df_pass; l.df_acc += acc; l.drafts.emplace_back(T - 1, acc);
+        l.acc_kept = 0.75 * l.acc_kept + acc; l.acc_miss = 0.75 * l.acc_miss + (rejected ? 1.0 : 0.0);   // (B5: mimo26_draft_acc)
+        s.df_offered += T - 1; s.df_accepted += acc;
+    }
+    if (!ended) { if (serve_commit(b, l, nxt, st)) l.next = nxt; else ended = true; }
+    if (ended) { serve_end(s, l, l.finish, false); return; }
+    if (l.want_stop) { serve_end(s, l, "abort", false); return; }
+    if (s.pause || s.stopping) { l.parked = true; s.cv.notify_all(); return; }
+    serve_prepare_decode(b, l, li);
+    serve_submit(b, l, li);
+    if (s.draft_weight) s.cb_used += uint32_t(l.rows.size());   // (B5, weighted: this group's rows so far)
+    s.cv.notify_all();
+}
+
+// After a stage error the forward refuses every step until pipe_stop: every running request fails, the lanes' caches are cleared
+void serve_pipe_failed(Mimo26Serve& s, const std::string& e) {
+    std::fprintf(stderr, "[mimo26 lanes] the lane pipe failed: %s -- every running request fails and the lanes' caches are cleared\n", e.c_str());
+    for (auto& l : s.lanes) if (l.busy && l.phase != SPhase::kDone) serve_end(s, l, "error: mimo_v2 pipe: " + e, true);
+}
+
+// The serial turn (lk holds mu): after the current holder; then the pipe is PAUSED -- the callbacks park their lanes at their
+// next completion (pause), pipe_pause waits for the steps in flight; the stage threads stay, and their thread-local oneDNN
+// contexts (the forward's and the drafter's primitives) with them. A stage error stops the pipe (pipe_stop clears it; the next
+// release starts a new one) and fails every lane. IE_MIMO26_PIPE_PAUSE=0 stops the pipe at every turn and starts it again at
+// the release (new stage threads: the 5b71003 behaviour, kept for the A/B in docs/mimo26/P4_B4_SERVE.md).
+void serve_take_turn(Mimo26Bundle& b, std::unique_lock<std::mutex>& lk) {
+    static const bool keep_stages = [] { const char* v = std::getenv("IE_MIMO26_PIPE_PAUSE"); return !(v && *v == '0'); }();
+    Mimo26Serve& s = b.serve;
+    ++s.turn_waiters;
+    s.cv.wait(lk, [&] { return !s.turn_busy; });
+    --s.turn_waiters;
+    s.turn_busy = true;
+    if (s.piping) {
+        s.pause = true;
+        lk.unlock();
+        std::string e = b.fwd.pipe_pause();
+        if (!e.empty() || !keep_stages) { const std::string e2 = b.fwd.pipe_stop(); if (e.empty()) e = e2; }
+        lk.lock();
+        s.piping = false; s.pause = false;
+        if (!e.empty()) serve_pipe_failed(s, e);
+    }
+    ++s.turns; s.turn_t0 = std::chrono::steady_clock::now();
+}
+
+// Releases the turn: the parked lanes' steps (the drafts prepared first, while the pipe is paused and the drafter is this
+// thread's) go into the resumed pipe (a new one when none is paused: the first request, or after a stage error)
+void serve_release_turn(Mimo26Bundle& b, std::unique_lock<std::mutex>& lk) {
+    Mimo26Serve& s = b.serve;
+    std::vector<uint32_t> due;
+    for (uint32_t li = 0; li < s.lanes.size(); ++li) {
+        SLane& l = s.lanes[li];
+        if (!l.busy || !l.parked) continue;
+        if (l.want_stop) { serve_end(s, l, "abort", false); continue; }
+        due.push_back(li);
+    }
+    if (!due.empty() && !s.stopping) {
+        for (uint32_t li : due) if (s.lanes[li].phase == SPhase::kDecode) serve_prepare_decode(b, s.lanes[li], li);
+        // (B5: a group holds at most the draft budget's rows -- 0 = the pipe's kDecodeRows, the B4 pipe)
+        const std::string e = b.fwd.pipe_paused() ? b.fwd.pipe_resume()
+            : b.fwd.pipe_start([&b](uint32_t li, const std::vector<float>& lg, const float* f, uint32_t n) { serve_done(b, li, lg, f, n); },
+                               s.group_lanes, s.draft_budget);
+        if (!e.empty()) {
+            for (uint32_t li : due) serve_end(s, s.lanes[li], "error: mimo_v2 pipe: " + e, true);
+        } else {
+            s.piping = true; ++s.runs; s.run_t0 = std::chrono::steady_clock::now();
+            for (uint32_t li : due) serve_submit(b, s.lanes[li], li);
+        }
+    }
+    (void)lk;
+    s.paused_ms += serve_ms(s.turn_t0);
+    s.turn_busy = false;
+    s.cv.notify_all();
+}
+
+// A stage error whose group ran no callback (a lone failing lane) is seen from the request threads' waits
+void serve_poll_pipe(Mimo26Bundle& b, std::unique_lock<std::mutex>& lk) {
+    if (!b.serve.piping || b.fwd.pipe_error().empty()) return;
+    serve_take_turn(b, lk);
+    serve_release_turn(b, lk);
+}
+
+// The lane for a prompt (the turn held), by mimo26_choose_lane (include/ie/mimo26_host_rules.hpp) among the idle lanes it fits
+// (ids < cap): first the lanes that leave its reply room -- min(max_tokens, a quarter of the lane) past the prompt; within
+// them the one whose state serves the most of the prompt (the prefix cache's reading of the lane, with the forward selected
+// on it) when that is at least the cache's min_tokens (1,024: below it, the prefill saved is not worth cutting or evicting a
+// conversation -- an EMPTY lane comes first); then the smallest capacity (short prompts leave lane 0 to the long ones); then
+// the least recently released. -1 = none fits now.
+int serve_choose(Mimo26Bundle& b, const std::vector<int32_t>& ids, uint32_t max_tokens) {
+    Mimo26Serve& s = b.serve;
+    std::vector<Mimo26LaneView> v(s.lanes.size());
+    for (uint32_t li = 0; li < s.lanes.size(); ++li) {
+        const SLane& l = s.lanes[li];
+        v[li].idle = !l.busy; v[li].occupied = !l.live.empty(); v[li].cap = l.cap; v[li].tick = l.tick;
+        if (l.busy || l.cap <= ids.size() || !b.prefix_reuse || l.live.empty()) continue;
+        std::string e = b.fwd.select_lane(li);
+        if (e.empty() && b.dflash) e = b.dflash->select_lane(li);
+        if (e.empty()) v[li].match = b.cache.servable(l.live, ids);
+    }
+    return mimo26_choose_lane(v, uint32_t(ids.size()), max_tokens, b.cache.options().min_tokens);
+}
+
+// A lost lane (the turn held): its caches, its drafter context and its prefix bookkeeping are forgotten
+void serve_clear_lane(Mimo26Bundle& b, SLane& l, uint32_t li) {
+    if (b.fwd.select_lane(li).empty()) b.fwd.reset();
+    if (b.dflash && b.dflash->select_lane(li).empty()) b.dflash->reset();
+    b.cache.live_lost();
+    l.live.clear(); l.lost = false;
+}
+
+GenerateResult mimo26_run_lanes(Mimo26Bundle& b, const std::vector<int32_t>& ids, const SamplingParams& sp, const TokenCallback& on_token,
+                                bool chat, bool thinking, const std::string& tools_json) {
+    GenerateResult r;
+    kmp_set_blocktime(0);
+    Mimo26Serve& s = b.serve;
+    VitalsWindow* const vit = sp.vitals;
+    if (vit) vit->active = true;
+    if (chat) r.tool_calls_json = "[]";
+    r.prompt_tokens = uint32_t(ids.size());
+    if (ids.empty()) { r.finish_reason = "error: empty prompt"; return r; }
+    for (int32_t id : ids) if (id < 0) { r.finish_reason = "error: mimo_v2 image input: images are served at --parallel 1 only (P4 B4)"; return r; }
+    uint32_t cap_max = 0;
+    for (const auto& l : s.lanes) cap_max = std::max(cap_max, l.cap);
+    if (ids.size() >= cap_max) { r.finish_reason = "context_length_exceeded"; return r; }
+    const auto t_pf = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point t_dec{};
+
+    std::unique_lock<std::mutex> lk(s.mu);
+    // 1. a lane, chosen under the serial turn; a prompt only lane 0 fits waits for lane 0
+    int li = -1;
+    for (;;) {
+        s.cv.wait(lk, [&] { if (s.stopping) return true; for (const auto& l : s.lanes) if (!l.busy && l.cap > ids.size()) return true; return false; });
+        if (s.stopping) { r.finish_reason = "abort"; return r; }
+        serve_take_turn(b, lk);
+        li = serve_choose(b, ids, sp.max_tokens);
+        if (li >= 0) break;
+        serve_release_turn(b, lk);
+    }
+    const uint32_t lane = uint32_t(li);
+    SLane& l = s.lanes[lane];
+    l.busy = true; l.phase = SPhase::kPrefill; l.finish.clear(); l.want_stop = false; l.lost = false; l.parked = false;
+    l.outbox.clear(); l.drafts.clear(); l.first_logits.clear(); l.rows.clear(); l.pend = 0; l.steps = 0; l.chunks = 0;
+    l.df_on = b.dflash != nullptr; l.df_pass = l.df_acc = 0; l.df_reason.clear(); l.cb_ms = l.samp_ms = l.dfctx_ms = l.draft_ms = 0;
+    l.acc_kept = 4.0; l.acc_miss = 1.0; l.shared_passes = 0;   // (B5: the acceptance prior, 0.8)
+    l.vitals = vit != nullptr;
+    l.sp = Ds41SampleParams{}; l.sp.temperature = sp.temperature; l.sp.top_k = sp.top_k; l.sp.top_p = sp.top_p; l.sp.min_p = sp.min_p;
+    l.sp.repeat_penalty = sp.repeat_penalty; l.sp.repeat_window = sp.repeat_window;
+    l.sp.seed = sp.seed ? sp.seed : uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
+    l.rng = l.sp.seed; l.ignore_eos = sp.ignore_eos;
+    l.recent.assign(ids.end() - std::ptrdiff_t(std::min<size_t>(ids.size(), 512)), ids.end());
+    const uint32_t room = l.cap - uint32_t(ids.size());
+    l.max_new = sp.max_tokens == 0 ? room : std::min(sp.max_tokens, room); l.n_new = 0;
+    auto release_lane = [&] {   // (mu held) the lane goes idle with its live ids; the LRU order follows the release
+        l.busy = false; l.phase = SPhase::kIdle; l.tick = ++s.tick;
+        l.outbox.clear(); l.drafts.clear(); l.first_logits.clear(); l.first_logits.shrink_to_fit(); l.prompt.clear(); l.prompt.shrink_to_fit();
+        s.cv.notify_all();
+    };
+    // 2. the prefix step on the lane (the turn held): what serves the prompt -- the lane's live state, a host slot swapped in
+    // (the lane's conversation kept in one first), or its prompt-end snapshot -- then the caches cut there
+    {
+        std::string e = b.fwd.select_lane(lane);
+        if (e.empty() && b.dflash) e = b.dflash->select_lane(lane);
+        uint32_t L = 0; std::string source;
+        if (e.empty() && b.prefix_reuse) e = b.cache.prepare(ids, l.live, L, source);
+        if (!e.empty()) {
+            serve_clear_lane(b, l, lane);
+            r.finish_reason = "error: mimo_v2 prefix cache: " + e;
+            release_lane(); serve_release_turn(b, lk);
+            return r;
+        }
+        b.fwd.rewind(L); l.live.resize(L);
+        if (L == 0) b.fwd.reset();
+        if (b.dflash) { if (L == 0) b.dflash->reset(); else b.dflash->rewind(L); }
+        r.restore_ms = serve_ms(t_pf); r.cached_tokens = L; r.cache_source = b.prefix_reuse ? source : "";
+        l.prompt = ids; l.prefill_at = L;
+        l.parked = true;   // the first chunk is due: the turn's release submits it
+    }
+    serve_release_turn(b, lk);
+    // 3. the prompt runs through the pipe in chunks; after each one the server's liveness probe (an empty fragment) -- a client
+    // that left ends the request at the next completion
+    uint32_t seen = l.prefill_at;
+    while (l.phase == SPhase::kPrefill) {
+        s.cv.wait_for(lk, std::chrono::seconds(1));
+        if (l.phase != SPhase::kPrefill) break;
+        if (l.prefill_at != seen && on_token && !l.want_stop) {
+            seen = l.prefill_at;
+            lk.unlock();
+            const bool alive = on_token(std::string_view{});
+            lk.lock();
+            if (!alive) l.want_stop = true;
+        }
+        serve_poll_pipe(b, lk);
+    }
+    // 4. the prompt's end (the turn held): the snapshot (#87) and the first token
+    if (l.phase == SPhase::kPromptReady) {
+        serve_take_turn(b, lk);
+        if (l.phase == SPhase::kPromptReady) {
+            std::string e = b.fwd.select_lane(lane);
+            if (e.empty() && b.dflash) e = b.dflash->select_lane(lane);
+            if (e.empty()) e = b.cache.prompt_done(uint32_t(ids.size()));
+            if (!e.empty()) serve_end(s, l, "error: mimo_v2 prefix cache: " + e, true);
+            else {
+                r.prefill_ms = serve_ms(t_pf);
+                const Mimo26Scan sc = mimo26_scan_f32(l.first_logits.data(), l.first_logits.size());
+                if (sc.non_finite) {
+                    std::fprintf(stderr, "[mimo26] lane %u prefill: %llu of %zu logits non-finite at position %zu -- not sampled; the request fails and the lane's caches are cleared\n",
+                                 lane, (unsigned long long)sc.non_finite, l.first_logits.size(), ids.size() - 1);
+                    serve_end(s, l, "error: mimo_v2 prefill: non-finite logits at position " + std::to_string(ids.size() - 1), true);
+                } else {
+                    Ds41SampleStats st;
+                    std::vector<float> raw;   // (diagnostic, IE_MIMO26_GAP_LOG: the sampler may change its copy's order; the row as it came)
+                    if (serve_gap_on()) raw = l.first_logits;
+                    const int32_t id = Ds41Generator::sample(l.first_logits, l.recent, l.sp, l.rng, l.vitals ? &st : nullptr);
+                    if (serve_gap_on()) serve_gap_log(lane, uint32_t(ids.size()), raw.data(), uint32_t(raw.size()), id);
+                    t_dec = std::chrono::steady_clock::now();
+                    if (!serve_commit(b, l, id, st)) serve_end(s, l, l.finish, false);
+                    else { l.next = id; l.phase = SPhase::kDecode; l.parked = true; }
+                }
+            }
+            l.first_logits.clear(); l.first_logits.shrink_to_fit();
+        }
+        serve_release_turn(b, lk);
+    }
+    // 5. the outcome: ids as they land in the outbox, decoded to text and streamed (the callback declining cancels the lane)
+    std::string text, pending;
+    bool aborted = false;
+    std::vector<Mimo26Serve::Tok> got; std::vector<std::pair<uint32_t, uint32_t>> gd;
+    for (;;) {
+        s.cv.wait_for(lk, std::chrono::seconds(1), [&] { return !l.outbox.empty() || !l.drafts.empty() || l.phase == SPhase::kDone; });
+        got.swap(l.outbox); gd.swap(l.drafts);
+        const bool done = l.phase == SPhase::kDone;
+        if (!got.empty() || !gd.empty()) {
+            lk.unlock();
+            for (const auto& t : got) {
+                ++r.completion_tokens;
+                if (vit) vit->add_token(t.has_H, t.H, t.margin);
+                pending += b.tok.decode(std::vector<int32_t>{t.id});
+                const size_t d = utf8_complete(pending);
+                if (d) {
+                    const std::string piece = pending.substr(0, d);
+                    pending.erase(0, d);
+                    text += piece;
+                    if (!aborted && on_token && !on_token(piece)) aborted = true;
+                }
+            }
+            for (const auto& [off, acc] : gd) if (vit) vit->add_draft(off, acc);
+            got.clear(); gd.clear();
+            lk.lock();
+            if (aborted) l.want_stop = true;
+        }
+        if (done) break;
+        serve_poll_pipe(b, lk);
+    }
+    // 6. the finish
+    r.finish_reason = aborted ? "abort" : (l.finish.empty() ? "length" : l.finish);
+    if (t_dec.time_since_epoch().count()) r.decode_ms = serve_ms(t_dec);
+    if (b.dflash) std::fprintf(stderr, "[mimo26 dflash] lane %u: %u passes, %u drafts accepted (%.2f per pass); %u draft calls while other lanes decoded; "
+                                       "acceptance estimate %.2f%s\n", lane, l.df_pass, l.df_acc,
+                               l.df_pass ? double(l.df_acc) / l.df_pass : 0.0, l.shared_passes, mimo26_draft_acc(l.acc_kept, l.acc_miss),
+                               l.df_on ? "" : "; OFF after a drafter fault");
+    std::fprintf(stderr, "[mimo26 lanes] lane %u: prompt %zu (%u cached%s%s) in %u chunk(s), %.0f ms; %u tokens (reply cap %u) in %u steps; %s; %u lane(s) busy; "
+                         "callback %.0f ms (sampling %.0f, drafter context %.0f); drafting %.0f ms (in the callback or at a turn's release); %llu turns so far, "
+                         "the pipe paused %.0f ms for them\n", lane, ids.size(),
+                 r.cached_tokens, r.cache_source.empty() ? "" : " from ", r.cache_source.c_str(), l.chunks, r.prefill_ms, r.completion_tokens, l.max_new, l.steps,
+                 r.finish_reason.c_str(), serve_busy(s), l.cb_ms, l.samp_ms, l.dfctx_ms, l.draft_ms, (unsigned long long)s.turns, s.paused_ms);
+    if (l.lost) { serve_take_turn(b, lk); serve_clear_lane(b, l, lane); serve_release_turn(b, lk); }
+    release_lane();
+    lk.unlock();
+    if (!pending.empty()) { text += pending; if (on_token && !aborted) on_token(pending); }
+    if (!chat) { r.text = text; return r; }
+    const Mimo26Parsed pc = mimo26_parse_completion(text, thinking, tools_json);
+    if (pc.repaired || pc.malformed_call)
+        std::fprintf(stderr, "[mimo26] tool calls: %u parameter(s) repaired (no </parameter>, or an enum value's stray quote)%s\n", pc.repaired,
+                     pc.malformed_call ? "; an unparseable call block was returned as text" : "");
+    r.reasoning_content = pc.reasoning;
+    r.text = pc.content;
+    if (!pc.tool_calls_json.empty()) { r.tool_calls_json = pc.tool_calls_json; if (r.finish_reason == "stop") r.finish_reason = "tool_calls"; }
+    return r;
+}
+
 }  // namespace
+
+std::string Engine::mimo26_serving_status_json() const {
+    if (!mimo26_ || mimo26_->serve.lanes.empty()) return {};
+    Mimo26Serve& s = mimo26_->serve;
+    std::lock_guard<std::mutex> lk(s.mu);
+    const auto [gate1, gaten] = mimo26_->fwd.pipe_gate_ms();
+    char buf[768];
+    // (B5) draft_*: the draft passes since load (every lane), their ms, the drafts offered / kept, and the passes with other lanes decoding
+    std::snprintf(buf, sizeof buf, "{\"lanes_active\":%u,\"decoding\":%u,\"tokens\":%llu,\"step_ms\":%.1f,\"rows_per_step\":%.2f,\"turns\":%llu,\"paused_ms\":%.0f,"
+                  "\"gate_ms_1\":%.1f,\"gate_ms_n\":%.1f,\"draft_budget\":%u,\"draft_calls\":%llu,\"draft_ms\":%.0f,\"draft_offered\":%llu,"
+                  "\"draft_accepted\":%llu,\"draft_shared\":%llu,\"decode_steps\":%llu,\"grouped_steps\":%llu,\"draft_max_lanes\":%u,"
+                  "\"draft_feeds_skipped\":%llu}", serve_busy(s), serve_decoding(s),
+                  (unsigned long long)s.tokens, s.step_ms, s.rows_per_step,
+                  (unsigned long long)s.turns, s.paused_ms, gate1, gaten, s.draft_budget, (unsigned long long)s.df_calls, s.df_ms,
+                  (unsigned long long)s.df_offered, (unsigned long long)s.df_accepted, (unsigned long long)s.df_shared,
+                  (unsigned long long)s.steps, (unsigned long long)s.grouped_steps, s.draft_max_lanes, (unsigned long long)s.df_feed_skipped);
+    return buf;
+}
 
 GenerateResult Engine::mimo26_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
                                    bool enable_thinking, std::string_view tools_json, std::string_view reasoning_effort) {
@@ -688,7 +1254,9 @@ GenerateResult Engine::mimo26_chat(std::span<const ChatTurn> turns, const Sampli
     for (const auto& t : turns) {
         std::string content = t.content_without_tool_calls.value_or(t.content);
         if (!t.images.empty()) {
-            if (!b.vis_ready) { r.finish_reason = "error: mimo_v2 image input: " + b.vis_error; return r; }
+            if (auto why = mimo26_vision_refusal(b.vis_ready, b.vis_error, uint32_t(b.serve.lanes.size())); !why.empty()) {
+                r.finish_reason = "error: mimo_v2 image input: " + why; return r;
+            }
             content = mimo26_place_images(std::move(content), t.images.size());
             for (const auto& bytes : t.images) {
                 Img im; im.bytes = &bytes; im.hash = mimo26_image_hash(bytes);
@@ -709,6 +1277,8 @@ GenerateResult Engine::mimo26_chat(std::span<const ChatTurn> turns, const Sampli
         std::ofstream(std::string(dd) + "/req_" + std::to_string(n_req++) + ".txt", std::ios::binary) << prompt;
     }
     std::vector<int32_t> ids = b.tok.encode(prompt, /*allow_special=*/true);
+    if (!b.serve.lanes.empty())   // P4 B4: --parallel > 1 (images were refused above: the pipe runs text positions only)
+        return mimo26_run_lanes(b, ids, sp, on_token, /*chat=*/true, enable_thinking, std::string(tools_json));
     if (images.empty()) return mimo26_run_ids(b, ids, sp, on_token, /*chat=*/true, enable_thinking, std::string(tools_json));
     // the processor's expansion: each image's one <|image_pad|> becomes its N image ids (negative: the forward takes
     // their rows from the provider, the prefix cache matches them like any other ids)
@@ -749,6 +1319,7 @@ GenerateResult Engine::mimo26_chat(std::span<const ChatTurn> turns, const Sampli
 
 GenerateResult Engine::mimo26_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token) {
     const auto ids = mimo26_->tok.encode(prompt, /*allow_special=*/true);
+    if (!mimo26_->serve.lanes.empty()) return mimo26_run_lanes(*mimo26_, ids, sp, on_token, /*chat=*/false, false, {});   // P4 B4
     return mimo26_run_ids(*mimo26_, ids, sp, on_token, /*chat=*/false, false, {});
 }
 

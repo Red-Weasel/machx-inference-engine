@@ -14,7 +14,9 @@
 // ~70-90 MiB of pageable RAM whatever the context, reused request to request, and OUTSIDE the byte budget, like the
 // 2 x 64 MiB pinned bounces. Every transfer goes through a pinned bounce allocated in the queue's own context
 // (a pageable or foreign-context pointer turns a SYCL memcpy into a minutes-long stall -- deepseek41_prefix_cache.cpp).
-// One request at a time (the engine's parallel is 1 for this arch): no locking.
+// No locking: one request at a time at --parallel 1, and under the engine's serial turn (Mimo26Serve) at --parallel > 1.
+// P4 B1 lanes: prepare / prompt_done / live_lost act on the forward's active lane (select the drafter's to match); the live
+// bookkeeping is per lane, the slots shared. P4 B4: servable() is the lane choice's view of an idle lane.
 #pragma once
 
 #include "ie/mimo26_dflash.hpp"
@@ -38,6 +40,11 @@ public:
         uint32_t min_tokens = 1024;         // a shorter state is not kept; also the continuation slack (mimo26_continues)
         uint32_t swap_margin = 256;         // a slot must serve this many positions more than the live state to be swapped in
         uint32_t snap_margin = 128;         // #87: the prompt-end snapshot serves a divergence up to this far before the prompt's end
+        // P4 B16 (~/ds41_work/p60/mimo_ident/ANALYSIS.md): a reuse shorter than this counts as none (mimo26_reuse_floor) -- the
+        // live state, the prompt-end snapshot and a host slot alike, so a slot swap also needs this many positions. 0 = any
+        // length (--parallel 1, the P3b rule); the engine sets min_tokens at --parallel > 1, where a short reuse moved the
+        // remainder's prefill split and start position with arrival order (batch != solo)
+        uint32_t min_reuse = 0;
     };
     Mimo26PrefixCache() = default;
     ~Mimo26PrefixCache() { free_all(); }
@@ -56,6 +63,9 @@ public:
     // its ids: the caller rewinds / resets to `reused` exactly as for live reuse. `source`: "live", "slot K" or "none".
     // An error leaves the device state undefined: the caller resets the forward and the drafter and calls live_lost().
     std::string prepare(const std::vector<int32_t>& ids, std::vector<int32_t>& live, uint32_t& reused, std::string& source);
+    // P4 B4: how many leading positions of `ids` the ACTIVE lane's state serves without any transfer -- its live ids (under the
+    // rings it still holds) or its prompt-end snapshot: prepare's own reading of the lane, for choosing among idle lanes.
+    uint32_t    servable(const std::vector<int32_t>& live, const std::vector<int32_t>& ids);
     // The prompt has run: the live state's positions [0, prompt_len) are prompt. A slot the request continued is dropped
     // (the live state supersedes it). #87: the prompt-end snapshot is taken (host slots on, prompt_len >= min_tokens,
     // mimo26_prompt_snapshot says one is needed). An error is a failed device-to-host copy or host allocation: the caller fails the request
@@ -114,6 +124,14 @@ private:
     };
     Snap     snap_;
     double   snap_ms_ = 0, snap_load_ms_ = 0;
+    // P4 B1 lanes (Mimo26Forward::select_lane): the live bookkeeping above -- live_prompt_, live_uses_, drop_id_, snap_ -- is
+    // the ACTIVE lane's (the forward's lane(), with the drafter on the same lane); every other lane's waits here and
+    // sync_lane() swaps it in at each entry point (a no-op with one lane). The host slots are shared: a slot kept from one
+    // lane serves any lane whose capacity holds it.
+    struct LaneLive { uint32_t prompt = 0, uses = 0; uint64_t drop_id = 0; Snap snap; };
+    std::vector<LaneLive> lanes_;
+    uint32_t lane_ = 0;
+    std::string sync_lane();
 };
 
 }  // namespace ie

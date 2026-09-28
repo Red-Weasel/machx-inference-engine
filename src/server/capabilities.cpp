@@ -3,7 +3,10 @@
 #include "ie/gguf.hpp"
 #include "ie/reasoning.hpp"
 #include "ie/glm5_memory_policy.hpp"
+#include "ie/openai_proto.hpp"
+#include "ie/recommended_sampling.hpp"
 #include "nlohmann/json.hpp"
+#include <cmath>
 #include <cstdlib>
 #include <stdexcept>
 namespace ie {
@@ -36,7 +39,7 @@ std::string server_capabilities_json(const std::string& model_path) {
     using nlohmann::json;
     ModelArch arch = ModelArch::kUnknown;
     std::string name;
-    std::string chat_template;
+    std::string chat_template, model_name, base_repo;
     if (!model_path.empty() && Engine::ds41_dir(model_path)) { arch = ModelArch::kDeepSeek41; name = "deepseek_v41"; }
     else if (!model_path.empty() && Engine::mimo26_dir(model_path)) { arch = ModelArch::kMimo26; name = "mimo_v2"; }
     else if (!model_path.empty()) {
@@ -45,6 +48,9 @@ std::string server_capabilities_json(const std::string& model_path) {
         arch = detect_arch(g);
         if (auto a = g.find_kv("general.architecture")) name = a->as_string();
         if (auto t=g.find_kv("tokenizer.chat_template");t && t->type==GgufValueType::kString)chat_template=t->as_string();
+        // P4 B20: what recommended_sampling matches the exact weights on
+        if (auto t=g.find_kv("general.name");t && t->type==GgufValueType::kString)model_name=t->as_string();
+        if (auto t=g.find_kv("general.base_model.0.repo_url");t && t->type==GgufValueType::kString)base_repo=t->as_string();
     }
     const bool generic = model_path.empty();
     const bool supported = generic || server_supports_arch(arch);
@@ -69,6 +75,14 @@ std::string server_capabilities_json(const std::string& model_path) {
     // and concurrency combinations remain subject to Engine's load validation.
     const bool kv8 = generic || is_dense_arch(arch) || arch == ModelArch::kQwen35Moe ||
         arch == ModelArch::kQwen35Dense || arch == ModelArch::kQwen3Moe;
+    // P4 B20: "defaults" are what a request omitting a field gets in the default mode: IE_SERVE_* env, else the
+    // model's recommended sampling (recommended_sampling.hpp), else the library default. CLI flags are not seen here.
+    const std::optional<Recommendation> rec = generic ? std::nullopt : recommended_sampling(arch, chat_template, model_name, base_repo);
+    oai::ChatRequest resolved = oai::server_defaults_from_environment();
+    oai::apply_recommended(resolved, rec ? &*rec : nullptr);
+    const SamplingParams& sp = resolved.sampling;
+    // 0.95f -> 0.95, not 0.949999988 (through text: icpx's fast math turns a /1e6 into *1e-6, which is not exact)
+    auto r6 = [](double v) { char b[32]; std::snprintf(b, sizeof b, "%.6g", v); return std::strtod(b, nullptr); };
     json j = {
         {"schema_version",1}, {"architecture",name}, {"supported",supported},
         {"memory_planner",server_streams_experts(arch)?"streaming":"resident"},
@@ -81,9 +95,10 @@ std::string server_capabilities_json(const std::string& model_path) {
         {"features",{{"prompt_cache",cache},{"speculative",spec},{"int8_kv",kv8},
                      {"context_shift",false},
                      {"vision",arch==ModelArch::kDeepSeek4 || arch==ModelArch::kQwen4Exp || arch==ModelArch::kDeepSeek41 || arch==ModelArch::kMimo26}}},
-        {"defaults",{{"temperature",0.7},{"top_k",40},{"top_p",0.95},{"min_p",0.0},
-                     {"repeat_penalty",1.0},{"repeat_last_n",64},{"presence_penalty",0.0},
-                     {"frequency_penalty",0.0},{"seed",0},{"max_tokens",16384},
+        {"defaults",{{"temperature",r6(sp.temperature)},{"top_k",sp.top_k},{"top_p",r6(sp.top_p)},{"min_p",r6(sp.min_p)},
+                     {"repeat_penalty",r6(sp.repeat_penalty)},{"repeat_last_n",sp.repeat_window},{"presence_penalty",r6(sp.presence_penalty)},
+                     {"frequency_penalty",r6(sp.frequency_penalty)},{"seed",sp.seed},
+                     {"max_tokens",sp.max_tokens==kMaxTokensUnlimited?0u:sp.max_tokens},
                      {"stop",json::array()},{"thinking",default_thinking},{"threads",0},
                      {"prefill_chunk",256},{"parallel",1},{"slot_ctx",0},{"prompt_cache",cache}}},
         {"notes",json::array({"Architecture support is not a memory-fit or tensor-format guarantee.",
@@ -92,6 +107,30 @@ std::string server_capabilities_json(const std::string& model_path) {
                              "All penalties use the last repeat_last_n prompt/output tokens, up to 512; zero disables penalties.",
                              "CPU threads configure OpenMP expert work; GPU kernels have separate scheduling."})}
     };
+    j["recommended"] = nullptr;
+    if (rec) {
+        // The shape Dream's reader takes (DREAM-179, dream/local/model_defaults.py recommended_modes): the modes as
+        // top-level "thinking" / "instruct" objects with label, when, temp, top_p, top_k, min_p, presence, repeat and
+        // max_output; "effort" as {level: note}; "note"; "source_url". Unstated fields carry the neutral value.
+        auto mode = [&](const RecommendedMode& m, const char* label, bool thinking) {
+            json o{{"label",label},{"when",m.when},{"temp",m.temperature},{"top_p",m.top_p},{"top_k",m.top_k},
+                   {"min_p",m.min_p},{"presence",m.presence_penalty},{"repeat",m.repeat_penalty}};
+            if (thinking && rec->max_reasoning) o["max_output"] = {{"reasoning",rec->max_reasoning},{"answer",rec->max_output}};
+            else if (rec->max_output && (thinking || rec->max_output_instruct)) o["max_output"] = rec->max_output;
+            return o;
+        };
+        json effort = json::object();
+        for (const auto& e : rec->effort) effort[e.level] = e.when;
+        j["recommended"] = {
+            {"model",rec->model},{"source_url",rec->source},
+            {"thinking",mode(rec->thinking,"Thinking",true)},
+            {"instruct",rec->instruct ? mode(*rec->instruct,rec->instruct_label,false) : json(nullptr)},
+            {"default_mode",!resolved.enable_thinking && rec->instruct ? "instruct" : "thinking"},
+            {"effort",effort},{"max_output_note",rec->max_output_note},
+            {"context",rec->context},{"note",rec->note},
+            {"resolution","request > CLI/env > the recommendation for the request's mode > library default; "
+                          "a request or server default of temperature 0 (greedy) takes nothing from it"}};
+    }
     if(reasoning.thinking)j["load"].push_back("thinking");
     if (arch == ModelArch::kMimo26 || arch == ModelArch::kDeepSeek41) {   // the auto expert tier honours a VRAM headroom knob;
         j["load"].push_back("vram_reserve_gib");                              // Dream sends the advertised default EXPLICITLY, so it

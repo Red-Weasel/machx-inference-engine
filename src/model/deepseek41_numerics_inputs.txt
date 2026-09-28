@@ -27,7 +27,10 @@
 #   unlisted: src/engine/ds41_engine.cpp             it chooses options, not arithmetic: the head (logits only, never
 #                                                    cached state), the context capacity, the cache's budgets, the image
 #                                                    plumbing. The expert tail file it enables is verified byte for byte
-#                                                    against the pack path at load (deepseek41_experts.cpp)
+#                                                    against the pack path at load (deepseek41_experts.cpp). P4 B6b: the
+#                                                    lanes' serving path prefills with Ds41Generator::plan_prefill (this
+#                                                    list's deepseek41_generate.cpp) -- run()'s chunks -- and writes no disk
+#                                                    entry from a prefill it chunked otherwise (IE_DS41_MIX_CHUNK)
 #   unlisted: src/core/allocator.cpp                 the vision tower's pinned staging (DeviceAllocator::malloc) and the
 #                                                    P2P probe deepseek4.cpp calls: allocation and topology, no arithmetic
 #   unlisted: src/core/dtype.cpp                     type_info/bytes_for: dtype names in expert_stream.cpp's error messages,
@@ -105,6 +108,7 @@ include/ie/deepseek4_experts.hpp
 include/ie/deepseek4_ops.hpp
 include/ie/dequant_ref.hpp
 include/ie/dp4a.hpp
+include/ie/ds41_serve_rules.hpp
 include/ie/ds41_vision.hpp
 include/ie/ds4_decode_gemv.hpp
 include/ie/ds4_vision.hpp

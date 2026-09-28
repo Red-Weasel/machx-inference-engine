@@ -1,6 +1,7 @@
 // tests/unit/mimo26_host_rules_test.cpp -- the MiMo-V2.6 serving rules that need no device (include/ie/mimo26_host_rules.hpp,
 // docs/mimo26/P7_FIX64_FIX70.md): the ring's slot runs, the servable prefix (the P3b ring rule), the continuation test, the
-// host-slot admission policy (#70) and the drafter's fp16 range check (#64). CPU only, no SYCL:
+// host-slot admission policy (#70), the drafter's fp16 range check (#64), the lane choice (P4 B4) and the image refusal
+// behind /props "vision" (P4 follow-up) the adaptive drafting rule and the lanes' reuse floor (P4 B16). CPU only, no SYCL:
 //   g++ -std=c++20 -O1 -Wall -Wextra -I include tests/unit/mimo26_host_rules_test.cpp src/model/mimo26_host_rules.cpp
 #include "ie/mimo26_host_rules.hpp"
 
@@ -256,6 +257,100 @@ void test_scan() {
     check(t.non_finite == 0 && t.max_at == 2 && t.max_abs == 3.0517578125e-05f, "scan f16: denormals decode exactly (0x0200 = 2^-15)");
 }
 
+// P4 B4 gate note: the lane choice honours the reply budget. Lanes as the gate ran them: --ctx 32768 --parallel 4
+// --slot-ctx 16384 = lane 0 at 32,768 positions, lanes 1-3 at 16,384; min_tokens 1,024.
+void test_choose_lane() {
+    using V = ie::Mimo26LaneView;
+    auto lanes = [] { std::vector<V> v(4); v[0].cap = 32768; for (int i = 1; i < 4; ++i) v[i].cap = 16384; for (auto& l : v) l.idle = true; return v; };
+    auto pick = [](const std::vector<V>& v, uint32_t prompt, uint32_t budget) { return ie::mimo26_choose_lane(v, prompt, budget, 1024); };
+    auto v = lanes();
+    check(pick(v, 15993, 2000) == 0, "lanes: the gate's case -- a 15,993-token prompt with max_tokens 2,000 takes idle lane 0, not a 16,384 lane (391 left)");
+    v[0].occupied = true; v[0].match = 5;
+    check(pick(v, 15993, 2000) == 0, "lanes: ... also when lane 0 holds another conversation (the reply room outranks an empty lane)");
+    v = lanes(); v[0].idle = false;
+    check(pick(v, 15993, 2000) == 1, "lanes: no idle lane leaves the reply room (lane 0 busy): today's rule, the smallest lane (the reply is cut there)");
+    v = lanes();
+    check(pick(v, 1620, 16384) == 1, "lanes: a 1,620-token prompt with the server's default budget (16,384) takes a small lane (room >= a quarter of it)");
+    check(pick(v, 1620, 31000) == 1, "lanes: ... and with a window-sized budget (Dream: window - prompt)");
+    check(pick(v, 1620, 0) == 1, "lanes: ... and unlimited (0)");
+    check(pick(v, 13000, 16384) == 0, "lanes: a 13,000-token prompt leaves 3,384 < 4,096 on a small lane: lane 0");
+    check(pick(v, 12288, 16384) == 1, "lanes: a 12,288-token prompt leaves exactly a quarter (4,096) of a small lane: the small lane");
+    check(pick(v, 16200, 100) == 1, "lanes: a budget smaller than the room left (100 <= 184): the small lane");
+    v = lanes(); v[2].occupied = true; v[2].match = 5000;
+    check(pick(v, 5100, 2000) == 2, "lanes: a big prefix match on a lane that leaves the room beats the empty lanes");
+    v = lanes(); v[1].occupied = true; v[1].match = 15992;
+    check(pick(v, 15993, 2000) == 0, "lanes: the gate's case repeated -- its own lane 1 (match 15,992) leaves 391: lane 0 re-prefills it rather than cut the reply");
+    v[0].idle = false;
+    check(pick(v, 15993, 2000) == 1, "lanes: ... with lane 0 busy, the prefix match decides among the lanes left (lane 1, the reply cut at 391)");
+    v = lanes(); v[0].idle = false;
+    check(pick(v, 17000, 2000) == -1, "lanes: a prompt only lane 0 fits, lane 0 busy: none (the request waits for it)");
+    v = lanes(); v[1].occupied = true; v[1].match = 200;
+    check(pick(v, 2000, 2000) == 2, "lanes: no big match -- an empty lane before one holding a conversation");
+    v = lanes(); v[1].tick = 5; v[2].tick = 3; v[3].tick = 9;
+    check(pick(v, 2000, 2000) == 2, "lanes: equal lanes -- the least recently released (tick 3)");
+    v = lanes(); for (auto& l : v) l.idle = false;
+    check(pick(v, 10, 10) == -1, "lanes: every lane busy: none");
+}
+
+// P4 follow-up: /props "vision" and the image refusal come from one rule. --parallel 1 has no lanes (0); --parallel N, N lanes.
+void test_vision_refusal() {
+    const std::string lanes_only = "images are served at --parallel 1 only (P4 B4)";
+    const std::string off = "vision is disabled (IE_MIMO26_VISION=0)";
+    check(ie::mimo26_vision_refusal(true, "", 0).empty(), "vision: the tower staged, --parallel 1: images are taken");
+    check(ie::mimo26_vision_refusal(true, "", 1).empty(), "vision: ... one lane: taken");
+    check(ie::mimo26_vision_refusal(true, "", 2) == lanes_only, "vision: two lanes: refused, the reason /props shows");
+    check(ie::mimo26_vision_refusal(true, "", 4) == lanes_only, "vision: four lanes: refused");
+    check(ie::mimo26_vision_refusal(false, off, 0) == off, "vision: no tower at --parallel 1: the tower's reason");
+    check(ie::mimo26_vision_refusal(false, off, 2) == off, "vision: no tower at two lanes: the tower's reason comes first");
+}
+
+// P4 B16: adaptive drafting. A lone lane always drafts; with several decoding, only below IE_MIMO26_DFLASH_MAX_LANES.
+void test_lanes_draft() {
+    using ie::mimo26_lanes_draft;
+    check(ie::kMimo26DraftMaxLanesDefault == 0, "adaptive drafting: default off (p4-rel A-B-A: cap 5 was 8 % slower at N=8)");
+    const uint32_t cap = ie::kMimo26DraftMaxLanesTested;
+    bool lone = true;
+    for (uint32_t m = 0; m <= 32; ++m) lone = lone && mimo26_lanes_draft(0, m) && mimo26_lanes_draft(1, m);
+    check(lone, "adaptive drafting: one (or no) lane decoding drafts at every cap 0..32 -- the --parallel 1 shape never changes");
+    bool below = true, at_above = true;
+    for (uint32_t n = 2; n < cap; ++n) below = below && mimo26_lanes_draft(n, cap);
+    for (uint32_t n = cap; n <= 16; ++n) at_above = at_above && !mimo26_lanes_draft(n, cap);
+    check(below, "adaptive drafting: cap 5, 2..4 decoding lanes draft (the B5 budget's 7 / 3 / 3 drafts stay)");
+    check(at_above, "adaptive drafting: cap 5, 5..16 decoding lanes take plain rows (0 drafts, no context feed)");
+    bool nocap = true;
+    for (uint32_t n = 0; n <= 64; ++n) nocap = nocap && mimo26_lanes_draft(n, 0);
+    check(nocap, "adaptive drafting: cap 0 = no cap, every lane count drafts (the B5 rule, byte for byte)");
+    check(mimo26_lanes_draft(1, 1) && !mimo26_lanes_draft(2, 1) && mimo26_lanes_draft(1, 2) && !mimo26_lanes_draft(2, 2),
+          "adaptive drafting: caps 1 and 2 = only a lone lane drafts");
+    check(mimo26_lanes_draft(15, 16) && !mimo26_lanes_draft(16, 16) && mimo26_lanes_draft(16, 17),
+          "adaptive drafting: cap 16 turns drafting off only with all 16 lanes decoding; 17 never at --parallel 16");
+    bool mono = true;   // once off at n lanes, off at every larger count (no flapping inside a cap)
+    for (uint32_t m = 0; m <= 20; ++m)
+        for (uint32_t n = 1; n < 40; ++n) if (!mimo26_lanes_draft(n, m) && mimo26_lanes_draft(n + 1, m)) mono = false;
+    check(mono, "adaptive drafting: monotone in the lane count for every cap 0..20");
+}
+
+// P4 B16 (mimo_ident ANALYSIS): the reuse floor at --parallel > 1 -- a short common prefix (the gate's N = 3 / 8) counts as none
+void test_reuse_floor() {
+    using ie::mimo26_reuse_floor;
+    bool p1 = true;
+    for (uint32_t L : {0u, 1u, 3u, 8u, 1023u, 1024u, 5000u}) p1 = p1 && mimo26_reuse_floor(L, 0) == L;
+    check(p1, "reuse floor: min_reuse 0 (--parallel 1) keeps every L unchanged");
+    check(mimo26_reuse_floor(3, 1024) == 0 && mimo26_reuse_floor(8, 1024) == 0 && mimo26_reuse_floor(1023, 1024) == 0,
+          "reuse floor: 3 / 8 / 1023 reused tokens under the 1,024 floor count as 0 (the prompt prefills from position 0)");
+    check(mimo26_reuse_floor(1024, 1024) == 1024 && mimo26_reuse_floor(2500, 1024) == 2500, "reuse floor: 1,024 and above are kept as they are");
+    // with the servable prefix: two conversations that share a 8-token system header and nothing else
+    std::vector<int32_t> have = seq(0, 8), ids = seq(0, 8);
+    for (int32_t i = 0; i < 40; ++i) { have.push_back(1000 + i); ids.push_back(2000 + i); }
+    const uint32_t L = ie::mimo26_servable(have, uint32_t(have.size()), 0, 0, ids);
+    check(L == 8 && mimo26_reuse_floor(L, 1024) == 0 && mimo26_reuse_floor(L, 0) == 8,
+          "reuse floor: an 8-token shared header -- servable 8, floored to 0 at --parallel > 1, 8 at --parallel 1");
+    // a slot swap needs the floored L_slot to beat the floored live state by the swap margin: a slot under the floor never swaps
+    const uint32_t margin = 256, L_here = 0, L_slot = mimo26_reuse_floor(900, 1024);
+    check(!(L_slot >= L_here + margin), "reuse floor: a 900-token slot match under the floor is not swapped in (L_slot 0)");
+    check(mimo26_reuse_floor(1300, 1024) >= mimo26_reuse_floor(1000, 1024) + margin, "reuse floor: 1,300 vs a floored 1,000 live state: the slot swaps");
+}
+
 }  // namespace
 
 int main() {
@@ -268,6 +363,10 @@ int main() {
     test_prompt_snapshot();
     test_first_non_f16();
     test_scan();
+    test_choose_lane();
+    test_vision_refusal();
+    test_lanes_draft();
+    test_reuse_floor();
     std::printf("\nMIMO26 HOST RULES: %s\n", g_fail ? "FAILURE(S)" : "PASS");
     return g_fail ? 1 : 0;
 }

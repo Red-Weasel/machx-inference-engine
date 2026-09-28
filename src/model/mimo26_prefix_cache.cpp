@@ -38,6 +38,7 @@ std::string Mimo26PrefixCache::init(Mimo26Forward& fwd, Mimo26DFlash* df, const 
     free_all();
     fwd_ = &fwd; df_ = df; opt_ = o;
     live_prompt_ = live_uses_ = 0;
+    lanes_.assign(std::max<uint32_t>(1, fwd.n_lanes()), LaneLive{}); lane_ = fwd.lane();
     if (!o.budget) return {};
     auto add = [&](sycl::queue* q) -> std::string {
         if (!q) return "a card has no queue";
@@ -63,6 +64,22 @@ void Mimo26PrefixCache::free_all() {
     bounce_.clear();
     slots_.clear(); held_ = 0; on_ = false; drop_id_ = 0;
     snap_ = Snap{};
+    for (auto& l : lanes_) l = LaneLive{};
+}
+
+std::string Mimo26PrefixCache::sync_lane() {
+    if (!fwd_) return "the prefix cache is not attached to a forward";
+    const uint32_t l = fwd_->lane();
+    if (l != lane_) {
+        if (l >= lanes_.size() || lane_ >= lanes_.size()) lanes_.resize(std::max(l, lane_) + 1);
+        LaneLive& cur = lanes_[lane_];
+        cur.prompt = live_prompt_; cur.uses = live_uses_; cur.drop_id = drop_id_; std::swap(cur.snap, snap_);
+        LaneLive& nx = lanes_[l];
+        live_prompt_ = nx.prompt; live_uses_ = nx.uses; drop_id_ = nx.drop_id; std::swap(snap_, nx.snap);
+        lane_ = l;
+    }
+    if (df_ && df_->lane() != l) return "the drafter is on lane " + std::to_string(df_->lane()) + ", the forward on lane " + std::to_string(l);
+    return {};
 }
 
 uint8_t* Mimo26PrefixCache::bounce_for(const sycl::queue* q) const {
@@ -217,21 +234,35 @@ std::string Mimo26PrefixCache::load_snapshot(std::vector<int32_t>& live) {
     return {};
 }
 
-std::string Mimo26PrefixCache::prepare(const std::vector<int32_t>& ids, std::vector<int32_t>& live, uint32_t& reused, std::string& source) {
-    reused = 0; source = "none"; drop_id_ = 0;
-    if (!fwd_) return "the prefix cache is not attached to a forward";
+uint32_t Mimo26PrefixCache::servable(const std::vector<int32_t>& live, const std::vector<int32_t>& ids) {
+    if (!fwd_ || !sync_lane().empty()) return 0;
     const uint32_t ring = fwd_->ring(), win = fwd_->window();
-    const uint32_t L_live = mimo26_servable(live, fwd_->written_end(), ring, win, ids);
+    uint32_t L = mimo26_servable(live, fwd_->written_end(), ring, win, ids);
+    if (snap_.valid && live.size() >= snap_.n) {
+        const std::vector<int32_t> have(live.begin(), live.begin() + std::ptrdiff_t(snap_.n));
+        L = std::max(L, mimo26_servable(have, snap_.hi, ring, win, ids));
+    }
+    return L;
+}
+
+std::string Mimo26PrefixCache::prepare(const std::vector<int32_t>& ids, std::vector<int32_t>& live, uint32_t& reused, std::string& source) {
+    reused = 0; source = "none";
+    if (!fwd_) return "the prefix cache is not attached to a forward";
+    if (auto e = sync_lane(); !e.empty()) return e;
+    drop_id_ = 0;
+    const uint32_t ring = fwd_->ring(), win = fwd_->window();
+    const uint32_t L_live = mimo26_reuse_floor(mimo26_servable(live, fwd_->written_end(), ring, win, ids), opt_.min_reuse);
     // #87: what the live conversation's prompt-end snapshot serves -- its prompt, under the rings it restores
     uint32_t L_snap = 0;
     if (snap_.valid && live.size() >= snap_.n) {
         const std::vector<int32_t> have(live.begin(), live.begin() + std::ptrdiff_t(snap_.n));
-        L_snap = mimo26_servable(have, snap_.hi, ring, win, ids);
+        L_snap = mimo26_reuse_floor(mimo26_servable(have, snap_.hi, ring, win, ids), opt_.min_reuse);
     }
     const uint32_t L_here = std::max(L_live, L_snap);
     int best = -1; uint32_t L_slot = 0;
     for (size_t i = 0; i < slots_.size(); ++i) {
-        const uint32_t l = mimo26_servable(slots_[i].ids, slots_[i].written_end, ring, win, ids);
+        if (slots_[i].written_end > fwd_->capacity()) continue;   // (P4 B1: kept from a larger lane than the active one)
+        const uint32_t l = mimo26_reuse_floor(mimo26_servable(slots_[i].ids, slots_[i].written_end, ring, win, ids), opt_.min_reuse);
         if (l > L_slot) { L_slot = l; best = int(i); }
     }
     try {
@@ -287,6 +318,7 @@ std::string Mimo26PrefixCache::prepare(const std::vector<int32_t>& ids, std::vec
 }
 
 std::string Mimo26PrefixCache::prompt_done(uint32_t prompt_len) {
+    if (auto e = sync_lane(); !e.empty()) return e;
     live_prompt_ = prompt_len;
     if (drop_id_) {
         for (size_t i = 0; i < slots_.size(); ++i)
@@ -323,6 +355,7 @@ std::string Mimo26PrefixCache::prompt_done(uint32_t prompt_len) {
 }
 
 void Mimo26PrefixCache::live_lost() {
+    if (auto e = sync_lane(); !e.empty()) std::fprintf(stderr, "[mimo26 cache] live_lost: %s\n", e.c_str());
     live_prompt_ = live_uses_ = 0;
     drop_id_ = 0;
     snap_.valid = false;

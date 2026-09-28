@@ -159,7 +159,8 @@ static void note_http_thread() {
 }
 
 int run_openai_server(Engine& eng, const std::string& model_id,
-                      const std::string& host, int port, uint32_t max_queue) {
+                      const std::string& host, int port, uint32_t max_queue,
+                      const std::string& root_id) {
     httplib::Server srv;
     // Admission bound: up to eng.parallel() generations in flight at once (the
     // engine's internal FIFO gate owns the actual GPU serialization and
@@ -178,6 +179,19 @@ int run_openai_server(Engine& eng, const std::string& model_id,
     const unsigned pool_threads = eng.parallel() + max_queue + 4;
     srv.new_task_queue = [pool_threads] { return new httplib::ThreadPool(pool_threads); };
     std::atomic<uint64_t> req_no{0};
+    // P4 B20: the publisher's recommended sampling for this model, per mode; fills what a request and the CLI/env omit
+    const std::optional<Recommendation> rec = recommended_sampling(eng.arch(),
+        eng.gguf_string("tokenizer.chat_template"), eng.gguf_string("general.name"), eng.gguf_string("general.base_model.0.repo_url"));
+    if (rec) {
+        std::fprintf(stderr, "[ie] recommended sampling (%s, %s) fills what a request and the CLI/env omit: thinking %s",
+                     rec->model, rec->source, oai::sampling_summary([&] { oai::ChatRequest t; t.enable_thinking = true;
+                         oai::apply_recommended(t, &*rec); return t.sampling; }()).c_str());
+        if (rec->instruct) {
+            oai::ChatRequest t; t.enable_thinking = false; oai::apply_recommended(t, &*rec);
+            std::fprintf(stderr, "; instruct %s", oai::sampling_summary(t.sampling).c_str());
+        }
+        std::fprintf(stderr, " (frequency_penalty is the library default)\n");
+    } else std::fprintf(stderr, "[ie] no recommended sampling for this model: requests that omit a field get the library defaults\n");
     // Releases exactly once: non-copyable, so no temporary can ever run the
     // destructor a second time (a make_shared<AdmRelease>(AdmRelease{..}) did).
     std::atomic<bool> admin_stop{false};   // set by POST /admin/shutdown
@@ -229,11 +243,17 @@ int run_openai_server(Engine& eng, const std::string& model_id,
         if (adm.stopping())  { h["status"] = "stopping"; res.status = 503; }
         // #29: seconds > 0 while an idle spin lasts; cores = the CPU rate over the latest full idle window
         if (spin_cfg.enabled) h["idle_spin"] = {{"seconds", std::llround(spin_s.load())}, {"cores", std::round(spin_cores.load() * 100.0) / 100.0}};
+        // P4 B4 (docs/mimo26/P4_B4_SERVE.md) / P4 B6b (docs/deepseek41/P4_B6B_SERVE.md): MiMo-V2.6 and DeepSeek-V4.1 at
+        // --parallel > 1 add lanes_active, decoding, tokens, step_ms, rows_per_step, ...; "" elsewhere
+        if (const std::string sv = eng.serving_status_json(); !sv.empty()) {
+            const auto j = nlohmann::json::parse(sv, nullptr, false);
+            if (j.is_object()) for (const auto& [k, v] : j.items()) h[k] = v;
+        }
         res.set_content(h.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
                         "application/json");
     });
     srv.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
-        res.set_content(oai::models_json(model_id), "application/json");
+        res.set_content(oai::models_json(model_id, root_id), "application/json");
     });
     // /props — llama.cpp-compatible server-truth for the LOADED context window.
     // Dream (and other llama.cpp-shaped clients) probe exactly this shape to learn
@@ -265,6 +285,22 @@ int run_openai_server(Engine& eng, const std::string& model_id,
             res.status = 400;
             res.set_content(nlohmann::json{{"error",{{"message",cr.error}}}}.dump(),
                             "application/json");
+            return;
+        }
+        // P4 B20: the recommendation for the request's ACTUAL mode fills the fields nobody set; a dropped penalty is said
+        if (const uint32_t filled = oai::apply_recommended(cr, rec ? &*rec : nullptr))
+            std::fprintf(stderr, "[req] sampling: %s-mode recommendation (%s) filled %u field(s) -> %s\n",
+                         cr.enable_thinking ? "thinking" : "instruct", rec->model, unsigned(__builtin_popcount(filled)),
+                         oai::sampling_summary(cr.sampling).c_str());
+        if (const std::string w = dropped_penalty_warning(eng.arch(), cr.sampling); !w.empty())
+            std::fprintf(stderr, "[req] WARNING: %s\n", w.c_str());
+        // Images on a load that does not take them (/props "vision" not ready: MiMo-V2.6 at --parallel > 1, a model
+        // without a tower) are the request's fault: 400 here, before admission -- a stream's 200 goes out before the
+        // engine runs, so its own refusal could only be an error event.
+        if (const std::string why = oai::image_refusal(cr, eng.vision_status_json()); !why.empty()) {
+            std::fprintf(stderr, "[req] refused (400): %s\n", why.c_str());
+            res.status = 400;
+            res.set_content(oai::error_json(why, "invalid_request_error", "vision_not_ready"), "application/json");
             return;
         }
         const std::string id = "chatcmpl-" + std::to_string(++req_no);
@@ -582,7 +618,9 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                     sink.done();
                     return true;
                 }
-                if (r.finish_reason == "abort")
+                // A matched stop sequence ends the generation through the callback too, which the engine reports as
+                // "abort": a normal finish (the client is told "stop" below), not a disconnect or a shutdown.
+                if (r.finish_reason == "abort" && !stopped)
                     std::fprintf(stderr, adm.stopping()
                         ? "[req] stream aborted by shutdown after %u tok\n"
                         : "[req] stream client disconnected mid-generation — aborted after %u tok\n",

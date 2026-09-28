@@ -11,6 +11,7 @@
 // so the launch-heavy loop is tolerable for validation.
 
 #include "ie/qwen35moe_split.hpp"
+#include "ie/q35m_lanes.hpp"
 
 #include "ie/dequant.hpp"
 #include "ie/dequant_ref.hpp"   // ie::ref::dequant_q4_K/q5_K/q6_K_buffer (K-quant experts → Q8_0)
@@ -247,6 +248,9 @@ void Qwen35MoeSplitModel::free_all() {
     prefill_bt_.clear(); prefill_bt_cap_.clear(); act_q8_.clear();
     for (auto& s : dn_) s.free_storage();
     for (auto& c : kv_) c.free_storage();
+    for (auto& l : lane_dn_) for (auto& s : l) s.free_storage();
+    for (auto& l : lane_kv_) for (auto& c : l) c.free_storage();
+    lane_dn_.clear(); lane_kv_.clear();
 }
 
 std::string Qwen35MoeSplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
@@ -533,6 +537,8 @@ std::string Qwen35MoeSplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
         else                      kv_local_[L] = n_full[dev]++;
     }
     dn_.resize(n_dev_); kv_.resize(n_dev_);
+    cur_.assign(n_dev_, 0);
+    max_ctx_ = max_ctx;
     for (uint32_t dev = 0; dev < n_dev_; ++dev) {
         if (n_lin[dev]) {
             DeltaNetStateConfig dc{};
@@ -721,18 +727,7 @@ std::string Qwen35MoeSplitModel::forward(const int32_t* input_ids, uint32_t T,
                                          sycl::half* out_logits_host) {
     if (T == 0) return "T == 0";
     const uint32_t H    = cfg_.hidden;                  // 2048
-    const uint32_t HD   = cfg_.head_dim;                // 256
-    const uint32_t N_q  = cfg_.n_q_heads  * HD;         // 4096
-    const uint32_t N_qg = N_q * 2u;                     // 8192
-    const uint32_t N_kv = cfg_.n_kv_heads * HD;         // 512
     const uint32_t V    = cfg_.vocab;
-    const uint32_t EFF  = cfg_.expert_ffn;             // 512
-    const uint32_t E    = cfg_.n_experts;               // 256
-    const uint32_t Kt   = cfg_.experts_topk;            // 8
-    const uint32_t rope_n = cfg_.rope_dim;              // 64
-    const float    eps  = cfg_.rms_eps;
-    const uint32_t n_layers = cfg_.n_layers;
-    const uint32_t n_kv = cfg_.n_kv_heads;
 
     if (ws_.size() != n_dev_) ws_.assign(n_dev_, {});
     for (uint32_t dev = 0; dev < n_dev_; ++dev)
@@ -744,39 +739,19 @@ std::string Qwen35MoeSplitModel::forward(const int32_t* input_ids, uint32_t T,
         if (ws_[dev].positions)
             fleet_->dev(dev).queue().memcpy(ws_[dev].positions, pos.data(), T * sizeof(int32_t)).wait();
         if (reset_kv) {
-            if (dn_[dev].ready()) dn_[dev].reset(fleet_->dev(dev).queue());
-            if (kv_[dev].ready()) kv_[dev].reset();
+            if (dn_at(dev).ready()) dn_at(dev).reset(fleet_->dev(dev).queue());
+            if (kv_at(dev).ready()) kv_at(dev).reset();
         }
     }
 
     // embedding → ws_[embed_dev].x
-    {
-        auto& alloc = fleet_->dev(plan_.embed_dev);
-        auto& q = alloc.queue();
-        int32_t* d_ids = static_cast<int32_t*>(alloc.malloc(T * sizeof(int32_t)));
-        if (!d_ids) return "d_ids alloc failed";
-        q.memcpy(d_ids, input_ids, T * sizeof(int32_t)).wait();
-        if (token_embd_dtype_ == DType::kQ4_K)
-            embedding_lookup_q4k(q, d_ids, token_embd_, ws_[plan_.embed_dev].x, T, H);
-        else if (token_embd_dtype_ == DType::kQ8_0)
-            embedding_lookup_q8_0(q, d_ids, token_embd_, ws_[plan_.embed_dev].x, T, H);
-        else if (token_embd_dtype_ == DType::kF16)
-            // NB: embedding_lookup_f16 takes (embd, tokens) — swapped vs the q* kernels.
-            embedding_lookup_f16(q, static_cast<const sycl::half*>(token_embd_), d_ids,
-                                 ws_[plan_.embed_dev].x, T, H);
-        else
-            embedding_lookup_q6k(q, d_ids, token_embd_, ws_[plan_.embed_dev].x, T, H);
-        q.wait();
-        alloc.free(d_ids);
-    }
+    if (auto m = embed(input_ids, T); !m.empty()) return m;
 
     // IE_Q35MOE_TIMING: per-section wall-clock (adds q.wait barriers → relative
     // attribution only, not absolute tok/s). Answers "is prefill attn- or MoE-bound?".
     const bool dbg_timing = std::getenv("IE_Q35MOE_TIMING") != nullptr;
     double t_attn = 0.0, t_moe = 0.0;
     for (uint32_t dev = 0; dev < n_dev_; ++dev) {
-        Workspace& w = ws_[dev];
-        auto& q = fleet_->dev(dev).queue();
         if (dev > 0) {
             // Drain the SOURCE card's queue before the cross-card x copy. The GPU-resident
             // MoE removed the per-layer host-pull that used to drain it implicitly, so without
@@ -784,252 +759,10 @@ std::string Qwen35MoeSplitModel::forward(const int32_t* input_ids, uint32_t T,
             // cross-card race that faults the device (UR_RESULT_ERROR_DEVICE_LOST). One barrier
             // per card boundary (n_dev-1 total) — compute stays fully on the GPU.
             fleet_->dev(dev - 1).queue().wait();
-            fleet_->copy_across(dev - 1, w.x, dev, ws_[dev - 1].x, uint64_t(T) * H * sizeof(sycl::half));
+            fleet_->copy_across(dev - 1, ws_[dev].x, dev, ws_[dev - 1].x, uint64_t(T) * H * sizeof(sycl::half));
         }
-        const uint64_t per_layer_kv =
-            uint64_t(n_kv) * (kv_[dev].ready() ? kv_[dev].config().max_ctx : 0u) * HD;
-
-        for (uint32_t L = 0; L < n_layers; ++L) {
-            if (plan_.dev_of_layer[L] != dev) continue;
-            const LayerW& w_l = layers_[L];
-            double _ta = 0.0; if (dbg_timing) { q.wait(); _ta = now_ms(); }
-            rms_norm_f32w(q, w.x, w_l.attn_norm, w.x_normed, T, H, eps);
-
-            if (w_l.is_linear) {
-                const uint32_t SKH = cfg_.ssm_n_k_heads;          // 16
-                const uint32_t SVH = cfg_.ssm_n_v_heads;          // 32
-                const uint32_t SHD = cfg_.ssm_head_dim;           // 128
-                const uint32_t SI  = cfg_.ssm_inner;              // 4096
-                const uint32_t conv_ch = SI + 2u * SKH * SHD;     // 8192
-                const uint32_t kw  = SKH * SHD;                   // 2048
-                const uint32_t rep = SVH / SKH;                   // 2 (16→32) — crown TILE
-                const float qscale = 1.0f / sycl::sqrt(float(SHD));
-
-                sgemv(dev, w.x_normed, w_l.attn_qkv, w.dn_qkv, H, conv_ch, T);
-                sycl::half* conv_state = dn_[dev].conv_state_ptr() +
-                    uint64_t(dn_local_[L]) * dn_[dev].conv_elems_per_layer();
-                depthwise_conv1d_causal(q, w.dn_qkv, w_l.ssm_conv1d_fp16, conv_state,
-                                        w.dn_conv, T, conv_ch, cfg_.ssm_conv_kernel);
-                cast_qkv_split_fp16_to_fp32(q, w.dn_conv, w.dn_qpre, w.dn_kpre, w.dn_vpre, T, kw, SI);
-                l2_norm_scale(q, w.dn_qpre, w.dn_qpre, T * SKH, SHD, qscale, 1e-6f);
-                l2_norm_scale(q, w.dn_kpre, w.dn_kpre, T * SKH, SHD, 1.0f,   1e-6f);
-                repeat_interleave_heads(q, w.dn_qpre, w.dn_qrep, T, SKH, SHD, rep);
-                repeat_interleave_heads(q, w.dn_kpre, w.dn_krep, T, SKH, SHD, rep);
-                const uint32_t SVHp = ((SVH + 63u) / 64u) * 64u;
-                dense::gemv_q_T(q, w.x_normed, w_l.ssm_alpha, w.dn_alpha64, H, SVHp, T);
-                dense::gemv_q_T(q, w.x_normed, w_l.ssm_beta,  w.dn_beta64,  H, SVHp, T);
-                extract_cols(q, w.dn_alpha64, w.dn_alpha_h, T, SVH, SVHp);
-                extract_cols(q, w.dn_beta64,  w.dn_beta_h,  T, SVH, SVHp);
-                compute_g_beta_h16(q, w.dn_alpha_h, w.dn_beta_h, w_l.ssm_a, w_l.ssm_dt_bias,
-                                   w.dn_g, w.dn_beta, T, SVH);
-                float* state_layer = dn_[dev].state_ptr() +
-                    uint64_t(dn_local_[L]) * dn_[dev].state_elems_per_layer();
-                deltanet_recurrence(q, w.dn_qrep, w.dn_krep, w.dn_vpre, w.dn_g, w.dn_beta,
-                                    state_layer, w.dn_out, /*B=*/1, T, SVH, SHD, SHD);
-                sgemv(dev, w.x_normed, w_l.attn_gate, w.dn_z, H, SI, T);
-                gated_rms_norm(q, w.dn_out, w.dn_z, w_l.ssm_norm_fp16, w.dn_qkv, T * SVH, SHD, eps);
-                sgemv(dev, w.dn_qkv, w_l.ssm_out, w.attn_block, SI, H, T);
-            } else {
-                sgemv(dev, w.x_normed, w_l.attn_q, w.qg, H, N_qg, T);
-                split_q_gate_per_head(q, w.qg, w.q, w.gate, T, cfg_.n_q_heads, HD);
-                sgemv(dev, w.x_normed, w_l.attn_k, w.k, H, N_kv, T);
-                sgemv(dev, w.x_normed, w_l.attn_v, w.v, H, N_kv, T);
-                rms_norm_f32w(q, w.q, w_l.attn_q_norm, w.q, T * cfg_.n_q_heads,  HD, eps);
-                rms_norm_f32w(q, w.k, w_l.attn_k_norm, w.k, T * cfg_.n_kv_heads, HD, eps);
-                rope_partial(q, w.q, w.positions, w.q, T, cfg_.n_q_heads,  HD, rope_n, cfg_.rope_theta);
-                rope_partial(q, w.k, w.positions, w.k, T, cfg_.n_kv_heads, HD, rope_n, cfg_.rope_theta);
-                auto& kvc = kv_[dev];
-                const uint32_t li = kv_local_[L];   // local full-attn layer index on this card
-                sycl::half* kc = kvc.k_ptr() + per_layer_kv * li;
-                sycl::half* vc = kvc.v_ptr() + per_layer_kv * li;
-                const uint32_t max_ctx = kvc.config().max_ctx;
-                if (T == 1 && w.attn_partials) {
-                    // INT8-KV decode (--int8-kv): halve KV BW+storage via the int8 shadow
-                    // when it's populated up to start_pos; else fp16 FA2. Mirrors qwen36.cpp.
-                    if (kvc.is_int8() && kvc.k_int8_ptr() && start_pos == kvc.int8_length(li)) {
-                        const uint64_t i8pl = uint64_t(cfg_.n_kv_heads) * max_ctx * HD;
-                        const uint64_t scpl = uint64_t(cfg_.n_kv_heads) * max_ctx;
-                        full_attention_fa2_decode_int8(q, w.q, w.k, w.v,
-                                                       kvc.k_int8_ptr() + i8pl * li,
-                                                       kvc.v_int8_ptr() + i8pl * li,
-                                                       kvc.k_scales_ptr() + scpl * li,
-                                                       kvc.v_scales_ptr() + scpl * li,
-                                                       nullptr, nullptr,
-                                                       w.attn_out, w.attn_partials, start_pos,
-                                                       cfg_.n_q_heads, cfg_.n_kv_heads, HD, max_ctx);
-                        kvc.set_int8_length(li, start_pos + 1);   // inline quantize-on-write wrote start_pos
-                    } else {
-                        full_attention_fa2_decode(q, w.q, w.k, w.v, kc, vc, w.attn_out,
-                                                  w.attn_partials, start_pos,
-                                                  cfg_.n_q_heads, cfg_.n_kv_heads, HD, max_ctx);
-                    }
-                } else {
-                    full_attention(q, w.q, w.k, w.v, kc, vc, w.attn_out, T, start_pos,
-                                   cfg_.n_q_heads, cfg_.n_kv_heads, HD, max_ctx);
-                    // Post-quantize the fp16 prefill rows into the int8 shadow so the next
-                    // T=1 decode step can take the int8 path.
-                    if (kvc.is_int8()) kvc.quantize_to_int8(q, li, start_pos, T);
-                }
-                kvc.set_length(li, start_pos + T);
-                sigmoid_gate(q, w.attn_out, w.gate, w.attn_out, uint64_t(T) * N_q);
-                sgemv(dev, w.attn_out, w_l.attn_output, w.attn_block, N_q, H, T);
-            }
-
-            // residual + post-attn norm → MoE.
-            residual_add_rms_norm_fused(q, w.x, w.attn_block, w_l.post_attn_norm, w.x_normed, T, H, eps);
-            if (dbg_timing) { q.wait(); t_attn += now_ms() - _ta; _ta = now_ms(); }
-            if (std::getenv("IE_MOE_DBG")) { std::fprintf(stderr,"[L%u T%u dev%u attn-done is_lin=%d]\n",L,T,dev,(int)w_l.is_linear); q.wait(); }
-
-            // ---- MoE — FULLY GPU-RESIDENT (no host pull, no per-expert host loop):
-            // router → quantize x → gate_up_silu_q8 → quantize h → down_q8 → reduce.
-            // topk_idx/topk_w stay on device; the grouped kernels read the expert id
-            // per token-slot from device memory. ----
-            moe_router(q, w.x_normed, w_l.ffn_gate_inp, w.topk_idx, w.topk_w, T, H, E, Kt);
-            if (std::getenv("IE_MOE_DBG") && dev > 0) {   // card-1 router input + topk sanity
-                std::vector<sycl::half> _xn(H);
-                q.memcpy(_xn.data(), w.x_normed, H * sizeof(sycl::half)).wait();
-                int _bad = 0; float _mx = 0.f;
-                for (auto hh : _xn) { float v = float(hh); if (v != v || v > 1e30f || v < -1e30f) _bad++; float a = v < 0 ? -v : v; if (a > _mx) _mx = a; }
-                std::vector<int32_t> _ti(uint64_t(T) * Kt);
-                q.memcpy(_ti.data(), w.topk_idx, _ti.size() * sizeof(int32_t)).wait();
-                int _tmn = 1 << 30, _tmx = -(1 << 30); for (int32_t v : _ti) { if (v < _tmn) _tmn = v; if (v > _tmx) _tmx = v; }
-                std::fprintf(stderr, "[card1 L%u T%u] x_normed bad=%d maxabs=%.1f | topk min=%d max=%d (E=%u)\n", L, T, _bad, _mx, _tmn, _tmx, E);
-            }
-            // The DECODE (T==1) per-token-slot kernels re-stream every expert's Q8
-            // weights ~TK/E times — fine at T=1 (host/comm-bound) but ~80% of pp512
-            // prefill. T>1 routes through the EXPERT-BATCHED (weight-stationary) GEMM
-            // analog: host counting-sort of the TK slots by expert → expert-sorted
-            // gather → batched gate_up/down reading each weight column once. Numerics
-            // are bit-identical (same block_q8_1x activation, same dp4a/lane order,
-            // weight folded at down) so PPL is exact. Opt out: IE_Q35MOE_NO_PREFILL_GEMM.
-            static const bool no_prefill_gemm = std::getenv("IE_Q35MOE_NO_PREFILL_GEMM") != nullptr;
-            // Native K-quant experts always take the batched (prefill) path for T>1 —
-            // the crown moe_decode_*_q4k kernels are single-token (no T arg).
-            const bool moe_native = w_l.exp_gate.dtype != DType::kQ8_0;
-            if (T > 1 && (!no_prefill_gemm || moe_native)) {
-                const uint32_t TOTAL = T * Kt;
-                // Pull topk to host (the only blocking read), counting-sort by expert,
-                // push the partition + gather index + reduce map back (mirror qwen36.cpp).
-                std::vector<int32_t>    hidx(TOTAL);
-                std::vector<sycl::half> htw(TOTAL);
-                q.memcpy(hidx.data(), w.topk_idx, TOTAL * sizeof(int32_t));
-                q.memcpy(htw.data(),  w.topk_w,   TOTAL * sizeof(sycl::half)).wait();
-                std::vector<uint32_t> off(E + 1, 0);
-                for (uint32_t i = 0; i < TOTAL; ++i) ++off[uint32_t(hidx[i]) + 1];
-                for (uint32_t ee = 0; ee < E; ++ee) off[ee + 1] += off[ee];
-                std::vector<int32_t>    sidx(TOTAL);
-                std::vector<sycl::half> sw(TOTAL);
-                std::vector<uint32_t>   tk2pk(TOTAL);
-                std::vector<uint32_t>   cursor(E, 0);
-                for (uint32_t t = 0; t < T; ++t)
-                    for (uint32_t kk = 0; kk < Kt; ++kk) {
-                        const uint32_t ex  = uint32_t(hidx[t * Kt + kk]);
-                        const uint32_t pos = off[ex] + cursor[ex]++;
-                        sidx[pos]            = int32_t(t);
-                        sw[pos]              = htw[t * Kt + kk];
-                        tk2pk[t * Kt + kk]   = pos;
-                    }
-                q.memcpy(w.moe_eoff,  off.data(),   (E + 1) * sizeof(uint32_t));
-                q.memcpy(w.moe_sidx,  sidx.data(),  TOTAL * sizeof(int32_t));
-                q.memcpy(w.moe_sw,    sw.data(),    TOTAL * sizeof(sycl::half));
-                q.memcpy(w.moe_tk2pk, tk2pk.data(), TOTAL * sizeof(uint32_t)).wait();
-
-                moe_gather_rows(q, w.x_normed, w.moe_sidx, w.moe_xp, TOTAL, H);
-                if (moe_native) {
-                    // Native K-quant batched prefill (crown fused kernels). NOTE: the
-                    // Q4_K prefill kernels consume the block_q8_1s activation stream
-                    // (quantize_q8_1s, 48B) — NOT the block_q8_1x the Q8 kernels use.
-                    // The down kernel does NOT fold the routing weight, so the reduce
-                    // is the WEIGHTED moe_prefill_reduce (moe_sw), not _sum.
-                    quantize_q8_1s(q, w.moe_xp, w.xp_q8, uint64_t(TOTAL) * H);
-                    moe_prefill_gate_up_silu_q4k_q8(q, w.xp_q8, w_l.exp_gate.blob, w_l.exp_up.blob,
-                                                    w.moe_eoff, w.moe_hp, E, H, EFF,
-                                                    w_l.exp_gate.expert_stride_bytes, w_l.exp_gate.soa);
-                    quantize_q8_1s(q, w.moe_hp, w.h_q8, uint64_t(TOTAL) * EFF);
-                    if (w_l.exp_down.dtype == DType::kQ4_K)
-                        moe_prefill_down_packed_q4k_q8(q, w.h_q8, w_l.exp_down.blob, w.moe_eoff,
-                                                       w.moe_yp, E, H, EFF,
-                                                       w_l.exp_down.expert_stride_bytes, w_l.exp_down.soa);
-                    else
-                        moe_prefill_down_packed_q6k_q8(q, w.h_q8, w_l.exp_down.blob, w.moe_eoff,
-                                                       w.moe_yp, E, H, EFF,
-                                                       w_l.exp_down.expert_stride_bytes, w_l.exp_down.soa);
-                    // moe_prefill_reduce ACCUMULATES into moe_y (acc = y + Σ w·down),
-                    // unlike the Q8 moe_prefill_reduce_sum which writes — so moe_y (reused
-                    // per layer, holds stale data) MUST be zeroed first. In-order queue.
-                    q.memset(w.moe_y, 0, uint64_t(T) * H * sizeof(sycl::half));
-                    moe_prefill_reduce(q, w.moe_yp, w.moe_tk2pk, w.moe_sw, w.moe_y, T, Kt, H);
-                } else {
-                quantize_q8_1(q, w.moe_xp, static_cast<block_q8_1x*>(w.xp_q8), uint32_t(TOTAL) * H);
-                moe_prefill_gate_up_silu_q8(q, w.xp_q8, w_l.exp_gate.qs, w_l.exp_gate.d,
-                                            w_l.exp_up.qs, w_l.exp_up.d, w_l.exp_gate.qs_stride,
-                                            w_l.exp_gate.d_stride, w.moe_eoff, w.moe_hp, E, H, EFF);
-                quantize_q8_1(q, w.moe_hp, static_cast<block_q8_1x*>(w.h_q8), uint32_t(TOTAL) * EFF);
-                moe_prefill_down_q8(q, w.h_q8, w_l.exp_down.qs, w_l.exp_down.d,
-                                    w_l.exp_down.qs_stride, w_l.exp_down.d_stride, w.moe_eoff,
-                                    w.moe_sw, w.moe_yp, E, H, EFF);
-                moe_prefill_reduce_sum(q, w.moe_yp, w.moe_tk2pk, w.moe_y, T, Kt, H);
-                }
-            } else {
-            // DECODE (and IE_Q35MOE_NO_PREFILL_GEMM A/B fallback) — per-token-slot
-            // grouped kernels. Activation → block_q8_1x in ONE batched quantize.
-            // H % 32 == 0 so the per-32 blocks are row-independent → quantizing all
-            // T·H elements at once is identical to a per-row loop but a SINGLE enqueue
-            // (the per-row loop overran the device command queue → DEVICE_LOST).
-            if (moe_native) {
-                // Native K-quant decode (T==1; native forces T>1 to the prefill path).
-                // gate/up: W4A16 (fp16 x_normed) → fp16 h. down: fp16 h_in, folds topk_w
-                // AND reduces over K_top → moe_y directly (no separate moe_reduce).
-                moe_decode_gate_up_silu_q4k(q, w.x_normed, w_l.exp_gate.blob, w_l.exp_up.blob,
-                                            w.topk_idx, w.moe_hp, H, EFF, Kt,
-                                            w_l.exp_gate.expert_stride_bytes, w_l.exp_gate.soa);
-                if (w_l.exp_down.dtype == DType::kQ4_K)
-                    moe_decode_down_q4k(q, w.moe_hp, w_l.exp_down.blob, w.topk_idx, w.topk_w,
-                                        w.moe_y, H, EFF, Kt,
-                                        w_l.exp_down.expert_stride_bytes, w_l.exp_down.soa);
-                else
-                    moe_decode_down_q6k(q, w.moe_hp, w_l.exp_down.blob, w.topk_idx, w.topk_w,
-                                        w.moe_y, H, EFF, Kt,
-                                        w_l.exp_down.expert_stride_bytes, w_l.exp_down.soa);
-            } else {
-            quantize_q8_1(q, w.x_normed, static_cast<block_q8_1x*>(w.x_q8), uint32_t(T) * H);
-            moe_gate_up_silu_q8(q, w.x_q8, w_l.exp_gate.qs, w_l.exp_gate.d,
-                                w_l.exp_up.qs, w_l.exp_up.d, w_l.exp_gate.qs_stride,
-                                w_l.exp_gate.d_stride, w.topk_idx, w.moe_hp, T, Kt, H, EFF);
-            quantize_q8_1(q, w.moe_hp, static_cast<block_q8_1x*>(w.h_q8), uint32_t(T) * Kt * EFF);
-            moe_down_q8(q, w.h_q8, w_l.exp_down.qs, w_l.exp_down.d, w_l.exp_down.qs_stride,
-                        w_l.exp_down.d_stride, w.topk_idx, w.topk_w, w.moe_yp, T, Kt, EFF, H);
-            moe_reduce_q8(q, w.moe_yp, w.moe_y, T, Kt, H);   // moe_y = Σ_k weighted experts
-            }
-            }
-            // shared expert (always-on, sigmoid-gated).
-            if (w_l.ffn_gate_inp_shexp) {
-                sgemv(dev, w.x_normed, w_l.sh_gate, w.gate_o, H, EFF, T);
-                sgemv(dev, w.x_normed, w_l.sh_up,   w.up_o,   H, EFF, T);
-                swiglu(q, w.gate_o, w.up_o, w.ffn_h, uint64_t(T) * EFF);
-                sgemv(dev, w.ffn_h, w_l.sh_down, w.eo, EFF, H, T);
-                // shared-expert gate g[t]=sigmoid(ffn_gate_inp_shexp · x_normed[t]);
-                // moe_y += eo*g. [VERIFY gate semantics vs qwen36.cpp:1775-1829.]
-                {
-                    float* dng = w.dn_g; const float* gw = w_l.ffn_gate_inp_shexp;
-                    const sycl::half* xn = w.x_normed; const sycl::half* eo = w.eo;
-                    sycl::half* my = w.moe_y; const uint32_t HH = H;
-                    q.parallel_for(sycl::range<1>(T), [=](sycl::id<1> ti) {
-                        const uint32_t t = uint32_t(ti); float gg = 0.f;
-                        for (uint32_t h = 0; h < HH; ++h) gg += gw[h] * float(xn[uint64_t(t) * HH + h]);
-                        dng[t] = 1.f / (1.f + sycl::exp(-gg));
-                    });
-                    q.parallel_for(sycl::range<1>(uint64_t(T) * HH), [=](sycl::id<1> i) {
-                        const uint32_t t = uint32_t(uint64_t(i) / HH);
-                        my[i] = sycl::half(float(my[i]) + float(eo[i]) * dng[t]);
-                    });
-                }
-            }
-            residual_add(q, w.x, w.moe_y, w.x, uint64_t(T) * H);
-            if (dbg_timing) { q.wait(); t_moe += now_ms() - _ta; }
-            if (std::getenv("IE_MOE_DBG")) { std::fprintf(stderr,"[L%u T%u dev%u moe-done]\n",L,T,dev); q.wait(); }
-        }
-        q.wait();
+        run_layers(dev, T, start_pos, dbg_timing, t_attn, t_moe);
+        fleet_->dev(dev).queue().wait();
     }
     if (dbg_timing)
         std::fprintf(stderr, "[q35moe-timing T=%u] attn=%.2f ms  moe=%.2f ms  (moe %.0f%%)\n",
@@ -1037,18 +770,617 @@ std::string Qwen35MoeSplitModel::forward(const int32_t* input_ids, uint32_t T,
 
     // final norm + lm_head on head_dev.
     {
-        const uint32_t hd = plan_.head_dev;
-        Workspace& w = ws_[hd];
-        auto& alloc = fleet_->dev(hd);
-        auto& q = alloc.queue();
-        rms_norm_f32w(q, w.x, output_norm_, w.x_normed, T, H, eps);
-        const sycl::half* last = w.x_normed + uint64_t(T - 1) * H;
+        auto& alloc = fleet_->dev(plan_.head_dev);
         sycl::half* d_logits = static_cast<sycl::half*>(alloc.malloc(uint64_t(V) * sizeof(sycl::half)));
         if (!d_logits) return "logits alloc failed";
-        sgemv(hd, last, output_, d_logits, H, V, 1).wait();
-        q.memcpy(out_logits_host, d_logits, uint64_t(V) * sizeof(sycl::half)).wait();
+        head(T, d_logits);
+        alloc.queue().memcpy(out_logits_host, d_logits, uint64_t(V) * sizeof(sycl::half)).wait();
         alloc.free(d_logits);
     }
+    return {};
+}
+
+std::string Qwen35MoeSplitModel::embed(const int32_t* input_ids, uint32_t T) {
+    const uint32_t H = cfg_.hidden;
+    auto& alloc = fleet_->dev(plan_.embed_dev);
+    auto& q = alloc.queue();
+    int32_t* d_ids = static_cast<int32_t*>(alloc.malloc(T * sizeof(int32_t)));
+    if (!d_ids) return "d_ids alloc failed";
+    q.memcpy(d_ids, input_ids, T * sizeof(int32_t)).wait();
+    if (token_embd_dtype_ == DType::kQ4_K)
+        embedding_lookup_q4k(q, d_ids, token_embd_, ws_[plan_.embed_dev].x, T, H);
+    else if (token_embd_dtype_ == DType::kQ8_0)
+        embedding_lookup_q8_0(q, d_ids, token_embd_, ws_[plan_.embed_dev].x, T, H);
+    else if (token_embd_dtype_ == DType::kF16)
+        // NB: embedding_lookup_f16 takes (embd, tokens) — swapped vs the q* kernels.
+        embedding_lookup_f16(q, static_cast<const sycl::half*>(token_embd_), d_ids,
+                             ws_[plan_.embed_dev].x, T, H);
+    else
+        embedding_lookup_q6k(q, d_ids, token_embd_, ws_[plan_.embed_dev].x, T, H);
+    q.wait();
+    alloc.free(d_ids);
+    return {};
+}
+
+// One card's layers of a T-row step at start_pos (the selected lane's state on that card): x → x in ws_[dev].
+void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_pos, bool dbg_timing,
+                                     double& t_attn, double& t_moe) {
+    const uint32_t H    = cfg_.hidden;                  // 2048
+    const uint32_t HD   = cfg_.head_dim;                // 256
+    const uint32_t N_q  = cfg_.n_q_heads  * HD;         // 4096
+    const uint32_t N_qg = N_q * 2u;                     // 8192
+    const uint32_t N_kv = cfg_.n_kv_heads * HD;         // 512
+    const uint32_t EFF  = cfg_.expert_ffn;             // 512
+    const uint32_t E    = cfg_.n_experts;               // 256
+    const uint32_t Kt   = cfg_.experts_topk;            // 8
+    const uint32_t rope_n = cfg_.rope_dim;              // 64
+    const float    eps  = cfg_.rms_eps;
+    const uint32_t n_layers = cfg_.n_layers;
+    const uint32_t n_kv = cfg_.n_kv_heads;
+    Workspace& w = ws_[dev];
+    auto& q = fleet_->dev(dev).queue();
+    const uint64_t per_layer_kv =
+        uint64_t(n_kv) * (kv_at(dev).ready() ? kv_at(dev).config().max_ctx : 0u) * HD;
+
+    for (uint32_t L = 0; L < n_layers; ++L) {
+        if (plan_.dev_of_layer[L] != dev) continue;
+        const LayerW& w_l = layers_[L];
+        double _ta = 0.0; if (dbg_timing) { q.wait(); _ta = now_ms(); }
+        rms_norm_f32w(q, w.x, w_l.attn_norm, w.x_normed, T, H, eps);
+
+        if (w_l.is_linear) {
+            const uint32_t SKH = cfg_.ssm_n_k_heads;          // 16
+            const uint32_t SVH = cfg_.ssm_n_v_heads;          // 32
+            const uint32_t SHD = cfg_.ssm_head_dim;           // 128
+            const uint32_t SI  = cfg_.ssm_inner;              // 4096
+            const uint32_t conv_ch = SI + 2u * SKH * SHD;     // 8192
+            const uint32_t kw  = SKH * SHD;                   // 2048
+            const uint32_t rep = SVH / SKH;                   // 2 (16→32) — crown TILE
+            const float qscale = 1.0f / sycl::sqrt(float(SHD));
+
+            sgemv(dev, w.x_normed, w_l.attn_qkv, w.dn_qkv, H, conv_ch, T);
+            sycl::half* conv_state = dn_at(dev).conv_state_ptr() +
+                uint64_t(dn_local_[L]) * dn_at(dev).conv_elems_per_layer();
+            depthwise_conv1d_causal(q, w.dn_qkv, w_l.ssm_conv1d_fp16, conv_state,
+                                    w.dn_conv, T, conv_ch, cfg_.ssm_conv_kernel);
+            cast_qkv_split_fp16_to_fp32(q, w.dn_conv, w.dn_qpre, w.dn_kpre, w.dn_vpre, T, kw, SI);
+            l2_norm_scale(q, w.dn_qpre, w.dn_qpre, T * SKH, SHD, qscale, 1e-6f);
+            l2_norm_scale(q, w.dn_kpre, w.dn_kpre, T * SKH, SHD, 1.0f,   1e-6f);
+            repeat_interleave_heads(q, w.dn_qpre, w.dn_qrep, T, SKH, SHD, rep);
+            repeat_interleave_heads(q, w.dn_kpre, w.dn_krep, T, SKH, SHD, rep);
+            const uint32_t SVHp = ((SVH + 63u) / 64u) * 64u;
+            dense::gemv_q_T(q, w.x_normed, w_l.ssm_alpha, w.dn_alpha64, H, SVHp, T);
+            dense::gemv_q_T(q, w.x_normed, w_l.ssm_beta,  w.dn_beta64,  H, SVHp, T);
+            extract_cols(q, w.dn_alpha64, w.dn_alpha_h, T, SVH, SVHp);
+            extract_cols(q, w.dn_beta64,  w.dn_beta_h,  T, SVH, SVHp);
+            compute_g_beta_h16(q, w.dn_alpha_h, w.dn_beta_h, w_l.ssm_a, w_l.ssm_dt_bias,
+                               w.dn_g, w.dn_beta, T, SVH);
+            float* state_layer = dn_at(dev).state_ptr() +
+                uint64_t(dn_local_[L]) * dn_at(dev).state_elems_per_layer();
+            deltanet_recurrence(q, w.dn_qrep, w.dn_krep, w.dn_vpre, w.dn_g, w.dn_beta,
+                                state_layer, w.dn_out, /*B=*/1, T, SVH, SHD, SHD);
+            sgemv(dev, w.x_normed, w_l.attn_gate, w.dn_z, H, SI, T);
+            gated_rms_norm(q, w.dn_out, w.dn_z, w_l.ssm_norm_fp16, w.dn_qkv, T * SVH, SHD, eps);
+            sgemv(dev, w.dn_qkv, w_l.ssm_out, w.attn_block, SI, H, T);
+        } else {
+            sgemv(dev, w.x_normed, w_l.attn_q, w.qg, H, N_qg, T);
+            split_q_gate_per_head(q, w.qg, w.q, w.gate, T, cfg_.n_q_heads, HD);
+            sgemv(dev, w.x_normed, w_l.attn_k, w.k, H, N_kv, T);
+            sgemv(dev, w.x_normed, w_l.attn_v, w.v, H, N_kv, T);
+            rms_norm_f32w(q, w.q, w_l.attn_q_norm, w.q, T * cfg_.n_q_heads,  HD, eps);
+            rms_norm_f32w(q, w.k, w_l.attn_k_norm, w.k, T * cfg_.n_kv_heads, HD, eps);
+            rope_partial(q, w.q, w.positions, w.q, T, cfg_.n_q_heads,  HD, rope_n, cfg_.rope_theta);
+            rope_partial(q, w.k, w.positions, w.k, T, cfg_.n_kv_heads, HD, rope_n, cfg_.rope_theta);
+            auto& kvc = kv_at(dev);
+            const uint32_t li = kv_local_[L];   // local full-attn layer index on this card
+            sycl::half* kc = kvc.k_ptr() + per_layer_kv * li;
+            sycl::half* vc = kvc.v_ptr() + per_layer_kv * li;
+            const uint32_t max_ctx = kvc.config().max_ctx;
+            if (T == 1 && w.attn_partials) {
+                // INT8-KV decode (--int8-kv): halve KV BW+storage via the int8 shadow
+                // when it's populated up to start_pos; else fp16 FA2. Mirrors qwen36.cpp.
+                if (kvc.is_int8() && kvc.k_int8_ptr() && start_pos == kvc.int8_length(li)) {
+                    const uint64_t i8pl = uint64_t(cfg_.n_kv_heads) * max_ctx * HD;
+                    const uint64_t scpl = uint64_t(cfg_.n_kv_heads) * max_ctx;
+                    full_attention_fa2_decode_int8(q, w.q, w.k, w.v,
+                                                   kvc.k_int8_ptr() + i8pl * li,
+                                                   kvc.v_int8_ptr() + i8pl * li,
+                                                   kvc.k_scales_ptr() + scpl * li,
+                                                   kvc.v_scales_ptr() + scpl * li,
+                                                   nullptr, nullptr,
+                                                   w.attn_out, w.attn_partials, start_pos,
+                                                   cfg_.n_q_heads, cfg_.n_kv_heads, HD, max_ctx);
+                    kvc.set_int8_length(li, start_pos + 1);   // inline quantize-on-write wrote start_pos
+                } else {
+                    full_attention_fa2_decode(q, w.q, w.k, w.v, kc, vc, w.attn_out,
+                                              w.attn_partials, start_pos,
+                                              cfg_.n_q_heads, cfg_.n_kv_heads, HD, max_ctx);
+                }
+            } else {
+                full_attention(q, w.q, w.k, w.v, kc, vc, w.attn_out, T, start_pos,
+                               cfg_.n_q_heads, cfg_.n_kv_heads, HD, max_ctx);
+                // Post-quantize the fp16 prefill rows into the int8 shadow so the next
+                // T=1 decode step can take the int8 path.
+                if (kvc.is_int8()) kvc.quantize_to_int8(q, li, start_pos, T);
+            }
+            kvc.set_length(li, start_pos + T);
+            sigmoid_gate(q, w.attn_out, w.gate, w.attn_out, uint64_t(T) * N_q);
+            sgemv(dev, w.attn_out, w_l.attn_output, w.attn_block, N_q, H, T);
+        }
+
+        // residual + post-attn norm → MoE.
+        residual_add_rms_norm_fused(q, w.x, w.attn_block, w_l.post_attn_norm, w.x_normed, T, H, eps);
+        if (dbg_timing) { q.wait(); t_attn += now_ms() - _ta; _ta = now_ms(); }
+        if (std::getenv("IE_MOE_DBG")) { std::fprintf(stderr,"[L%u T%u dev%u attn-done is_lin=%d]\n",L,T,dev,(int)w_l.is_linear); q.wait(); }
+
+        // ---- MoE — FULLY GPU-RESIDENT (no host pull, no per-expert host loop):
+        // router → quantize x → gate_up_silu_q8 → quantize h → down_q8 → reduce.
+        // topk_idx/topk_w stay on device; the grouped kernels read the expert id
+        // per token-slot from device memory. ----
+        moe_router(q, w.x_normed, w_l.ffn_gate_inp, w.topk_idx, w.topk_w, T, H, E, Kt);
+        if (std::getenv("IE_MOE_DBG") && dev > 0) {   // card-1 router input + topk sanity
+            std::vector<sycl::half> _xn(H);
+            q.memcpy(_xn.data(), w.x_normed, H * sizeof(sycl::half)).wait();
+            int _bad = 0; float _mx = 0.f;
+            for (auto hh : _xn) { float v = float(hh); if (v != v || v > 1e30f || v < -1e30f) _bad++; float a = v < 0 ? -v : v; if (a > _mx) _mx = a; }
+            std::vector<int32_t> _ti(uint64_t(T) * Kt);
+            q.memcpy(_ti.data(), w.topk_idx, _ti.size() * sizeof(int32_t)).wait();
+            int _tmn = 1 << 30, _tmx = -(1 << 30); for (int32_t v : _ti) { if (v < _tmn) _tmn = v; if (v > _tmx) _tmx = v; }
+            std::fprintf(stderr, "[card1 L%u T%u] x_normed bad=%d maxabs=%.1f | topk min=%d max=%d (E=%u)\n", L, T, _bad, _mx, _tmn, _tmx, E);
+        }
+        // The DECODE (T==1) per-token-slot kernels re-stream every expert's Q8
+        // weights ~TK/E times — fine at T=1 (host/comm-bound) but ~80% of pp512
+        // prefill. T>1 routes through the EXPERT-BATCHED (weight-stationary) GEMM
+        // analog: host counting-sort of the TK slots by expert → expert-sorted
+        // gather → batched gate_up/down reading each weight column once. Numerics
+        // are bit-identical (same block_q8_1x activation, same dp4a/lane order,
+        // weight folded at down) so PPL is exact. Opt out: IE_Q35MOE_NO_PREFILL_GEMM.
+        static const bool no_prefill_gemm = std::getenv("IE_Q35MOE_NO_PREFILL_GEMM") != nullptr;
+        // Native K-quant experts always take the batched (prefill) path for T>1 —
+        // the crown moe_decode_*_q4k kernels are single-token (no T arg).
+        const bool moe_native = w_l.exp_gate.dtype != DType::kQ8_0;
+        if (T > 1 && (!no_prefill_gemm || moe_native)) {
+            const uint32_t TOTAL = T * Kt;
+            // Pull topk to host (the only blocking read), counting-sort by expert,
+            // push the partition + gather index + reduce map back (mirror qwen36.cpp).
+            std::vector<int32_t>    hidx(TOTAL);
+            std::vector<sycl::half> htw(TOTAL);
+            q.memcpy(hidx.data(), w.topk_idx, TOTAL * sizeof(int32_t));
+            q.memcpy(htw.data(),  w.topk_w,   TOTAL * sizeof(sycl::half)).wait();
+            std::vector<uint32_t> off(E + 1, 0);
+            for (uint32_t i = 0; i < TOTAL; ++i) ++off[uint32_t(hidx[i]) + 1];
+            for (uint32_t ee = 0; ee < E; ++ee) off[ee + 1] += off[ee];
+            std::vector<int32_t>    sidx(TOTAL);
+            std::vector<sycl::half> sw(TOTAL);
+            std::vector<uint32_t>   tk2pk(TOTAL);
+            std::vector<uint32_t>   cursor(E, 0);
+            for (uint32_t t = 0; t < T; ++t)
+                for (uint32_t kk = 0; kk < Kt; ++kk) {
+                    const uint32_t ex  = uint32_t(hidx[t * Kt + kk]);
+                    const uint32_t pos = off[ex] + cursor[ex]++;
+                    sidx[pos]            = int32_t(t);
+                    sw[pos]              = htw[t * Kt + kk];
+                    tk2pk[t * Kt + kk]   = pos;
+                }
+            q.memcpy(w.moe_eoff,  off.data(),   (E + 1) * sizeof(uint32_t));
+            q.memcpy(w.moe_sidx,  sidx.data(),  TOTAL * sizeof(int32_t));
+            q.memcpy(w.moe_sw,    sw.data(),    TOTAL * sizeof(sycl::half));
+            q.memcpy(w.moe_tk2pk, tk2pk.data(), TOTAL * sizeof(uint32_t)).wait();
+
+            moe_gather_rows(q, w.x_normed, w.moe_sidx, w.moe_xp, TOTAL, H);
+            if (moe_native) {
+                // Native K-quant batched prefill (crown fused kernels). NOTE: the
+                // Q4_K prefill kernels consume the block_q8_1s activation stream
+                // (quantize_q8_1s, 48B) — NOT the block_q8_1x the Q8 kernels use.
+                // The down kernel does NOT fold the routing weight, so the reduce
+                // is the WEIGHTED moe_prefill_reduce (moe_sw), not _sum.
+                quantize_q8_1s(q, w.moe_xp, w.xp_q8, uint64_t(TOTAL) * H);
+                moe_prefill_gate_up_silu_q4k_q8(q, w.xp_q8, w_l.exp_gate.blob, w_l.exp_up.blob,
+                                                w.moe_eoff, w.moe_hp, E, H, EFF,
+                                                w_l.exp_gate.expert_stride_bytes, w_l.exp_gate.soa);
+                quantize_q8_1s(q, w.moe_hp, w.h_q8, uint64_t(TOTAL) * EFF);
+                if (w_l.exp_down.dtype == DType::kQ4_K)
+                    moe_prefill_down_packed_q4k_q8(q, w.h_q8, w_l.exp_down.blob, w.moe_eoff,
+                                                   w.moe_yp, E, H, EFF,
+                                                   w_l.exp_down.expert_stride_bytes, w_l.exp_down.soa);
+                else
+                    moe_prefill_down_packed_q6k_q8(q, w.h_q8, w_l.exp_down.blob, w.moe_eoff,
+                                                   w.moe_yp, E, H, EFF,
+                                                   w_l.exp_down.expert_stride_bytes, w_l.exp_down.soa);
+                // moe_prefill_reduce ACCUMULATES into moe_y (acc = y + Σ w·down),
+                // unlike the Q8 moe_prefill_reduce_sum which writes — so moe_y (reused
+                // per layer, holds stale data) MUST be zeroed first. In-order queue.
+                q.memset(w.moe_y, 0, uint64_t(T) * H * sizeof(sycl::half));
+                moe_prefill_reduce(q, w.moe_yp, w.moe_tk2pk, w.moe_sw, w.moe_y, T, Kt, H);
+            } else {
+            quantize_q8_1(q, w.moe_xp, static_cast<block_q8_1x*>(w.xp_q8), uint32_t(TOTAL) * H);
+            moe_prefill_gate_up_silu_q8(q, w.xp_q8, w_l.exp_gate.qs, w_l.exp_gate.d,
+                                        w_l.exp_up.qs, w_l.exp_up.d, w_l.exp_gate.qs_stride,
+                                        w_l.exp_gate.d_stride, w.moe_eoff, w.moe_hp, E, H, EFF);
+            quantize_q8_1(q, w.moe_hp, static_cast<block_q8_1x*>(w.h_q8), uint32_t(TOTAL) * EFF);
+            moe_prefill_down_q8(q, w.h_q8, w_l.exp_down.qs, w_l.exp_down.d,
+                                w_l.exp_down.qs_stride, w_l.exp_down.d_stride, w.moe_eoff,
+                                w.moe_sw, w.moe_yp, E, H, EFF);
+            moe_prefill_reduce_sum(q, w.moe_yp, w.moe_tk2pk, w.moe_y, T, Kt, H);
+            }
+        } else {
+        // DECODE (and IE_Q35MOE_NO_PREFILL_GEMM A/B fallback) — per-token-slot
+        // grouped kernels. Activation → block_q8_1x in ONE batched quantize.
+        // H % 32 == 0 so the per-32 blocks are row-independent → quantizing all
+        // T·H elements at once is identical to a per-row loop but a SINGLE enqueue
+        // (the per-row loop overran the device command queue → DEVICE_LOST).
+        if (moe_native) {
+            // Native K-quant decode (T==1; native forces T>1 to the prefill path).
+            // gate/up: W4A16 (fp16 x_normed) → fp16 h. down: fp16 h_in, folds topk_w
+            // AND reduces over K_top → moe_y directly (no separate moe_reduce).
+            moe_decode_gate_up_silu_q4k(q, w.x_normed, w_l.exp_gate.blob, w_l.exp_up.blob,
+                                        w.topk_idx, w.moe_hp, H, EFF, Kt,
+                                        w_l.exp_gate.expert_stride_bytes, w_l.exp_gate.soa);
+            if (w_l.exp_down.dtype == DType::kQ4_K)
+                moe_decode_down_q4k(q, w.moe_hp, w_l.exp_down.blob, w.topk_idx, w.topk_w,
+                                    w.moe_y, H, EFF, Kt,
+                                    w_l.exp_down.expert_stride_bytes, w_l.exp_down.soa);
+            else
+                moe_decode_down_q6k(q, w.moe_hp, w_l.exp_down.blob, w.topk_idx, w.topk_w,
+                                    w.moe_y, H, EFF, Kt,
+                                    w_l.exp_down.expert_stride_bytes, w_l.exp_down.soa);
+        } else {
+        quantize_q8_1(q, w.x_normed, static_cast<block_q8_1x*>(w.x_q8), uint32_t(T) * H);
+        moe_gate_up_silu_q8(q, w.x_q8, w_l.exp_gate.qs, w_l.exp_gate.d,
+                            w_l.exp_up.qs, w_l.exp_up.d, w_l.exp_gate.qs_stride,
+                            w_l.exp_gate.d_stride, w.topk_idx, w.moe_hp, T, Kt, H, EFF);
+        quantize_q8_1(q, w.moe_hp, static_cast<block_q8_1x*>(w.h_q8), uint32_t(T) * Kt * EFF);
+        moe_down_q8(q, w.h_q8, w_l.exp_down.qs, w_l.exp_down.d, w_l.exp_down.qs_stride,
+                    w_l.exp_down.d_stride, w.topk_idx, w.topk_w, w.moe_yp, T, Kt, EFF, H);
+        moe_reduce_q8(q, w.moe_yp, w.moe_y, T, Kt, H);   // moe_y = Σ_k weighted experts
+        }
+        }
+        // shared expert (always-on, sigmoid-gated).
+        if (w_l.ffn_gate_inp_shexp) {
+            sgemv(dev, w.x_normed, w_l.sh_gate, w.gate_o, H, EFF, T);
+            sgemv(dev, w.x_normed, w_l.sh_up,   w.up_o,   H, EFF, T);
+            swiglu(q, w.gate_o, w.up_o, w.ffn_h, uint64_t(T) * EFF);
+            sgemv(dev, w.ffn_h, w_l.sh_down, w.eo, EFF, H, T);
+            // shared-expert gate g[t]=sigmoid(ffn_gate_inp_shexp · x_normed[t]);
+            // moe_y += eo*g. [VERIFY gate semantics vs qwen36.cpp:1775-1829.]
+            {
+                float* dng = w.dn_g; const float* gw = w_l.ffn_gate_inp_shexp;
+                const sycl::half* xn = w.x_normed; const sycl::half* eo = w.eo;
+                sycl::half* my = w.moe_y; const uint32_t HH = H;
+                q.parallel_for(sycl::range<1>(T), [=](sycl::id<1> ti) {
+                    const uint32_t t = uint32_t(ti); float gg = 0.f;
+                    for (uint32_t h = 0; h < HH; ++h) gg += gw[h] * float(xn[uint64_t(t) * HH + h]);
+                    dng[t] = 1.f / (1.f + sycl::exp(-gg));
+                });
+                q.parallel_for(sycl::range<1>(uint64_t(T) * HH), [=](sycl::id<1> i) {
+                    const uint32_t t = uint32_t(uint64_t(i) / HH);
+                    my[i] = sycl::half(float(my[i]) + float(eo[i]) * dng[t]);
+                });
+            }
+        }
+        residual_add(q, w.x, w.moe_y, w.x, uint64_t(T) * H);
+        if (dbg_timing) { q.wait(); t_moe += now_ms() - _ta; }
+        if (std::getenv("IE_MOE_DBG")) { std::fprintf(stderr,"[L%u T%u dev%u moe-done]\n",L,T,dev); q.wait(); }
+    }
+}
+
+// Final norm + lm_head of the last row into d_logits (device, head_dev); returns when it is written.
+void Qwen35MoeSplitModel::head(uint32_t T, sycl::half* d_logits) {
+    const uint32_t H = cfg_.hidden, V = cfg_.vocab;
+    const uint32_t hd = plan_.head_dev;
+    Workspace& w = ws_[hd];
+    auto& q = fleet_->dev(hd).queue();
+    rms_norm_f32w(q, w.x, output_norm_, w.x_normed, T, H, cfg_.rms_eps);
+    const sycl::half* last = w.x_normed + uint64_t(T - 1) * H;
+    sgemv(hd, last, output_, d_logits, H, V, 1).wait();
+}
+
+
+// ---- P4 B10: request lanes (docs/lanes/LANES_SERVE.md) -----------------------------------------------------------
+
+std::string Qwen35MoeSplitModel::init_lanes(uint32_t n_lanes, uint32_t lane_ctx, uint32_t max_rows, uint64_t reserve_bytes) {
+    if (n_lanes < 2) return {};
+    if (!fleet_ || n_dev_ != 2 || plan_.embed_dev != 0 || plan_.head_dev != 1)
+        return "request lanes need the two-card plan (embedding on card 0, head on card 1)";
+    if (!lane_kv_.empty()) return "request lanes are already allocated";
+    if (lane_ctx < 9 || lane_ctx > max_ctx_)
+        return "lane context " + std::to_string(lane_ctx) + " outside [9, " + std::to_string(max_ctx_) + "]";
+    for (uint32_t dev = 0; dev < n_dev_; ++dev)
+        if (kv_[dev].ready() && kv_[dev].is_int8()) return "request lanes do not support --int8-kv";
+    // the workspace for the largest step first (it only grows; the lanes then never meet a growth mid-pipe)
+    if (ws_.size() != n_dev_) ws_.assign(n_dev_, {});
+    for (uint32_t dev = 0; dev < n_dev_; ++dev)
+        // (B14 gate #6: at least a whole rows group too, so forward_stage_rows never grows it on a stage thread)
+        if (auto m = ensure_ws(dev, std::max<uint32_t>(max_rows, kMaxRows)); !m.empty()) return m;
+    lane_bytes_.assign(n_dev_, 0);
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+        Q35mLaneShape sh;
+        if (kv_[dev].ready()) {
+            const auto& kc = kv_[dev].config();
+            sh.n_full = kc.n_layers_full; sh.n_kv_heads = kc.n_kv_heads; sh.head_dim = kc.head_dim;
+        }
+        if (dn_[dev].ready()) {
+            const auto& dc = dn_[dev].config();
+            sh.n_lin = dc.n_layers_linear; sh.v_heads = dc.n_v_heads; sh.k_head_dim = dc.k_head_dim; sh.v_head_dim = dc.v_head_dim;
+            sh.conv_channels = dc.conv_channels; sh.conv_kernel = dc.conv_kernel;
+        }
+        lane_bytes_[dev] = q35m_lane_bytes(sh, lane_ctx);
+        const sycl::device dv = fleet_->dev(dev).device();
+        if (!dv.has(sycl::aspect::ext_intel_free_memory)) return "request lanes: card " + std::to_string(dev) + " does not report free memory";
+        const uint64_t free_now = dv.get_info<sycl::ext::intel::info::device::free_memory>();
+        // B14 gate #5: the rows buffers allocated below (the G-row activation on each card, the G rows' logits on the head card)
+        // are counted in the reserve's place: they come out of the free memory before the reserve is kept
+        const uint32_t Kmax_r = std::max(std::max(cfg_.hidden, cfg_.expert_ffn), std::max(cfg_.ssm_inner, cfg_.n_q_heads * cfg_.head_dim));
+        const uint64_t rows_b = uint64_t(kMaxRows) * (Kmax_r / 32) * sizeof(block_q8_1x) +
+                                (dev == plan_.head_dev ? uint64_t(kMaxRows) * cfg_.vocab * sizeof(sycl::half) : 0ull);
+        if (auto m = q35m_lanes_fit(free_now, lane_bytes_[dev], n_lanes, lane_ctx, reserve_bytes + rows_b, dev); !m.empty()) return m;
+    }
+    lane_ctx_ = lane_ctx;
+    lane_kv_.resize(n_lanes - 1);
+    lane_dn_.resize(n_lanes - 1);
+    for (uint32_t l = 0; l + 1 < n_lanes; ++l) {
+        lane_kv_[l].resize(n_dev_);
+        lane_dn_[l].resize(n_dev_);
+        for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+            uint64_t got = 0;
+            if (kv_[dev].ready()) {
+                KvCacheConfig kc = kv_[dev].config();
+                kc.max_ctx = lane_ctx;
+                if (auto m = lane_kv_[l][dev].init(fleet_->dev(dev), kc); !m.empty())
+                    return "lane " + std::to_string(l + 1) + " kv card " + std::to_string(dev) + ": " + m;
+                got += 2 * lane_kv_[l][dev].bytes_per_layer() * kc.n_layers_full;
+            }
+            if (dn_[dev].ready()) {
+                auto& d = lane_dn_[l][dev];
+                if (auto m = d.init(fleet_->dev(dev), dn_[dev].config()); !m.empty())
+                    return "lane " + std::to_string(l + 1) + " deltanet card " + std::to_string(dev) + ": " + m;
+                got += d.config().n_layers_linear * (d.state_elems_per_layer() * sizeof(float) + d.conv_elems_per_layer() * sizeof(sycl::half));
+            }
+            if (got != lane_bytes_[dev])
+                return "request lanes: internal: card " + std::to_string(dev) + " allocated " + std::to_string(got) +
+                       " bytes per lane, the arithmetic says " + std::to_string(lane_bytes_[dev]);
+        }
+    }
+    lane_logits_ = static_cast<sycl::half*>(fleet_->dev(plan_.head_dev).malloc(uint64_t(cfg_.vocab) * sizeof(sycl::half)));
+    if (!lane_logits_) return "request lanes: logits buffer alloc failed";
+    owned_[plan_.head_dev].push_back(lane_logits_);
+    // P4 B14 rows: the G-row int-dot activation per card and the G rows' logits (~80 KiB + ~7.9 MB; inside the reserve)
+    const uint32_t Kmax = std::max(std::max(cfg_.hidden, cfg_.expert_ffn), std::max(cfg_.ssm_inner, cfg_.n_q_heads * cfg_.head_dim));
+    act_rows_.assign(n_dev_, nullptr);
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+        void* p = fleet_->dev(dev).malloc(uint64_t(kMaxRows) * (Kmax / 32) * sizeof(block_q8_1x));
+        if (!p) return "request lanes: rows activation alloc failed on card " + std::to_string(dev);
+        owned_[dev].push_back(p);
+        act_rows_[dev] = p;
+    }
+    rows_logits_ = static_cast<sycl::half*>(fleet_->dev(plan_.head_dev).malloc(uint64_t(kMaxRows) * cfg_.vocab * sizeof(sycl::half)));
+    if (!rows_logits_) return "request lanes: rows logits buffer alloc failed";
+    owned_[plan_.head_dev].push_back(rows_logits_);
+    return {};
+}
+
+void Qwen35MoeSplitModel::select_lane(uint32_t lane) {
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) cur_[dev] = lane;
+}
+
+void Qwen35MoeSplitModel::reset_state() {
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+        if (dn_at(dev).ready()) dn_at(dev).reset(fleet_->dev(dev).queue());
+        if (kv_at(dev).ready()) kv_at(dev).reset();
+    }
+}
+
+std::string Qwen35MoeSplitModel::forward_stage(uint32_t dev, uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0,
+                                               sycl::half* x_host) {
+    if (T == 0) return "T == 0";
+    if (lane >= n_lanes() || n_dev_ != 2 || dev >= 2 || !lane_logits_) return "forward_stage: no such lane/card (lanes not initialised?)";
+    if (auto m = ensure_ws(dev, T); !m.empty()) return m;
+    cur_[dev] = lane;
+    auto& q = fleet_->dev(dev).queue();
+    Workspace& w = ws_[dev];
+    // forward()'s per-card order: positions, the reset at pos 0, the embedding (card 0) or the residual in (card 1), the
+    // layers, then the residual out (card 0) or the head (card 1)
+    std::vector<int32_t> pos(T);
+    for (uint32_t t = 0; t < T; ++t) pos[t] = int32_t(pos0 + t);
+    if (w.positions) q.memcpy(w.positions, pos.data(), T * sizeof(int32_t)).wait();
+    if (pos0 == 0) {
+        if (dn_at(dev).ready()) dn_at(dev).reset(q);
+        if (kv_at(dev).ready()) kv_at(dev).reset();
+    }
+    const uint64_t xb = uint64_t(T) * cfg_.hidden * sizeof(sycl::half);
+    if (dev == plan_.embed_dev) { if (auto m = embed(ids, T); !m.empty()) return m; }
+    else q.memcpy(w.x, x_host, xb).wait();
+    double t_attn = 0.0, t_moe = 0.0;
+    run_layers(dev, T, pos0, false, t_attn, t_moe);
+    if (dev != plan_.head_dev) { q.memcpy(x_host, w.x, xb).wait(); return {}; }
+    head(T, lane_logits_);
+    return {};
+}
+
+
+// ---- P4 B14 phase 1b: a rows-mode group's decode step (G lanes, one row each) ------------------------------------------
+
+std::string Qwen35MoeSplitModel::rows_off_reason() const {
+    if (lane_kv_.empty() || act_rows_.size() != n_dev_ || !rows_logits_) return "the request lanes are not initialised";
+    for (uint32_t dev = 0; dev < n_dev_; ++dev)
+        if (kv_[dev].ready() && kv_[dev].is_int8()) return "--int8-kv";
+    if (!output_.q8_qs) return "the head is not Q8_0";
+    if (cfg_.n_experts != 256 || cfg_.experts_topk != 8)   // (B14 gate #4: moe_router_rows' shape; refuse at load, not per group)
+        return "router shape " + std::to_string(cfg_.n_experts) + " experts top-" + std::to_string(cfg_.experts_topk) + " (rows: 256 / top-8 only)";
+    for (uint32_t L = 0; L < layers_.size(); ++L) {
+        const LayerW& l = layers_[L];
+        const std::string at = " (layer " + std::to_string(L) + ")";
+        if (l.is_linear) {
+            if (!l.attn_qkv.q8_qs || !l.attn_gate.q8_qs || !l.ssm_out.q8_qs) return "a DeltaNet projection is not Q8_0" + at;
+        } else if (!l.attn_q.q8_qs || !l.attn_k.q8_qs || !l.attn_v.q8_qs || !l.attn_output.q8_qs) {
+            return "an attention projection is not Q8_0" + at;
+        }
+        if (l.exp_gate.dtype != DType::kQ8_0 || l.exp_up.dtype != DType::kQ8_0 || l.exp_down.dtype != DType::kQ8_0)
+            return "native K-quant experts (single-token decode kernels)" + at;
+        if (l.ffn_gate_inp_shexp && (!l.sh_gate.q8_qs || !l.sh_up.q8_qs || !l.sh_down.q8_qs))
+            return "a shared-expert projection is not Q8_0" + at;
+    }
+    return {};
+}
+
+sycl::event Qwen35MoeSplitModel::srows(uint32_t dev, const sycl::half* A, const SplitW& w, sycl::half* out, uint32_t K,
+                                       uint32_t N, uint32_t G) {
+    auto& q = fleet_->dev(dev).queue();
+    quantize_q8_1(q, A, act_rows_[dev], G * K);
+    return gemv_q8_0_soa_q8_batched(q, act_rows_[dev], w.q8_qs, w.q8_d, out, K, N, G);
+}
+
+// run_layers' T == 1 decode path for G rows (row i = lanes[i] at pos0[i]); run_layers is not touched. The shared kernels run
+// once over the G rows; the per-lane state (conv, DeltaNet recurrence, KV) is addressed by lane index, never through cur_.
+void Qwen35MoeSplitModel::run_layers_rows(uint32_t dev, std::span<const uint32_t> lanes, const uint32_t* pos0) {
+    const uint32_t G    = uint32_t(lanes.size());
+    const uint32_t H    = cfg_.hidden;
+    const uint32_t HD   = cfg_.head_dim;
+    const uint32_t N_q  = cfg_.n_q_heads * HD;
+    const uint32_t N_qg = N_q * 2u;
+    const uint32_t N_kv = cfg_.n_kv_heads * HD;
+    const uint32_t EFF  = cfg_.expert_ffn;
+    const uint32_t E    = cfg_.n_experts;
+    const uint32_t Kt   = cfg_.experts_topk;
+    const uint32_t rope_n = cfg_.rope_dim;
+    const float    eps  = cfg_.rms_eps;
+    const uint32_t n_kv = cfg_.n_kv_heads;
+    Workspace& w = ws_[dev];
+    auto& q = fleet_->dev(dev).queue();
+
+    for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
+        if (plan_.dev_of_layer[L] != dev) continue;
+        const LayerW& w_l = layers_[L];
+        rms_norm_f32w(q, w.x, w_l.attn_norm, w.x_normed, G, H, eps);
+        if (w_l.is_linear) {
+            const uint32_t SKH = cfg_.ssm_n_k_heads;
+            const uint32_t SVH = cfg_.ssm_n_v_heads;
+            const uint32_t SHD = cfg_.ssm_head_dim;
+            const uint32_t SI  = cfg_.ssm_inner;
+            const uint32_t conv_ch = SI + 2u * SKH * SHD;
+            const uint32_t kw  = SKH * SHD;
+            const uint32_t rep = SVH / SKH;
+            const uint32_t Vd  = SVH * SHD;
+            const float qscale = 1.0f / sycl::sqrt(float(SHD));
+            const uint32_t SVHp = ((SVH + 63u) / 64u) * 64u;
+
+            srows(dev, w.x_normed, w_l.attn_qkv, w.dn_qkv, H, conv_ch, G);
+            for (uint32_t i = 0; i < G; ++i) {
+                DeltaNetState& d = lane_dn(lanes[i], dev);
+                sycl::half* conv_state = d.conv_state_ptr() + uint64_t(dn_local_[L]) * d.conv_elems_per_layer();
+                depthwise_conv1d_causal(q, w.dn_qkv + uint64_t(i) * conv_ch, w_l.ssm_conv1d_fp16, conv_state,
+                                        w.dn_conv + uint64_t(i) * conv_ch, 1, conv_ch, cfg_.ssm_conv_kernel);
+            }
+            cast_qkv_split_fp16_to_fp32(q, w.dn_conv, w.dn_qpre, w.dn_kpre, w.dn_vpre, G, kw, SI);
+            l2_norm_scale(q, w.dn_qpre, w.dn_qpre, G * SKH, SHD, qscale, 1e-6f);
+            l2_norm_scale(q, w.dn_kpre, w.dn_kpre, G * SKH, SHD, 1.0f,   1e-6f);
+            repeat_interleave_heads(q, w.dn_qpre, w.dn_qrep, G, SKH, SHD, rep);
+            repeat_interleave_heads(q, w.dn_kpre, w.dn_krep, G, SKH, SHD, rep);
+            // alpha/beta per ROW: the G-row F16 route is another kernel (oneDNN / XMX gemm), not the T == 1 gemv
+            for (uint32_t i = 0; i < G; ++i) {
+                dense::gemv_q_T(q, w.x_normed + uint64_t(i) * H, w_l.ssm_alpha, w.dn_alpha64 + uint64_t(i) * SVHp, H, SVHp, 1);
+                dense::gemv_q_T(q, w.x_normed + uint64_t(i) * H, w_l.ssm_beta,  w.dn_beta64  + uint64_t(i) * SVHp, H, SVHp, 1);
+            }
+            extract_cols(q, w.dn_alpha64, w.dn_alpha_h, G, SVH, SVHp);
+            extract_cols(q, w.dn_beta64,  w.dn_beta_h,  G, SVH, SVHp);
+            compute_g_beta_h16(q, w.dn_alpha_h, w.dn_beta_h, w_l.ssm_a, w_l.ssm_dt_bias, w.dn_g, w.dn_beta, G, SVH);
+            for (uint32_t i = 0; i < G; ++i) {
+                DeltaNetState& d = lane_dn(lanes[i], dev);
+                float* state_layer = d.state_ptr() + uint64_t(dn_local_[L]) * d.state_elems_per_layer();
+                deltanet_recurrence(q, w.dn_qrep + uint64_t(i) * Vd, w.dn_krep + uint64_t(i) * Vd, w.dn_vpre + uint64_t(i) * SI,
+                                    w.dn_g + uint64_t(i) * SVH, w.dn_beta + uint64_t(i) * SVH, state_layer,
+                                    w.dn_out + uint64_t(i) * Vd, /*B=*/1, /*T=*/1, SVH, SHD, SHD);
+            }
+            srows(dev, w.x_normed, w_l.attn_gate, w.dn_z, H, SI, G);
+            gated_rms_norm(q, w.dn_out, w.dn_z, w_l.ssm_norm_fp16, w.dn_qkv, G * SVH, SHD, eps);
+            srows(dev, w.dn_qkv, w_l.ssm_out, w.attn_block, SI, H, G);
+        } else {
+            srows(dev, w.x_normed, w_l.attn_q, w.qg, H, N_qg, G);
+            split_q_gate_per_head(q, w.qg, w.q, w.gate, G, cfg_.n_q_heads, HD);
+            srows(dev, w.x_normed, w_l.attn_k, w.k, H, N_kv, G);
+            srows(dev, w.x_normed, w_l.attn_v, w.v, H, N_kv, G);
+            rms_norm_f32w(q, w.q, w_l.attn_q_norm, w.q, G * cfg_.n_q_heads,  HD, eps);
+            rms_norm_f32w(q, w.k, w_l.attn_k_norm, w.k, G * cfg_.n_kv_heads, HD, eps);
+            rope_partial(q, w.q, w.positions, w.q, G, cfg_.n_q_heads,  HD, rope_n, cfg_.rope_theta);   // row i at pos0[i]
+            rope_partial(q, w.k, w.positions, w.k, G, cfg_.n_kv_heads, HD, rope_n, cfg_.rope_theta);
+            const uint32_t li = kv_local_[L];
+            for (uint32_t i = 0; i < G; ++i) {
+                KvCache& kvc = lane_kv(lanes[i], dev);
+                const uint32_t max_ctx = kvc.config().max_ctx;           // the lane's own capacity
+                const uint64_t per_layer_kv = uint64_t(n_kv) * max_ctx * HD;
+                full_attention_fa2_decode(q, w.q + uint64_t(i) * N_q, w.k + uint64_t(i) * N_kv, w.v + uint64_t(i) * N_kv,
+                                          kvc.k_ptr() + per_layer_kv * li, kvc.v_ptr() + per_layer_kv * li,
+                                          w.attn_out + uint64_t(i) * N_q, w.attn_partials, pos0[i],
+                                          cfg_.n_q_heads, cfg_.n_kv_heads, HD, max_ctx);
+                kvc.set_length(li, pos0[i] + 1);
+            }
+            sigmoid_gate(q, w.attn_out, w.gate, w.attn_out, uint64_t(G) * N_q);
+            srows(dev, w.attn_out, w_l.attn_output, w.attn_block, N_q, H, G);
+        }
+        residual_add_rms_norm_fused(q, w.x, w.attn_block, w_l.post_attn_norm, w.x_normed, G, H, eps);
+
+        // MoE: always the Q8_0 decode chain over the G rows (never the prefill expert-GEMM branch)
+        moe_router_rows(q, w.x_normed, w_l.ffn_gate_inp, w.topk_idx, w.topk_w, G, H, E, Kt);   // == the T == 1 router per row
+        quantize_q8_1(q, w.x_normed, static_cast<block_q8_1x*>(w.x_q8), uint32_t(G) * H);
+        moe_gate_up_silu_q8(q, w.x_q8, w_l.exp_gate.qs, w_l.exp_gate.d,
+                            w_l.exp_up.qs, w_l.exp_up.d, w_l.exp_gate.qs_stride,
+                            w_l.exp_gate.d_stride, w.topk_idx, w.moe_hp, G, Kt, H, EFF);
+        quantize_q8_1(q, w.moe_hp, static_cast<block_q8_1x*>(w.h_q8), uint32_t(G) * Kt * EFF);
+        moe_down_q8(q, w.h_q8, w_l.exp_down.qs, w_l.exp_down.d, w_l.exp_down.qs_stride,
+                    w_l.exp_down.d_stride, w.topk_idx, w.topk_w, w.moe_yp, G, Kt, EFF, H);
+        moe_reduce_q8(q, w.moe_yp, w.moe_y, G, Kt, H);
+        if (w_l.ffn_gate_inp_shexp) {
+            srows(dev, w.x_normed, w_l.sh_gate, w.gate_o, H, EFF, G);
+            srows(dev, w.x_normed, w_l.sh_up,   w.up_o,   H, EFF, G);
+            swiglu(q, w.gate_o, w.up_o, w.ffn_h, uint64_t(G) * EFF);
+            srows(dev, w.ffn_h, w_l.sh_down, w.eo, EFF, H, G);
+            {   // run_layers' shared-expert gate, verbatim (row-wise)
+                float* dng = w.dn_g; const float* gw = w_l.ffn_gate_inp_shexp;
+                const sycl::half* xn = w.x_normed; const sycl::half* eo = w.eo;
+                sycl::half* my = w.moe_y; const uint32_t HH = H;
+                q.parallel_for(sycl::range<1>(G), [=](sycl::id<1> ti) {
+                    const uint32_t t = uint32_t(ti); float gg = 0.f;
+                    for (uint32_t h = 0; h < HH; ++h) gg += gw[h] * float(xn[uint64_t(t) * HH + h]);
+                    dng[t] = 1.f / (1.f + sycl::exp(-gg));
+                });
+                q.parallel_for(sycl::range<1>(uint64_t(G) * HH), [=](sycl::id<1> i) {
+                    const uint32_t t = uint32_t(uint64_t(i) / HH);
+                    my[i] = sycl::half(float(my[i]) + float(eo[i]) * dng[t]);
+                });
+            }
+        }
+        residual_add(q, w.x, w.moe_y, w.x, uint64_t(G) * H);
+    }
+}
+
+std::string Qwen35MoeSplitModel::forward_stage_rows(uint32_t dev, std::span<const uint32_t> lanes, const int32_t* ids,
+                                                    const uint32_t* pos0, sycl::half* x_host) {
+    const uint32_t G = uint32_t(lanes.size());
+    if (G < 2 || G > kMaxRows) return "forward_stage_rows: " + std::to_string(G) + " rows (a group takes 2.." + std::to_string(kMaxRows) + ")";
+    if (n_dev_ != 2 || dev >= 2 || act_rows_.size() != n_dev_ || !rows_logits_)
+        return "forward_stage_rows: no such card, or the rows buffers are not initialised";
+    for (uint32_t i = 0; i < G; ++i) {
+        if (lanes[i] >= n_lanes()) return "forward_stage_rows: lane " + std::to_string(lanes[i]) + " of " + std::to_string(n_lanes());
+        if (pos0[i] == 0) return "forward_stage_rows: lane " + std::to_string(lanes[i]) + " at position 0 (a group row never starts a sequence)";
+    }
+    if (dev == plan_.embed_dev && !ids) return "forward_stage_rows: no ids";
+    if (auto m = ensure_ws(dev, G); !m.empty()) return m;
+    auto& q = fleet_->dev(dev).queue();
+    Workspace& w = ws_[dev];
+    if (kv_[dev].ready() && !w.attn_partials) return "forward_stage_rows: no decode attention scratch on card " + std::to_string(dev);
+    int32_t pos[kMaxRows];
+    for (uint32_t i = 0; i < G; ++i) pos[i] = int32_t(pos0[i]);
+    q.memcpy(w.positions, pos, G * sizeof(int32_t)).wait();
+    const uint64_t xb = uint64_t(G) * cfg_.hidden * sizeof(sycl::half);
+    if (dev == plan_.embed_dev) { if (auto m = embed(ids, G); !m.empty()) return m; }
+    else q.memcpy(w.x, x_host, xb).wait();
+    run_layers_rows(dev, lanes, pos0);
+    if (dev != plan_.head_dev) { q.memcpy(x_host, w.x, xb).wait(); return {}; }
+    // head(): the final norm, then the lm_head over the G rows (batched int-dot; row i == the one-row sgemv's)
+    const uint32_t H = cfg_.hidden;
+    rms_norm_f32w(q, w.x, output_norm_, w.x_normed, G, H, cfg_.rms_eps);
+    quantize_q8_1(q, w.x_normed, act_rows_[dev], G * H);
+    gemv_q8_0_soa_q8_batched(q, act_rows_[dev], output_.q8_qs, output_.q8_d, rows_logits_, H, cfg_.vocab, G).wait();
     return {};
 }
 

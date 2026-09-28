@@ -64,6 +64,23 @@ Allocation checks can still fail if another process consumes resources later.
 Server defaults apply when an HTTP request omits an option. Explicit request
 values, including zero, override those defaults. Invalid values return an error.
 
+Recommended sampling (P4 B20). For Qwen3.8-27B, Qwen3.8-Flash-Next,
+Qwen3.8-35B-A3B-Distill, MiMo-V2.6-Flash-RL, GLM-5.3-Flash and
+DeepSeek-V4.1-Flash the server fills `temperature`, `top_p`, `top_k`, `min_p`,
+`presence_penalty` and `repeat_penalty` from the model card's values for the
+request's actual mode (thinking or instruct). The order is: request value, then
+CLI flag or `IE_SERVE_*` environment, then the recommendation, then the library
+default. A temperature of 0 set by the request or the server (greedy) takes
+nothing from the recommendation. `max_tokens`, `frequency_penalty` and the
+performance settings (prefill chunk and the rest) are not part of it.
+`ie capabilities` reports the resolved `defaults` and a `recommended` block
+(modes, values, max output, context, when-to-use notes, card URL); the server
+logs the filled values per request. `chat_template_kwargs.enable_thinking` and
+`chat_template_kwargs.reasoning_effort` are accepted as aliases of the
+top-level fields (the top-level field wins). DeepSeek-V4.1 and MiMo-V2.6 sample
+on the host without presence or frequency penalties: a nonzero value is served
+without them and logged as a WARNING.
+
 | CLI option | Accepted behavior |
 |---|---|
 | `--temp` | 0–2; zero is greedy |
