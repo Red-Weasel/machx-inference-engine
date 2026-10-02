@@ -17,6 +17,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -37,7 +38,14 @@ constexpr uint32_t kChunk = 5;   // the fake's prefill chunk (pf_chunk)
 uint64_t mix(uint64_t h, uint64_t v) { return (h ^ v) * 0x100000001B3ull; }
 constexpr uint64_t kSeed = 0xcbf29ce484222325ull;
 uint32_t g_stop_at = 0;   // the depth at which the "model" emits kStop (0 = never)
+int32_t  g_stop_first = -1;   // (P4 B39) ... only for a sequence whose first id is this (-1 = any)
+bool stops_at(const std::vector<int32_t>& seq) { return g_stop_at && seq.size() == g_stop_at && (g_stop_first < 0 || (!seq.empty() && seq[0] == g_stop_first)); }
 int32_t id_of(uint64_t h, uint64_t seed) { return int32_t(10 + ((h ^ (seed * 0x9E3779B97F4A7C15ull)) >> 11) % 990); }
+// P4 B39: the crown's IE_Q35MOE_TURN_DRAIN=1 in every FakeCrown made while this is set -- every serial turn drains the pipe and
+// the plan's tail runs in prompt_end (B10-B38); off = the default: the turns run beside the pipe, the tail through it
+bool g_turn_drain = false;
+// P4 B42: the crown's decode regroup (IE_Q35MOE_GROUP_WAIT_US) in every FakeCrown made while this is set; 0 = IE_Q35MOE_REGROUP=0
+uint32_t g_regroup_us = 20000;
 
 // Stage 1's state after one step: a marker for the step's start, then its ids.
 uint64_t step_hash(uint64_t h, const int32_t* ids, uint32_t T, uint32_t pos0) {
@@ -116,7 +124,7 @@ std::vector<int32_t> serial_ref(Cache& c, const std::vector<int32_t>& ids, uint3
     prefill_to(T);
     std::vector<int32_t> out;
     for (uint32_t step = 0; step < n; ++step) {
-        const int32_t id = g_stop_at && pos == g_stop_at ? kStop : id_of(h, rng + step);
+        const int32_t id = g_stop_at && pos == g_stop_at && (g_stop_first < 0 || ids[0] == g_stop_first) ? kStop : id_of(h, rng + step);
         if (id == kStop) break;
         out.push_back(id);
         h = step_hash(h, &id, 1, pos); ++pos;
@@ -162,7 +170,15 @@ struct FakeCrown final : ie::LanesModel {
         : st(caps.size()), cap(caps), ckh(caps.size(), 0),
           pipe(uint32_t(caps.size()), kChunk, 1, 2, [this](uint32_t s, const ie::Glm5LanePipe::Step& x) { return stage(s, x); },
                [this](uint32_t s, std::span<const ie::Glm5LanePipe::Step> x, float*) { return stage_rows(s, x); }, 16, 0, g_pipeline),
-          rows_on(rows) { sticky.resize(uint32_t(caps.size())); }
+          rows_on(rows) { sticky.resize(uint32_t(caps.size())); pipe.set_regroup(g_regroup_us); }
+    // P4 B42: while record_groups, every decode group stage 0 ran, by size, in order (a lone 1-row step counts as a group of 1)
+    std::atomic<bool> record_groups{false};
+    std::vector<uint32_t> gsz;
+    void rec_group(uint32_t n) {
+        if (!record_groups) return;
+        std::lock_guard<std::mutex> g(rec_mu);
+        gsz.push_back(n);
+    }
     // P4 B34 (Q35mLanesModel::pipe_lookahead / pipe_submit_ahead)
     bool pipe_lookahead(std::function<void()> idle) override {
         if (!g_pipeline) return false;
@@ -175,7 +191,32 @@ struct FakeCrown final : ie::LanesModel {
         return e;
     }
 
+    // P4 B39: the serial hooks take turn_ms (a restore's / snapshot's device copies), and while record_dec every decode row's
+    // stage-0 start time per lane (a drained turn shows as a gap in a decoder's steps)
+    std::atomic<int> turn_ms{0};
+    std::atomic<bool> record_dec{false};
+    std::vector<std::vector<double>> dec_t0 = std::vector<std::vector<double>>(64);
+    const std::chrono::steady_clock::time_point t_base = std::chrono::steady_clock::now();
+    double now_ms() const { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_base).count(); }
+    void rec_dec(uint32_t lane) {
+        if (!record_dec || lane >= dec_t0.size()) return;
+        std::lock_guard<std::mutex> g(rec_mu);
+        dec_t0[lane].push_back(now_ms());
+    }
+    void turn_sleep() { if (const int t = turn_ms.load()) std::this_thread::sleep_for(std::chrono::milliseconds(t)); }
+    // (B39 follow-up) the serial hooks' order in time while record_turns: 'P' prefix_prepare begins, 'M' mark, 'S' snapshot, and
+    // 'L' = stage 1 forwarded a lane's piece ending at land_at (the piece whose landing makes the lane wait for its mark turn)
+    std::atomic<bool> record_turns{false};
+    std::atomic<uint32_t> land_at{0};
+    std::vector<std::tuple<char, uint32_t, double>> turns;
+    void rec_turn(char k, uint32_t lane) {
+        if (!record_turns) return;
+        std::lock_guard<std::mutex> g(rec_mu);
+        turns.emplace_back(k, lane, now_ms());
+    }
+
     std::string stage_rows(uint32_t s, std::span<const ie::Glm5LanePipe::Step> x) {
+        if (s == 0) { for (const auto& step : x) rec_dec(step.lane); rec_group(uint32_t(x.size())); }
         const int a = ++active;
         for (int m = max_active.load(); a > m && !max_active.compare_exchange_weak(m, a);) {}
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -234,6 +275,7 @@ struct FakeCrown final : ie::LanesModel {
         if (L.seq[s].size() != pos0) { ++bad; return "stage " + std::to_string(s) + " at " + std::to_string(L.seq[s].size()) + ", step at " + std::to_string(pos0); }
         L.seq[s].insert(L.seq[s].end(), ids, ids + T);
         if (s == 1) L.h = step_hash(L.h, ids, T, pos0);
+        if (s == 1 && land_at && pos0 + T == land_at) rec_turn('L', lane);
         if (s == 1 && record) {
             std::lock_guard<std::mutex> g(rec_mu);
             if (pieces.size() < st.size()) pieces.resize(st.size());
@@ -253,9 +295,12 @@ struct FakeCrown final : ie::LanesModel {
     std::atomic<uint32_t> calls_after_abort{0};
     uint32_t abort() override { const uint32_t h = pipe.cancel(); aborted = true; return h; }
     int deep_cost(uint32_t T, uint32_t pos0) const { return T > 1 && pos0 >= deep_from.load() ? deep_ms.load() + deep_row_ms.load() * int(T) : 0; }
+    std::atomic<int> slow_lane{-1}, slow_ms{0};   // (B39 (5)) this lane's stage-0 steps take slow_ms more (a step that holds stage 0)
     std::string stage(uint32_t s, const ie::Glm5LanePipe::Step& x) {
         if (aborted) ++calls_after_abort;
+        if (s == 0 && x.T == 1) { rec_dec(x.lane); if (x.pos0) rec_group(1); }
         if (s == 0) rec0(x.lane, x.pos0, x.T);
+        if (s == 0 && int(x.lane) == slow_lane.load()) std::this_thread::sleep_for(std::chrono::milliseconds(slow_ms.load()));
         if (watch && x.T > 1) for (uint32_t v = max_piece; x.T > v && !max_piece.compare_exchange_weak(v, x.T);) {}
         const int a = ++active;
         for (int m = max_active.load(); a > m && !max_active.compare_exchange_weak(m, a);) {}
@@ -277,6 +322,8 @@ struct FakeCrown final : ie::LanesModel {
     std::string prefix_prepare(uint32_t lane, const ie::LanesRequest& rq, uint32_t& reused, std::string& source) override {
         St& L = st[lane];
         source.clear();
+        rec_turn('P', lane);
+        turn_sleep();
         if (lane < plen.size()) plen[lane] = uint32_t(rq.ids->size());   // (P4 B36 (C): dec_sleep's decode rows)
         // Fix B (Q35mLanesModel::prefix_prepare): the lane's own checkpoint when it serves at least as much as the cache
         const uint32_t own = sticky.match(lane, *rq.ids);
@@ -298,13 +345,36 @@ struct FakeCrown final : ie::LanesModel {
         L.h = reused ? h : kSeed;
         return {};
     }
+    // P4 B39 (Q35mLanesModel::plan): the tail through the pipe behind the snapshot boundary unless the drain switch is on
     ie::LanesPlan plan(const ie::LanesRequest& rq, uint32_t reused) override {
-        return ie::q35m_plan(uint32_t(rq.ids->size()), rq.snap_at, reused, kChunk, rq.share_at);
+        return ie::q35m_plan(uint32_t(rq.ids->size()), rq.snap_at, reused, kChunk, rq.share_at, /*pipe_tail=*/!g_turn_drain);
+    }
+    // P4 B39 (Q35mLanesModel::serial_drains): with the switch every turn drains; else only a "length" finish (it forwards the
+    // last id: a full forward) and a lost lane's reset
+    bool serial_drains(Turn k) const override { return g_turn_drain || k == Turn::kFinishLength || k == Turn::kReset; }
+    std::string pipe_wait_lane(uint32_t lane) override { return pipe.wait_lane(lane); }
+    // P4 B39 (Q35mLanesModel::snapshot): the conversation snapshot at `pos` -- prompt_end's insert + the lane's checkpoint
+    std::atomic<int> snap_turns{0};
+    std::string conv_snapshot(uint32_t lane, const ie::LanesRequest& rq, uint32_t pos) {
+        St& L = st[lane];
+        if (L.seq[0].size() != pos || L.seq[1].size() != pos) { ++bad; return "snapshot: the lane is not at " + std::to_string(pos); }
+        cache.insert(std::vector<int32_t>(rq.ids->begin(), rq.ids->begin() + pos), L.h, false, anchor_on && rq.anchor);
+        ++snaps;
+        if (sticky.on) { ckh[lane] = L.h; sticky.set(lane, *rq.ids, pos); }   // Fix B
+        return {};
+    }
+    std::string snapshot(uint32_t lane, const ie::LanesRequest& rq, uint32_t pos) override {
+        ++snap_turns;
+        rec_turn('S', lane);
+        turn_sleep();
+        return conv_snapshot(lane, rq, pos);
     }
     // P4 B15 (Q35mLanesModel::mark / cache_peek): the lane's state at the shared prefix into the shared cache
     std::atomic<int> marks{0};
     std::string mark(uint32_t lane, const ie::LanesRequest& rq, uint32_t pos) override {
         ++marks;
+        rec_turn('M', lane);
+        turn_sleep();
         St& L = st[lane];
         if (L.seq[0].size() != pos || L.seq[1].size() != pos) { ++bad; return "mark: the lane is not at " + std::to_string(pos); }
         cache.insert(std::vector<int32_t>(rq.ids->begin(), rq.ids->begin() + pos), L.h, /*shared=*/true);
@@ -328,11 +398,9 @@ struct FakeCrown final : ie::LanesModel {
     std::string prompt_end(uint32_t lane, const ie::LanesRequest& rq, uint32_t Tp, uint32_t reused, bool kept) override {
         St& L = st[lane];
         const uint32_t T = uint32_t(rq.ids->size());
-        if (rq.snap_at > reused && Tp == rq.snap_at) {
-            cache.insert(std::vector<int32_t>(rq.ids->begin(), rq.ids->begin() + Tp), L.h, false, anchor_on && rq.anchor);
-            ++snaps;
-        }
-        if (sticky.on && rq.snap_at > reused && Tp == rq.snap_at) { ckh[lane] = L.h; sticky.set(lane, *rq.ids, Tp); }   // Fix B
+        turn_sleep();
+        if (rq.snap_at > reused && Tp == rq.snap_at)
+            if (auto e = conv_snapshot(lane, rq, Tp); !e.empty()) return e;
         if (Tp < T) {
             std::vector<ie::LanesChunk> rest;
             ie::q35m_chunks(Tp, T, kChunk, rest);
@@ -346,13 +414,14 @@ struct FakeCrown final : ie::LanesModel {
     }
     std::string reset_lane(uint32_t lane) override { st[lane] = St{}; sticky.drop(lane); return pipe.reset_lane(lane); }
     int32_t sample(uint32_t lane, bool first, const ie::LanesSampling&, std::span<const int32_t>, uint64_t seed, std::string&) override {
-        if (g_stop_at && st[lane].seq[1].size() == g_stop_at) return kStop;
+        if (stops_at(st[lane].seq[1])) return kStop;
         return id_of(first ? st[lane].kept : st[lane].h, seed);
     }
     // the crown's finish (Q35mLanesModel::finish): forward a "length" reply's last id, then the reply snapshot
     std::atomic<int> finishes{0};
     std::string finish(uint32_t lane, const ie::LanesRequest& rq, std::span<const int32_t> out, const std::string&, uint32_t pos) override {
         ++finishes;
+        turn_sleep();
         std::vector<int32_t> full(rq.ids->begin(), rq.ids->end());
         full.insert(full.end(), out.begin(), out.end());
         if (pos + 1 == full.size()) {
@@ -378,6 +447,13 @@ struct FakeCrown final : ie::LanesModel {
     std::string pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) override {
         rec('S', lane, pos0, T);
         return pipe.submit(lane, ids, T, pos0);
+    }
+    // (B39 (5): Q35mLanesModel::pipe_submit_front -- the tail piece to the front of stage 0's queue)
+    std::atomic<uint32_t> fronts{0};
+    std::string pipe_submit_front(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) override {
+        ++fronts;
+        rec('F', lane, pos0, T);
+        return pipe.submit(lane, ids, T, pos0, /*front=*/true);
     }
     std::string pipe_pause() override { return pipe.pause(); }
     std::string pipe_resume() override { return pipe.resume(); }
@@ -566,9 +642,15 @@ void test_serve(bool rows) {
         const auto gs = m.pipe.group_sizes();   // (since the first start: every pipe of this server)
         uint64_t multi = 0;
         for (size_t g = 2; g < gs.size(); ++g) multi += gs[g];
-        check(multi > 0 && m.group_steps.load() > 0 && m.rows_calls.load() > 0 && m.rows_calls.load() < m.rows_ids.load(),
-              "rows: groups of >= 2 lanes ran (" + std::to_string(multi) + "), sample_rows " + std::to_string(m.rows_calls.load()) +
-                  " calls for " + std::to_string(m.rows_ids.load()) + " ids");
+        const std::string seen = "rows: groups of >= 2 lanes ran (" + std::to_string(multi) + "), sample_rows " + std::to_string(m.rows_calls.load()) +
+                                 " calls for " + std::to_string(m.rows_ids.load()) + " ids";
+        // P4 B39: with equal stage times, singleton decode groups rotate over the two stages and stage 0 finds two lanes queued
+        // only after a BURST -- several lanes resubmitted together -- which the paused turns' releases gave at every turn; the
+        // turns beside the pipe give none, so a merge is a matter of the lanes' alignment (0 or dozens from run to run). P4 B42:
+        // the regroup wait merges them again (required with it, as under the drain switch); reported only with both off.
+        if (g_turn_drain || g_regroup_us) check(multi > 0 && m.group_steps.load() > 0 && m.rows_calls.load() > 0 && m.rows_calls.load() < m.rows_ids.load(), seen);
+        else std::printf("  (%s; the merged groups need a burst the drain-free turns do not give)\n", seen.c_str());
+        check(m.rows_calls.load() <= m.rows_ids.load(), "rows: every sample_rows call covered >= 1 id");
     } else {
         check(m.rows_calls.load() == 0 && m.group_steps.load() == 0, "rows off: the per-lane pipe (no group step, no sample_rows)");
     }
@@ -603,9 +685,11 @@ void test_rows_prefill_piece() {
          prefix_of(d3.res.text, text_of(serial_ref(ref, d3.ids, 14, 3000, 93)));
     check(ok, "rows: prompts beside decoding lanes == --parallel 1's (" + std::to_string(tries) + " prompts)");
     // (P4 B34: a lookahead enters only an idle stage 0, so a 1-row last piece sent that way never meets a queued decode lane;
-    // with the lane pipeline the group landing is reported, not required -- the block without it requires it)
-    if (!g_pipeline) check(m.kept_in_group.load() > 0, "rows: a prompt's last (1-row) piece landed inside a group and kept its logits");
-    else std::printf("  (lane pipeline: a last 1-row piece landed inside a group %u time(s))\n", m.kept_in_group.load());
+    // with the lane pipeline the group landing is reported, not required -- the block without it requires it. P4 B39: the
+    // landing needs a burst at stage 0, which the paused turns' releases gave; with the turns beside the pipe (no bursts) it is
+    // reported, and required in the IE_Q35MOE_TURN_DRAIN=1 run)
+    if (!g_pipeline && g_turn_drain) check(m.kept_in_group.load() > 0, "rows: a prompt's last (1-row) piece landed inside a group and kept its logits");
+    else std::printf("  (%s: a last 1-row piece landed inside a group %u time(s))\n", g_pipeline ? "lane pipeline" : "turns beside the pipe", m.kept_in_group.load());
     check(m.bad == 0, "rows: no stage saw a wrong position");
     s.shutdown();
 }
@@ -1109,7 +1193,10 @@ void test_short_first_abort() {
     for (int k = 0; k < 6; ++k) { std::vector<int32_t> p = conv(9, 58000 + 1000 * k); sh.push_back(std::make_unique<Req>(p, 4, 610 + uint64_t(k), 9)); }
     std::vector<std::thread> ts;
     for (auto& r : sh) ts.emplace_back([&r, &s] { r->run(s); });
-    for (int i = 0; i < 3000 && health_field(s, "short_bypass") == 0; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // (P4 B39: the lead's piece in flight is no longer drained for each short prompt's turns, so a hold -- short_bypass > 0 -- is
+    // not guaranteed before the fake's short prompts finish; the stop comes once the short prompts are admitted beside the lead)
+    for (int i = 0; i < 3000 && health_field(s, "short_bypass") == 0 && health_field(s, "lanes_active") < 7; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
     const auto t0 = Clock::now();
     const uint32_t held = s.abort_all();
     const double abort_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
@@ -1119,10 +1206,11 @@ void test_short_first_abort() {
     s.shutdown();
     const double down_ms = std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     bool all_abort = d.res.finish_reason == "abort" && lead.res.finish_reason == "abort";
-    for (auto& r : sh) all_abort = all_abort && (r->res.finish_reason == "abort" || r->res.finish_reason == "length");
+    std::string fins = "decoder " + d.res.finish_reason + ", lead " + lead.res.finish_reason + ", short:";
+    for (auto& r : sh) { all_abort = all_abort && (r->res.finish_reason == "abort" || r->res.finish_reason == "length"); fins += " " + r->res.finish_reason; }
     check(abort_ms < 50 && join_ms < 300, "short-first abort: abort_all does not block (" + std::to_string(int(abort_ms)) + " ms), every request returned (" +
                                               std::to_string(int(join_ms)) + " ms)");
-    check(all_abort, "short-first abort: the decoder and the held lead end abort; each short prompt ends abort or had finished");
+    check(all_abort, "short-first abort: the decoder and the held lead end abort; each short prompt ends abort or had finished (" + fins + ")");
     check(held <= 2 && m.calls_after_abort.load() <= held, "short-first abort: nothing started on a stage after the stop beyond the " + std::to_string(held) +
                                                              " held step(s) (" + std::to_string(m.calls_after_abort.load()) + " calls after)");
     check(down_ms < 400 && m.bad == 0, "short-first abort: shutdown waited only for the held steps (" + std::to_string(int(down_ms)) + " ms); no wrong position");
@@ -1515,9 +1603,467 @@ void test_anchor_lru() {
     s.shutdown();
 }
 
+// ---- P4 B39: the serial turns beside the running pipe ---------------------------------------------------------------------
+
+// The plan with the tail through the pipe (q35m_plan pipe_tail): the pieces are --parallel 1's prefill_to(share), prefill_to(snap),
+// prefill_to(T) exactly (the tail's pieces = prompt_end's pf_chunk-cut rest), Tp = T, snap = snap_at exactly when reused < snap_at
+// < T, mark as before, and a chunk ends at the snap.
+void test_pipe_tail_plan() {
+    bool all = true, bounds = true, ends = true;
+    for (uint32_t T = 2; T <= 34 && all; ++T)
+        for (uint32_t snap = 1; snap <= T && all; ++snap)
+            for (uint32_t share = 0; share < snap && all; ++share)
+                for (uint32_t reused = 0; reused < T && all; ++reused)
+                    for (uint32_t pf : {1u, 3u, 8u}) {
+                        std::vector<ie::LanesChunk> ref;
+                        uint32_t pos = reused;
+                        auto to = [&](uint32_t end) { while (pos < end) { const uint32_t k = std::min(pf, end - pos); ref.emplace_back(pos, k); pos += k; } };
+                        if (share > reused) to(share);
+                        to(snap); to(T);
+                        const ie::LanesPlan old = ie::q35m_plan(T, snap, reused, pf, share);
+                        const ie::LanesPlan p = ie::q35m_plan(T, snap, reused, pf, share, /*pipe_tail=*/true);
+                        if (p.chunks != ref || p.Tp != T) { all = false; std::printf("  pipe-tail plan mismatch T %u snap %u share %u reused %u pf %u\n", T, snap, share, reused, pf); }
+                        const bool due = snap > reused && snap < T;
+                        if ((p.snap != 0) != due || (due && p.snap != snap) || p.mark != old.mark) bounds = false;
+                        // the old plan's pieces + prompt_end's rest == the new plan's pieces (the same cuts in the same order)
+                        std::vector<ie::LanesChunk> joined = old.chunks;
+                        ie::q35m_chunks(old.Tp, T, pf, joined);
+                        if (joined != p.chunks) all = false;
+                        if (due) {
+                            bool e = false;
+                            for (const auto& c : p.chunks) e = e || c.first + c.second == snap;
+                            if (!e) ends = false;
+                        }
+                    }
+    check(all, "pipe-tail plan: pieces == --parallel 1's prefill_to(share), prefill_to(snap), prefill_to(T) == the old plan + prompt_end's rest, Tp = T (T <= 34)");
+    check(bounds && ends, "pipe-tail plan: snap == snap_at exactly when reused < snap_at < T (a chunk ends there), mark as before");
+}
+
+// The decoders keep stepping through other lanes' serial turns. Production shape (rows, the lane pipeline, short-first, re-cut,
+// the quota, sticky lanes): conversation C's turn 1 alone (its checkpoint on its lane), then two decoders; then, beside them,
+// request A ends with a reply snapshot (its finish turn) while C's turn 2 restores in place (prefix_prepare), prefills through
+// the pipe with its snapshot turn at snap_at and its prompt-end turn, and decodes. Every serial hook takes 150 ms. Drain OFF
+// (the default): the decoders' longest gap between two steps stays well under a turn (nothing drained: /health drains 0,
+// turns_nodrain > 0); ON (IE_Q35MOE_TURN_DRAIN=1): each turn drains the pipe and the decoders stall for it (a gap >= 150 ms,
+// drains > 0). Both: every reply == --parallel 1's, A's snapshot and C's restore happened, no stage saw a wrong position.
+void test_turn_nodrain(bool drain) {
+    const bool saved = g_turn_drain;
+    g_turn_drain = drain;
+    const std::string tag = std::string("turns beside the pipe, drain ") + (drain ? "ON (IE_Q35MOE_TURN_DRAIN=1)" : "OFF");
+    FakeCrown m({4000, 4000, 4000, 4000, 4000}, true);
+    m.sticky.on = true; m.cache.supersede = true;
+    ie::LanesServe::Options o;   // (no mix cut: the plan's pieces, so --parallel 1's reference applies; the cut is test_mix_chunk's)
+    o.prefill_fifo = true; o.short_first = true; o.short_rows = 20; o.decode_quota = 4; o.quota_max_ms = 60000;
+    ie::LanesServe s(m, o);
+    Cache refC, refA;
+    std::vector<int32_t> c = conv(31, 90000);
+    Req c1 = turn_req(c, 901); c1.run(s);
+    check(c1.res.text == text_of(serial_ref(refC, c1.ids, c1.rq.snap_at, 6, 901)), tag + ": C's turn 1 alone == --parallel 1");
+    std::atomic<bool> quit{false};
+    Req d1(conv(12, 91000), 3000, 902, 12), d2(conv(13, 92000), 3000, 903, 13);
+    d1.quit = &quit; d2.quit = &quit;
+    std::thread t1([&] { d1.run(s); }), t2([&] { d2.run(s); });
+    for (int i = 0; i < 3000 && health_field(s, "decoding") < 2; ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    m.turn_ms = 150; m.record_dec = true;
+    const uint64_t drains0 = health_field(s, "drains");
+    // A: a new prompt whose reply stops after 3 ids and is snapshotted (its finish turn); C2: C's turn 2 (restored in place)
+    std::vector<int32_t> pa = conv(40, 93000);
+    Req a(pa, 20, 904, 38);
+    a.rq.reply_cache = true;
+    g_stop_first = pa[0]; g_stop_at = uint32_t(pa.size()) + 3;
+    Req c2 = turn_req(with_reply(c, c1.res.text, 9300), 905);
+    std::thread ta([&] { a.run(s); }), tc([&] { c2.run(s); });
+    ta.join(); tc.join();
+    const std::string wa = text_of(serial_ref(refA, a.ids, a.rq.snap_at, 20, 904, nullptr, true));   // (under A's stop rule)
+    g_stop_at = 0; g_stop_first = -1;
+    m.record_dec = false;
+    quit = true;
+    t1.join(); t2.join();
+    const uint64_t drains = health_field(s, "drains") - drains0, nodrain = health_field(s, "turns_nodrain");
+    // the decoders' longest gap between two consecutive decode steps while A and C2 ran
+    double gap = 0;
+    {
+        std::lock_guard<std::mutex> g(m.rec_mu);
+        for (uint32_t ln : {d1.res.lane, d2.res.lane}) {
+            const auto& ts = m.dec_t0[ln];
+            for (size_t i = 1; i < ts.size(); ++i) gap = std::max(gap, ts[i] - ts[i - 1]);
+        }
+    }
+    uint32_t rc2 = 0;
+    const std::string wc2 = text_of(serial_ref(refC, c2.ids, c2.rq.snap_at, 6, 905, &rc2));
+    Cache n1, n2;
+    const bool decs = text_of(serial_ref(n1, d1.ids, 12, 3000, 902)).rfind(d1.res.text, 0) == 0 &&
+                      text_of(serial_ref(n2, d2.ids, 13, 3000, 903)).rfind(d2.res.text, 0) == 0 && !d1.res.text.empty() && !d2.res.text.empty();
+    std::printf("  (%s: A %s %u ids '%s' want '%s'; C2 lane %u cached %u '%s' want '%s' (ref %u); d1 %s %u ids, d2 %s %u ids; bad %u, own restores %u, finishes %d)\n",
+                tag.c_str(), a.res.finish_reason.c_str(), a.res.completion_tokens, a.res.text.c_str(), wa.c_str(), c2.res.lane, c2.res.cached_tokens,
+                c2.res.text.c_str(), wc2.c_str(), rc2, d1.res.finish_reason.c_str(), d1.res.completion_tokens, d2.res.finish_reason.c_str(),
+                d2.res.completion_tokens, m.bad.load(), m.own_restores.load(), m.finishes.load());
+    check(a.res.finish_reason == "stop" && a.res.completion_tokens == 3 && a.res.text == wa && m.finishes.load() == 1,
+          tag + ": A stopped after 3 ids == --parallel 1, its reply snapshot taken in its finish turn");
+    check(c2.res.text == wc2 && c2.res.cached_tokens == rc2 && rc2 == c1.rq.snap_at && m.own_restores.load() == 1,
+          tag + ": C's turn 2 restored in place at " + std::to_string(c2.res.cached_tokens) + " beside the decoders == --parallel 1");
+    check(decs && m.bad == 0, tag + ": the decoders' replies are prefixes of --parallel 1's; no stage saw a wrong position");
+    const std::string seen = "longest decoder gap " + std::to_string(int(gap)) + " ms; drains " + std::to_string(drains) + ", turns beside the pipe " +
+                             std::to_string(nodrain) + ", snapshot turns " + std::to_string(m.snap_turns.load());
+    // (snapshot turns: C1's in its lone prefill, then A's and C2's at their snap boundaries)
+    if (!drain)
+        check(gap < 100 && drains == 0 && nodrain >= 4 && m.snap_turns.load() == 3,
+              tag + ": the decoders kept stepping through A's finish and C2's prepare / snapshot / prompt-end turns (" + seen + ")");
+    else
+        check(gap >= 150 && drains >= 2 && m.snap_turns.load() == 0,
+              tag + ": every turn drained the pipe and the decoders waited for it (" + seen + ")");
+    s.shutdown();
+    g_turn_drain = saved;
+}
+
+// The wave on a running pipe (the B39 gate's finding): a leader and N followers with one shared prefix arrive together while the
+// pipe runs (a request finished before them). The leader prepares alone and prefills its first piece in its turn; when the
+// followers wait for the turn it stops, and its remaining pieces go through the pipe while the followers' prepare turns (each a
+// cache MISS -- the leader's mark is not inserted yet -- then parked in the FIFO on extends_mark) chain, every one turn_ms long.
+// The leader's piece ending at the mark lands early in that chain and the leader waits for ITS mark turn. Without priority the mark
+// turn queues behind every follower prepare still waiting (the followers cannot restore anything before it, so every turn they
+// hold delays the whole wave); with it the mark runs right after the prepare holding the turn. Checked: follower prepares that
+// BEGIN after the leader's mark piece landed and before its mark ran <= 1 (the one that already held the turn, or one that took
+// it in the gap before the leader registered), the followers all restore the shared prefix (their re-prepare after the mark),
+// every reply == a cold server's (the restore changes no byte), /health turns_boundary_first >= 1.
+void test_wave_priority() {
+    constexpr uint32_t kSys = 23;
+    constexpr int kN = 8;
+    const std::vector<int32_t> sys = conv(kSys, 95000);
+    auto wave_req = [&](int k, uint64_t rng) {
+        std::vector<int32_t> ids = sys;
+        for (int32_t v : conv(10, 96000 + 100 * k)) ids.push_back(v);
+        const uint32_t snap = uint32_t(ids.size());
+        ids.push_back(3); ids.push_back(5);
+        return std::make_unique<Req>(ids, 4, rng, snap, kSys);
+    };
+    std::vector<uint32_t> caps(kN + 2, 4000);
+    FakeCrown m(caps, true);
+    m.sticky.on = true; m.cache.supersede = true;
+    ie::LanesServe::Options o;
+    o.prefill_fifo = true; o.short_first = true; o.short_rows = 20; o.decode_quota = 4; o.quota_max_ms = 60000;
+    ie::LanesServe s(m, o);
+    Req warm(conv(9, 94000), 3, 940, 9);   // the pipe runs (idle) when the wave arrives, as after the replay's workers phase
+    warm.run(s);
+    m.turn_ms = 20; m.land_at = kSys; m.record_turns = true;
+    auto leader = wave_req(0, 950);
+    std::thread tl([&] { leader->run(s); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));   // (inside the leader's prepare: its `alone` was decided already)
+    std::vector<std::unique_ptr<Req>> fs;
+    for (int k = 1; k <= kN; ++k) fs.push_back(wave_req(k, 950 + uint64_t(k)));
+    std::vector<std::thread> ts;
+    for (auto& f : fs) ts.emplace_back([&f, &s] { f->run(s); });
+    tl.join();
+    for (auto& t : ts) t.join();
+    m.record_turns = false; m.land_at = 0;
+    std::vector<std::tuple<char, uint32_t, double>> ev;
+    { std::lock_guard<std::mutex> g(m.rec_mu); ev = m.turns; }
+    const uint32_t ll = leader->res.lane;
+    double t_land = -1, t_mark = -1;
+    for (const auto& [k, ln, t] : ev) {
+        if (ln != ll) continue;
+        if (k == 'L' && t_land < 0) t_land = t;
+        if (k == 'M' && t_mark < 0) t_mark = t;
+    }
+    int between = 0, before = 0;
+    for (const auto& [k, ln, t] : ev)
+        if (k == 'P' && ln != ll) { if (t > t_land && t < t_mark) ++between; else if (t < t_land) ++before; }
+    int restored = 0;
+    bool cold = true;
+    for (auto& f : fs) {
+        restored += f->res.cached_tokens == kSys;
+        Cache none;
+        cold = cold && f->res.text == text_of(serial_ref(none, f->ids, f->rq.snap_at, 4, f->rq.rng, nullptr, false, kSys));
+    }
+    Cache none;
+    cold = cold && leader->res.text == text_of(serial_ref(none, leader->ids, leader->rq.snap_at, 4, leader->rq.rng, nullptr, false, kSys));
+    const uint64_t pri = health_field(s, "turns_boundary_first");
+    const std::string seen = std::to_string(between) + " follower prepare(s) began between the leader's mark piece landing and its mark (" +
+                             std::to_string(before) + " before the landing); " + std::to_string(restored) + " of " + std::to_string(kN) +
+                             " followers restored the shared prefix; turns_boundary_first " + std::to_string(pri);
+    check(t_land >= 0 && t_mark > t_land && m.marks.load() >= 1, "wave priority: the leader's mark piece landed, then its mark ran (" + seen + ")");
+    check(between <= 1 && pri != UINT64_MAX && pri >= 1, "wave priority: the leader's mark turn went ahead of the follower prepares waiting with it (" + seen + ")");
+    check(restored == kN && cold && m.bad == 0, "wave priority: every follower restored the shared prefix after the mark; every reply == a cold server's; no wrong position");
+    s.shutdown();
+}
+
+// The server's wave sequence (the B39 gate, b39gate2: 15 conversations with one shared prefix arriving while the pipe runs): the
+// leader prepares ALONE (no follower has registered yet) and prefills its first plan piece in its turn; the followers register
+// during it, so it stops there and its remainder is parked; its release submits the remainder into the running pipe -- before
+// any follower is a busy lane; the followers' miss-prepares chain, park on the leader's mark, re-prepare after it and send their
+// mark-extension pieces; the leader's snapshot turn then sends its tail. Two B39 effects the gate measured: (i) the remainder
+// went as ONE plan piece (3,275 rows, unpipelined: maybe_recut saw no busy lane; +1.2 s), (ii) the 7-row tail landed behind the
+// 14 followers' first pieces (+1.3 s). B39 (5): (i) a request waiting for its prepare turn counts as an arriving lane, so the
+// release re-cuts the remainder into mix pieces (the documented kind; a lead that stays alone keeps its plan); (ii) the tail goes
+// to the front of stage 0's queue. Checked here with the fake (kChunk 5, mix 2, 2 ms a row a stage): the leader's pieces after its
+// first are the mix cut (<= 2 rows) and /health recuts >= 1; the tail was submitted to the front and ran before any follower
+// piece that was queued when it was sent; every follower restored the shared prefix; the followers' replies == a cold server's;
+// the leader's == a run over its own pieces; a leader that stays alone keeps its 5-row pieces and == --parallel 1.
+void test_wave_sequence() {
+    constexpr uint32_t kSys = 23;
+    constexpr int kN = 8;
+    const std::vector<int32_t> sys = conv(kSys, 98000);
+    auto wave_req = [&](int k, uint64_t rng) {
+        std::vector<int32_t> ids = sys;
+        for (int32_t v : conv(10, 98500 + 100 * k)) ids.push_back(v);
+        const uint32_t snap = uint32_t(ids.size());
+        ids.push_back(3); ids.push_back(5);
+        return std::make_unique<Req>(ids, 4, rng, snap, kSys);
+    };
+    // a leader that stays alone: its plan's 5-row pieces, == --parallel 1
+    {
+        FakeCrown m(std::vector<uint32_t>(kN + 2, 4000), true);
+        ie::LanesServe::Options o;
+        o.prefill_fifo = true; o.short_first = true; o.short_rows = 20; o.mix_chunk = 2; o.recut = true; o.decode_quota = 4; o.quota_max_ms = 60000;
+        ie::LanesServe s(m, o);
+        m.deep_from = 0; m.deep_row_ms = 2; m.record = true;
+        auto a = wave_req(0, 990);
+        a->run(s);
+        std::vector<std::pair<uint32_t, uint32_t>> lp;
+        { std::lock_guard<std::mutex> g(m.rec_mu); lp = m.pieces[a->res.lane]; }
+        bool plan5 = !lp.empty();
+        for (const auto& [p0, t] : lp) if (p0 < kSys + 10) plan5 = plan5 && (t == kChunk || p0 + t == kSys || p0 + t == kSys + 10);
+        Cache none;
+        check(plan5 && a->res.text == text_of(serial_ref(none, a->ids, a->rq.snap_at, 4, 990, nullptr, false, kSys)) && health_field(s, "recuts") == 0,
+              "wave sequence: a leader that stays alone keeps its plan pieces (no re-cut) and == --parallel 1");
+        s.shutdown();
+    }
+    FakeCrown m(std::vector<uint32_t>(kN + 2, 4000), true);
+    ie::LanesServe::Options o;
+    o.prefill_fifo = true; o.short_first = true; o.short_rows = 20; o.mix_chunk = 2; o.recut = true; o.decode_quota = 4; o.quota_max_ms = 60000;
+    ie::LanesServe s(m, o);
+    Req warm(conv(9, 97900), 3, 989, 9);   // the pipe runs when the wave arrives (the replay's workers phase before it)
+    warm.run(s);
+    m.deep_from = 0; m.deep_row_ms = 2;   // a 5-row piece: 10 ms a stage; the leader's first piece runs 20 ms in its turn
+    m.record = true;
+    auto leader = wave_req(0, 991);
+    std::thread tl([&] { leader->run(s); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(6));   // (the leader decided `alone` and is in its first piece)
+    std::vector<std::unique_ptr<Req>> fs;
+    for (int k = 1; k <= kN; ++k) fs.push_back(wave_req(k, 991 + uint64_t(k)));
+    std::vector<std::thread> ts;
+    for (auto& f : fs) ts.emplace_back([&f, &s] { f->run(s); });
+    tl.join();
+    for (auto& t : ts) t.join();
+    m.record = false;
+    std::vector<std::pair<uint32_t, uint32_t>> lp;
+    std::vector<Ev> ev;
+    { std::lock_guard<std::mutex> g(m.rec_mu); lp = m.pieces[leader->res.lane]; ev = m.ev; }
+    const uint32_t ll = leader->res.lane, T = uint32_t(leader->ids.size()), snap = leader->rq.snap_at;
+    // (i) the leader's pieces: its first 5 rows in the turn, then the mix cut (<= 2 rows) up to its snapshot boundary
+    bool first5 = !lp.empty() && lp[0] == std::make_pair(0u, kChunk), cut = true;
+    uint32_t cut_pieces = 0;
+    for (const auto& [p0, t] : lp)
+        if (p0 >= kChunk && p0 < snap) { cut = cut && t <= o.mix_chunk; ++cut_pieces; }
+    const uint64_t recuts = health_field(s, "recuts");
+    check(first5 && cut && cut_pieces >= 9 && recuts >= 1,
+          "wave sequence (i): the alone leader's parked remainder was re-cut at its release for the arriving followers (" + std::to_string(cut_pieces) +
+              " pieces of <= " + std::to_string(o.mix_chunk) + " rows after its first " + std::to_string(kChunk) + "; recuts " + std::to_string(recuts) + ")");
+    // (ii) the tail: submitted to the front, and no other lane's prefill piece that was queued when it was sent ran before it
+    size_t i_front = SIZE_MAX, i_run = SIZE_MAX;
+    for (size_t i = 0; i < ev.size(); ++i) {
+        const auto [k, ln, p0, t] = ev[i];
+        if (ln != ll || p0 != snap) continue;
+        if (k == 'F' && i_front == SIZE_MAX) i_front = i;
+        if (k == '0' && i_run == SIZE_MAX && i > i_front) i_run = i;
+    }
+    int ahead = 0, queued = 0;
+    if (i_front != SIZE_MAX && i_run != SIZE_MAX) {
+        for (size_t i = i_front + 1; i < i_run; ++i) { const auto [k, ln, p0, t] = ev[i]; if (k == '0' && ln != ll && t > 1) ++ahead; }
+        for (size_t i = 0; i < i_front; ++i) {   // followers' pieces submitted before the tail and not yet run by then
+            const auto [k, ln, p0, t] = ev[i];
+            if (k != 'S' || ln == ll || t <= 1) continue;
+            bool ran = false;
+            for (size_t j = i + 1; j < i_front && !ran; ++j) { const auto [k2, ln2, p02, t2] = ev[j]; ran = k2 == '0' && ln2 == ln && p02 == p0; }
+            if (!ran) ++queued;
+        }
+    }
+    if (queued == 0 && i_front != SIZE_MAX) {   // (diagnostic: the events around the tail's submit)
+        std::string trail;
+        for (size_t i = i_front > 12 ? i_front - 12 : 0; i < std::min(ev.size(), i_run + 4); ++i) {
+            const auto [k, ln, p0, t] = ev[i];
+            trail += std::string(1, k) + ":" + std::to_string(ln) + "@" + std::to_string(p0) + "+" + std::to_string(t) + " ";
+        }
+        std::printf("  (wave sequence: events around the tail's submit: %s)\n", trail.c_str());
+    }
+    check(m.fronts.load() >= 1 && i_front != SIZE_MAX && i_run != SIZE_MAX && ahead == 0,
+          "wave sequence (ii): the leader's tail [" + std::to_string(snap) + ", " + std::to_string(T) + ") went to the front of the queue and ran before the " +
+              std::to_string(queued) + " follower piece(s) queued when it was sent (" + std::to_string(ahead) + " ran ahead of it; fronts " +
+              std::to_string(m.fronts.load()) + ")");
+    // the followers: each restored the leader's state at the mark (the hash over the leader's pieces up to kSys) and ran its own
+    // pieces from there (mix-cut, as a cold prompt arriving beside busy lanes would be): its reply == that run
+    int restored = 0, same = 0;
+    for (auto& f : fs) {
+        restored += f->res.cached_tokens == kSys;
+        std::vector<std::pair<uint32_t, uint32_t>> fp;
+        { std::lock_guard<std::mutex> g(m.rec_mu); fp = m.pieces[f->res.lane]; }
+        uint64_t h = kSeed;
+        uint32_t pos = 0;
+        for (const auto& [p0, t] : lp) if (p0 < kSys) { h = step_hash(h, leader->ids.data() + p0, t, p0); pos = p0 + t; }
+        bool contiguous = pos == kSys;
+        for (const auto& [p0, t] : fp) {
+            if (p0 >= f->ids.size()) continue;
+            if (p0 != pos) { contiguous = false; break; }
+            h = step_hash(h, f->ids.data() + p0, t, p0); pos = p0 + t;
+        }
+        std::vector<int32_t> want;
+        if (contiguous && pos == f->ids.size())
+            for (uint32_t k = 0; k < 4; ++k) { const int32_t id = id_of(h, f->rq.rng + k); want.push_back(id); h = step_hash(h, &id, 1, pos++); }
+        same += contiguous && f->res.text == text_of(want);
+        if (&f == &fs.front()) {   // (the first follower's pieces: the mix cut from the mark, then its tail)
+            std::string ps;
+            for (const auto& [p0, t] : fp) if (p0 < f->ids.size()) ps += std::to_string(p0) + "+" + std::to_string(t) + " ";
+            std::printf("  (wave sequence: follower 1 on lane %u, cached %u, pieces %s)\n", f->res.lane, f->res.cached_tokens, ps.c_str());
+        }
+    }
+    const std::string lref = text_of(ref_over(leader->ids, lp, 4, 991));
+    check(restored == kN && same == kN && leader->res.text == lref && !leader->res.text.empty() && m.bad == 0,
+          "wave sequence: " + std::to_string(restored) + " of " + std::to_string(kN) + " followers restored the shared prefix, " + std::to_string(same) +
+              " replies == the restored state ++ their own pieces; the leader's == a run over its own pieces (" +
+              (leader->res.text == lref ? "yes" : "NO") + "); wrong positions " + std::to_string(m.bad.load()));
+    s.shutdown();
+}
+
+// The pipe's front flag itself (Glm5LanePipe::submit(front)): lane 1's piece holds stage 0 (40 ms), lanes 2 and 3 queue their
+// pieces behind it, lane 4's piece is submitted to the FRONT; stage 0 runs 1, then 4, then 2, 3. Direct, no serve module.
+void test_front_submit() {
+    FakeCrown m({100, 100, 100, 100, 100}, true);
+    m.record = true; m.slow_lane = 1; m.slow_ms = 40;
+    std::mutex dm; std::condition_variable dcv; int done = 0;
+    check(m.pipe_start_rows([&](uint32_t) { std::lock_guard<std::mutex> g(dm); ++done; dcv.notify_all(); },
+                            [&](std::span<const uint32_t> ls) { std::lock_guard<std::mutex> g(dm); done += int(ls.size()); dcv.notify_all(); }).empty(),
+          "front submit: the rows pipe started");
+    const std::vector<int32_t> ids = {11, 12, 13};
+    check(m.pipe.submit(1, ids.data(), 3, 0).empty(), "front submit: lane 1's piece in (it holds stage 0 for 40 ms)");
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    check(m.pipe.submit(2, ids.data(), 3, 0).empty() && m.pipe.submit(3, ids.data(), 3, 0).empty(), "front submit: lanes 2 and 3 queued behind it");
+    check(m.pipe.submit(4, ids.data(), 3, 0, /*front=*/true).empty(), "front submit: lane 4's piece to the front");
+    { std::unique_lock<std::mutex> g(dm); dcv.wait_for(g, std::chrono::seconds(5), [&] { return done >= 4; }); }
+    std::vector<uint32_t> order;
+    { std::lock_guard<std::mutex> g(m.rec_mu); for (const auto& [ln, p0, t] : m.s0_log) order.push_back(ln); }
+    check(order == std::vector<uint32_t>{1, 4, 2, 3}, "front submit: stage 0 ran lane 1, then the FRONT piece (4), then 2 and 3 (" +
+                                                       [&] { std::string s; for (uint32_t x : order) s += std::to_string(x) + " "; return s; }() + ")");
+    check(m.pipe.stop().empty() && m.bad == 0, "front submit: the pipe stopped clean, every step at its stage's depth");
+}
+
+// ---- P4 B42: the decode regroup ------------------------------------------------------------------------------------------
+
+// D decoders (prompts of 9-14 rows, 3000-token replies, cut by `quit`) started one by one as their prompt ends release them --
+// the way the swarm's lanes arrive -- with nothing else in the pipe; rows + the lane pipeline. Returns the decode groups stage 0
+// formed (by size, in order) after every decoder ran for `settle_ms`, the regroup's stats, and whether every reply was a prefix of
+// --parallel 1's.
+struct RegroupRun { std::vector<uint32_t> groups; ie::Glm5LanePipe::RegroupStats rg; bool same = true; double step_ms = 0; };
+RegroupRun run_decoders(int D, int settle_ms, int window_ms, bool with_lead = false) {
+    std::vector<uint32_t> caps(size_t(D) + 2, 4000);
+    FakeCrown m(caps, true);
+    ie::LanesServe::Options o;
+    o.prefill_fifo = true; o.short_first = true; o.short_rows = 20; o.decode_quota = 4; o.quota_max_ms = 60000;
+    if (with_lead) { o.mix_chunk = 2; o.recut = true; m.deep_from = 0; m.deep_row_ms = 2; }
+    ie::LanesServe s(m, o);
+    std::atomic<bool> quit{false};
+    std::vector<std::unique_ptr<Req>> ds;
+    std::vector<std::thread> ts;
+    for (int k = 0; k < D; ++k) {
+        ds.push_back(std::make_unique<Req>(conv(9 + uint32_t(k % 6), 97000 + 1000 * k), 3000, 970 + uint64_t(k), 9 + uint32_t(k % 6)));
+        ds.back()->quit = &quit;
+        ts.emplace_back([&r = ds.back(), &s] { r->run(s); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(3));   // (staggered first decode steps, as the prompt ends release them)
+    }
+    for (int i = 0; i < 3000 && health_field(s, "decoding") < uint64_t(D); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    std::unique_ptr<Req> lead;
+    std::thread tl;
+    if (with_lead) {   // a deep lead prefilling through the pipe beside the decoders (200 rows, 2 ms a row a stage)
+        lead = std::make_unique<Req>(conv(200, 99000), 4, 981, 200);
+        tl = std::thread([&] { lead->run(s); });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(settle_ms));
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint64_t steps0 = health_field(s, "tokens");
+    m.record_groups = true;
+    std::this_thread::sleep_for(std::chrono::milliseconds(window_ms));
+    m.record_groups = false;
+    const uint64_t steps1 = health_field(s, "tokens");
+    RegroupRun r;
+    r.step_ms = steps1 > steps0 ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / double(steps1 - steps0) * D : 0;
+    if (with_lead) tl.join();
+    quit = true;
+    for (auto& t : ts) t.join();
+    { std::lock_guard<std::mutex> g(m.rec_mu); r.groups = m.gsz; }
+    r.rg = m.pipe.regroup_stats();
+    for (auto& d : ds) {
+        Cache none;
+        r.same = r.same && !d->res.text.empty() && text_of(serial_ref(none, d->ids, d->rq.snap_at, 3000, d->rq.rng)).rfind(d->res.text, 0) == 0;
+    }
+    if (with_lead) { Cache none; r.same = r.same && lead->res.text == text_of(serial_ref(none, lead->ids, 200, 4, 981)) || lead->res.finish_reason == "length"; }
+    r.same = r.same && m.bad == 0;
+    s.shutdown();
+    return r;
+}
+
+std::string hist_of(const std::vector<uint32_t>& g) {
+    std::map<uint32_t, int> h;
+    for (uint32_t x : g) ++h[x];
+    std::string s;
+    for (const auto& [k, v] : h) s += std::to_string(k) + ":" + std::to_string(v) + " ";
+    return s.empty() ? "none" : s;
+}
+
+// The contract (Glm5LanePipe regroup, the AUTO cap = ceil(busy / stages)): with D >= 3 decoders and nothing else in the pipe, once
+// settled every decode group stage 0 forms has >= floor(D / 2) rows -- the decoders rotate in exactly two groups of ceil(D / 2)
+// and floor(D / 2) rows (6 -> 3 + 3, 5 -> 3 + 2), the state the paused turns' bursts used to leave and the drain-free turns lost
+// (singletons rotating, B39 gate). Rows == solo for every lane. One or two decoders never wait (regroup waits 0: their cadence is
+// untouched). With the regroup OFF (IE_Q35MOE_REGROUP=0) the same start gives the fragmented rotation (reported, not required: it
+// is an alignment coin toss). Under the lane pipeline beside a deep prefilling lane, the decoders' groups stay merged: the mean
+// decode group >= 1.8 rows with 4 decoders (two groups), where the fragmented rotation gives ~1.
+void test_regroup() {
+    for (int D : {6, 5}) {
+        const RegroupRun r = run_decoders(D, 150, 250);
+        uint32_t mn = UINT32_MAX;
+        for (uint32_t g : r.groups) mn = std::min(mn, g);
+        const uint32_t want = uint32_t(D / 2);
+        check(r.same && !r.groups.empty() && mn >= want,
+              "regroup: " + std::to_string(D) + " decoders settle into two groups (every group >= " + std::to_string(want) + " rows: sizes " +
+                  hist_of(r.groups) + "); waits " + std::to_string(r.rg.waits) + " merged " + std::to_string(r.rg.merges) + " timed out " +
+                  std::to_string(r.rg.timeouts) + "; replies prefixes of --parallel 1's");
+    }
+    for (int D : {1, 2}) {
+        const RegroupRun r = run_decoders(D, 60, 150);
+        check(r.same && r.rg.waits == 0 && !r.groups.empty(),
+              "regroup: " + std::to_string(D) + " decoder(s) never wait (regroup waits " + std::to_string(r.rg.waits) + "; " +
+                  std::to_string(r.groups.size()) + " steps, sizes " + hist_of(r.groups) + "; replies prefixes of --parallel 1's)");
+    }
+    {
+        const RegroupRun r = run_decoders(4, 150, 300, /*with_lead=*/true);
+        double mean = 0;
+        for (uint32_t g : r.groups) mean += g;
+        mean = r.groups.empty() ? 0 : mean / double(r.groups.size());
+        check(r.same && mean >= 1.8,
+              "regroup beside a deep prefilling lead (lane pipeline, re-cut, quota): 4 decoders' groups stay merged (mean " +
+                  std::to_string(mean).substr(0, 4) + " rows, sizes " + hist_of(r.groups) + "; waits " + std::to_string(r.rg.waits) +
+                  ", merged " + std::to_string(r.rg.merges) + "); replies prefixes of --parallel 1's, the lead == --parallel 1");
+    }
+    {
+        const uint32_t saved = g_regroup_us;
+        g_regroup_us = 0;
+        const RegroupRun r = run_decoders(6, 150, 250);
+        g_regroup_us = saved;
+        check(r.same && r.rg.waits == 0, "regroup OFF (IE_Q35MOE_REGROUP=0): no wait; 6 decoders' groups as the alignment left them (sizes " + hist_of(r.groups) + ")");
+    }
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc > 1) {   // one section alone (the gate's quick runs): b39 = the P4 B39 tests; abort = the B33 abort tests with the production defaults
+        const std::string which = argv[1];
+        g_pipeline = true;
+        if (which == "b39") { test_pipe_tail_plan(); test_turn_nodrain(false); test_turn_nodrain(true); test_wave_priority(); test_front_submit(); test_wave_sequence(); }
+        else if (which == "abort") { test_short_first_abort(); test_recut_abort(); test_quota_abort(); }
+        else if (which == "b42") { test_regroup(); for (bool rows : {true}) test_serve(rows); }
+        else { std::printf("unknown section %s (b39 | abort | b42)\n", which.c_str()); return 2; }
+        std::printf("%s\n", g_fail ? "Q35M LANES TEST (section): FAIL" : "Q35M LANES TEST (section): PASS");
+        return g_fail ? 1 : 0;
+    }
     test_rules();
     for (bool rows : {false, true}) {
         std::printf("---- %s\n", rows ? "rows ON (P4 B14: grouped decode steps)" : "rows off (the per-lane pipe)");
@@ -1578,6 +2124,29 @@ int main() {
     std::printf("---- the anchor (P4 B36 (B))\n");
     for (bool on : {true, false}) test_anchor(on);
     test_anchor_lru();
+    std::printf("---- the serial turns beside the pipe (P4 B39): the plan's tail through the pipe, drain-free turns\n");
+    test_pipe_tail_plan();
+    test_turn_nodrain(false);
+    test_turn_nodrain(true);
+    test_wave_priority();
+    test_front_submit();
+    test_wave_sequence();
+    std::printf("---- the decode regroup (P4 B42): two groups without the drains' bursts\n");
+    test_regroup();
+    // the drain switch (IE_Q35MOE_TURN_DRAIN=1) = B10-B38's protocol for the whole set: every reply == --parallel 1's there too
+    std::printf("---- IE_Q35MOE_TURN_DRAIN=1 (every turn drains, the tail in prompt_end): the serving set again\n");
+    g_turn_drain = true;
+    for (bool rows : {false, true}) {
+        test_serve(rows);
+        test_reply_snapshot(rows);
+    }
+    test_rows_prefill_piece();
+    test_agent_traffic();
+    for (bool fifo : {false, true}) test_wave(fifo);
+    test_multiturn_cap(true);
+    test_sticky();
+    for (bool on : {true, false}) test_anchor(on);
+    g_turn_drain = false;
     std::printf("%s\n", g_fail ? "Q35M LANES TEST: FAIL" : "Q35M LANES TEST: PASS");
     return g_fail ? 1 : 0;
 }

@@ -37,6 +37,19 @@
 namespace ie {
 namespace {
 
+// P4 B43: the prefill-attention threshold -- a full-attention prefill piece of T rows at start_pos takes the wide-tile FA2 kernel
+// iff start_pos + T >= this, the naive kernel below. IE_Q35MOE_FA2_TILE_MINCTX (> 0); default 512 (B29-v0.2.6: 6144, the 27B's gate,
+// never measured on the crown; `=6144` restores v0.2.6's bytes). Read once; printed by load().
+uint32_t q35m_fa2_tile_minctx() {
+    static const uint32_t v = []() -> uint32_t {
+        const char* e = std::getenv("IE_Q35MOE_FA2_TILE_MINCTX");
+        if (!e) return 512u;
+        const int n = std::atoi(e);
+        return n > 0 ? uint32_t(n) : 512u;
+    }();
+    return v;
+}
+
 DecodeProf g_dp35("35B qwen35moe_split");   // P4 B22 (off unless IE_DECODE_PROF=1)
 #define DPE(DEV, C, ...) do { sycl::event dpe_ = (__VA_ARGS__); if (g_dp35.active()) g_dp35.tag((DEV), dpe_, DecodeProf::C); } while (0)
 
@@ -672,6 +685,13 @@ std::string Qwen35MoeSplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
     for (uint32_t dev = 0; dev < n_dev_; ++dev)
         std::fprintf(stderr, "[qwen35moe_split] card %u weights: %.2f GB\n",
                      dev, double(dev_bytes_[dev]) / 1e9);
+    // P4 B43: the prefill-attention threshold, so a log says which bytes a run produced
+    if (std::getenv("IE_Q35MOE_NO_FA2_TILE"))
+        std::fprintf(stderr, "[qwen35moe_split] prefill attention: the naive kernel at every depth (IE_Q35MOE_NO_FA2_TILE)\n");
+    else
+        std::fprintf(stderr, "[qwen35moe_split] prefill attention: tiled (FA2 wide tile) from %u positions, naive below "
+                             "(IE_Q35MOE_FA2_TILE_MINCTX; 6144 = v0.2.6's bytes; IE_Q35MOE_NO_FA2_TILE = naive everywhere)\n",
+                     q35m_fa2_tile_minctx());
     return {};
 }
 
@@ -1038,13 +1058,16 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
                 // P4 B29: long-ctx full-attn prefill through the Gemma wide-tile kernel at ctx >= minctx -- the gate of the 27B split
                 // (qwen35_split.cpp) and the single-card crown (qwen36.cpp); naive O(T^2) re-reads the whole KV per query row and
                 // was 80-90% of a 30-54K-deep swarm piece. Covers --parallel 1's prefill and the lanes' pieces (both run_layers;
-                // the rows step is decode-only). Opt-out IE_Q35MOE_NO_FA2_TILE; tune IE_Q35MOE_FA2_TILE_MINCTX (default 6144).
+                // the rows step is decode-only). Opt-out IE_Q35MOE_NO_FA2_TILE; tune IE_Q35MOE_FA2_TILE_MINCTX.
+                // P4 B43: the default is 512, not the 27B's 6144 (B29 copied it, never measured on the crown). Measured on the GPU
+                // (~/ds41_work/p60/fa2minctx/REPORT.md, v0.2.6, 11 jobs): below 6144 the naive kernel costs ~30 ms per 1K positions
+                // per 512-row piece vs ~18 on the tile, with no tile overhead at depth 0; at 512 the swarm replay 132.0 -> 123.5 s
+                // (-6.4 %), the workers phase -9 %, their TTFT p50 4.1 -> 3.0 s, decode p50 8.5 -> 9.2, a 2,038-token cold prefill
+                // 1.41 -> 1.28 s; PPL on the chunks that change kernel within +-0.5 % either way, needles 6/6 with byte-identical
+                // replies. It also removes a concurrency-dependent bit difference: a prompt crossing 6144 took naive or tile rows
+                // depending on whether it was re-cut. IE_Q35MOE_FA2_TILE_MINCTX=6144 restores v0.2.6's bytes.
                 static const bool no_tile = std::getenv("IE_Q35MOE_NO_FA2_TILE") != nullptr;
-                static const uint32_t tile_minctx = []() -> uint32_t {
-                    const char* e = std::getenv("IE_Q35MOE_FA2_TILE_MINCTX");
-                    if (!e) return 6144u;
-                    int v = std::atoi(e); return v > 0 ? uint32_t(v) : 6144u;
-                }();
+                static const uint32_t tile_minctx = q35m_fa2_tile_minctx();
                 if (!no_tile && HD == 256 && (start_pos + T) >= tile_minctx) {
                     full_attention_fa2_prefill_tile_gemma(q, w.q, w.k, w.v, kc, vc, w.attn_out, T, start_pos,
                                                           cfg_.n_q_heads, cfg_.n_kv_heads, HD, max_ctx, 0 /*window: full causal*/);
@@ -1361,6 +1384,14 @@ void Qwen35MoeSplitModel::reset_state() {
     for (uint32_t dev = 0; dev < n_dev_; ++dev) {
         if (dn_at(dev).ready()) dn_at(dev).reset(fleet_->dev(dev).queue());
         if (kv_at(dev).ready()) kv_at(dev).reset();
+    }
+}
+
+// P4 B39: reset_state for `lane` by index (cur_ untouched: a card pipe stage may be running another lane on either card)
+void Qwen35MoeSplitModel::reset_lane_state(uint32_t lane) {
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+        if (lane_dn(lane, dev).ready()) lane_dn(lane, dev).reset(fleet_->dev(dev).queue());
+        if (lane_kv(lane, dev).ready()) lane_kv(lane, dev).reset();
     }
 }
 

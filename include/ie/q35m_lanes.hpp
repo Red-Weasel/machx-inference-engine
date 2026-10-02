@@ -124,15 +124,25 @@ inline uint32_t shared_prefix_boundary(uint32_t shared_len, uint32_t snap_at, bo
 // snap_at == T when the cache is off. P4 B15: with a shared-prefix boundary inside the pipe's part (reused < share_at < Tp) the
 // pieces are cut there too and plan.mark = share_at (LanesModel::mark snapshots it); the pieces after it are the same whether
 // [0, share_at) was prefilled or restored.
-inline LanesPlan q35m_plan(uint32_t T, uint32_t snap_at, uint32_t reused, uint32_t pf_chunk, uint32_t share_at = 0) {
+// P4 B39 pipe_tail: the pieces cover the WHOLE prompt (Tp = T); when the snapshot boundary is due inside it (reused < snap_at < T)
+// the pieces are cut there too and plan.snap = snap_at (LanesModel::snapshot runs there in a turn, then the tail [snap_at, T) --
+// what prompt_end ran in its turn -- goes through the pipe). The same pieces in the same order as prompt_end's pf_chunk-cut
+// tail: a lane's numerics do not depend on the mode.
+inline LanesPlan q35m_plan(uint32_t T, uint32_t snap_at, uint32_t reused, uint32_t pf_chunk, uint32_t share_at = 0,
+                           bool pipe_tail = false) {
     LanesPlan p;
-    p.Tp = snap_at > reused ? snap_at : T;
-    if (share_at > reused && share_at < p.Tp) {
+    const uint32_t Tc = snap_at > reused ? snap_at : T;   // the conversation snapshot's depth (prompt_end's Tp)
+    p.Tp = pipe_tail ? T : Tc;
+    if (share_at > reused && share_at < Tc) {
         q35m_chunks(reused, share_at, pf_chunk, p.chunks);
-        q35m_chunks(share_at, p.Tp, pf_chunk, p.chunks);
+        q35m_chunks(share_at, Tc, pf_chunk, p.chunks);
         p.mark = share_at;
     } else {
-        q35m_chunks(reused, p.Tp, pf_chunk, p.chunks);
+        q35m_chunks(reused, Tc, pf_chunk, p.chunks);
+    }
+    if (pipe_tail && Tc < T) {
+        q35m_chunks(Tc, T, pf_chunk, p.chunks);
+        p.snap = Tc;
     }
     return p;
 }

@@ -2462,10 +2462,14 @@ public:
     // card) and a group runs as one card step (Qwen35MoeSplitModel::forward_stage_rows); off: today's per-lane pipe.
     // P4 B34: pipeline = the lane pipeline (a lane's next prefill piece on card 0 while card 1 runs the piece before; a second
     // residual buffer per lane); off: one piece of a lane in the pipe at a time (B10-B33).
+    // P4 B39: the serial turns run BESIDE the lane pipe by default (serial_drains below; the plan puts the prompt's tail through
+    // the pipe behind its snapshot boundary); IE_Q35MOE_TURN_DRAIN=1 = B10-B38's protocol (every turn pauses the pipe, the tail
+    // runs in prompt_end).
     Q35mLanesModel(Qwen35MoeSplitModel& m, FleetPrefixCache* cache, const Tokenizer& tok, const int32_t* stop_ids,
                    const int32_t* tool_ids, uint32_t pf_chunk, bool rows, uint32_t group_cap, bool pipeline)
         : m_(m), cache_(cache), tok_(tok), pf_chunk_(pf_chunk), H_(m.config().hidden), V_(m.config().vocab), rows_(rows),
           pipeline_(pipeline),
+          drain_([] { const char* v = std::getenv("IE_Q35MOE_TURN_DRAIN"); return v && *v == '1'; }()),
           pipe_(m.n_lanes(), pf_chunk, H_ / 2, 2,   // the residual [T, hidden] fp16 = hidden / 2 floats a row
                 [this](uint32_t s, const Glm5LanePipe::Step& st) { return stage(s, st); },
                 [this](uint32_t s, std::span<const Glm5LanePipe::Step> steps, float* gw) { return stage_rows(s, steps, gw); },
@@ -2473,14 +2477,18 @@ public:
         stop_[0] = tok.eos_token_id(); stop_[1] = stop_ids[0]; stop_[2] = stop_ids[1];
         tool_[0] = tool_ids[0]; tool_[1] = tool_ids[1];
     }
+    bool turn_drain() const { return drain_; }
     ~Q35mLanesModel() override {
         (void)pipe_.stop();
-        if (rows_) {   // P4 B14: how the decode steps grouped (groups that finished every stage, by size)
+        if (rows_) {   // P4 B14: how the decode steps grouped (groups that finished every stage, by size); P4 B42: the regroup's counts
             const std::vector<uint64_t> gs = pipe_.group_sizes();
             std::string line;
             for (size_t g = 1; g < gs.size(); ++g)
                 if (gs[g]) line += " " + std::to_string(g) + ":" + std::to_string(gs[g]);
-            std::fprintf(stderr, "[qwen35moe] lane rows: groups by size (rows:count)%s\n", line.empty() ? " none" : line.c_str());
+            const Glm5LanePipe::RegroupStats rg = pipe_.regroup_stats();
+            std::fprintf(stderr, "[qwen35moe] lane rows: groups by size (rows:count)%s; regroup waits %llu (merged %llu, timed out %llu, %.0f ms)\n",
+                         line.empty() ? " none" : line.c_str(), (unsigned long long)rg.waits, (unsigned long long)rg.merges,
+                         (unsigned long long)rg.timeouts, rg.wait_ms);
         }
         sycl::queue& q = hq();
         try { q.wait(); } catch (...) {}
@@ -2510,6 +2518,20 @@ public:
     }
     uint64_t host_bytes() const { return pipe_.host_bytes() + 2 * uint64_t(pf_chunk_) * H_ * sizeof(sycl::half); }
     bool pipeline() const { return pipeline_; }
+    // P4 B42: the rows-mode regroup wait (IE_Q35MOE_GROUP_WAIT_US; 0 = IE_Q35MOE_REGROUP=0, off)
+    void set_regroup(uint32_t wait_us) { pipe_.set_regroup(wait_us); }
+    // /health "pipe": the decode groups by size so far and the regroup's counts (P4 B42)
+    std::string pipe_stats() const override {
+        if (!rows_) return {};
+        const std::vector<uint64_t> gs = pipe_.group_sizes();
+        const Glm5LanePipe::RegroupStats rg = pipe_.regroup_stats();
+        std::string js = "{\"groups\":[";
+        for (size_t g = 1; g < gs.size(); ++g) js += (g > 1 ? "," : "") + std::to_string(gs[g]);
+        char b[160];
+        std::snprintf(b, sizeof b, "],\"regroup_waits\":%llu,\"regroup_merges\":%llu,\"regroup_timeouts\":%llu,\"regroup_wait_ms\":%.0f}",
+                      (unsigned long long)rg.waits, (unsigned long long)rg.merges, (unsigned long long)rg.timeouts, rg.wait_ms);
+        return js + b;
+    }
 
     const char* tag() const override { return "q35m lanes"; }
     uint32_t n_lanes() const override { return m_.n_lanes(); }
@@ -2561,67 +2583,72 @@ public:
     }
     uint64_t sticky_mib() const { return ck_mib_; }
 
+    // P4 B39: every serial hook addresses the lane BY INDEX (Qwen35MoeSplitModel::lane_kv_cache / lane_dn_state /
+    // reset_lane_state, Q35mLaneView for the cache) and never calls select_lane: with the turns beside the running pipe, a
+    // stage thread may be running another lane's step on either card through cur_ (forward_stage sets cur_[card] itself for
+    // the pieces run_chunks runs here). The prompt cache's trie is under cache_mu_: a done callback's cache_peek meets the
+    // serial worker's restore or insert now, and answers 0 while the worker holds it (the re-prepare check is re-run at the
+    // next callback).
     std::string prefix_prepare(uint32_t lane, const LanesRequest& rq, uint32_t& reused, std::string& source) override {
         source.clear();   // (--parallel 1 reports no cache source on this arch)
-        m_.select_lane(lane);
+        std::lock_guard<std::mutex> cl(cache_mu_);
         // P4 B29 Fix B: the lane's own checkpoint, in place, when it serves at least as much as the shared cache would
-        if (const uint32_t own = sticky_.match(lane, *rq.ids); Q35mSticky::own_wins(own, cache_peek(rq))) {
+        if (const uint32_t own = sticky_.match(lane, *rq.ids); Q35mSticky::own_wins(own, peek_locked(rq))) {
             if (auto e = restore_own(lane, own); e.empty()) { reused = own; return {}; }
             else std::fprintf(stderr, "[q35m lanes] lane %u in-place restore at %u: %s; the cache or a full prefill\n", lane, own, e.c_str());
         }
         sticky_.drop(lane);   // the lane's rows are about to be overwritten (a cache restore or a new sequence)
-        reused = cache_ ? fleet_cache_restore(m_, *cache_, *rq.ids, "crown-split-cache") : 0;
-        if (!reused) m_.reset_state();   // a new sequence (a failed restore's half-copied state goes too)
+        Q35mLaneView view{m_, lane};
+        reused = cache_ ? fleet_cache_restore(view, *cache_, *rq.ids, "crown-split-cache") : 0;
+        if (!reused) m_.reset_lane_state(lane);   // a new sequence (a failed restore's half-copied state goes too)
         return {};
     }
+    // P4 B39: the prompt's tail [snap_at, T) through the pipe behind the snapshot boundary (q35m_plan pipe_tail), unless the
+    // drain switch keeps B10-B38's plan (the tail in prompt_end)
     LanesPlan plan(const LanesRequest& rq, uint32_t reused) override {
-        return q35m_plan(uint32_t(rq.ids->size()), rq.snap_at, reused, pf_chunk_, cache_ ? rq.share_at : 0u);
+        return q35m_plan(uint32_t(rq.ids->size()), rq.snap_at, reused, pf_chunk_, cache_ ? rq.share_at : 0u, /*pipe_tail=*/!drain_);
     }
     // P4 B15: the shared prefix [0, pos) into the prompt cache (--parallel 1's insert at share_at): any lane restores it
     // (prefix_prepare's fleet_cache_restore finds the deepest endpoint along a prompt)
     std::string mark(uint32_t lane, const LanesRequest& rq, uint32_t pos) override {
         if (!cache_) return {};
         const auto t0 = std::chrono::steady_clock::now();
-        m_.select_lane(lane);
         const std::vector<int32_t> pref(rq.ids->begin(), rq.ids->begin() + pos);
-        const std::string e = cache_->insert(m_, pref, /*shared=*/true);   // (P4 B29: never superseded)
+        Q35mLaneView view{m_, lane};
+        std::string e;
+        {
+            std::lock_guard<std::mutex> cl(cache_mu_);
+            e = cache_->insert(view, pref, /*shared=*/true);   // (P4 B29: never superseded)
+        }
         std::fprintf(stderr, "[crown-split-cache] lane %u shared prefix %u: %s (%.1f ms)\n", lane, pos, e.empty() ? "inserted" : e.c_str(),
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
         return e;
     }
     // what prefix_prepare's fleet_cache_restore would restore now (its clamp: a DeltaNet model never restores a full-length match)
     uint32_t cache_peek(const LanesRequest& rq) const override {
-        if (!cache_) return 0;
-        const uint32_t M = cache_->peek_longest_match(*rq.ids);
-        return M < rq.ids->size() ? M : 0u;
+        std::unique_lock<std::mutex> cl(cache_mu_, std::try_to_lock);
+        if (!cl.owns_lock()) return 0;   // (P4 B39: the serial worker holds the cache -- a restore or an insert -- nothing to report now)
+        return peek_locked(rq);
     }
     std::string prefill_serial(uint32_t lane, const LanesRequest& rq, std::span<const LanesChunk> chunks,
                                const std::function<bool()>& stop, size_t& done) override {
-        m_.select_lane(lane);
         return run_chunks(lane, rq.ids->data(), chunks, stop, done);
     }
     // P4 B36 (B): IE_Q35MOE_ANCHOR (on unless 0): a prompt that ends with a user query snapshots as the conversation's anchor
     void set_anchor(bool on) { anchor_ = on; }
     bool anchor() const { return anchor_; }
-    // --parallel 1's insert at the snapshot boundary (when [reused, snap_at) was prefilled), then the rest of the prompt
+    // P4 B39: the conversation snapshot at plan.snap (the lane's state ends exactly there; the tail follows through the pipe):
+    // what prompt_end does at Tp == snap_at
+    std::string snapshot(uint32_t lane, const LanesRequest& rq, uint32_t pos) override {
+        conv_snapshot(lane, rq, pos);
+        return {};
+    }
+    // --parallel 1's insert at the snapshot boundary (when [reused, snap_at) was prefilled), then the rest of the prompt. P4 B39:
+    // with the tail through the pipe, Tp == T past the boundary (the snapshot turn took it) and kept: nothing to do here.
     std::string prompt_end(uint32_t lane, const LanesRequest& rq, uint32_t Tp, uint32_t reused, bool kept) override {
-        m_.select_lane(lane);
         const std::vector<int32_t>& ids = *rq.ids;
         const uint32_t T = uint32_t(ids.size());
-        if (cache_ && rq.snap_at > reused && Tp == rq.snap_at) {
-            const std::vector<int32_t> pref(ids.begin(), ids.begin() + Tp);
-            if (auto e = cache_->insert(m_, pref, /*shared=*/false, /*anchor=*/anchor_ && rq.anchor); !e.empty())
-                std::fprintf(stderr, "[crown-split-cache] insert: %s\n", e.c_str());
-            else ++snaps_;   // P4 B29: /health "snapshots" (a success is not logged per insert)
-        }
-        // P4 B29 Fix B: the lane's in-place checkpoint at the same boundary (its DeltaNet + conv state; its KV rows stay)
-        if (sticky_.on && rq.snap_at > reused && Tp == rq.snap_at) {
-            std::string e;
-            for (uint32_t dev = 0; dev < 2 && e.empty(); ++dev)
-                if (m_.dev_has_dn(dev)) e = ckdn_[uint64_t(lane) * 2 + dev]->copy_from(m_.fleet()->dev(dev).queue(), m_.dn_state(dev));
-            if (e.empty()) sticky_.set(lane, ids, Tp);
-            else { sticky_.drop(lane); std::fprintf(stderr, "[q35m lanes] lane %u checkpoint at %u: %s\n", lane, Tp, e.c_str()); }
-        }
+        if (rq.snap_at > reused && Tp == rq.snap_at) conv_snapshot(lane, rq, Tp);
         if (Tp < T) {
             std::vector<LanesChunk> rest;
             q35m_chunks(Tp, T, pf_chunk_, rest);
@@ -2638,20 +2665,18 @@ public:
         const std::string pe = pipe_.reset_lane(lane);
         sticky_.drop(lane);   // (P4 B29)
         try {
-            m_.select_lane(lane);
-            m_.reset_state();
+            m_.reset_lane_state(lane);
             for (uint32_t d = 0; d < 2; ++d) m_.fleet()->dev(d).queue().wait();
         } catch (const sycl::exception& x) { return x.what(); }
         return pe;
     }
     // --parallel 1's reply snapshot (the gen-cache endpoint at prompt ++ reply). --parallel 1 forwards every sampled id, the
     // last one of a "length" reply too; a lane has not forwarded that one yet, so it runs here first (one row, like the
-    // serial loop's step) and the state is then prompt ++ reply exactly.
+    // serial loop's step; that turn drains the pipe: serial_drains) and the state is then prompt ++ reply exactly.
     std::string finish(uint32_t lane, const LanesRequest& rq, std::span<const int32_t> out, const std::string&,
                        uint32_t pos) override {
         if (!cache_) return {};
         const auto t0 = std::chrono::steady_clock::now();
-        m_.select_lane(lane);
         std::vector<int32_t> full(rq.ids->begin(), rq.ids->end());
         full.insert(full.end(), out.begin(), out.end());
         if (pos + 1 == full.size()) {
@@ -2663,7 +2688,12 @@ public:
         }
         if (pos != full.size())
             return "reply snapshot: the lane holds " + std::to_string(pos) + " positions, prompt ++ reply is " + std::to_string(full.size());
-        const std::string e = cache_->insert(m_, full);
+        Q35mLaneView view{m_, lane};
+        std::string e;
+        {
+            std::lock_guard<std::mutex> cl(cache_mu_);
+            e = cache_->insert(view, full);
+        }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         if (e.empty()) { ++snaps_; std::fprintf(stderr, "[crown-split-cache] reply snapshot at depth %zu (%.1f ms)\n", full.size(), ms); }
         else           std::fprintf(stderr, "[crown-split-cache] reply snapshot skipped: %s\n", e.c_str());
@@ -2722,6 +2752,8 @@ public:
     bool        rows() const override { return rows_; }
     std::string pipe_start_rows(DoneFn done, RowsDoneFn rows_done) override { return pipe_.start(std::move(done), std::move(rows_done)); }
     std::string pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) override { return pipe_.submit(lane, ids, T, pos0); }
+    // P4 B39 (5): the prompt's tail piece to the front of stage 0's queue
+    std::string pipe_submit_front(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) override { return pipe_.submit(lane, ids, T, pos0, true); }
     // P4 B34: the lane pipeline. Two pieces of one lane in flight touch different cards' state (forward_stage: card 0's KV,
     // DeltaNet + conv state and workspace for piece k + 1 while card 1's run piece k, as run_chunks has them), and each in its
     // own residual buffer (the pipe's two slots a lane); per card the lane's launches stay in piece order.
@@ -2742,9 +2774,50 @@ public:
     std::string pipe_stop() override { return pipe_.stop(); }
     std::string pipe_error() const override { return pipe_.error(); }
     uint32_t    pipe_max_rows() const override { return pipe_.max_rows(); }
+    // P4 B39: which turns pause the pipe. Default: none but a "length" reply's finish (it forwards the last id: a full forward
+    // on the cards' shared workspace) and a lost lane's reset. The rest -- the restore (prefix_prepare), the shared-prefix mark,
+    // the conversation snapshot, the prompt end (its tail went through the pipe; the first sample reads the lane's kept logits)
+    // and a "stop" reply's snapshot -- copy only the lane's own KV / DeltaNet state and the cache's buffers, by lane index, on
+    // the cards' in-order queues (ordered behind the steps in flight there), and the sampler uses the lane's own buffers.
+    // IE_Q35MOE_TURN_DRAIN=1: every turn drains (B10-B38).
+    bool serial_drains(Turn k) const override {
+        if (drain_) return true;
+        return k == Turn::kFinishLength || k == Turn::kReset;
+    }
+    std::string pipe_wait_lane(uint32_t lane) override { return pipe_.wait_lane(lane); }
 
 private:
     sycl::queue& hq() { return m_.fleet()->dev(m_.head_dev()).queue(); }
+    // (cache_mu_ held) what prefix_prepare's fleet_cache_restore would restore
+    uint32_t peek_locked(const LanesRequest& rq) const {
+        if (!cache_) return 0;
+        const uint32_t M = cache_->peek_longest_match(*rq.ids);
+        return M < rq.ids->size() ? M : 0u;
+    }
+    // The conversation snapshot at `pos` (the lane's state ends exactly there): --parallel 1's insert at the snapshot boundary
+    // (P4 B36 (B): as the anchor when the prompt ends with a user query) and P4 B29 Fix B's in-place checkpoint (the lane's
+    // DeltaNet + conv state; its KV rows stay). By lane index (P4 B39).
+    void conv_snapshot(uint32_t lane, const LanesRequest& rq, uint32_t pos) {
+        const std::vector<int32_t>& ids = *rq.ids;
+        if (cache_) {
+            const std::vector<int32_t> pref(ids.begin(), ids.begin() + pos);
+            Q35mLaneView view{m_, lane};
+            std::string e;
+            {
+                std::lock_guard<std::mutex> cl(cache_mu_);
+                e = cache_->insert(view, pref, /*shared=*/false, /*anchor=*/anchor_ && rq.anchor);
+            }
+            if (!e.empty()) std::fprintf(stderr, "[crown-split-cache] insert: %s\n", e.c_str());
+            else ++snaps_;   // P4 B29: /health "snapshots" (a success is not logged per insert)
+        }
+        if (sticky_.on) {
+            std::string e;
+            for (uint32_t dev = 0; dev < 2 && e.empty(); ++dev)
+                if (m_.dev_has_dn(dev)) e = ckdn_[uint64_t(lane) * 2 + dev]->copy_from(m_.fleet()->dev(dev).queue(), m_.lane_dn_state(lane, dev));
+            if (e.empty()) sticky_.set(lane, ids, pos);
+            else { sticky_.drop(lane); std::fprintf(stderr, "[q35m lanes] lane %u checkpoint at %u: %s\n", lane, pos, e.c_str()); }
+        }
+    }
     // One card's part of one lane's step (a stage thread; only this thread touches that card while the pipe runs).
     std::string stage(uint32_t s, const Glm5LanePipe::Step& st) {
         std::string e;
@@ -2804,17 +2877,17 @@ private:
         return err;
     }
 
-    // P4 B29 Fix B: the selected lane back to its checkpoint at `depth`: the DeltaNet + conv state copied back on every card
-    // that has DeltaNet layers, every full-attention layer's KV length set to `depth` (its rows below are the lane's own)
+    // P4 B29 Fix B: the lane back to its checkpoint at `depth`: the DeltaNet + conv state copied back on every card that has
+    // DeltaNet layers, every full-attention layer's KV length set to `depth` (its rows below are the lane's own). By index.
     std::string restore_own(uint32_t lane, uint32_t depth) {
         for (uint32_t dev = 0; dev < 2; ++dev) {
             if (m_.dev_has_dn(dev)) {
                 const DeltaNetState* c = ckdn_[uint64_t(lane) * 2 + dev].get();
                 if (!c) return "no checkpoint on card " + std::to_string(dev);
-                if (auto e = m_.dn_state(dev).copy_from(m_.fleet()->dev(dev).queue(), *c); !e.empty()) return e;
+                if (auto e = m_.lane_dn_state(lane, dev).copy_from(m_.fleet()->dev(dev).queue(), *c); !e.empty()) return e;
             }
             if (m_.dev_has_kv(dev)) {
-                KvCache& kv = m_.kv_cache(dev);
+                KvCache& kv = m_.lane_kv_cache(lane, dev);
                 for (uint32_t li = 0; li < kv.config().n_layers_full; ++li) kv.set_length(li, depth);
             }
         }
@@ -2823,6 +2896,7 @@ private:
 
     Qwen35MoeSplitModel& m_;
     FleetPrefixCache* cache_;   // null = the prompt cache is off
+    mutable std::mutex cache_mu_;      // P4 B39: the trie, between the serial worker's restore / insert and a callback's cache_peek
     std::atomic<uint64_t> snaps_{0};   // P4 B29: successful prompt-end + reply snapshots
     Q35mSticky sticky_;                // P4 B29 Fix B (off until init_sticky)
     std::vector<std::unique_ptr<DeltaNetState>> ckdn_;   // [lane * 2 + card] the in-place checkpoints
@@ -2831,6 +2905,7 @@ private:
     uint32_t pf_chunk_, H_, V_;
     bool rows_;
     bool pipeline_;                        // P4 B34
+    bool drain_;                           // P4 B39: IE_Q35MOE_TURN_DRAIN=1 (every serial turn pauses the pipe; the tail in prompt_end)
     bool anchor_ = false;                  // P4 B36 (B)
     CardPipe pipe_;
     std::vector<sycl::half> xb_[2];
@@ -2931,9 +3006,37 @@ std::string Engine::q35m_lanes_init() {
                            gcap ? std::to_string(gcap).c_str() : "AUTO (one group per card)");
     else std::fprintf(stderr, "[qwen35moe] lane rows OFF (%s): one lane a card step\n",
                       rows_why.empty() ? "IE_Q35MOE_ROWS=0" : rows_why.c_str());
+    // P4 B42: the decode regroup, on by default with rows. The B39 gate's replay (2026-10-02): without the paused turns' release
+    // bursts the decode groups stayed as the lanes' arrival aligned them (3.42 rows per card step vs 4.69 on v0.2.6; 1,698 singleton
+    // steps vs 607), the reason the per-request decode p50 did not move when the drains went. Stage 0 now waits -- at most
+    // IE_Q35MOE_GROUP_WAIT_US (default 20,000: one 8-row card-1 step is 17.5-20.7 ms, the landing lag is uniform over it) -- for
+    // the decode group landing on card 1 before forming a group that would leave >= 3 groups rotating; one or two decoders never
+    // wait. IE_Q35MOE_REGROUP=0 = off (B14-B39's formation).
+    uint32_t regroup_us = 0;
+    if (rows) {
+        const char* rgv = std::getenv("IE_Q35MOE_REGROUP");
+        regroup_us = (rgv && std::string(rgv) == "0") ? 0u : 20000u;
+        if (const char* v = std::getenv("IE_Q35MOE_GROUP_WAIT_US"); v && regroup_us)
+            regroup_us = uint32_t(std::clamp(std::atoi(v), 1, 1000000));
+        lm->set_regroup(regroup_us);
+        if (regroup_us)
+            std::fprintf(stderr, "[qwen35moe] decode regroup ON: stage 0 waits up to %u us for the decode group landing on card 1 before "
+                                 "forming a group that would leave 3+ groups rotating (IE_Q35MOE_GROUP_WAIT_US; IE_Q35MOE_REGROUP=0 = off)\n",
+                         regroup_us);
+        else std::fprintf(stderr, "[qwen35moe] decode regroup OFF (IE_Q35MOE_REGROUP=0): groups form from the lanes queued at stage 0\n");
+    }
     std::fprintf(stderr, "[qwen35moe] lane pipeline %s (IE_Q35MOE_LANE_PIPELINE=0 = a lane's pieces one at a time)\n",
                  lm->pipeline() ? "ON: a prefilling lane's next piece goes onto card 0 while card 1 runs the piece before, when "
                                   "card 0 is idle" : "OFF");
+    // P4 B39: the serial turns beside the pipe (the 2026-10-02 trace026 swarm replay: 84 turn drains, 16.5 s, 89 % of them the
+    // prompt-end turn's -- its 3-6 tail rows ran in the turn on the cards' shared workspace, so the whole pipe had to stand still
+    // for every request's prompt end; the restore / snapshot copies touch one lane only). IE_Q35MOE_TURN_DRAIN=1 = B10-B38.
+    std::fprintf(stderr, "[qwen35moe] serial turns %s (IE_Q35MOE_TURN_DRAIN=1 = every turn pauses the lane pipe, the prompt's tail rows run in "
+                         "the turn, B10-B38)\n",
+                 lm->turn_drain() ? "DRAIN the lane pipe (IE_Q35MOE_TURN_DRAIN=1)"
+                                  : "run BESIDE the lane pipe: a request's restore, conversation snapshot, prompt end and reply snapshot wait "
+                                    "for their own lane only; the prompt's tail rows go through the pipe behind the snapshot (a \"length\" "
+                                    "reply's snapshot and a lost lane's reset still drain)");
     LanesServe::Options so;
     // P4 B29: a prompt that starts while other lanes run goes through the pipe in pieces of at most 2,048 rows (default on), so
     // the decoding lanes' groups step between pieces instead of queueing behind an 8,192-row piece per card (the 2026-09-30

@@ -1,7 +1,7 @@
 
 # Mach X — LLM Inference Engine for Intel Arc
 
-**A C++/SYCL local LLM inference engine for Intel Arc GPUs, built and tuned on two Arc Pro B70 cards. XMX kernels, quantized models and multi-GPU execution. New in v0.2.6: agent swarms on one engine — up to 16 agents that read and write at once, faster prefill, and tool calls and reasoning returned in the OpenAI fields.**
+**A C++/SYCL local LLM inference engine for Intel Arc GPUs, built and tuned on two Arc Pro B70 cards. XMX kernels, quantized models and multi-GPU execution. New in v0.2.8: the agent swarm on the 35B-A3B class runs its 15-agent replay 12 % faster than v0.2.6 and a worker's first token comes in 2.6–2.8 s instead of 3.8–4.8 s — the engine's serial turns no longer pause the other lanes, decoding lanes regroup, and the tiled prefill attention starts at 512 positions.**
 
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue)
 ![Language](https://img.shields.io/badge/C%2B%2B20-SYCL%20%2F%20DPC%2B%2B-orange)
@@ -29,7 +29,7 @@ September 29 – October 1 were measured for v0.2.6 on that same stack; earlier 
 | **DeepSeek-V4-Flash** | 155 GB GGUF (MXFP4 experts, Q8_0 dense) | **571** tok/s at 4K | **26.1** tok/s at 4K, **32.7** short | tool calls, prompt cache; measured on the previous driver stack (September 11, 2026) |
 | **GLM-5.3-Flash** | UD-Q4_K_XL GGUF, host-resident experts | **156.4** tok/s at 16K | **14.0–14.4** tok/s at 16K | MTP draft, two-GPU pipelined prefill, request lanes in a test tool (two lanes ×1.68 against one request; `ie serve` runs GLM one request at a time) |
 | **Qwen3.8-Flash** (Flash-Next) | 104 GB UD-Q4_K_XL GGUF | **495–502** tok/s pipelined, once warm | **37.1–38.2** tok/s chat, **44.4–44.6** code (lossless speculative) | native vision, up to 16 requests at once in `ie serve` (two at **59.0–62.6** tok/s together, ×1.94–2.06; 16 at **118.4** with row batching) |
-| **Qwen3.6-35B-A3B class** | Q8_0 GGUF, split over both cards | a 2K-token prompt in **1.41 s**, 8K in **5.96 s**, 32K in **48.4 s** (one request, cold, wall time for the prompt plus one token; October 1) | **85.7** tok/s on a short prompt (October 1); **60.9** at a 33K-token prompt (September 30) | up to 16 requests at once in `ie serve`, the lane count picked at load: 16 at **414.1** tok/s together, 25.9 each (October 1); a 15-agent replay with a shared-prompt wave in **139.7 s** ([New in v0.2.6](#new-in-v026)); XML tool calls and reasoning returned in the OpenAI fields; native Q6_K / Q5_K. Measured on community fine-tunes of the model; this split has no vision path. |
+| **Qwen3.6-35B-A3B class** | Q8_0 GGUF, split over both cards | a 2K-token prompt in **1.28 s** (October 2, with v0.2.8's attention threshold set by environment on the v0.2.6 build; 1.41 s at v0.2.6's threshold), 8K in **5.96 s**, 32K in **48.4 s** (one request, cold, wall time for the prompt plus one token; October 1) | **85.7** tok/s on a short prompt (October 1); **60.9** at a 33K-token prompt (September 30) | up to 16 requests at once in `ie serve`, the lane count picked at load: 16 at **414.1** tok/s together, 25.9 each (October 1); a 15-agent replay with a shared-prompt wave in **116.3–116.5 s** (October 2; v0.2.6 measured 131.3–132.4 s in the same session and 139.7 s on October 1; [New in v0.2.8](#new-in-v028)); XML tool calls and reasoning returned in the OpenAI fields; native Q6_K / Q5_K. Measured on community fine-tunes of the model; this split has no vision path. |
 | **Qwen3.8-27B** | Q8_0 GGUF | **945** tok/s at 2K | **24.5** tok/s (tensor-parallel + speculative); both August 15–26. Q6_K **22.0** and Q5_K_M **24.0** tok/s on the two-card split (one request, September 29) | prompt cache (layer-split), up to 16 requests at once in `ie serve` with row batching: 16 at **153.5** tok/s together, 17.2–17.3 alone (`--ctx 8192 --parallel 16`, October 1, on a community fine-tune; the same run with the new Q8_0 GEMV kernels switched off gives 113.8, and v0.2.0's figure, 108.0, was measured with `--ctx 16384 --slot-ctx 4096`) |
 
 Everything runs behind one OpenAI-compatible server (`ie serve`) with tool calls. Since v0.2.0, `ie supervise` puts
@@ -40,6 +40,154 @@ class ([New in v0.2.6](#new-in-v026)).
 
 ![DeepSeek-V4.1-Flash running locally in the Dream Agent Harness, served by Mach X on two Arc Pro B70 cards](docs/images/dream-deepseek-v41.png)
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
+
+---
+
+<a id="new-in-v028"></a>
+## 🆕 New in v0.2.8
+
+Everything since [v0.2.6](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.6). The
+[release notes](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.8) list every change and the
+behaviour changes. Three changes to the agent-swarm scheduling of the Qwen3.6-35B-A3B class (Q8_0, split over both
+cards); there is no new kernel and no change to the request API. Every figure here was measured on October 2, 2026, on
+the driver stack the v0.2.6 figures were measured on, on a community fine-tune of the model, by an independent run of
+each build against the build before it, two runs per build where a line gives two numbers; the replies of each build
+were compared byte for byte with the build before it.
+
+### The agent replay: 12 % faster, a worker's first token in 2.6–2.8 s
+
+The replay from [v0.2.6](#new-in-v026) (`tools/swarm_replay.py`: 15 worker conversations for 3 turns each, prompts
+growing from 1.4K to about 8K tokens, then a wave of 15 new conversations that share one system prompt of about 12K
+tokens, with one follow-up each; 75 requests against
+`ie serve --gpus 2 --ctx 262144 --parallel 16 --max-queue 16 --thinking on`), every run 75 of 75 requests with 0 errors.
+Each row compares two runs of a build with two runs of the build before it, all on October 2: alternating in one
+session for the first row, at most three hours apart for the other two (the same prompts). v0.2.6's 139.7 s in the
+section below was measured on October 1; the same binary measured 131.3 and 132.4 s on October 2, so compare within a
+row, not with the v0.2.6 section.
+
+| change | whole replay | workers' decode per request, median (5th percentile) | workers' first token, median |
+|---|---:|---:|---:|
+| serial turns beside the lane pipe | 132.4 / 131.3 → **127.7 / 127.7 s** | 8.65 / 8.80 (6.88 / 6.50) → 8.59 / 8.61 (**7.66 / 7.65**) tok/s | 3.79 / 4.79 → 4.16 / 4.00 s |
+| decoding lanes regrouped; a lone prompt's remainder re-cut, a prompt's tail first | 127.8 / 128.9 → **122.2 / 122.2 s** | 8.76 / 8.61 (7.68 / 7.24) → **8.85 / 8.93** (7.87 / 7.84) | 4.15 / 4.15 → 4.06 / 4.01 s |
+| tiled prefill attention from 512 positions | 122.2 / 122.2 → **116.3 / 116.5 s** | 8.85 / 8.93 (7.87 / 7.84) → **9.83 / 9.86** (7.12 / 7.13) | 4.06 / 4.01 → **2.83 / 2.58 s** |
+| **v0.2.6 → v0.2.8** | 131.3–132.4 → **116.3–116.5 s (−12 %)**; the workers phase 82.0–82.8 → 70.3 s | 8.65–8.80 (6.50–6.88) → **9.83–9.86 (7.12–7.13)** | 3.79–4.79 → **2.58–2.83 s** |
+
+- **The serial turns run beside the lane pipe.** Between a lane's prefill pieces and its decode steps the server takes
+  short exclusive turns for that lane: restoring a cached prefix, marking a shared prefix, snapshotting the
+  conversation, ending the prompt. In v0.2.6 every turn paused the two-card pipe and waited for every step in flight to
+  land, because the prompt-end turn ran the prompt's last 3–6 rows (the generation prompt) as a full two-card forward
+  on the cards' shared workspace. In one trace of the replay on v0.2.6 that was 84 pauses and 16.5 s of waiting, 89 %
+  of it the prompt-end turn's. Now those rows go through the pipe as the prompt's last piece, each turn's copies
+  address their lane by index, and the turns run while the other lanes keep stepping; only a lost lane's reset, and
+  the snapshot of a reply that ended at its length limit (taken only on templates without thinking), still pause the
+  pipe. Measured over two runs of each build: pauses 84–86 → 0, the pipe's paused time 13.3–13.4 → 0.7 s; card 0's
+  longest idle gap before a decode step 2.07 s → 0.29 s and its idle time in the workers phase 19.9 → 10.8 s
+  (24.5 → 13.8 %); card 1 never idles before a decode step any more; the 15 workers' first tokens at the start of the
+  replay 5.17–5.19 → 4.22–4.23 s (median). The median decode did not move, and the trace shows why: without the
+  pauses' release bursts the decoding lanes formed smaller groups (3.20 rows per card step against 4.53), which the
+  next item fixes. With an 80K-token lead and six workers (the v0.2.6 shape below) nothing regressed: the workers'
+  first token 12.2 s against 12.6, the lead's 169.0 s against 169.5, the same replies. The replies of all five lane
+  models (35B-A3B class, Qwen3.8-27B, Qwen3.8-Flash, MiMo-V2.6-Flash, DeepSeek-V4.1-Flash) equalled v0.2.6's byte for
+  byte (156 checks, 0 differences), and the replay's 45 worker replies too; 28 of the 30 wave replies differ because
+  the wave's first prompt took the prefill path of a prompt that starts alone (its first 8,192 rows in one piece) in
+  every run of the new builds, a path v0.2.6 takes too, depending on arrival timing (1 of its 4 runs) — the pieces
+  decide the bits, as the v0.2.6 note says. `IE_Q35MOE_TURN_DRAIN=1` restores v0.2.6's protocol; on the build with
+  only this change the replay's 75 replies then equalled v0.2.6's.
+- **Decoding lanes regroup.** The decoding lanes step in groups; a group is one card step that reads the weights
+  once, so a row costs 5.7–5.8 ms in a 1-row step and 2.2 ms in an 8-row step (17.5–17.7 ms). The pipe merges only
+  the lanes it finds queued when it forms a group, and a landed group's lanes resubmit together, so three or more
+  groups rotating over the two cards never met: one lands per step, one forms per step. The paused turns had been
+  merging them by accident, releasing every parked lane at once. Now, before forming a group that would leave three or
+  more rotating, card 0 waits up to 20 ms for the decode group landing on card 1 and forms from everything queued; one
+  or two decoders never wait, and a merge is paid once. In the replay's workers phase: 3.30 → 4.56 rows per decode
+  card step (v0.2.6: 4.53), 1-row steps 792–819 → 175–177, 21.9–22.4 → 19.6–19.7 s of decode card time for the same
+  7,236 rows; the waits held card 0 for 636–644 ms in all (37–41 waits, 4–5 of them timed out). The replay's replies
+  are 75 of 75 identical to the build before: a row's bytes do not depend on its group. `IE_Q35MOE_REGROUP=0` turns it
+  off; `IE_Q35MOE_GROUP_WAIT_US` sets the wait. Qwen3.8-27B and Qwen3.8-Flash keep their paused turns and are
+  unchanged.
+- **The wave's first prompt.** The first change had moved the first token of the shared-prompt wave's leader from
+  8.57 s (v0.2.6 when the leader interleaved with its followers from the start) or 10.22 s (v0.2.6 when it prefilled
+  alone first) to 12.4 s: released into the running pipe, its remaining 3,275 rows ran as one piece, and its 7-row
+  tail queued behind the 14 followers' first pieces. Now a prompt that started alone has its remaining pieces re-cut
+  into 512-row pieces as soon as another request waits for its turn (the leader's prefill 11.1 → 8.9 s, where v0.2.6
+  alone took 8.8), and a prompt's tail piece goes to the front of the queue (one piece of at most 512 rows per prompt,
+  so nothing starves). The leader's first token 12.38–12.43 → **11.17–11.31 s**; the followers' 12.41–12.42 →
+  **11.29–11.31 s** (v0.2.6: 11.28–11.36 or 12.93–13.00, by the same timing). The leader stays 2.6–2.7 s behind
+  v0.2.6's better outcome: see [What is still slow](#what-is-still-slow-v028).
+- **Tiled prefill attention from 512 positions.** v0.2.6 took the tiled attention kernel for a prefill piece whose last
+  position reached 6,144 and the previous kernel below, a threshold copied from the 27B and never measured on this
+  class. Measured on the replay's 512-row pieces (card 0 medians): below 6,144 the previous kernel cost 155 ms + 30 ms
+  per 1,000 positions of depth, the tile 159 + 18 at every depth, with no overhead at depth 0 (156.5 against 158.0 ms),
+  so a piece at 4–6K depth (296 ms) was slower than one at 6–8K (276 ms). From 512 positions every piece lies on the
+  one line: 208.0 → 190.1 ms at 0–2K (−9 %), 247.1 → 215.0 at 2–4K (−13 %), 295.8 → 248.8 at 4–6K (−16 %),
+  unchanged from 6K up. In the replay: the workers' first token 4.06 / 4.01 → 2.83 / 2.58 s (median), their prefill
+  1,085 → 1,171 tok/s together, their decode median 8.85 / 8.93 → 9.83 / 9.86 tok/s, the workers phase 75.9 → 70.3 s;
+  the wave, all of it deeper than 8K, is unchanged. One request at a time: a 2,038-token cold prompt 1.41 → 1.28 s
+  (server-side 1,395 → 1,271 ms; measured with the threshold set by environment on the v0.2.6 build), 8,065- /
+  16,369- / 32,161-token prompts unchanged within 0.4 % (their 8,192-row pieces were on the tile already); needle
+  prompts of 2,043 and 3,580 tokens got their first token in 1.36–1.42 s instead of 1.47–1.50 and in 2.30–2.31 s
+  instead of 2.65–2.67, found 6 of 6 needles, and gave byte-identical replies. Numerics: perplexity on the
+  12,288-token anchor is 2.3529 at both thresholds; on prefill chunks of 4,096 / 2,048 / 1,024 / 512 rows, which
+  change kernel, it moves −0.064 / +0.183 / −0.497 / +0.028 % (511 scored tokens each; the sign changes between
+  windows). Bits: a prompt whose prefill pieces end between 512 and 6,143 positions computes other bits than on v0.2.6
+  (39 of the replay's 45 worker replies differ, 6 are identical; the 30 wave replies, deeper than 8K, are identical);
+  prompts shorter than 512 tokens and pieces ending at 6,144 or deeper are unchanged. It also removes a dependence of
+  the bits on timing: on v0.2.6 a prompt crossing 6,144 computed its rows below 6,144 with the other kernel if it had
+  been re-cut into 512-row pieces beside a running lane (28 of 30 wave replies differed between two v0.2.6 runs at the
+  same threshold). `IE_Q35MOE_FA2_TILE_MINCTX=6144` gives v0.2.6's kernel choice: with it the release build
+  reproduced v0.2.6's recorded replies on the check's short prompts, tool call and batch of four, and v0.2.6's
+  perplexity to six decimals on the chunks that change kernel. The 27B's own threshold is unchanged.
+
+### Serving
+
+- **The load log says which protocol a run used**: `[qwen35moe] serial turns run BESIDE the lane pipe ...` (or
+  `DRAIN the lane pipe (IE_Q35MOE_TURN_DRAIN=1)`), `[qwen35moe] decode regroup ON: stage 0 waits up to 20000 us ...`
+  (or `OFF`), and `[qwen35moe_split] prefill attention: tiled (FA2 wide tile) from 512 positions, naive below ...`.
+- **`/health` gains** `turns_nodrain` (serial turns that ran beside the pipe), `turns_boundary_first`, and on the
+  35B-A3B class `pipe`: `groups` (the decode groups formed so far, by size), `regroup_waits`, `regroup_merges`,
+  `regroup_timeouts`, `regroup_wait_ms`. `drains`, `drain_ms`, `drain_max_ms` and `paused_ms` now count only the turns
+  that paused the pipe. The shutdown line's `groups by size` gains the regroup counts.
+- **A stop is as fast as before**: 0.45 s from `POST /admin/shutdown` to process exit on the release build with the
+  80K-token lead and six workers mid-run (a 512-row piece at 42K positions in flight), a clean restart that answered
+  the same reply, and 0 GPU fault lines after each of the 40 GPU jobs that checked this release (0.53 s on the build
+  before the attention change; 0.38 s on the first build of the series with four ~18.8K-token prompts mid-prefill,
+  where v0.2.6 took 0.43).
+
+### Switches
+
+Each is read once per process and applies to the 35B-A3B class's two-card split with more than one lane; the
+kernel threshold applies to `--parallel 1` as well.
+
+| switch | default | what the other value does |
+|---|---|---|
+| `IE_Q35MOE_TURN_DRAIN` | unset: the serial turns (restore, shared-prefix mark, conversation snapshot, prompt end, the snapshot of a reply that ended with a stop) run beside the lane pipe, each waiting only for its own lane's steps | `=1` every turn pauses the pipe and the prompt's last rows run inside the prompt-end turn, as in v0.2.6 |
+| `IE_Q35MOE_REGROUP` | on | `=0` no wait before a decode group forms; the groups stay as the lanes' arrival aligned them |
+| `IE_Q35MOE_GROUP_WAIT_US` | 20000 (1–1,000,000) | the most card 0 waits for the decode group landing on card 1 before forming a group that would leave three or more rotating |
+| `IE_Q35MOE_FA2_TILE_MINCTX` | 512 (6144 in v0.2.6): a prefill piece whose last position reaches this takes the tiled attention kernel | `=6144` v0.2.6's kernel choice (the same bytes for the same prefill pieces); `IE_Q35MOE_NO_FA2_TILE` set to any value: the previous kernel at every depth |
+
+<a id="what-is-still-slow-v028"></a>
+### What is still slow
+
+- **Many agents reading at once.** With 15 agents that each append 1–3K tokens of tool output per turn, an agent
+  decodes at a median 9.8 tok/s (5th percentile 7.1), against 25.9 tok/s per agent when 16 only write. The cards
+  still spend the difference reading the agents' prompts.
+- **The first prompt of a shared-prompt burst.** When 15 conversations arrive together with one shared prompt, the
+  first one's first token comes at 11.3 s, against 8.6 or 10.2 s on v0.2.6 (by the timing of the followers' arrival);
+  the 14 followers' at 11.3 s, as v0.2.6's better outcome. The cause is not established: the leader's prefill is as
+  fast as v0.2.6's (8.9 s), but 2.3–2.4 s pass between its first sampled token and the first byte the client receives,
+  against 1.3–1.4 s on v0.2.6. A test build that ran the leader's first decode step ahead of the followers' pieces
+  did not change its first token (11.2 s), so the decode queue is not the cause. Not fixed in this release.
+- **The slowest 5 % of agent replies decode slower than on the build before the attention change**: 7.87 / 7.84 →
+  7.12 / 7.13 tok/s, still above v0.2.6's 6.50–6.88. Per-step times are unchanged; the slowest replies are 18–55
+  tokens long and decode during the replay's opening while 14 other lanes read their prompts, and the faster pieces
+  leave more 1-row decode steps (285–288 against 175–177 in the workers phase).
+- **Bits change for prompts with prefill pieces ending between 512 and 6,143 positions** on the 35B-A3B class;
+  perplexity on such chunks moved by at most 0.5 % in either direction. `IE_Q35MOE_FA2_TILE_MINCTX=6144` gives
+  v0.2.6's kernel choice.
+- **The regroup wait holds card 0 for up to 20 ms per merge**: 636–650 ms over the replay (37–46 waits, 4–8 of them
+  timed out at the bound).
+- **The changes are for the 35B-A3B class only.** Qwen3.8-27B and Qwen3.8-Flash keep their paused turns, and the
+  v0.2.6 list below still applies.
 
 ---
 
@@ -94,10 +242,11 @@ compare within a row, not down a column):
   of 0 in a five-round test). At 16 lanes and `--ctx 262144` the checkpoints take 491 MiB per card and the cache holds
   up to 40 entries in 2.24 GiB per card, with 1.5 GiB per card kept free.
 - **Long prompts prefill faster at depth.** The split's prefill attention takes the tiled kernel from 6,144
-  positions: a cold 55,923-token prompt in 94.5 s instead of 200.4 s, and a follow-up turn with 1,164 new tokens at
-  56K depth in 6.38 s instead of 11.70 s (September 30). Not bit-identical: perplexity 2.3529 against 2.3525
-  (+0.017 %; a 12,288-token prefill, then 511 scored tokens), and needles at 10 / 50 / 90 % depth found 6 of 6 at 32K
-  and 54K. Setting `IE_Q35MOE_NO_FA2_TILE` restores the previous kernel and its exact output.
+  positions (from 512 since v0.2.8, [above](#new-in-v028)): a cold 55,923-token prompt in 94.5 s instead of 200.4 s,
+  and a follow-up turn with 1,164 new tokens at 56K depth in 6.38 s instead of 11.70 s (September 30). Not
+  bit-identical: perplexity 2.3529 against 2.3525 (+0.017 %; a 12,288-token prefill, then 511 scored tokens), and
+  needles at 10 / 50 / 90 % depth found 6 of 6 at 32K and 54K. Setting `IE_Q35MOE_NO_FA2_TILE` restores the previous
+  kernel and its exact output.
 - **Both cards busy during a deep prefill.** A lane's next piece enters card 0 while card 1 still runs the piece
   before it (the lane pipeline). A 51,459-token prompt prefilling beside a decoding lane: first token in 64.1 s
   instead of 119.3 s (×1.86), the cards 93 / 96 % busy instead of 50 / 51 %, and the lane decoding beside it at
@@ -231,7 +380,7 @@ Every default below can be turned off on its own; each is read once per process.
 | `IE_Q35MOE_LANES_CACHE` | on: up to max(12, 2 × lanes + 8) entries within a VRAM budget | `=0` 12 entries, no budget; `IE_PROMPT_CACHE_MAX_ENTRIES` and `IE_PROMPT_CACHE_VRAM_MIB` set the limits |
 | `IE_Q35MOE_CACHE_SUPERSEDE` | on | `=0` a conversation keeps its older snapshots |
 | `IE_Q35MOE_ANCHOR` | on | `=0` no snapshot kept at the last user query |
-| `IE_Q35MOE_NO_FA2_TILE` | unset: tiled prefill attention from `IE_Q35MOE_FA2_TILE_MINCTX` (6144) positions | set to any value: the previous kernel and output |
+| `IE_Q35MOE_NO_FA2_TILE` | unset: tiled prefill attention from `IE_Q35MOE_FA2_TILE_MINCTX` positions (6144 in v0.2.6, 512 since v0.2.8; the 27B's threshold is its own) | set to any value: the previous kernel and output at every depth |
 | `IE_Q35MOE_LANE_PIPELINE` | on | `=0` one piece of a lane in the pipe at a time |
 | `IE_Q35MOE_SHORT_FIRST` | on, with `IE_Q35MOE_SHORT_ROWS` 16384, `IE_Q35MOE_SHORT_SLOTS` 2, `IE_Q35MOE_SHORT_WAIT_MS` 10000 | `=0` the FIFO window and arrival order alone |
 | `IE_Q35MOE_MIX_CHUNK` | 512 rows | `=<rows>` another piece size; `=0` the plan's 8,192-row pieces, which also turns re-cut off |
@@ -268,8 +417,9 @@ Every default below can be turned off on its own; each is read once per process.
   class: it is read in 512-row pieces (a prompt that gets company mid-prefill is re-cut the same way). A prompt of up
   to 512 tokens, a prompt that starts alone and runs alone, and `--parallel 1` are byte-identical to before.
 - **Long-context replies differ from v0.2.0's** on the 27B and 35B-A3B splits: the tiled prefill attention (from
-  6,144 positions, 35B-A3B class) and the XMX decode attention (from 4,096) are not bit-identical to the kernels they
-  replace. Perplexity moved by +0.017 % and by at most 0.002 nats.
+  6,144 positions on the 35B-A3B class in v0.2.6, from 512 since v0.2.8; `IE_Q35MOE_FA2_TILE_MINCTX=6144` gives
+  v0.2.6's bytes) and the XMX decode attention (from 4,096) are not bit-identical to the kernels they replace.
+  Perplexity moved by +0.017 % and by at most 0.002 nats.
 - **The new scheduling is for the 35B-A3B class only.** On Qwen3.8-27B, Qwen3.8-Flash, MiMo-V2.6-Flash and
   DeepSeek-V4.1-Flash a long new prompt still slows or pauses the other lanes while it prefills. The Qwen3.8-27B
   gets no lanes from the pick at `--ctx 32768` with the prompt cache on.
@@ -580,7 +730,7 @@ and four ×1.27 (below).
 
 ## Highlights
 
-- 🆕 **Agent swarms on two B70s** — a lead and up to 15 sub-agents on one `ie serve` (Qwen3.6-35B-A3B class, Q8_0): a shared system prompt read once, each conversation resumed in its lane, both cards busy during a deep prefill, structured tool calls and `reasoning_content`, and a lane count the engine picks at load. A 15-agent replay that did not finish in 336 s now takes 139.7 s. See [New in v0.2.6](#new-in-v026).
+- 🆕 **Agent swarms on two B70s** — a lead and up to 15 sub-agents on one `ie serve` (Qwen3.6-35B-A3B class, Q8_0): a shared system prompt read once, each conversation resumed in its lane, both cards busy during a deep prefill, structured tool calls and `reasoning_content`, and a lane count the engine picks at load. A 15-agent replay that did not finish in 336 s took 139.7 s on v0.2.6 and takes 116 s on v0.2.8 (v0.2.6 measured 131–132 s in that session). See [New in v0.2.8](#new-in-v028) and [New in v0.2.6](#new-in-v026).
 - 🐋 **DeepSeek-V4.1-Flash on two B70s** — the 475 GB safetensors checkpoint with host-resident experts: 223K-token context verified, native tool calls and **image input** through `ie serve`, a prompt cache that answers follow-up turns in ~1–2 s, and prompt-lookup speculation that decodes agent tool loops **1.47× faster**, and several requests at once ([lanes](#several-requests-at-once-request-lanes)). See [the V4.1 numbers](#deepseek-v41-flash).
 - 🆕 **MiMo-V2.6-Flash** — Xiaomi's 309B / 15B-active hybrid sliding-window model, running from its safetensors the day it was released: XMX attention kernels for its 192/128 head sizes, FP8 dense weights kept FP8 on the card, its bundled DFlash drafter decoding **1.46×** faster, native vision, conversations kept in host memory, and request lanes that decode several requests together ([lanes](#several-requests-at-once-request-lanes)). See [the MiMo numbers](#mimo-v26-flash).
 - 🧩 **Several models, one endpoint** — `ie supervise` routes each request by model name to its own `ie serve` child on its own cards; `--cards`, layout files and `ie cards` make placement explicit. See [New in v0.2.0](#new-in-v020).
@@ -746,7 +896,8 @@ results, rejected experiments, test coverage and reproduction commands.
 **Measured for v0.2.6** (September 29 – October 1, 2026, on the driver stack v0.2.0 shipped on; two cards; Q8_0
 unless a row says otherwise; the 35B-A3B-class rows, and the Qwen3.8-27B's lanes and Q6_K / Q5_K rows, on community
 fine-tunes of those models). The
-agent replay, the lead-and-workers runs and the stop times are in [New in v0.2.6](#new-in-v026).
+agent replay, the lead-and-workers runs and the stop times are in [New in v0.2.6](#new-in-v026); v0.2.8's replay,
+its per-piece prefill times and its stop time (October 2, 2026, the same stack) are in [New in v0.2.8](#new-in-v028).
 
 | model | workload | v0.2.6 | before |
 |---|---|---:|---:|

@@ -208,7 +208,12 @@ that runs sub-agents on the lanes can size each one's context from it.
 `GET /health` returns `{"status":"ok","inflight":..,"queued":..,"parallel":..,"max_queue":..}`
 with 200 while the device is healthy. With request lanes on the 35B-A3B class, Qwen3.8-27B
 and Qwen3.8-Flash it also carries the lanes' counters; v0.2.6 adds `snapshots`, `drains` / `drain_ms` / `drain_max_ms`, `lookaheads`,
-`short_bypass`, `short_guard`, `short_guard_wait`, `recuts`, `quota_holds` and `quota_guard`. If a forward ever reports a lost or reset
+`short_bypass`, `short_guard`, `short_guard_wait`, `recuts`, `quota_holds` and `quota_guard`. v0.2.8 adds `turns_nodrain`
+(serial turns that ran beside the lane pipe instead of pausing it), `turns_boundary_first` (mark or snapshot turns taken
+ahead of waiting prepare turns) and, on the 35B-A3B class only, `pipe`: `{"groups": [...], "regroup_waits", "regroup_merges",
+"regroup_timeouts", "regroup_wait_ms"}` — the decode groups formed so far by size (1 to 16 rows; `[]` until the first group
+forms) and the decode regroup's counters. Since v0.2.8 `drains`, `drain_ms`, `drain_max_ms` and `paused_ms` count only the
+turns that paused the pipe. If a forward ever reports a lost or reset
 device (`DEVICE_LOST`, "device lost", `DEVICE_RESET` in the error text), the
 server latches the fault: `/health` turns **503** `{"status":"unhealthy","reason":..}`
 and every generation is refused with 503 `code:"device_lost"` until the process
@@ -250,7 +255,9 @@ Measured on October 1, 2026, stop request to process exit: 0.43 s where the prev
 build took 14.58 s (4 lanes mid-prefill), 1.08 s where it took 49.70 s (16 lanes, an
 80K-token prompt mid-prefill), 0.45–0.53 s on the release's defaults, 0.82 s on the
 27B and 3.08 s on Qwen3.8-Flash, with no GPU fault and a clean restart after the
-35B-A3B stops. The bound is one layer of the running prefill piece and was measured
+35B-A3B stops. On v0.2.8 the 16-lane stop with an 80K-token lead and six workers
+measured 0.45 s (October 2, 2026; a 512-row piece at 42K positions in flight, no GPU
+fault, a clean restart). The bound is one layer of the running prefill piece and was measured
 down to 43K tokens of depth. Give a server that time: killing a process that still
 has work on a card can leave the GPU faulting. DeepSeek-V4.1-Flash and
 MiMo-V2.6-Flash stop as before, at the next token.
@@ -260,16 +267,28 @@ per-request image staging is engine-global and not slot-safe. (DeepSeek-V4.1-Fla
 takes images on its lanes.) Since v0.2.6 a load of MiMo-V2.6-Flash or Qwen3.8-Flash
 without `--parallel` has 4 lanes, so pass `--parallel 1` to serve images on them.
 
-## Request lanes on the 35B-A3B class: scheduling switches (v0.2.6)
+## Request lanes on the 35B-A3B class: scheduling switches (v0.2.6, v0.2.8)
 
 These are read once per process and apply to the `qwen35moe` two-card split with more
 than one lane. The load log prints each rule's state. Measurements are in the README,
-"New in v0.2.6".
+"New in v0.2.6" and "New in v0.2.8".
+
+Since v0.2.8 the serial turns this class takes for a lane (a cached prefix's restore, the
+shared-prefix mark, the conversation snapshot, the prompt's end, the snapshot of a reply that
+ended with a stop) run beside the lane pipe: the other lanes keep stepping, and the turn waits
+only for its own lane's steps. The prompt's last rows (the generation prompt) go through the
+pipe as the prompt's last piece, ahead of the other prompts' queued pieces. A lost lane's
+reset, and the snapshot of a reply that ended at its length limit, still pause the pipe. The load log says
+`[qwen35moe] serial turns run BESIDE the lane pipe ...`, or `DRAIN the lane pipe
+(IE_Q35MOE_TURN_DRAIN=1)` with the switch. Qwen3.8-27B and Qwen3.8-Flash keep the paused turns.
 
 | Switch | Default | Effect of the other value |
 |---|---|---|
 | `IE_LANES_PREFILL_FIFO` | on for this class (off on Qwen3.8-Flash and Qwen3.8-27B) | `=0`: every waiting prompt's pieces at once, so agents that share a prompt each read it; `=1` turns it on for the other two |
-| `IE_Q35MOE_NO_FA2_TILE` | unset: tiled prefill attention from `IE_Q35MOE_FA2_TILE_MINCTX` (6144) positions | set to any value, `0` included: the previous kernel and its exact output |
+| `IE_Q35MOE_FA2_TILE_MINCTX` | 512 since v0.2.8 (6144 in v0.2.6): a prefill piece whose last position reaches this takes the tiled attention kernel, a piece that ends below it the previous kernel; `--parallel 1` included. The load log prints `[qwen35moe_split] prefill attention: tiled (FA2 wide tile) from 512 positions, naive below ...` | `=6144`: v0.2.6's kernel choice (the same bytes for the same prefill pieces). The 27B's `IE_QWEN35_FA2_TILE_MINCTX` is a separate knob and unchanged |
+| `IE_Q35MOE_NO_FA2_TILE` | unset | set to any value, `0` included: the previous kernel at every depth and its exact output |
+| `IE_Q35MOE_TURN_DRAIN` | unset (v0.2.8): the serial turns run beside the lane pipe (above) | `=1`: every turn pauses the pipe and the prompt's last rows run inside the prompt-end turn, as in v0.2.6 |
+| `IE_Q35MOE_REGROUP` | on (v0.2.8): before forming a decode group that would leave three or more groups rotating over the two cards, card 0 waits up to `IE_Q35MOE_GROUP_WAIT_US` (20000; 1–1,000,000) microseconds for the decode group landing on card 1, then forms from every lane queued. One or two decoding lanes never wait, and a prefill piece at the front of the queue never waits. The load log prints `[qwen35moe] decode regroup ON: stage 0 waits up to 20000 us ...`; the shutdown line's `groups by size` and `/health` `pipe` carry the counts | `=0`: no wait; the groups stay as the lanes' arrival aligned them. Same bytes either way |
 | `IE_Q35MOE_LANE_PIPELINE` | on: a lane's next prefill piece enters card 0 while card 1 runs the piece before | `=0`: one piece of a lane at a time |
 | `IE_Q35MOE_SHORT_FIRST` | on: a prompt with at most `IE_Q35MOE_SHORT_ROWS` (16384) rows left goes ahead of a long prompt's next piece, which waits for at most `IE_Q35MOE_SHORT_SLOTS` (2) short pieces or `IE_Q35MOE_SHORT_WAIT_MS` (10000) ms | `=0`: the FIFO window and arrival order alone |
 | `IE_Q35MOE_MIX_CHUNK` | 512: the rows of a prefill piece while another lane is busy | `=<rows>`; `=0`: the plan's 8,192-row pieces (re-cut is then off) |

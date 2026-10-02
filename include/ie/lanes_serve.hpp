@@ -8,6 +8,9 @@
 // pipe error's recovery, teardown ordering and the /health fields. An arch supplies its state and device work through
 // LanesModel (the hooks below); the protocol is V4.1 B6b's (its gated behaviour: pause/park, handover, lost lanes reset in a
 // turn, the pipe never stopped from a callback, the serve mutex before the pipe's).
+// P4 B39: an arch may declare a turn kind drain-free (LanesModel::serial_drains): the pipe then runs on through that turn, the
+// turn waits for its own lane only (pipe_wait_lane), and the plan may put the prompt's tail through the pipe behind a snapshot
+// boundary (LanesPlan::snap, LanesModel::snapshot). The crown does; every other arch keeps the paused turn.
 //
 // No SYCL here: the protocol is unit-tested on the CPU with a fake model (tests/unit/lanes_serve_test.cpp).
 //
@@ -123,6 +126,11 @@ struct LanesPlan {
     // P4 B15: a chunk of `chunks` ends here (reused < mark < Tp); after it lands, LanesModel::mark runs in a serial turn with the
     // lane's state exactly at `mark` (0 = none)
     uint32_t mark = 0;
+    // P4 B39: a chunk of `chunks` ends here (mark < snap < Tp); after it lands, LanesModel::snapshot runs in a serial turn with the
+    // lane's state exactly at `snap` (the conversation snapshot prompt_end takes at Tp == snap_at), then the chunks after it --
+    // the prompt's tail, which prompt_end ran in its turn -- go through the pipe; prompt_end then runs with kept = true and no
+    // rows left (0 = none). No lookahead crosses it.
+    uint32_t snap = 0;
 };
 
 // What an arch provides. Threads: the host reads run under the serve mutex (the turn held, the lane idle); the serial-turn
@@ -158,12 +166,36 @@ public:
         (void)lane; (void)rq; (void)pos;
         return {};
     }
+    // P4 B39: the serial turn, the lane's state ends exactly at pos == plan.snap: the arch's conversation snapshot (what its
+    // prompt_end does at Tp == snap_at: the cache insert, its checkpoints). An error is logged, not the request's.
+    virtual std::string snapshot(uint32_t lane, const LanesRequest& rq, uint32_t pos) {
+        (void)lane; (void)rq; (void)pos;
+        return {};
+    }
+    // P4 B39: the serial turns' kinds, and whether a turn of that kind needs the pipe DRAINED before its device work
+    // (pipe_pause: every step in flight on every card finished, the stage threads stopped; resumed at the release). Default:
+    // every kind drains (B6b-B38's protocol). An arch answers false for a kind whose serial work touches only the turn's own
+    // lane's state and the arch's own caches, addressed by lane index (no per-device "current lane" register a running stage
+    // also sets), with no scratch a running step uses, on queues that order it behind the steps in flight; LanesServe then
+    // leaves the pipe running (the other lanes' steps keep flowing), waits for the turn's own lane through pipe_wait_lane,
+    // and submits the parked lanes at the release even before a handover. The turn's work must also not touch host state a
+    // done callback reads without the serve mutex. kFinishStop / kFinishLength = finish after a "stop" / "length" reply.
+    enum class Turn : uint8_t { kPrepare, kMark, kSnapshot, kPromptEnd, kFinishStop, kFinishLength, kReset };
+    virtual bool serial_drains(Turn k) const { (void)k; return true; }
+    // P4 B39: wait until the lane holds no claim in the pipe (its last done callback returned); the other lanes run on. Never
+    // from a callback. "" = idle now; an error = the arch has no per-lane wait (LanesServe drains the pipe for that turn instead).
+    virtual std::string pipe_wait_lane(uint32_t lane) { (void)lane; return "no per-lane wait"; }
     // P4 B15: host-only -- the prefix prefix_prepare would restore for this prompt now (into any lane; 0 = none). Called from a
     // done callback or by the turn holder, never beside the serial worker's device work (which is what mutates the caches).
+    // P4 B39: with drain-free turns a callback's call CAN meet the serial worker's restore or snapshot: the arch guards its cache
+    // (the crown answers 0 while its worker holds the cache; the check is re-run at the next callback).
     virtual uint32_t cache_peek(const LanesRequest& rq) const { (void)rq; return 0; }
     // P4 B29: the conversation snapshots the arch's prompt cache took so far (prompt-end + reply; not the shared-prefix
     // marks, counted by LanesServe), for /health "snapshots". Any thread.
     virtual uint64_t snapshots() const { return 0; }
+    // P4 B42: the arch's pipe counters as a JSON object for /health's "pipe" (the crown: the decode groups by size and the regroup
+    // waits); "" = none. Any thread.
+    virtual std::string pipe_stats() const { return {}; }
     // one id from the lane's logits: first = the prompt's (prompt_end's), else the step that just finished. window = the
     // repetition window (prompt tail + output), seed = rng + the ids sampled before.
     virtual int32_t sample(uint32_t lane, bool first, const LanesSampling& sp, std::span<const int32_t> window,
@@ -206,6 +238,10 @@ public:
         return {};
     }
     virtual std::string pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) = 0;
+    // P4 B39 (5): the lane's step AHEAD of the other lanes' queued steps (a prompt's tail piece past plan.snap, <= kTailFront rows:
+    // v0.2.6 ran it inside the drained prompt-end turn, before everything; through the pipe it landed behind the other prompts'
+    // first pieces -- the wave leader's 7 rows waited 1.4 s behind 14 followers). Default: no priority (pipe_submit).
+    virtual std::string pipe_submit_front(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) { return pipe_submit(lane, ids, T, pos0); }
     // P4 B34 (the lane pipeline): true = the arch's pipe takes a prefilling lane's next piece while the lane's previous piece
     // is still on a later card (Glm5LanePipe::submit_ahead); `idle` is then registered with it (card 0 is idle and a lookahead
     // may have become possible) and LanesServe offers that piece from there through pipe_submit_ahead. Called once, by
@@ -249,7 +285,7 @@ public:
     std::string start(LanesModel::DoneFn done, LanesModel::RowsDoneFn rows_done = {});
     bool        rows_mode() const { return rows_on_; }
     std::vector<uint64_t> group_sizes() const { return pipe_.group_sizes(); }
-    std::string submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0);
+    std::string submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool front = false);   // (front: P4 B39 (5))
     // P4 B34: the pipe's idle hook for every start / resume from now on; the lookahead submit
     void        set_idle(Glm5LanePipe::IdleFn idle) { idle_ = std::move(idle); }
     std::string submit_ahead(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool& taken) {
@@ -261,6 +297,10 @@ public:
     bool        paused() const { return paused_; }
     std::string stop();
     uint32_t    cancel() { return pipe_.cancel(); }   // P4 B33: Glm5LanePipe::cancel (a process stop)
+    std::string wait_lane(uint32_t lane) { return pipe_.wait_lane_idle(lane); }   // P4 B39: Glm5LanePipe::wait_lane_idle
+    // P4 B42: the rows-mode regroup wait (Glm5LanePipe::set_regroup; 0 = off) and its counts
+    void set_regroup(uint32_t wait_us) { pipe_.set_regroup(wait_us); }
+    Glm5LanePipe::RegroupStats regroup_stats() const { return pipe_.regroup_stats(); }
     std::string error() const { return pipe_.error(); }
     uint32_t    max_rows() const { return pipe_.max_T(); }
     uint64_t    host_bytes() const { return pipe_.host_bytes(); }
@@ -335,7 +375,8 @@ public:
     uint32_t abort_all();
 
     struct Lane {
-        enum class Phase : uint8_t { kIdle, kPrefill, kPromptReady, kDecode, kDone, kMark };   // kMark: at plan.mark, waits for its turn
+        // kMark: at plan.mark, waits for its turn; kSnap (P4 B39): at plan.snap, waits for its turn
+        enum class Phase : uint8_t { kIdle, kPrefill, kPromptReady, kDecode, kDone, kMark, kSnap };
         bool     busy = false;
         uint32_t cap = 0;
         Phase    phase = Phase::kIdle;
@@ -350,6 +391,8 @@ public:
         std::string finish;
         bool     want_stop = false, lost = false, parked = false;
         uint32_t mark_at = 0;                  // P4 B15: plan.mark still due (0 = none)
+        uint32_t snap_at = 0;                  // P4 B39: plan.snap still due (0 = none)
+        bool     preparing = false;            // P4 B39: its prepare runs on the serial worker; its plan is not made yet
         bool     reprep = false;               // P4 B15: the FIFO head's cache_peek grew: its request re-runs prefix_prepare
         uint32_t repreps = 0;
         bool     ahead = false;                // P4 B34: chunks[chunk_at + 1] is in the pipe too (a lookahead, on_idle0)
@@ -394,8 +437,18 @@ private:
     bool step_landed(Lane& l, uint32_t li);
     void step_sampled(Lane& l, uint32_t li, int32_t id, const std::string& err);
     void pipe_failed(const std::string& e);
-    bool take_turn(std::unique_lock<std::mutex>& lk);   // P4 B33: false = stopping, the turn not taken
+    // P4 B33: false = stopping, the turn not taken. P4 B39: drain = pause the pipe for the turn (every step in flight finished);
+    // false = the pipe runs on (LanesModel::serial_drains answered false for the turn's kind). kind: a lane at its mark / snapshot
+    // boundary (kMark / kSnapshot) goes before the kPrepare turns waiting with it (the B39 gate's wave: the followers of a shared
+    // prefix cannot restore before the leader's mark lands, so every prepare turn ahead of the mark delays the whole wave); the
+    // other kinds neither yield nor are yielded to (the default kReset: poll_pipe's recovery turn)
+    bool take_turn(std::unique_lock<std::mutex>& lk, bool drain = true, LanesModel::Turn kind = LanesModel::Turn::kReset);
+    void drain_pipe(std::unique_lock<std::mutex>& lk);   // (mu held) the pause: take_turn's drain, or lane_wait's fallback
+    // P4 B39: a turn taken without the drain waits for ITS lane's steps in the pipe before its serial work (the lane's last
+    // callback may still hold its claim); an arch without the per-lane wait gets the drain instead
+    void lane_wait(std::unique_lock<std::mutex>& lk, uint32_t li);
     void release_turn(std::unique_lock<std::mutex>& lk);
+    uint32_t pipe_end(const Lane& l) const { return l.plan.snap ? l.plan.snap : l.plan.Tp; }   // P4 B39: the pipe part's end for the short / long rules (the tail aside)
     void poll_pipe(std::unique_lock<std::mutex>& lk);
     int  choose(const std::vector<int32_t>& ids, uint32_t max_tokens) const;
     std::string serial(std::unique_lock<std::mutex>& lk, const std::function<void()>& fn,
@@ -428,6 +481,15 @@ private:
     double   paused_ms_ = 0;
     uint64_t drains_ = 0;                      // P4 B29: the turns' pipe_pause waits (count, total, longest)
     double   drain_ms_ = 0, drain_max_ms_ = 0;
+    uint64_t turns_nodrain_ = 0;               // P4 B39: turns the pipe ran through (no pause)
+    bool     turn_paused_ = false;             // P4 B39: the pipe is paused for the turn being held (paused_ms_ counts it)
+    uint32_t boundary_waiters_ = 0;            // P4 B39: lanes at their mark / snapshot waiting for the turn (the prepares yield to them)
+    uint64_t boundary_first_ = 0;              //   ... turns such a lane took while prepare turns were waiting
+    // P4 B39 (5): requests waiting for a prepare turn (a new prompt, a re-prepare): other lanes ARRIVING -- a lone lane's parked
+    // remainder is re-cut for them at its release (maybe_recut), before they are busy lanes
+    uint32_t prepare_waiters_ = 0;
+    // P4 B39 (5): a prompt's tail piece (past plan.snap) of at most this many rows goes to the front of the pipe's queue
+    static constexpr uint32_t kTailFront = 512;
     Clock::time_point turn_t0_{};
     // the serial worker: the turn's device work runs on ONE persistent thread (V4.1 B6b: a thread that runs a forward may keep
     // per-thread state for good -- an OpenMP team -- so the HTTP request threads must not run it)

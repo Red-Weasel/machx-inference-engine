@@ -83,6 +83,13 @@ public:
     uint32_t    head_dev() const noexcept { return plan_.head_dev; }
     void        select_lane(uint32_t lane);   // every card: kv_cache/dn_state/forward act on the lane
     void        reset_state();                // the selected lane on every card: a new sequence
+    // P4 B39: a lane's state BY INDEX, without the per-card "current lane" register (cur_) that select_lane / kv_cache /
+    // dn_state / reset_state go through and that forward_stage sets for its card. The request lanes' serial hooks (a restore,
+    // a snapshot, a reset of ONE lane) use these so they can run while the card pipe's stages run other lanes' steps: nothing
+    // they touch is shared with a running step (the lane's own KV + DeltaNet state, the card's in-order queue).
+    KvCache&       lane_kv_cache(uint32_t lane, uint32_t dev) { return lane_kv(lane, dev); }
+    DeltaNetState& lane_dn_state(uint32_t lane, uint32_t dev) { return lane_dn(lane, dev); }
+    void           reset_lane_state(uint32_t lane);   // the lane on every card: a new sequence (reset_state by index)
     // One card's part of one step of `lane` (a card-pipe stage). Card 0: embeds ids, runs its layers, copies the residual rows
     // [T, hidden] fp16 out to x_host. Card 1: copies them in, runs its layers and the head: the last row's logits land in
     // logits() (device, card 1). pos0 0 resets the lane on the card first. Touches only that card's objects, so the two cards'
@@ -285,6 +292,21 @@ private:
     std::string ensure_ws(uint32_t dev, uint32_t max_T);
     void free_ws(uint32_t dev);
     void free_all();
+};
+
+// P4 B39: ONE lane of the crown split as the prompt cache sees a model -- the per-card surface FleetPrefixCache::insert and
+// fleet_cache_restore template on (fleet / n_devices / dev_has_kv / dev_has_dn / kv_cache(dev) / dn_state(dev)), answered for
+// a fixed lane by index (Qwen35MoeSplitModel::lane_kv_cache / lane_dn_state), never through cur_. A snapshot or restore of a
+// lane through this view touches only that lane's state and the cache's own buffers.
+struct Q35mLaneView {
+    Qwen35MoeSplitModel& m;
+    uint32_t lane;
+    DeviceFleet*   fleet() const noexcept { return m.fleet(); }
+    uint32_t       n_devices() const noexcept { return m.n_devices(); }
+    bool           dev_has_kv(uint32_t dev) const { return m.dev_has_kv(dev); }
+    bool           dev_has_dn(uint32_t dev) const { return m.dev_has_dn(dev); }
+    KvCache&       kv_cache(uint32_t dev) { return m.lane_kv_cache(lane, dev); }
+    DeltaNetState& dn_state(uint32_t dev) { return m.lane_dn_state(lane, dev); }
 };
 
 }  // namespace ie

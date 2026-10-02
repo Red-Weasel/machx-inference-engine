@@ -70,6 +70,8 @@ std::string Glm5LanePipe::start_rows(uint32_t n_stages, StageFn stage, RowsStage
         gfree_.clear();
         for (uint32_t i = uint32_t(groups_.size()); i-- > 0;) gfree_.push_back(i);
         if (gsizes_.size() != 17) gsizes_.assign(17, 0);   // cumulative over resumes
+        for (Group& g : groups_) g.decode = false;           // (P4 B42: nothing in flight at a start)
+        dec_inflight_ = 0; last_dec_running_ = false; last_gi_ = UINT32_MAX;
         max_group_ = max_group; group_cap_ = group_cap; rows_ = true;
         stage_ = std::move(stage); rows_stage_ = std::move(rows_stage);
         done_ = std::move(done); rows_done_ = std::move(rows_done);
@@ -111,7 +113,28 @@ std::vector<uint64_t> Glm5LanePipe::group_sizes() const {
     return gsizes_;
 }
 
-std::string Glm5LanePipe::submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) {
+// P4 B42 (see the header)
+void Glm5LanePipe::set_regroup(uint32_t wait_us) {
+    std::lock_guard<std::mutex> lk(mu_);
+    regroup_ = wait_us > 0;
+    regroup_wait_ = std::chrono::microseconds(wait_us);
+}
+
+Glm5LanePipe::RegroupStats Glm5LanePipe::regroup_stats() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return rg_;
+}
+
+// (mu held) P4 B42: every group leaves the pipe through here (its callback returned, a stage error, a cancel): the pool gets
+// it back and the regroup's counts of decode groups in flight / the one at the last stage follow
+void Glm5LanePipe::free_group(uint32_t gi) {
+    Group& g = groups_[gi];
+    if (g.decode) { --dec_inflight_; g.decode = false; }
+    if (gi == last_gi_) { last_gi_ = UINT32_MAX; last_dec_running_ = false; }
+    gfree_.push_back(gi);
+}
+
+std::string Glm5LanePipe::submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool front) {
     if (lane >= lanes_.size()) return "glm5 lane pipe: lane " + std::to_string(lane) + " of " + std::to_string(lanes_.size());
     Lane& ln = lanes_[lane];
     const std::string who = "glm5 lane pipe: lane " + std::to_string(lane);
@@ -155,7 +178,8 @@ std::string Glm5LanePipe::submit(uint32_t lane, const int32_t* ids, uint32_t T, 
         std::lock_guard<std::mutex> lk(mu_);
         if (pos0 == 0) ln.failed = false;  // a new sequence: every stage resets the lane before its forward
         if (!fresh) ln.resub = true;       // the callback's resubmit: its in-flight count carries over
-        q_[0].push_back(lane * 2 + sl);
+        if (front) q_[0].push_front(lane * 2 + sl);   // (P4 B39 (5): the owner's bounded priority)
+        else       q_[0].push_back(lane * 2 + sl);
     }
     cv_.notify_all();
     return {};
@@ -279,20 +303,54 @@ void Glm5LanePipe::stage_loop_rows(uint32_t s) {
         {
             std::unique_lock<std::mutex> lk(mu_);
             if (s == 0) {
+                // a prefill piece (T > 1) or a step that starts a sequence (pos0 0: every stage resets the lane) runs alone
+                auto alone = [&](uint32_t e) { const Lane& ln = lanes_[e >> 1]; return ln.T[e & 1u] > 1 || ln.pos0[e & 1u] == 0; };
+                auto lim_now = [&] {
+                    const uint32_t cap = group_cap_ ? group_cap_ : std::max<uint32_t>(1u, (busy_ + n_st - 1) / n_st);
+                    return std::min(cap, max_group_);
+                };
+                // the decode lanes at the front of the queue, up to `upto` (the group stage 0 would form now)
+                auto queued_dec = [&](uint32_t upto) {
+                    uint32_t n = 0;
+                    for (uint32_t e : q_[0]) { if (n >= upto || alone(e)) break; ++n; }
+                    return n;
+                };
+                // P4 B42 (see the header): forming now would leave >= n_st decode groups rotating beside this one, the one at the
+                // last stage lands within a step, and this one is not full yet
+                auto need_wait = [&] {
+                    if (!regroup_ || q_[0].empty() || alone(q_[0].front()) || !last_dec_running_ || dec_inflight_ < n_st) return false;
+                    const uint32_t lim = lim_now();
+                    return lim > 1 && queued_dec(lim) < lim;
+                };
                 cv_.wait(lk, [&] { return stop_ || (!q_[0].empty() && !pgate_); });
                 if (q_[0].empty()) return;        // stopping (stop() first waits for no step in flight)
+                if (need_wait()) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const auto deadline = t0 + regroup_wait_;
+                    const uint32_t before = queued_dec(max_group_);
+                    ++rg_.waits;
+                    for (;;) {
+                        if (!cv_.wait_until(lk, deadline, [&] { return stop_ || pgate_ || !need_wait(); })) { ++rg_.timeouts; break; }
+                        if (stop_) break;
+                        if (!pgate_) break;                                    // the condition cleared (a landing did not resubmit, or fewer groups)
+                        cv_.wait(lk, [&] { return stop_ || !pgate_; });        // a landing's callback resubmits its lanes: let them in
+                        if (stop_ || !need_wait()) break;                      // (still fragmented with time left: wait for the next)
+                    }
+                    rg_.wait_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                    if (queued_dec(max_group_) > before) ++rg_.merges;
+                    if (q_[0].empty()) continue;                               // (a cancel emptied the queue: back to the wait)
+                    if (pgate_) continue;                                      // (a callback is still resubmitting: back to the wait)
+                }
                 gi = gfree_.back();               // (n_groups(): a step is in at most one)
                 gfree_.pop_back();
                 Group& g = groups_[gi];
                 g.lanes.clear();
                 g.slots.clear();
                 g.steps.clear();
-                const uint32_t cap = group_cap_ ? group_cap_ : std::max<uint32_t>(1u, (busy_ + n_st - 1) / n_st);
-                const uint32_t lim = std::min(cap, max_group_);
-                // a prefill piece (T > 1) or a step that starts a sequence (pos0 0: every stage resets the lane) runs alone
-                auto alone = [&](uint32_t e) { const Lane& ln = lanes_[e >> 1]; return ln.T[e & 1u] > 1 || ln.pos0[e & 1u] == 0; };
+                const uint32_t lim = lim_now();
+                const bool dec = !alone(q_[0].front());
                 auto take = [&] { g.lanes.push_back(q_[0].front() >> 1); g.slots.push_back(q_[0].front() & 1u); q_[0].pop_front(); };
-                if (alone(q_[0].front())) take();
+                if (!dec) take();
                 else
                     while (!q_[0].empty() && g.lanes.size() < lim && !alone(q_[0].front())) take();
                 for (size_t i = 0; i < g.lanes.size(); ++i) {   // (P4 B34: at most one step of a lane waits for stage 0)
@@ -300,12 +358,15 @@ void Glm5LanePipe::stage_loop_rows(uint32_t s) {
                     const uint32_t sl = g.slots[i];
                     g.steps.push_back(Step{g.lanes[i], ln.T[sl], ln.pos0[sl], slot_ids(ln, sl), g.lanes.size() == 1 ? slot_wide(ln, sl) : nullptr});
                 }
+                g.decode = dec;
+                if (dec) ++dec_inflight_;         // (P4 B42: freed by free_group)
                 s0_busy_ = true;
             } else {
                 cv_.wait(lk, [&] { return stop_ || !gq_[s].empty(); });
                 if (gq_[s].empty()) return;
                 gi = gq_[s].front();
                 gq_[s].pop_front();
+                if (last) { last_gi_ = gi; last_dec_running_ = groups_[gi].decode; }   // (P4 B42: its landing is one step away)
             }
             ++running_;                           // (P4 B33: cancel() reports the groups a stage holds)
         }
@@ -335,7 +396,7 @@ void Glm5LanePipe::stage_loop_rows(uint32_t s) {
                     if (s == 0) ln.at0 = false;
                 }
                 if (s == 0) s0_busy_ = false;
-                gfree_.push_back(gi);
+                free_group(gi);
                 --running_;
             }
             cv_.notify_all();
@@ -349,7 +410,7 @@ void Glm5LanePipe::stage_loop_rows(uint32_t s) {
                 if (s == 0) { for (uint32_t l : g.lanes) lanes_[l].at0 = false; s0_busy_ = false; }
                 if (cancel_) {                     // P4 B33: no other stage runs the group
                     for (uint32_t i = 0; i < G; ++i) { drop_claim(lanes_[g.lanes[i]], g.slots[i]); lanes_[g.lanes[i]].failed = true; }
-                    gfree_.push_back(gi);
+                    free_group(gi);
                 } else {
                     gq_[s + 1].push_back(gi);
                 }
@@ -377,7 +438,7 @@ void Glm5LanePipe::stage_loop_rows(uint32_t s) {
             } else {
                 for (uint32_t i = 0; i < G; ++i) drop_claim(lanes_[g.lanes[i]], g.slots[i]);
                 if (s == 0) s0_busy_ = false;
-                gfree_.push_back(gi);
+                free_group(gi);
                 --running_;
             }
         }
@@ -399,7 +460,7 @@ void Glm5LanePipe::stage_loop_rows(uint32_t s) {
                 ln.resub = false;
             }
             pgate_ = false;
-            gfree_.push_back(gi);
+            free_group(gi);
             --running_;
             if (s == 0) s0_busy_ = false;
             for (uint32_t i = 0; i < G && !idle; ++i) idle = ahead_possible(lanes_[g.lanes[i]]);   // (P4 B34)
@@ -431,7 +492,7 @@ uint32_t Glm5LanePipe::cancel() {
             for (uint32_t gi : gq) {
                 const Group& g = groups_[gi];
                 for (size_t i = 0; i < g.lanes.size(); ++i) { drop_claim(lanes_[g.lanes[i]], g.slots[i]); lanes_[g.lanes[i]].failed = true; }
-                gfree_.push_back(gi);
+                free_group(gi);
             }
             gq.clear();
         }
@@ -466,6 +527,18 @@ std::string Glm5LanePipe::stop() {
     std::string e;
     std::swap(e, err_);
     return e;
+}
+
+// P4 B39 (see the header). Every claim drop notifies cv_ (the stage loops, cancel), so the wait wakes when the lane's last
+// claim goes; a stopped pipe holds no claims (stop() waited for busy_ == 0).
+std::string Glm5LanePipe::wait_lane_idle(uint32_t lane) {
+    if (lane >= lanes_.size()) return "glm5 lane pipe: lane " + std::to_string(lane) + " of " + std::to_string(lanes_.size());
+    for (const auto& t : th_)
+        if (t.get_id() == std::this_thread::get_id())
+            return "glm5 lane pipe: wait_lane_idle() from a stage thread (a done callback) would deadlock";
+    std::unique_lock<std::mutex> lk(mu_);
+    cv_.wait(lk, [&] { return th_.empty() || lanes_[lane].nfl == 0; });
+    return {};
 }
 
 uint32_t Glm5LanePipe::lane_pos(uint32_t lane) const {

@@ -1,11 +1,26 @@
 # IE Engine — v1 RELEASE
 
-> **Current release: v0.2.6 (October 2026).** This file is the record of the first release, of June 9, 2026, kept as
+> **Current release: v0.2.8 (October 2026).** This file is the record of the first release, of June 9, 2026, kept as
 > written; its figures are for one Arc Pro B70 and a Q4_K_M model and are not comparable with the two-card figures
-> below. Later releases are described in the README ("New in v0.2.6", "In v0.2.0") and in the GitHub release notes:
+> below. Later releases are described in the README ("New in v0.2.8", "New in v0.2.6", "In v0.2.0") and in the GitHub
+> release notes:
+> [v0.2.8](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.8),
 > [v0.2.6](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.6),
 > [v0.2.0](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.0),
 > [v0.1.0](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.1.0).
+>
+> **v0.2.8 in short** (two Arc Pro B70 cards, measured October 2, 2026; the Qwen3.6-35B-A3B class, Q8_0):
+> - The 15-agent replay takes 116.3–116.5 s where v0.2.6 took 131.3–132.4 s in the same day's runs (−12 %); an
+>   agent's decode goes from a median 8.65–8.80 to 9.83–9.86 tok/s and its first token from 3.79–4.79 to 2.58–2.83 s.
+> - The engine's serial turns (restore, shared-prefix mark, conversation snapshot, prompt end) run beside the lane
+>   pipe instead of pausing it: 84–86 pauses per replay → 0.
+> - Decoding lanes regroup without the pauses' bursts: 3.30 → 4.56 rows per decode card step.
+> - Tiled prefill attention from 512 positions instead of 6,144: 512-row prefill pieces at 2–6K depth 13–16 % faster,
+>   a 2,038-token cold prompt in 1.28 s instead of 1.41 s (that one measured with the threshold set by environment on
+>   the v0.2.6 build).
+> - Still slow, and changed: the first of 15 conversations that arrive together with one shared prompt gets its
+>   first token at 11.3 s (8.6 or 10.2 s on v0.2.6); prompts with prefill pieces ending between 512 and 6,143
+>   positions compute other bits than on v0.2.6 (`IE_Q35MOE_FA2_TILE_MINCTX=6144` gives v0.2.6's kernel choice).
 >
 > **v0.2.6 in short** (two Arc Pro B70 cards, measured September 29 – October 1, 2026):
 > - Agent swarms on the Qwen3.6-35B-A3B class (Q8_0): a replay of 15 agents that read and write at once, which did

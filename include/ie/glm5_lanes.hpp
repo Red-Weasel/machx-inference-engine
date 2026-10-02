@@ -56,8 +56,18 @@
 //    the next group together.
 //  * A stage error fails EVERY lane of the group (each is marked failed, as a lone lane's is) and latches the error.
 //  * start() and its stage loop are untouched by rows mode (the other archs' scheduling is start()'s).
+//  * P4 B42 regroup (set_regroup(wait_us); off by default): stage 0 merges only the decode lanes it finds QUEUED when it forms a
+//    group, and a landed group's lanes resubmit together (pgate_), so k >= 3 decode groups rotating over the stages never meet
+//    (one lands per step, one forms per step: the same membership forms again, forever) -- the paused serial turns' release
+//    bursts used to merge them. With the regroup, before forming a group whose front is a decode lane, with fewer than `lim`
+//    decode lanes queued, while a DECODE group runs at the last stage (its landing is one step away) and the decode groups in
+//    flight are >= the stages (forming now would make >= 3 rotate), stage 0 waits -- at most wait_us -- for that landing's
+//    callback (pgate_) or for the condition to clear, then forms from everything queued (<= lim: the AUTO cap keeps >= 2 groups).
+//    One or two decoders never wait (nothing to merge); a prefill piece at the front never waits; the stats count the waits,
+//    the merges (a wait that brought lanes) and the timeouts. A row's bytes do not depend on its group (the rows contract).
 #pragma once
 
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -110,11 +120,23 @@ public:
     void prepare_rows(uint32_t max_group);
     // Rows mode: groups that finished every stage since the pipe's first start_rows (cumulative over resumes), by size
     std::vector<uint64_t> group_sizes() const;
-    std::string submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0);
+    // P4 B42 (see the header): the regroup wait at stage 0, wait_us 0 = off (the default). Any time; takes effect at the next
+    // group formation.
+    void set_regroup(uint32_t wait_us);
+    struct RegroupStats { uint64_t waits = 0, merges = 0, timeouts = 0; double wait_ms = 0; };
+    RegroupStats regroup_stats() const;
+    // front (P4 B39 (5)): the step goes to the FRONT of stage 0's queue instead of its back -- the owner's bounded priority (a
+    // prompt's small tail piece ahead of other lanes' pieces); the claim rules are the same
+    std::string submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool front = false);
     // P4 B34 (see the header): taken = queued; "" and not taken = not now; an error = a request no lane state allows
     std::string submit_ahead(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool& taken);
     std::string stop();
     uint32_t cancel();   // P4 B33 (see the header): drop the waiting steps; returns the steps a stage is running
+    // P4 B39: wait until the lane holds no claim (no step of it in flight, queued or in its done callback) -- the other lanes'
+    // steps keep running. For an owner that works on ONE lane's state beside the running pipe (the crown's drain-free serial
+    // turns): the lane's last callback may still hold its claim when the owner is told the step landed. Called from a stage
+    // thread it refuses instead of deadlocking.
+    std::string wait_lane_idle(uint32_t lane);
     bool running() const { return !th_.empty(); }
     uint32_t lane_pos(uint32_t lane) const;   // the lane's committed position
     uint64_t steps_done() const;              // steps that finished every stage since start
@@ -156,7 +178,9 @@ private:
         std::vector<uint32_t> slots;   // (P4 B34) each lane's slot
         std::vector<Step> steps;
         std::vector<float> wide;   // [max_group x wide_row]
+        bool decode = false;       // (P4 B42) decode rows (not a lone prefill piece / new sequence), while in flight
     };
+    void free_group(uint32_t gi);   // (mu held) the group leaves the pipe: back to the pool, the regroup's accounting
 
     std::vector<Lane> lanes_;
     uint32_t max_T_ = 0;
@@ -189,6 +213,14 @@ private:
     std::vector<uint64_t> gsizes_;
     RowsStageFn rows_stage_;
     RowsDoneFn rows_done_;
+    // P4 B42 regroup (mu held): on with a bound; the decode groups formed and not yet freed; whether the group at the last stage
+    // (running or in its callback) is a decode group, and which; the stats
+    bool regroup_ = false;
+    std::chrono::microseconds regroup_wait_{0};
+    uint32_t dec_inflight_ = 0;
+    bool last_dec_running_ = false;
+    uint32_t last_gi_ = UINT32_MAX;
+    RegroupStats rg_;
 };
 
 }  // namespace ie

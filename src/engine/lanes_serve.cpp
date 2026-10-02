@@ -82,14 +82,14 @@ std::string CardPipe::launch() {
                             [rd](std::span<const uint32_t> lanes) { (*rd)(lanes); }, max_group_, group_cap_, idle_);
 }
 
-std::string CardPipe::submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) {
+std::string CardPipe::submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool front) {
     // A fresh claim (the serve protocol submits one only for a lane it prepared in a turn: reset, restored or prefilled
     // there) at a position serial work moved syncs the pipe's record of it first, and a refused sync refuses the submit: a
     // lane with a step in flight, or one whose last step failed part-way and was not reset since (reset_lane). A callback's
     // resubmit is at the position the pipe committed, so it skips the sync and meets the pipe's own checks unchanged.
     if (pos0 != 0 && pipe_.lane_pos(lane) != pos0)
         if (auto e = pipe_.set_lane_pos(lane, pos0); !e.empty()) return "card pipe: position sync refused: " + e;
-    return pipe_.submit(lane, ids, T, pos0);
+    return pipe_.submit(lane, ids, T, pos0, front);
 }
 
 std::string CardPipe::reset_lane(uint32_t lane) { return pipe_.reset_lane(lane); }
@@ -189,9 +189,12 @@ void LanesServe::fifo_kick() {
     for (size_t i = 0; i < fifo_.size() && (i < kWindow || o_.short_first) && !stopping_;) {
         const uint32_t h = fifo_[i];
         Lane& l = lanes_[h];
-        if (!l.busy || (l.phase != Lane::Phase::kPrefill && l.phase != Lane::Phase::kMark)) { fifo_.erase(fifo_.begin() + long(i)); continue; }
+        if (!l.busy || (l.phase != Lane::Phase::kPrefill && l.phase != Lane::Phase::kMark && l.phase != Lane::Phase::kSnap)) {
+            fifo_.erase(fifo_.begin() + long(i));
+            continue;
+        }
         if (i >= kWindow && (l.phase != Lane::Phase::kPrefill || !short_lane(l))) { ++i; continue; }   // (P4 B34 (3))
-        if (l.phase == Lane::Phase::kMark || !l.parked || l.reprep) { ++i; continue; }   // in the pipe, at its mark, re-preparing
+        if (l.phase != Lane::Phase::kPrefill || !l.parked || l.reprep || l.preparing) { ++i; continue; }   // in the pipe, at its mark / snap, (re-)preparing
         if (l.want_stop) { end_lane(l, "abort", false); continue; }                       // (drops it)
         if (l.chunk_at == 0 && l.repreps == 0) {
             if (m_.cache_peek(*l.rq) > l.reused) { l.reprep = true; cv_.notify_all(); ++i; continue; }
@@ -207,7 +210,8 @@ void LanesServe::fifo_kick() {
 // ---- P4 B34 (3): short-first (mu held throughout) ----------------------------------------------------------------------------
 
 bool LanesServe::short_lane(const Lane& l) const {
-    const uint32_t left = l.plan.Tp > l.pos ? l.plan.Tp - l.pos : 0u;
+    const uint32_t end = pipe_end(l);   // (P4 B39: the tail past plan.snap was prompt_end's; the rule counts the part before it)
+    const uint32_t left = end > l.pos ? end - l.pos : 0u;
     return left <= std::max(2u * l.piece_max, o_.short_rows);
 }
 
@@ -216,13 +220,14 @@ bool LanesServe::extends_mark(const Lane& l, const Lane& e) const {
     return mk && l.rq->ids->size() > mk && std::equal(e.rq->ids->begin(), e.rq->ids->begin() + mk, l.rq->ids->begin());
 }
 
-// Short work another lane has due: its pieces (in the pipe or parked for it), its mark or prompt-end turn. A prompt that has
-// not started and waits for l's own mark (the same shared prefix) does not count: l must reach that mark first.
+// Short work another lane has due: its pieces (in the pipe or parked for it), its mark, snapshot or prompt-end turn. A prompt
+// that has not started and waits for l's own mark (the same shared prefix) does not count: l must reach that mark first. P4 B39:
+// nor does a lane whose prepare is still running (no plan yet; with a drain-free prepare the pipe runs meanwhile).
 bool LanesServe::shorts_pending(const Lane& l, uint32_t li) const {
     for (uint32_t k = 0; k < lanes_.size(); ++k) {
         const Lane& s = lanes_[k];
-        if (k == li || !s.busy || !short_lane(s)) continue;
-        if (s.phase == Lane::Phase::kPromptReady || s.phase == Lane::Phase::kMark) return true;
+        if (k == li || !s.busy || s.preparing || !short_lane(s)) continue;
+        if (s.phase == Lane::Phase::kPromptReady || s.phase == Lane::Phase::kMark || s.phase == Lane::Phase::kSnap) return true;
         if (s.phase != Lane::Phase::kPrefill) continue;
         if (s.parked && s.chunk_at == 0 && s.repreps == 0 && extends_mark(s, l)) continue;
         return true;
@@ -263,17 +268,22 @@ void LanesServe::short_piece_in(uint32_t li) {
 // in order, once another lane is decoding or prefilling a short prompt (also one at its mark or prompt end). Once: no re-grow.
 void LanesServe::maybe_recut(Lane& l, uint32_t li, size_t from) {
     if (!o_.recut || !o_.mix_chunk || l.recut || l.piece_max <= o_.mix_chunk || l.phase != Lane::Phase::kPrefill) return;
-    bool active = false;
+    // P4 B39 (5): a request waiting for its prepare turn counts as arriving -- a lone lane's remainder is released into the running
+    // pipe before the arrivals are busy lanes (the drained prepare used to hold it until they were; the B39 gate's wave leader ran
+    // its 3,275-row remainder as one unpipelined piece, +1.2 s)
+    bool active = prepare_waiters_ > 0;
     for (uint32_t k = 0; k < lanes_.size() && !active; ++k) {
         const Lane& s = lanes_[k];
-        if (k == li || !s.busy || s.phase == Lane::Phase::kDone) continue;
+        if (k == li || !s.busy || s.preparing || s.phase == Lane::Phase::kDone) continue;   // (P4 B39: a lane still preparing has no plan)
         active = s.phase == Lane::Phase::kDecode || short_lane(s);
     }
     if (!active) return;
     std::vector<LanesChunk> cut(l.plan.chunks.begin(), l.plan.chunks.begin() + long(from));
-    for (size_t i = from; i < l.plan.chunks.size(); ++i)
+    for (size_t i = from; i < l.plan.chunks.size(); ++i) {
+        if (l.plan.snap && l.plan.chunks[i].first >= l.plan.snap) { cut.push_back(l.plan.chunks[i]); continue; }   // (P4 B39: the tail = prompt_end's piece, as cut)
         for (uint32_t q = 0; q < l.plan.chunks[i].second; q += o_.mix_chunk)
             cut.emplace_back(l.plan.chunks[i].first + q, std::min(o_.mix_chunk, l.plan.chunks[i].second - q));
+    }
     std::fprintf(stderr, "[%s] lane %u re-cut at %u: %zu plan piece(s) left -> %zu of at most %u rows (another lane is decoding or "
                          "prefilling a short prompt)\n", m_.tag(), li, from < l.plan.chunks.size() ? l.plan.chunks[from].first : l.pos,
                  l.plan.chunks.size() - from, cut.size() - from, o_.mix_chunk);
@@ -285,7 +295,8 @@ void LanesServe::maybe_recut(Lane& l, uint32_t li, size_t from) {
 
 // A long prompt: its whole pipe part above B34 (3)'s short threshold, so a lead stays long to its last (deepest) piece
 bool LanesServe::long_prompt(const Lane& l) const {
-    const uint32_t part = l.plan.Tp > l.reused ? l.plan.Tp - l.reused : 0u;
+    const uint32_t end = pipe_end(l);   // (P4 B39: as short_lane)
+    const uint32_t part = end > l.reused ? end - l.reused : 0u;
     return part > std::max(2u * l.piece_max, o_.short_rows);
 }
 
@@ -352,7 +363,10 @@ void LanesServe::submit(Lane& l, uint32_t li) {
         maybe_recut(l, li, l.chunk_at);   // (P4 B36 (A): nothing of the lane is in the pipe now)
         const auto [p0, t] = l.plan.chunks[l.chunk_at];
         l.pend = t; ++l.chunks;
-        e = m_.pipe_submit(li, l.rq->ids->data() + p0, t, p0);
+        // P4 B39 (5): the prompt's tail past its snapshot boundary (<= kTailFront rows) goes ahead of the other lanes' queued
+        // steps -- what the drained prompt-end turn did; one small piece per prompt, so no one starves
+        const bool tail = l.plan.snap && p0 >= l.plan.snap && t <= kTailFront;
+        e = tail ? m_.pipe_submit_front(li, l.rq->ids->data() + p0, t, p0) : m_.pipe_submit(li, l.rq->ids->data() + p0, t, p0);
     } else {
         l.pend = 0;
         e = m_.pipe_submit(li, &l.next, 1, l.pos);
@@ -371,12 +385,14 @@ void LanesServe::on_idle0() {
     std::lock_guard<std::mutex> lk(mu_);
     if (!piping_ || pause_ || stopping_) return;
     for (const Lane& l : lanes_)
-        if (l.busy && (l.phase == Lane::Phase::kPromptReady || l.phase == Lane::Phase::kMark || l.reprep)) return;
+        if (l.busy && (l.phase == Lane::Phase::kPromptReady || l.phase == Lane::Phase::kMark || l.phase == Lane::Phase::kSnap || l.reprep)) return;
     auto offer = [&](uint32_t li) {
         Lane& l = lanes_[li];
-        if (!l.busy || l.phase != Lane::Phase::kPrefill || l.parked || l.want_stop || l.ahead) return false;
+        if (!l.busy || l.preparing || l.phase != Lane::Phase::kPrefill || l.parked || l.want_stop || l.ahead) return false;
         const size_t k = l.chunk_at;   // the piece in flight
-        if (k + 1 >= l.plan.chunks.size() || (l.mark_at && l.plan.chunks[k].first + l.plan.chunks[k].second == l.mark_at)) return false;
+        if (k + 1 >= l.plan.chunks.size()) return false;
+        const uint32_t end_k = l.plan.chunks[k].first + l.plan.chunks[k].second;
+        if ((l.mark_at && end_k == l.mark_at) || (l.snap_at && end_k == l.snap_at)) return false;   // (a turn at that depth first; P4 B39: the snapshot too)
         const bool shrt = o_.short_first && short_lane(l);
         if (o_.short_first && !shrt && shorts_pending(l, li)) return false;   // (P4 B34 (3): a long lane's next piece waits)
         if (quota_due(l, li)) return false;                                   // (P4 B36 (C): no lookahead owing the decoders)
@@ -482,6 +498,12 @@ bool LanesServe::step_landed(Lane& l, uint32_t li) {
             cv_.notify_all();
             return false;
         }
+        if (l.snap_at && l.pos == l.snap_at && l.chunk_at < l.plan.chunks.size()) {   // P4 B39: the snapshot, in its request's turn
+            if (l.want_stop) end_lane(l, "abort", false);
+            else l.phase = Lane::Phase::kSnap;
+            cv_.notify_all();
+            return false;
+        }
         if (l.chunk_at < l.plan.chunks.size()) {
             if (l.want_stop) end_lane(l, "abort", false);               // the client left during the prompt
             else if (pause_ || stopping_ || hold_long(l, li)) l.parked = true;   // (P4 B34 (3): or held for the short prompts)
@@ -525,69 +547,114 @@ void LanesServe::pipe_failed(const std::string& e) {
 // lanes at their next completion and pipe_pause waits for the steps in flight. A stage error stops the pipe (the next release
 // starts a new one) and fails every running request. P4 B33: false once the engine is stopping (abort_all): the turn is not
 // taken (or given back when the stop came during the drain) and the caller skips its device work.
-bool LanesServe::take_turn(std::unique_lock<std::mutex>& lk) {
+// P4 B39: drain = false (the arch's serial_drains for the turn's kind) leaves the pipe running through the turn: no pause, no
+// wait for the other lanes' steps; the caller waits for its own lane (lane_wait) before its serial work. A turn handed over
+// with the pipe already paused runs paused either way (the chain resumes at its last release).
+bool LanesServe::take_turn(std::unique_lock<std::mutex>& lk, bool drain, LanesModel::Turn kind) {
+    // (the mark / snapshot of a lane goes before the prepares waiting with it; see the header. A boundary waiter is never blocked
+    // by anything but the holder, so nothing starves: the prepares wait while such lanes wait, each of their turns is short)
+    const bool boundary = kind == LanesModel::Turn::kMark || kind == LanesModel::Turn::kSnapshot;
+    const bool yields = kind == LanesModel::Turn::kPrepare;
     ++turn_waiters_;
-    cv_.wait(lk, [&] { return !turn_busy_ || stopping_; });
+    if (boundary) ++boundary_waiters_;
+    if (yields) ++prepare_waiters_;   // (P4 B39 (5): other lanes arriving -- maybe_recut reads it at a lone lane's release)
+    cv_.wait(lk, [&] { return stopping_ || (!turn_busy_ && (!yields || boundary_waiters_ == 0)); });
     --turn_waiters_;
+    if (yields) --prepare_waiters_;
+    if (boundary) { --boundary_waiters_; if (!stopping_ && prepare_waiters_ > 0) ++boundary_first_; }   // (counts the prepares it went ahead of)
     if (stopping_) return false;
     turn_busy_ = true;
-    if (piping_) {
-        pause_ = true;
-        paused_valid_ = true; pause_t0_ = Clock::now();   // (P4 B15: the handover budget counts from here)
-        const uint32_t dec = decoding(), act = busy();
-        lk.unlock();
-        std::string e = m_.pipe_pause();
-        if (!e.empty()) (void)m_.pipe_stop();   // (returns the same error and clears it)
-        lk.lock();
-        // P4 B29: the drain (the steps in flight finishing before the turn's serial work may start), always counted for /health
-        const double dms = ms_since(pause_t0_);
-        drain_ms_ += dms; drain_max_ms_ = std::max(drain_max_ms_, dms); ++drains_;
-        if (lanes_trace_on())
-            std::fprintf(stderr, "[%s drain] turn %llu: pipe_pause %.1f ms (%u lane(s) busy, %u decoding, %u waiting for the turn)\n",
-                         m_.tag(), (unsigned long long)turns_ + 1, dms, act, dec, turn_waiters_);
-        piping_ = false; pause_ = false;
-        // (P4 B33: a stop during the drain -- the error is a step cut at a layer boundary, every lane already ended by abort_all)
-        if (!e.empty() && !stopping_) pipe_failed(e);
-    }
+    if (piping_ && drain) drain_pipe(lk);
+    turn_paused_ = !piping_;
     ++turns_; turn_t0_ = Clock::now();
     if (stopping_) { release_turn(lk); return false; }   // (P4 B33: the stop came while the pipe drained)
     return true;
 }
 
+// The pause (mu held by lk; released while pipe_pause waits): the callbacks park their lanes, pipe_pause waits for the steps in
+// flight. P4 B29: the drain is always counted for /health.
+void LanesServe::drain_pipe(std::unique_lock<std::mutex>& lk) {
+    if (!piping_) return;
+    pause_ = true;
+    paused_valid_ = true; pause_t0_ = Clock::now();   // (P4 B15: the handover budget counts from here)
+    const uint32_t dec = decoding(), act = busy();
+    lk.unlock();
+    std::string e = m_.pipe_pause();
+    if (!e.empty()) (void)m_.pipe_stop();   // (returns the same error and clears it)
+    lk.lock();
+    const double dms = ms_since(pause_t0_);
+    drain_ms_ += dms; drain_max_ms_ = std::max(drain_max_ms_, dms); ++drains_;
+    if (lanes_trace_on())
+        std::fprintf(stderr, "[%s drain] turn %llu: pipe_pause %.1f ms (%u lane(s) busy, %u decoding, %u waiting for the turn)\n",
+                     m_.tag(), (unsigned long long)turns_ + 1, dms, act, dec, turn_waiters_);
+    piping_ = false; pause_ = false; turn_paused_ = true;
+    // (P4 B33: a stop during the drain -- the error is a step cut at a layer boundary, every lane already ended by abort_all)
+    if (!e.empty() && !stopping_) pipe_failed(e);
+}
+
+// P4 B39 (the turn held, lk holds mu): with the pipe running through this turn, wait until lane li holds no step in it -- its
+// last done callback may still hold its claim when this thread saw the step land. An arch without the per-lane wait gets the
+// drain (once logged): a drain-free kind it did not back with pipe_wait_lane.
+void LanesServe::lane_wait(std::unique_lock<std::mutex>& lk, uint32_t li) {
+    if (!piping_ || stopping_) return;
+    lk.unlock();
+    const std::string e = m_.pipe_wait_lane(li);
+    lk.lock();
+    if (e.empty() || !piping_) return;
+    static std::atomic<bool> said{false};
+    if (!said.exchange(true))
+        std::fprintf(stderr, "[%s] lane %u: %s -- the turn drains the pipe (serial_drains false without pipe_wait_lane)\n", m_.tag(), li, e.c_str());
+    drain_pipe(lk);
+}
+
 // Releases the turn (lk holds mu). Another request waiting for it takes it with the pipe still paused (no drain between the
 // two turns); otherwise the parked lanes' steps go into the resumed pipe -- a new one when none is paused (the first request,
-// or after a stage error).
+// or after a stage error). P4 B39: when the pipe ran through the turn, the parked lanes that are due go into it here, before a
+// handover too (nothing waits for the chain's end).
 void LanesServe::release_turn(std::unique_lock<std::mutex>& lk) {
     (void)lk;
-    paused_ms_ += ms_since(turn_t0_);
+    if (turn_paused_) paused_ms_ += ms_since(turn_t0_);
+    else ++turns_nodrain_;
+    if (piping_ && !stopping_) {   // (P4 B39)
+        for (uint32_t li = 0; li < lanes_.size(); ++li) {
+            Lane& l = lanes_[li];
+            if (!l.busy || !l.parked || l.preparing) continue;   // (a lane re-preparing on the worker has no pieces to send yet)
+            if (l.want_stop) { end_lane(l, "abort", false); continue; }
+            if (fifo_waiting(li) || hold_long(l, li)) continue;   // (the FIFO's lanes start through fifo_kick; a held lane stays parked)
+            submit(l, li);
+        }
+        fifo_kick();
+    }
     // P4 B15: hand over with the pipe still paused only within the budget, or when no decoding lane waits for it
     bool starve = false;
     if (turn_waiters_ > 0 && paused_valid_ && o_.handover_ms && ms_since(pause_t0_) >= double(o_.handover_ms))
         for (const auto& l : lanes_) if (l.busy && l.parked && l.phase == Lane::Phase::kDecode) { starve = true; break; }
     if (turn_waiters_ > 0 && !stopping_ && !starve) { ++handovers_; turn_busy_ = false; cv_.notify_all(); return; }
     if (starve) ++budget_releases_;
-    std::vector<uint32_t> due;
-    for (uint32_t li = 0; li < lanes_.size(); ++li) {
-        Lane& l = lanes_[li];
-        if (!l.busy || !l.parked) continue;
-        if (l.want_stop) { end_lane(l, "abort", false); continue; }
-        if (fifo_waiting(li)) continue;                                   // (the FIFO's lanes start through fifo_kick)
-        due.push_back(li);
-    }
-    fifo_kick();   // (the pipe is not running: this only drops stale heads or flags a re-prepare)
-    const bool head_go = !fifo_.empty();   // (fifo_kick below starts what may run)
-    if ((!due.empty() || head_go) && !stopping_) {
-        const std::string e = m_.pipe_paused() ? m_.pipe_resume()
-                              : m_.rows() ? m_.pipe_start_rows([this](uint32_t li) { on_done(li); },
-                                                               [this](std::span<const uint32_t> ls) { on_done_rows(ls); })
-                                          : m_.pipe_start([this](uint32_t li) { on_done(li); });
-        if (!e.empty()) {
-            for (uint32_t li : due) end_lane(lanes_[li], std::string("error: ") + m_.tag() + " pipe: " + e, true);
-            while (!fifo_.empty()) end_lane(lanes_[fifo_.front()], std::string("error: ") + m_.tag() + " pipe: " + e, true);
-        } else {
-            piping_ = true; paused_valid_ = false;
-            for (uint32_t li : due) if (!hold_long(lanes_[li], li)) submit(lanes_[li], li);   // (P4 B34 (3): a held lane stays parked)
-            fifo_kick();
+    if (!piping_) {
+        std::vector<uint32_t> due;
+        for (uint32_t li = 0; li < lanes_.size(); ++li) {
+            Lane& l = lanes_[li];
+            if (!l.busy || !l.parked) continue;
+            if (l.want_stop) { end_lane(l, "abort", false); continue; }
+            if (fifo_waiting(li)) continue;                                   // (the FIFO's lanes start through fifo_kick)
+            due.push_back(li);
+        }
+        fifo_kick();   // (the pipe is not running: this only drops stale heads or flags a re-prepare)
+        const bool head_go = !fifo_.empty();   // (fifo_kick below starts what may run)
+        if ((!due.empty() || head_go) && !stopping_) {
+            const std::string e = m_.pipe_paused() ? m_.pipe_resume()
+                                  : m_.rows() ? m_.pipe_start_rows([this](uint32_t li) { on_done(li); },
+                                                                   [this](std::span<const uint32_t> ls) { on_done_rows(ls); })
+                                              : m_.pipe_start([this](uint32_t li) { on_done(li); });
+            if (!e.empty()) {
+                for (uint32_t li : due) end_lane(lanes_[li], std::string("error: ") + m_.tag() + " pipe: " + e, true);
+                while (!fifo_.empty()) end_lane(lanes_[fifo_.front()], std::string("error: ") + m_.tag() + " pipe: " + e, true);
+            } else {
+                piping_ = true; paused_valid_ = false;
+                for (uint32_t li : due) if (!hold_long(lanes_[li], li)) submit(lanes_[li], li);   // (P4 B34 (3): a held lane stays parked)
+                fifo_kick();
+            }
         }
     }
     turn_busy_ = false;
@@ -671,6 +738,7 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     std::unique_lock<std::mutex> lk(mu_);
     // 1. a lane, chosen under the serial turn; a prompt only the big lane holds waits for it
     int li = -1;
+    using Turn = LanesModel::Turn;
     for (;;) {
         while (!stopping_ && !fits()) {
             cv_.wait_for(lk, std::chrono::seconds(1));
@@ -678,7 +746,7 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
             lk.unlock(); const bool ok = alive(); lk.lock();
             if (!ok) { r.finish_reason = "abort"; return r; }
         }
-        if (stopping_ || !take_turn(lk)) { r.finish_reason = "abort"; return r; }
+        if (stopping_ || !take_turn(lk, m_.serial_drains(Turn::kPrepare), Turn::kPrepare)) { r.finish_reason = "abort"; return r; }
         li = choose(ids, rq.sp.max_tokens);
         if (li >= 0) break;
         release_turn(lk);
@@ -689,13 +757,15 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     l.busy = true; l.phase = Lane::Phase::kPrefill; l.rq = &rq; l.finish.clear();
     l.want_stop = l.lost = l.parked = l.kept = l.ahead = l.held = l.recut = l.qheld = l.qfree = false; l.bypass = 0;
     l.outbox.clear(); l.out.clear(); l.pend = 0; l.next = -1; l.steps = l.chunks = 0; l.cb_ms = 0;
+    // (P4 B39: the callbacks of the other lanes may read these while the prepare runs: a new prompt with no plan yet)
+    l.plan = LanesPlan{}; l.pos = l.reused = l.chunk_at = l.mark_at = l.snap_at = l.piece_max = 0; l.preparing = true;
     l.hist.assign(ids.begin(), ids.end());
     l.max_new = lanes_reply_budget(T, rq.sp.max_tokens, l.cap); l.n_new = 0;   // (T < l.cap)
     uint32_t others = 0;                                               // lanes of other requests still running
     for (uint32_t k = 0; k < lanes_.size(); ++k) others += k != lane && lanes_[k].busy && lanes_[k].phase != Lane::Phase::kDone;
     const bool alone = others == 0 && turn_waiters_ == 0;
     auto release_lane = [&] {   // (mu held) the lane goes idle with its conversation; the LRU order follows the release
-        l.busy = false; l.phase = Lane::Phase::kIdle; l.tick = ++tick_; l.rq = nullptr;
+        l.busy = false; l.phase = Lane::Phase::kIdle; l.tick = ++tick_; l.rq = nullptr; l.preparing = false;
         l.outbox.clear(); l.hist.clear(); l.hist.shrink_to_fit();
         cv_.notify_all();
     };
@@ -703,7 +773,8 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     // 2. the prefix step (the turn held; the serial worker does the device work), then the plan. The prefill runs HERE when
     // every other lane is idle (the arch pipelines the cards over its chunks, until another request waits for the turn or the
     // client leaves) and otherwise through the lane pipe, beside the decoding lanes (P4 B15: one prompt's pieces at a time, in
-    // arrival order, when o_.prefill_fifo). A plan's mark (the shared prefix's end) runs LanesModel::mark in a turn.
+    // arrival order, when o_.prefill_fifo). A plan's mark (the shared prefix's end) runs LanesModel::mark in a turn; P4 B39: its
+    // snap (the conversation snapshot's depth) runs LanesModel::snapshot in a turn, the tail after it through the pipe.
     std::string e, pe;
     uint32_t reused = 0;
     bool ready = false;                                                // the prompt is in: its first id is sampled below
@@ -715,56 +786,89 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     };
     int32_t first = -1;
     std::string se;                                                    // the first sample's error
-    auto log_mark = [&](const std::string& me) {
-        if (!me.empty()) std::fprintf(stderr, "[%s] lane %u shared-prefix mark at %u: %s\n", m_.tag(), lane, l.mark_at, me.c_str());
+    auto log_mark = [&](const std::string& me, uint32_t at) {
+        if (!me.empty()) std::fprintf(stderr, "[%s] lane %u shared-prefix mark at %u: %s\n", m_.tag(), lane, at, me.c_str());
     };
+    auto log_snap = [&](const std::string& me, uint32_t at) {
+        if (!me.empty()) std::fprintf(stderr, "[%s] lane %u snapshot at %u: %s\n", m_.tag(), lane, at, me.c_str());
+    };
+    // P4 B39: what prep computes on the serial worker, committed to the lane under mu by after_prep (with a drain-free prepare
+    // the other lanes' callbacks run meanwhile and read the lane's fields)
+    struct Prep { LanesPlan plan; uint32_t mark_at = 0, snap_at = 0, piece_max = 0, chunk_at = 0, chunks = 0, pos = 0; } pp;
     // on the serial worker: the prefix step, the plan and (alone) the prefill; `alone_now` = no other lane runs
     auto prep = [&](bool alone_now) {
+        pp = Prep{};
         std::string source;
         pe = m_.prefix_prepare(lane, rq, reused, source);
         r.cache_source = source;
         if (!pe.empty()) return;
-        l.reused = reused; l.pos = reused; l.chunk_at = 0;
-        l.plan = m_.plan(rq, reused);
-        l.mark_at = (l.plan.mark > reused && l.plan.mark < l.plan.Tp) ? l.plan.mark : 0;
-        size_t kmark = l.plan.chunks.size();                            // the chunks up to and including the mark
-        if (l.mark_at) {
-            kmark = 0;
-            for (size_t k = 0; k < l.plan.chunks.size() && !kmark; ++k)
-                if (l.plan.chunks[k].first + l.plan.chunks[k].second == l.mark_at) kmark = k + 1;
+        pp.pos = reused;
+        pp.plan = m_.plan(rq, reused);
+        LanesPlan& plan = pp.plan;
+        pp.mark_at = (plan.mark > reused && plan.mark < plan.Tp) ? plan.mark : 0;
+        pp.snap_at = (plan.snap > reused && plan.snap < plan.Tp) ? plan.snap : 0;
+        // the chunk index just past a boundary (0 = no chunk ends there)
+        auto ends_at = [&](uint32_t at) {
+            for (size_t k = 0; k < plan.chunks.size(); ++k)
+                if (plan.chunks[k].first + plan.chunks[k].second == at) return k + 1;
+            return size_t(0);
+        };
+        size_t kmark = plan.chunks.size(), ksnap = plan.chunks.size();   // the chunks up to and including the mark / the snap
+        if (pp.mark_at) {
+            kmark = ends_at(pp.mark_at);
             if (!kmark) {   // (an arch whose plan has no chunk ending at its mark: no mark rather than one at the wrong depth)
                 std::fprintf(stderr, "[%s] lane %u: no prefill chunk ends at the mark %u; the shared prefix is not snapshotted\n",
-                             m_.tag(), lane, l.mark_at);
-                l.mark_at = 0; kmark = l.plan.chunks.size();
+                             m_.tag(), lane, pp.mark_at);
+                pp.mark_at = 0; kmark = plan.chunks.size();
+            }
+        }
+        if (pp.snap_at) {
+            ksnap = ends_at(pp.snap_at);
+            if (!ksnap) {
+                std::fprintf(stderr, "[%s] lane %u: no prefill chunk ends at the snapshot boundary %u; the conversation is not snapshotted\n",
+                             m_.tag(), lane, pp.snap_at);
+                pp.snap_at = 0; ksnap = plan.chunks.size();
             }
         }
         if (!alone_now && o_.mix_chunk) {                              // (a capped piece computes other bits: off by default)
             std::vector<LanesChunk> cut;
-            for (const auto& [p0, t] : l.plan.chunks)
+            for (const auto& [p0, t] : plan.chunks) {
+                if (plan.snap && p0 >= plan.snap) { cut.emplace_back(p0, t); continue; }   // (P4 B39: the tail = prompt_end's piece, as cut)
                 for (uint32_t q = 0; q < t; q += o_.mix_chunk) cut.emplace_back(p0 + q, std::min(o_.mix_chunk, t - q));
-            l.plan.chunks.swap(cut);
-        }
-        l.piece_max = 0;                                               // (P4 B34 (3): the short rule's piece size)
-        for (const auto& c : l.plan.chunks) l.piece_max = std::max(l.piece_max, c.second);
-        if (alone_now || l.plan.chunks.empty()) {
-            size_t done = 0;
-            const std::span<const LanesChunk> all(l.plan.chunks);
-            e = m_.prefill_serial(lane, rq, all.first(kmark), stop, done);
-            if (e.empty() && !gone.load() && l.mark_at && done == kmark) {
-                log_mark(m_.mark(lane, rq, l.mark_at));
-                ++marks_;
-                l.mark_at = 0;
-                if (kmark < all.size() && !stop()) {
-                    size_t d2 = 0;
-                    e = m_.prefill_serial(lane, rq, all.subspan(kmark), stop, d2);
-                    done += d2;
-                }
             }
-            l.chunk_at = uint32_t(done); l.chunks += uint32_t(done);
-            if (done) l.pos = l.plan.chunks[done - 1].first + l.plan.chunks[done - 1].second;
-            if (e.empty() && !gone.load() && l.chunk_at == l.plan.chunks.size()) {
-                e = m_.prompt_end(lane, rq, l.plan.Tp, reused, false);
-                if (e.empty()) l.pos = T;                              // the rows [Tp, T) are in: the first decode step's pos0
+            plan.chunks.swap(cut);
+            if (pp.mark_at) kmark = ends_at(pp.mark_at);
+            if (pp.snap_at) ksnap = ends_at(pp.snap_at);
+        }
+        pp.piece_max = 0;                                              // (P4 B34 (3): the short rule's piece size; the tail aside)
+        for (const auto& c : plan.chunks) if (!plan.snap || c.first < plan.snap) pp.piece_max = std::max(pp.piece_max, c.second);
+        if (alone_now || plan.chunks.empty()) {
+            // the chunks in segments: up to the mark, up to the snap, the rest -- the arch's hook after a boundary's segment ran
+            // whole, then on only while no one waits for the turn (`stop`)
+            size_t done = 0, from = 0;
+            const std::span<const LanesChunk> all(plan.chunks);
+            struct Seg { size_t end; int kind; };   // kind: 0 = the mark, 1 = the snap, 2 = the end
+            std::vector<Seg> segs;
+            if (pp.mark_at) segs.push_back({kmark, 0});
+            if (pp.snap_at) segs.push_back({ksnap, 1});
+            segs.push_back({all.size(), 2});
+            for (const Seg& sg : segs) {
+                if (from < sg.end) {
+                    size_t d = 0;
+                    e = m_.prefill_serial(lane, rq, all.subspan(from, sg.end - from), stop, d);
+                    done += d;
+                    if (!e.empty() || gone.load() || done != sg.end) break;
+                    from = sg.end;
+                }
+                if (sg.kind == 0) { log_mark(m_.mark(lane, rq, pp.mark_at), pp.mark_at); ++marks_; pp.mark_at = 0; }
+                if (sg.kind == 1) { log_snap(m_.snapshot(lane, rq, pp.snap_at), pp.snap_at); pp.snap_at = 0; }
+                if (sg.kind != 2 && stop()) break;
+            }
+            pp.chunk_at = uint32_t(done); pp.chunks = uint32_t(done);
+            if (done) pp.pos = plan.chunks[done - 1].first + plan.chunks[done - 1].second;
+            if (e.empty() && !gone.load() && pp.chunk_at == plan.chunks.size()) {
+                e = m_.prompt_end(lane, rq, plan.Tp, reused, false);
+                if (e.empty()) pp.pos = T;                             // the rows [Tp, T) are in: the first decode step's pos0
                 if (e.empty()) { first = sample_into(l, lane, true, se); ready = true; }
             }
         }
@@ -772,7 +876,10 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     // (mu held, the turn held) after prep: the lane ends, is ready for its first id, or waits for its pieces
     auto after_prep = [&](const std::string& we, bool initial) {
         r.cached_tokens = reused;
+        l.preparing = false;
         if (l.phase == Lane::Phase::kDone) return;                     // (P4 B33: abort_all ended it while the turn ran)
+        l.reused = reused; l.pos = pp.pos; l.chunk_at = pp.chunk_at; l.chunks += pp.chunks;
+        l.plan = std::move(pp.plan); l.mark_at = pp.mark_at; l.snap_at = pp.snap_at; l.piece_max = pp.piece_max;
         if (!we.empty() && e.empty()) e = we;
         if (!pe.empty()) end_lane(l, "error: prefix cache: " + pe, true);
         else if (!e.empty()) end_lane(l, "error: " + e, true);
@@ -791,25 +898,28 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
             if (initial && o_.prefill_fifo && l.phase == Lane::Phase::kPrefill) fifo_.push_back(lane);
         }
     };
+    lane_wait(lk, lane);   // (P4 B39: a drain-free turn: the lane's previous request's last callback may still hold its claim)
     const std::string we = serial(lk, [&] { prep(alone); }, alive, &gone);
     after_prep(we, true);
     const uint32_t serial_chunks = l.chunks;
     release_turn(lk);
     // 3. the rest of the prompt through the lane pipe; after each piece the server's liveness probe (a client that left ends
     // the request at the lane's next completion), and a stage error seen from here when no callback ran. P4 B15: the mark and
-    // a re-prepare (the FIFO head whose cache_peek grew) each take a turn here.
+    // a re-prepare (the FIFO head whose cache_peek grew) each take a turn here; P4 B39: the snapshot too.
     uint32_t seen = l.pos;
     for (;;) {
-        if (l.phase == Lane::Phase::kMark) {
-            if (!take_turn(lk)) { end_lane(l, "abort", false); continue; }   // (P4 B33: stopping)
-            if (l.phase == Lane::Phase::kMark) {
+        if (l.phase == Lane::Phase::kMark || l.phase == Lane::Phase::kSnap) {
+            const bool snap = l.phase == Lane::Phase::kSnap;
+            const Turn kind = snap ? Turn::kSnapshot : Turn::kMark;
+            if (!take_turn(lk, m_.serial_drains(kind), kind)) { end_lane(l, "abort", false); continue; }   // (P4 B33: stopping)
+            if (l.phase == (snap ? Lane::Phase::kSnap : Lane::Phase::kMark)) {
+                lane_wait(lk, lane);
                 const uint32_t at = l.pos;
                 std::string me;
-                const std::string wm = serial(lk, [&] { me = m_.mark(lane, rq, at); });
-                log_mark(me.empty() ? wm : me);
-                ++marks_;
-                l.mark_at = 0;
-                if (l.phase != Lane::Phase::kMark) {}                     // (P4 B33: abort_all ended it meanwhile)
+                const std::string wm = serial(lk, [&] { me = snap ? m_.snapshot(lane, rq, at) : m_.mark(lane, rq, at); });
+                if (snap) { log_snap(me.empty() ? wm : me, at); l.snap_at = 0; }
+                else      { log_mark(me.empty() ? wm : me, at); ++marks_; l.mark_at = 0; }
+                if (l.phase != (snap ? Lane::Phase::kSnap : Lane::Phase::kMark)) {}   // (P4 B33: abort_all ended it meanwhile)
                 else if (l.want_stop) end_lane(l, "abort", false);
                 else { l.phase = Lane::Phase::kPrefill; l.parked = true; }   // (still the FIFO's head)
             }
@@ -817,13 +927,15 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
             continue;
         }
         if (l.phase == Lane::Phase::kPrefill && l.reprep) {
-            if (!take_turn(lk)) { end_lane(l, "abort", false); continue; }   // (P4 B33: stopping)
+            if (!take_turn(lk, m_.serial_drains(Turn::kPrepare), Turn::kPrepare)) { end_lane(l, "abort", false); continue; }   // (P4 B33: stopping)
             if (l.phase == Lane::Phase::kPrefill && l.reprep) {
                 l.reprep = false; ++l.repreps; ++repreps_;
                 uint32_t oth = 0;
                 for (uint32_t k = 0; k < lanes_.size(); ++k) oth += k != lane && lanes_[k].busy && lanes_[k].phase != Lane::Phase::kDone;
                 const bool alone_now = oth == 0 && turn_waiters_ == 0;
                 e.clear(); pe.clear(); se.clear(); ready = false; first = -1;
+                l.preparing = true;
+                lane_wait(lk, lane);
                 const std::string wr = serial(lk, [&] { prep(alone_now); }, alive, &gone);
                 after_prep(wr, false);
             }
@@ -856,9 +968,10 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     }
     // 4. the prompt's end (the turn held): the arch's checkpoints and the rows past Tp, then the first id
     if (l.phase == Lane::Phase::kPromptReady) {
-        const bool turn = take_turn(lk);
+        const bool turn = take_turn(lk, m_.serial_drains(Turn::kPromptEnd), Turn::kPromptEnd);
         if (!turn) end_lane(l, "abort", false);                           // (P4 B33: stopping)
         if (turn && l.phase == Lane::Phase::kPromptReady) {
+            lane_wait(lk, lane);
             std::string e2;
             const bool kept = l.kept;
             const std::string we2 = serial(lk, [&] {
@@ -920,12 +1033,14 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     if (t_dec.time_since_epoch().count()) r.decode_ms = ms_since(t_dec);
     std::fprintf(stderr, "[%s] lane %u: prompt %u (%u cached), prefill %.0f ms: %u chunk(s) in the serial turn, %u through the lane pipe; "
                          "%u tokens (reply cap %u) in %u steps; %s; %u lane(s) busy; callbacks %.0f ms; "
-                         "%llu turns so far (%llu handed over), the pipe paused %.0f ms for them\n", m_.tag(), lane, T, r.cached_tokens,
-                 r.prefill_ms, serial_chunks, l.chunks - serial_chunks, l.n_new, l.max_new, l.steps, r.finish_reason.c_str(), busy(), l.cb_ms,
-                 (unsigned long long)turns_, (unsigned long long)handovers_, paused_ms_);
+                         "%llu turns so far (%llu handed over, %llu ran beside the pipe), the pipe paused %.0f ms for them\n", m_.tag(), lane, T,
+                 r.cached_tokens, r.prefill_ms, serial_chunks, l.chunks - serial_chunks, l.n_new, l.max_new, l.steps, r.finish_reason.c_str(), busy(),
+                 l.cb_ms, (unsigned long long)turns_, (unsigned long long)handovers_, (unsigned long long)turns_nodrain_, paused_ms_);
     // P4 B10: the arch's reply snapshot, in a turn (the lane is still this request's)
+    const Turn fkind = r.finish_reason == "stop" ? Turn::kFinishStop : Turn::kFinishLength;
     if (rq.reply_cache && !l.lost && !l.out.empty() && (r.finish_reason == "stop" || r.finish_reason == "length") && !stopping_ &&
-        take_turn(lk)) {
+        take_turn(lk, m_.serial_drains(fkind), fkind)) {
+        lane_wait(lk, lane);
         std::string e4;
         const std::string fin = r.finish_reason;
         const uint32_t pos = l.pos;
@@ -934,7 +1049,8 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
         if (!e4.empty()) std::fprintf(stderr, "[%s] lane %u finish: %s\n", m_.tag(), lane, e4.c_str());
         release_turn(lk);
     }
-    if (l.lost && take_turn(lk)) {   // (P4 B33: stopping skips the reset: the process ends and the lane with it)
+    if (l.lost && take_turn(lk, m_.serial_drains(Turn::kReset), Turn::kReset)) {   // (P4 B33: stopping skips the reset: the process ends and the lane with it)
+        lane_wait(lk, lane);
         (void)serial(lk, [&] { if (auto e3 = m_.reset_lane(lane); !e3.empty()) std::fprintf(stderr, "[%s] reset lane %u: %s\n", m_.tag(), lane, e3.c_str()); });
         l.lost = false;
         release_turn(lk);
@@ -948,21 +1064,25 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
 }
 
 std::string LanesServe::status_json() const {
+    const std::string pipe = m_.pipe_stats();   // (P4 B42: the arch's pipe counters, before our lock: the pipe has its own)
     std::lock_guard<std::mutex> lk(mu_);
-    char buf[1024];
+    char buf[1280];
     std::snprintf(buf, sizeof buf,
                   "{\"lanes\":%zu,\"lanes_active\":%u,\"decoding\":%u,\"tokens\":%llu,\"step_ms\":%.2f,\"turns\":%llu,"
                   "\"paused_ms\":%.0f,\"handovers\":%llu,\"prefill_queue\":%zu,\"marks\":%llu,\"repreps\":%llu,"
                   "\"budget_releases\":%llu,\"drains\":%llu,\"drain_ms\":%.0f,\"drain_max_ms\":%.0f,\"snapshots\":%llu,"
                   "\"lookaheads\":%llu,\"short_bypass\":%llu,\"short_guard\":%llu,\"short_guard_wait\":%llu,\"recuts\":%llu,"
-                  "\"quota_holds\":%llu,\"quota_guard\":%llu}",
+                  "\"quota_holds\":%llu,\"quota_guard\":%llu,\"turns_nodrain\":%llu,\"turns_boundary_first\":%llu}",
                   lanes_.size(), busy(), decoding(), (unsigned long long)tokens_, step_ms_, (unsigned long long)turns_, paused_ms_,
                   (unsigned long long)handovers_, fifo_.size(), (unsigned long long)marks_.load(), (unsigned long long)repreps_,
                   (unsigned long long)budget_releases_, (unsigned long long)drains_, drain_ms_, drain_max_ms_,
                   (unsigned long long)m_.snapshots(), (unsigned long long)lookaheads_, (unsigned long long)short_bypass_,
                   (unsigned long long)short_guard_, (unsigned long long)short_guard_wait_, (unsigned long long)recuts_,
-                  (unsigned long long)quota_holds_, (unsigned long long)quota_guard_);
-    return buf;
+                  (unsigned long long)quota_holds_, (unsigned long long)quota_guard_, (unsigned long long)turns_nodrain_,
+                  (unsigned long long)boundary_first_);
+    std::string js(buf);
+    if (!pipe.empty()) { js.pop_back(); js += ",\"pipe\":" + pipe + "}"; }
+    return js;
 }
 
 }  // namespace ie

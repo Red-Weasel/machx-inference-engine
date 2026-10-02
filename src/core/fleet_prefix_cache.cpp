@@ -296,6 +296,9 @@ template std::string FleetPrefixCache::init<Qwen35MoeSplitModel>(
     Qwen35MoeSplitModel&, const FleetPrefixCacheConfig&);
 template std::string FleetPrefixCache::insert<Qwen35MoeSplitModel>(
     Qwen35MoeSplitModel&, const std::vector<int32_t>&, bool, bool);
+// P4 B39: one lane of the crown split by index (the request lanes' snapshots beside a running card pipe)
+template std::string FleetPrefixCache::insert<Q35mLaneView>(
+    Q35mLaneView&, const std::vector<int32_t>&, bool, bool);
 template std::string FleetPrefixCache::init<GptOssTpModel>(
     GptOssTpModel&, const FleetPrefixCacheConfig&);
 template std::string FleetPrefixCache::insert<GptOssTpModel>(
