@@ -358,9 +358,21 @@ std::string Engine::mimo26_load(const std::string& dir) {
     // P4 B4 (docs/mimo26/P4_B4_SERVE.md): --parallel N > 1 = N lanes. Lane 0 keeps --ctx; lanes 1..N-1 get --slot-ctx positions
     // each (0 = 32,768, capped at --ctx). Their caches come out of the auto static tier, and the forward's init refuses, with
     // the numbers, when they do not fit (the load-time refusal). --parallel 1 is the pre-lane engine, byte for byte.
-    const uint32_t n_lanes = std::max<uint32_t>(1, opts_.parallel);
-    const uint32_t lane_ctx = n_lanes > 1 ? std::min<uint32_t>(opts_.max_ctx, opts_.slot_ctx ? opts_.slot_ctx : 32768u) : 0u;
+    // P4 B30: no --parallel = the fixed pick (lanes_auto.hpp: 4 lanes at 16K, measured best on MiMo), two cards or more
+    const bool auto_n = opts_.parallel == kLanesAuto;
+    const LanesAutoPlan lp = auto_n ? lanes_auto_plan(LanesArch::kMimo26, uint32_t(devs.size()), true, opts_.slot_ctx)
+                                    : LanesAutoPlan{std::max<uint32_t>(1, opts_.parallel), opts_.slot_ctx, false};
+    const uint32_t n_lanes = lp.n;
+    const uint32_t lane_ctx = n_lanes > 1 ? std::min<uint32_t>(opts_.max_ctx, lp.slot_ctx ? lp.slot_ctx : 32768u) : 0u;
+    if (auto_n) {
+        opts_.parallel = n_lanes;
+        std::fprintf(stderr, "%s\n", lanes_auto_line("mimo_v2", n_lanes, lane_ctx, n_lanes > 1
+            ? "the fixed pick, measured best on MiMo-V2.6 (b23, 2026-09-29: 23.5-23.9 tok/s alone, 26.4 for four); every lane is "
+              "reserved out of the static expert tier (the forward's lane lines below give their VRAM); images need --parallel 1"
+            : "the lanes need two cards").c_str());
+    }
     mo.lanes = n_lanes; mo.lane_ctx = lane_ctx;
+    lane_ctx_ = lane_ctx;   // P4 B38 (0 with one lane)
     // the static expert tier: sized from each card's free VRAM (P4 lever 2: -11 % per decode token vs a fixed 48 on
     // held-out chat, PPL within noise); IE_MIMO26_STATIC=N pins a count
     mo.n_static = 0;

@@ -6,7 +6,9 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <limits>
@@ -1229,7 +1231,8 @@ std::string Tokenizer::decode(std::span<const int32_t> ids, bool skip_special,
         if (id < 0 || size_t(id) >= vocab_.size()) continue;
         if (is_special(id)) {
             const bool keep = std::find(keep_special.begin(), keep_special.end(), id)
-                              != keep_special.end();
+                              != keep_special.end() ||
+                              std::find(shown_special_.begin(), shown_special_.end(), id) != shown_special_.end();
             if (skip_special && !keep) continue;
             out += vocab_[id];           // emit literal special-token text
             continue;
@@ -1279,10 +1282,13 @@ std::string Tokenizer::decode(std::span<const int32_t> ids, bool skip_special,
 
 // ===== Chat template =====
 
-// Canonical Qwen3 tools preamble (JSON tool-call convention). Chosen over the
-// Qwen3.6-native <function=NAME> XML format (research/04 §4.2) because
-// OpenAI-compat clients (Seal) recover text-embedded tool calls from the JSON
-// `{"name":..., "arguments":...}` shape — see docs/seal-integration.md gap 1.
+// Canonical Qwen3 tools preamble (JSON tool-call convention). Originally chosen
+// over the Qwen3.6-native <function=NAME> XML format (research/04 §4.2) so that
+// OpenAI-compat clients (Seal) could recover text-embedded tool calls from the
+// JSON `{"name":..., "arguments":...}` shape — see docs/seal-integration.md gap 1.
+// P4 B27: templates that teach the XML form get it (build_chatml_xml_prompt
+// below; the server hands every client structured tool_calls either way); this
+// preamble stays for the other templates and for IE_QWEN_TOOLS_JSON=1.
 static void append_tools_preamble(std::string& s, std::string_view tools_json) {
     s += "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
          "You are provided with function signatures within <tools></tools> XML tags:\n"
@@ -1301,12 +1307,477 @@ static void append_tools_preamble(std::string& s, std::string_view tools_json) {
          "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>";
 }
 
+// ---- P4 B27: the Qwen3.6+ template's XML tool convention ----
+namespace {
+
+using xjson = nlohmann::ordered_json;
+
+// Python json.dumps(ensure_ascii=False): what HF's `tojson` filter writes into
+// the template's <tools> block and the <parameter> values (", " / ": "
+// separators, key order kept, non-ASCII raw). Mirrors mimo26_engine.cpp.
+void xml_py_escape(std::string_view s, std::string& out) {
+    out += '"';
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            case '\b': out += "\\b"; break;
+            case '\f': out += "\\f"; break;
+            default:
+                if (c < 0x20) { char b[8]; std::snprintf(b, sizeof b, "\\u%04x", c); out += b; }
+                else out += char(c);
+        }
+    }
+    out += '"';
+}
+
+void xml_py_dump(const xjson& j, std::string& out) {
+    if (j.is_object()) {
+        out += '{';
+        bool first = true;
+        for (auto it = j.begin(); it != j.end(); ++it) {
+            if (!first) out += ", ";
+            first = false;
+            xml_py_escape(it.key(), out); out += ": "; xml_py_dump(it.value(), out);
+        }
+        out += '}';
+    } else if (j.is_array()) {
+        out += '[';
+        for (size_t i = 0; i < j.size(); ++i) { if (i) out += ", "; xml_py_dump(j[i], out); }
+        out += ']';
+    } else if (j.is_string()) {
+        xml_py_escape(j.get<std::string>(), out);
+    } else if (j.is_boolean()) {
+        out += j.get<bool>() ? "true" : "false";
+    } else if (j.is_null()) {
+        out += "null";
+    } else {
+        out += j.dump();   // numbers
+    }
+}
+
+// jinja `|trim` (Python str.strip; ASCII whitespace is what our inputs carry).
+std::string_view xml_trim(std::string_view s) {
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.front()))) s.remove_prefix(1);
+    while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.remove_suffix(1);
+    return s;
+}
+
+// The template's tools block, byte for byte (the 27B and the 35B share it).
+void append_xml_tools_block(std::string& s, std::string_view tools_json) {
+    s += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+    xjson tools = xjson::parse(tools_json, nullptr, /*allow_exceptions=*/false);
+    if (tools.is_array()) {
+        for (const auto& t : tools) { s += '\n'; xml_py_dump(t, s); }
+    } else {
+        s += '\n'; s += tools_json;   // unparseable: embed verbatim
+    }
+    s += "\n</tools>"
+         "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+         "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+         "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
+         "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
+         "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested "
+         "within <tool_call></tool_call> XML tags\n"
+         "- Required parameters MUST be specified\n"
+         "- You may provide optional reasoning for your function call in natural language BEFORE the function call, "
+         "but NOT after\n"
+         "- If there is no function call available, answer the question like normal with your current knowledge and "
+         "do not tell the user about function calls\n</IMPORTANT>";
+}
+
+// An assistant turn's OpenAI tool_calls in the template's history form. The
+// OpenAI `arguments` is a JSON string: parsed into its object (the template
+// wants a mapping); a string value as it is, anything else through tojson.
+void append_xml_tool_calls(std::string& s, std::string_view tool_calls_json, bool content_nonempty) {
+    xjson calls = xjson::parse(tool_calls_json, nullptr, /*allow_exceptions=*/false);
+    if (!calls.is_array()) return;
+    bool first = true;
+    for (const auto& tc0 : calls) {
+        const xjson& tc = (tc0.is_object() && tc0.contains("function") && tc0["function"].is_object()) ? tc0["function"] : tc0;
+        if (!tc.is_object() || !tc.contains("name") || !tc["name"].is_string()) continue;
+        s += first ? (content_nonempty ? "\n\n<tool_call>\n<function=" : "<tool_call>\n<function=")
+                   : "\n<tool_call>\n<function=";
+        first = false;
+        s += tc["name"].get<std::string>();
+        s += ">\n";
+        xjson args;
+        if (tc.contains("arguments")) {
+            args = tc["arguments"];
+            if (args.is_string()) args = xjson::parse(args.get<std::string>(), nullptr, /*allow_exceptions=*/false);
+        }
+        if (args.is_object()) {
+            for (auto it = args.begin(); it != args.end(); ++it) {
+                s += "<parameter="; s += it.key(); s += ">\n";
+                if (it.value().is_string()) s += it.value().get<std::string>();
+                else xml_py_dump(it.value(), s);
+                s += "\n</parameter>\n";
+            }
+        }
+        s += "</function>\n</tool_call>";
+    }
+}
+
+// The template with tools (tools_json non-empty, ChatmlXmlTools::enabled).
+std::string build_chatml_xml_prompt(std::span<const ChatTurn> turns, bool add_generation_prompt, bool enable_thinking,
+                                    std::string_view tools_json, bool model_has_think,
+                                    std::string_view reasoning_preamble, bool think_all_history) {
+    const size_t n = turns.size();
+    std::string s = "<|im_start|>system\n";
+    if (!reasoning_preamble.empty()) { s += reasoning_preamble; s += "\n\n"; }
+    append_xml_tools_block(s, tools_json);
+    // The leading system turns (the engine folds `developer` into system), each
+    // trimmed, joined by '\n' (the 27B's merge; the 35B takes exactly one), AFTER
+    // the tools block.
+    std::string sys;
+    size_t i = 0;
+    for (; i < n && turns[i].role == "system"; ++i) {
+        const std::string_view c = xml_trim(turns[i].content);
+        if (c.empty()) continue;
+        if (!sys.empty()) sys += '\n';
+        sys += c;
+    }
+    if (!sys.empty()) { s += "\n\n"; s += sys; }
+    s += "<|im_end|>\n";
+    // The last user query = the last user turn that is not a bare <tool_response>
+    // wrapper; assistant turns after it carry their <think> block (the 27B: all).
+    size_t last_query = n == 0 ? 0 : n - 1;
+    for (size_t k = n; k-- > 0;) {
+        if (turns[k].role != "user") continue;
+        const std::string_view c = xml_trim(turns[k].content);
+        if (!(c.starts_with("<tool_response>") && c.ends_with("</tool_response>"))) { last_query = k; break; }
+    }
+    for (; i < n; ++i) {
+        const auto& t = turns[i];
+        if (t.role == "tool") {
+            s += "<|im_start|>user";
+            while (i < n && turns[i].role == "tool") {
+                s += "\n<tool_response>\n";
+                s += xml_trim(turns[i].content);
+                s += "\n</tool_response>";
+                ++i;
+            }
+            --i;
+            s += "<|im_end|>\n";
+            continue;
+        }
+        if (t.role == "assistant") {
+            const std::string_view content =
+                xml_trim(t.content_without_tool_calls ? *t.content_without_tool_calls : t.content);
+            s += "<|im_start|>assistant\n";
+            if (think_all_history || i > last_query) {
+                s += "<think>\n";
+                if (t.reasoning_content) s += xml_trim(*t.reasoning_content);
+                s += "\n</think>\n\n";
+            }
+            s += content;
+            if (!t.tool_calls_json.empty()) append_xml_tool_calls(s, t.tool_calls_json, !content.empty());
+            s += "<|im_end|>\n";
+            continue;
+        }
+        s += "<|im_start|>";
+        s += t.role;
+        s += '\n';
+        s += xml_trim(t.content);
+        s += "<|im_end|>\n";
+    }
+    if (add_generation_prompt) {
+        s += "<|im_start|>assistant\n";
+        if (model_has_think) s += enable_thinking ? "<think>\n" : "<think>\n\n</think>\n\n";
+    }
+    return s;
+}
+
+// ---- the parser ----
+
+// A parameter's schema type in the OpenAI tools array ("" when unknown).
+std::string xml_param_type(const xjson& tools, std::string_view fn, std::string_view key) {
+    if (!tools.is_array()) return {};
+    for (const auto& t : tools) {
+        const xjson& f = (t.is_object() && t.contains("function") && t["function"].is_object()) ? t["function"] : t;
+        if (!f.is_object() || !f.contains("name") || !f["name"].is_string() || f["name"].get_ref<const std::string&>() != fn) continue;
+        if (!f.contains("parameters") || !f["parameters"].is_object()) return {};
+        const xjson& p = f["parameters"];
+        if (!p.contains("properties") || !p["properties"].is_object() || !p["properties"].contains(std::string(key))) return {};
+        const xjson& sch = p["properties"][std::string(key)];
+        if (!sch.is_object() || !sch.contains("type")) return {};
+        const xjson& ty = sch["type"];
+        if (ty.is_string()) return ty.get<std::string>();
+        if (ty.is_array()) {   // ["string","null"]: string when it lists string, else the first non-null member
+            for (const auto& t : ty) if (t.is_string() && t.get_ref<const std::string&>() == "string") return "string";
+            for (const auto& t : ty) if (t.is_string() && t.get_ref<const std::string&>() != "null") return t.get<std::string>();
+        }
+        return {};
+    }
+    return {};
+}
+
+// Is `name` a function of the tools array? (No array: nothing to check against.)
+bool xml_known_function(const xjson& tools, std::string_view name) {
+    if (!tools.is_array() || tools.empty()) return true;
+    for (const auto& t : tools) {
+        const xjson& f = (t.is_object() && t.contains("function") && t["function"].is_object()) ? t["function"] : t;
+        if (f.is_object() && f.contains("name") && f["name"].is_string() && f["name"].get_ref<const std::string&>() == name) return true;
+    }
+    return false;
+}
+
+// The value's text as the schema says: strings stay strings; boolean takes
+// true / false in any case (the Qwen3.8 models write Python's True); the other
+// types parse as JSON, then integer / number as plain digits ("02") and object /
+// array with Python's single quotes swapped; an unknown type parses only
+// JSON-looking text. Anything else stays text.
+xjson xml_typed_value(const std::string& v, const std::string& type) {
+    if (type == "string") return xjson(v);
+    if (type == "boolean") {
+        std::string l = v;
+        for (auto& c : l) c = char(std::tolower(static_cast<unsigned char>(c)));
+        if (l == "true") return xjson(true);
+        if (l == "false") return xjson(false);
+        return xjson(v);
+    }
+    const bool looks = !v.empty() && (v[0] == '{' || v[0] == '[' || v[0] == '-' || (v[0] >= '0' && v[0] <= '9') ||
+                                      v == "true" || v == "false" || v == "null");
+    if (!type.empty() || looks) {
+        xjson j = xjson::parse(v, nullptr, /*allow_exceptions=*/false);
+        if (!j.is_discarded()) return j;
+    }
+    if ((type == "integer" || type == "number") && !v.empty()) {
+        const char* s = v.c_str();
+        char* end = nullptr;
+        if (type == "integer") {
+            const long long n = std::strtoll(s, &end, 10);
+            if (end != s && *end == '\0') return xjson(n);
+        } else if (std::isdigit(static_cast<unsigned char>(v[0])) || v[0] == '-' || v[0] == '+' || v[0] == '.') {
+            const double d = std::strtod(s, &end);
+            if (end != s && *end == '\0' && std::isfinite(d)) return xjson(d);
+        }
+    }
+    if ((type == "array" || type == "object") && v.find('\'') != std::string::npos && v.find('"') == std::string::npos) {
+        std::string w = v;
+        for (auto& c : w) if (c == '\'') c = '"';
+        xjson j = xjson::parse(w, nullptr, /*allow_exceptions=*/false);
+        if (!j.is_discarded()) return j;
+    }
+    return xjson(v);
+}
+
+// The template writes "<parameter=K>\n" + V + "\n</parameter>": one newline each side is the format's, not the value's.
+std::string xml_strip_one_newline(std::string_view v) {
+    if (!v.empty() && v.front() == '\n') v.remove_prefix(1);
+    if (!v.empty() && v.back() == '\n') v.remove_suffix(1);
+    return std::string(v);
+}
+
+size_t xml_skip(std::string_view s, size_t i, std::string_view set) {
+    while (i < s.size() && set.find(s[i]) != std::string_view::npos) ++i;
+    return i;
+}
+
+// One <tool_call> body -> the call. `complete`: the block's own end marker was
+// seen (</function>, or a closed arguments object), so an unterminated last
+// <tool_call> may be accepted. A function the tools array does not list is
+// rejected (a quoted example, a salvage from prose).
+bool xml_call_from_body(std::string_view body, const xjson& tools, xjson& call, bool& complete) {
+    complete = false;
+    const size_t f0 = body.find("<function=");
+    std::string name;
+    xjson args = xjson::object();
+    std::string args_text;   // set when the arguments come as a string (the JSON form), else args.dump()
+    if (f0 != std::string_view::npos) {
+        const size_t f1 = body.find('>', f0 + 10);
+        if (f1 == std::string_view::npos) return false;
+        name = std::string(xml_trim(body.substr(f0 + 10, f1 - (f0 + 10))));
+        if (name.empty()) return false;
+        const size_t fe = body.find("</function>", f1);
+        complete = fe != std::string_view::npos;
+        const std::string_view inner = body.substr(f1 + 1, complete ? fe - (f1 + 1) : std::string_view::npos);
+        for (size_t q = inner.find("<parameter="); q != std::string_view::npos;) {
+            const size_t k1 = inner.find('>', q + 11);
+            if (k1 == std::string_view::npos) break;
+            const std::string key(xml_trim(inner.substr(q + 11, k1 - (q + 11))));
+            const size_t ve = inner.find("</parameter>", k1), nx = inner.find("<parameter=", k1);
+            std::string_view v;
+            if (ve != std::string_view::npos && (nx == std::string_view::npos || ve < nx)) {
+                v = inner.substr(k1 + 1, ve - (k1 + 1));
+                q = inner.find("<parameter=", ve + 12);
+            } else {   // no </parameter> before the next parameter / the end: the value runs there
+                v = inner.substr(k1 + 1, (nx == std::string_view::npos ? inner.size() : nx) - (k1 + 1));
+                while (!v.empty() && (v.back() == '\n' || v.back() == ' ')) v.remove_suffix(1);
+                q = nx;
+            }
+            if (!key.empty()) args[key] = xml_typed_value(xml_strip_one_newline(v), xml_param_type(tools, name, key));
+        }
+    } else if (xjson j = xjson::parse(xml_trim(body), nullptr, /*allow_exceptions=*/false);
+               j.is_object() && j.contains("name") && j["name"].is_string()) {
+        // The Qwen3 JSON form `{"name": "f", "arguments": {..}}` (a mixed reply keeps every call).
+        name = j["name"].get<std::string>();
+        if (j.contains("arguments") && !j["arguments"].is_null()) {
+            if (j["arguments"].is_string()) args_text = j["arguments"].get<std::string>();
+            else args = j["arguments"];
+        }
+        complete = true;
+    } else {
+        // Salvage of the hybrids: `<name="f", "arguments": {..}}`, `{"name="f",arguments={..}}`,
+        // `<name>f</name><arguments>{..}</arguments>`.
+        static constexpr std::string_view kJunk = " \t\r\n\"'=:>";
+        const size_t kn = body.find("name");
+        if (kn == std::string_view::npos) return false;
+        size_t p = xml_skip(body, kn + 4, kJunk), q = p;
+        while (q < body.size() && (std::isalnum(static_cast<unsigned char>(body[q])) || body[q] == '_' ||
+                                   body[q] == '-' || body[q] == '.')) ++q;
+        if (q == p) return false;
+        name = std::string(body.substr(p, q - p));
+        const size_t ka = body.find("arguments", q);
+        if (ka == std::string_view::npos) {
+            complete = true;   // a call without arguments
+        } else {
+            size_t a = xml_skip(body, ka + 9, kJunk);
+            if (a >= body.size() || body[a] != '{') return false;
+            int depth = 0; bool instr = false, esc = false; size_t b = a;
+            for (; b < body.size(); ++b) {
+                const char c = body[b];
+                if (instr) {
+                    if (esc) esc = false;
+                    else if (c == '\\') esc = true;
+                    else if (c == '"') instr = false;
+                } else if (c == '"') instr = true;
+                else if (c == '{') ++depth;
+                else if (c == '}') { if (--depth == 0) { ++b; break; } }
+            }
+            if (depth != 0) return false;
+            xjson av = xjson::parse(body.substr(a, b - a), nullptr, /*allow_exceptions=*/false);
+            if (!av.is_object()) return false;
+            args = std::move(av);
+            complete = true;
+        }
+    }
+    if (!xml_known_function(tools, name)) return false;
+    if (args_text.empty()) args_text = args.dump();
+    call = {{"type", "function"}, {"function", {{"name", name}, {"arguments", args_text}}}};
+    return true;
+}
+
+}  // namespace
+
+ChatmlXmlTools chatml_xml_tools_from_template(std::string_view chat_template) {
+    ChatmlXmlTools t;
+    t.enabled = chat_template.find("<function=") != std::string_view::npos;
+    t.think_all_history = t.enabled && chat_template.find("preserve_thinking is undefined") != std::string_view::npos;
+    return t;
+}
+
+ChatmlToolCalls parse_chatml_xml_tool_calls(std::string_view text, std::string_view tools_json, size_t answer_start) {
+    static constexpr std::string_view OPEN = "<tool_call>", CLOSE = "</tool_call>";
+    ChatmlToolCalls r;
+    if (answer_start == std::string::npos || answer_start >= text.size()) { r.content = std::string(text); return r; }
+    const xjson tools = tools_json.empty() ? xjson() : xjson::parse(tools_json, nullptr, /*allow_exceptions=*/false);
+    xjson calls = xjson::array();
+    std::string content(text.substr(0, answer_start));   // the reasoning: never scanned, kept verbatim
+    size_t pos = answer_start;
+    while (true) {
+        const size_t s = text.find(OPEN, pos);
+        if (s == std::string_view::npos) { content += text.substr(pos); break; }
+        content += text.substr(pos, s - pos);
+        const size_t is = s + OPEN.size();
+        const size_t e = text.find(CLOSE, is);
+        std::string_view body = text.substr(is, e == std::string_view::npos ? std::string_view::npos : e - is);
+        if (e == std::string_view::npos) {
+            // A trailing bare re-open is the model's malformed close.
+            const size_t reopen = body.rfind(OPEN);
+            if (reopen != std::string_view::npos && xml_trim(body.substr(reopen + OPEN.size())).empty())
+                body = body.substr(0, reopen);
+        }
+        xjson call;
+        bool complete = false;
+        if (xml_call_from_body(body, tools, call, complete) && (e != std::string_view::npos || complete)) {
+            calls.push_back(std::move(call));
+        } else {
+            content += text.substr(s, e == std::string_view::npos ? std::string_view::npos : (e + CLOSE.size()) - s);
+        }
+        if (e == std::string_view::npos) break;
+        pos = e + CLOSE.size();
+    }
+    if (calls.empty()) { r.content = std::string(text); return r; }
+    r.content = std::move(content);
+    r.tool_calls_json = calls.dump();
+    return r;
+}
+
+ChatmlToolCalls parse_chatml_xml_tail_calls(std::string_view text, std::string_view tools_json) {
+    static constexpr std::string_view OPEN = "<tool_call>";
+    // The leftmost block start from which every block is accepted and nothing but
+    // whitespace remains outside them is the maximal run that ends the reply.
+    for (size_t s = text.find(OPEN); s != std::string_view::npos; s = text.find(OPEN, s + OPEN.size())) {
+        ChatmlToolCalls r = parse_chatml_xml_tool_calls(text, tools_json, s);
+        if (r.tool_calls_json.empty()) continue;
+        // r.content = text before s + the residue outside the accepted blocks from s on
+        if (xml_trim(std::string_view(r.content).substr(s)).empty()) return r;
+    }
+    ChatmlToolCalls none;
+    none.content = std::string(text);
+    return none;
+}
+
+// ---- P4 B35: the reasoning split of a Qwen thinking reply ----
+namespace {
+constexpr std::string_view kQwenThinkClose = "</think>";
+std::string_view strip_newlines(std::string_view s) {
+    while (!s.empty() && s.front() == '\n') s.remove_prefix(1);
+    while (!s.empty() && s.back() == '\n') s.remove_suffix(1);
+    return s;
+}
+}  // namespace
+
+ChatmlThinkSplit split_chatml_think(std::string_view text) {
+    ChatmlThinkSplit r;
+    const size_t at = text.find(kQwenThinkClose);
+    if (at == std::string_view::npos) { r.reasoning = std::string(strip_newlines(text)); return r; }
+    r.reasoning = std::string(strip_newlines(text.substr(0, at)));
+    std::string_view rest = text.substr(at + kQwenThinkClose.size());
+    while (!rest.empty() && rest.front() == '\n') rest.remove_prefix(1);
+    r.content = std::string(rest);
+    return r;
+}
+
+void ChatmlThinkStream::update(std::string_view t) {
+    static constexpr std::string_view kTool = "<tool_call>";
+    if (close_ == std::string_view::npos) {   // each scan resumes where a match could still begin
+        close_ = t.find(kQwenThinkClose, seen_ >= kQwenThinkClose.size() ? seen_ - kQwenThinkClose.size() + 1 : 0);
+        if (tool_ == std::string_view::npos) tool_ = t.find(kTool, seen_ >= kTool.size() ? seen_ - kTool.size() + 1 : 0);
+        seen_ = t.size();
+    }
+    // the reasoning's leading '\n's (its start is fixed at its first other byte)
+    const size_t lim = std::min(close_, t.size());
+    while (begin_ < lim && t[begin_] == '\n') ++begin_;
+    // its end: the tag; while open, short of a forming tag / call (the longer of the two) and of the first <tool_call>
+    size_t e = close_ != std::string_view::npos ? close_ : std::min(t.size() > kTool.size() ? t.size() - kTool.size() : 0, tool_);
+    while (e > begin_ && t[e - 1] == '\n') --e;
+    end_ = std::max(e, begin_);
+    if (close_ != std::string_view::npos) {
+        content_ = std::max(content_, close_ + kQwenThinkClose.size());
+        while (content_ < t.size() && t[content_] == '\n') ++content_;
+    }
+}
+
+std::string_view ChatmlThinkStream::rest_of(std::string_view engine_reasoning, size_t sent) const noexcept {
+    const size_t done = sent > begin_ ? sent - begin_ : 0;
+    return done < engine_reasoning.size() ? engine_reasoning.substr(done) : std::string_view{};
+}
+
 std::string build_chatml_prompt(std::span<const ChatTurn> turns,
                                 bool add_generation_prompt,
                                 bool enable_thinking,
                                 std::string_view tools_json,
                                 bool model_has_think,
-                                std::string_view reasoning_preamble) {
+                                std::string_view reasoning_preamble,
+                                ChatmlXmlTools xml) {
+    if (xml.enabled && !tools_json.empty())
+        return build_chatml_xml_prompt(turns, add_generation_prompt, enable_thinking, tools_json, model_has_think,
+                                       reasoning_preamble, xml.think_all_history);
     std::string s;
     size_t i = 0;
     const size_t n = turns.size();

@@ -19,6 +19,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -78,10 +79,45 @@ struct FakeModel final : ie::LanesModel {
     std::atomic<bool> in_mark{false};
     std::vector<uint32_t> pf_log;                       // the lanes of the pipe's prefill pieces (stage 0), in order
     int prep_sleep_ms = 0;
+    // P4 B33: a prefill piece takes pf_ms 1-ms "layers" per stage (the pipe's and the serial turn's); abort() drops the pipe's
+    // waiting steps and stops a running piece at its next layer boundary, as the crown's Q35mLanesModel::abort does
+    std::atomic<int> pf_ms{0};
+    std::atomic<bool> aborted{false};
+    std::atomic<uint32_t> calls_after_abort{0}, preps{0}, serial_chunks{0};
+    uint32_t abort() override { const uint32_t h = pipe.cancel(); aborted = true; return h; }
+    std::string layers(uint32_t T) {
+        for (int i = 0; T > 1 && i < pf_ms.load(); ++i) {
+            if (aborted.load()) return "stopped at a layer boundary";
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        return {};
+    }
 
-    explicit FakeModel(std::vector<uint32_t> caps)
+    // P4 B34: the lane pipeline (as the crown's Q35mLanesModel has it: the pipe with lookahead slots, its idle hook); `tl` =
+    // every prefill piece's stage run (stage, lane, pos0, t0, t1 ms) while `record`; a piece of lane hold_lane at hold_pos
+    // holds stage 1, the one after it holds stage 0, both until abort()
+    bool pipeline_on = false;
+    std::atomic<bool> record{false};
+    std::vector<std::tuple<uint32_t, uint32_t, uint32_t, double, double>> tl;
+    std::atomic<int> hold_lane{-1};
+    std::atomic<uint32_t> hold_pos{0};
+    std::atomic<bool> held_at[2] = {false, false};
+    const std::chrono::steady_clock::time_point t_base = std::chrono::steady_clock::now();
+    double now_ms() const { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_base).count(); }
+    bool pipe_lookahead(std::function<void()> idle) override {
+        if (!pipeline_on) return false;
+        pipe.set_idle(std::move(idle));
+        return true;
+    }
+    std::string pipe_submit_ahead(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool& taken) override {
+        return pipe.submit_ahead(lane, ids, T, pos0, taken);
+    }
+
+    explicit FakeModel(std::vector<uint32_t> caps, bool pipeline = false)
         : st(caps.size()), cap(caps),
-          pipe(uint32_t(caps.size()), 8, 1, 2, [this](uint32_t s, const ie::Glm5LanePipe::Step& x) { return stage(s, x); }) {}
+          pipe(uint32_t(caps.size()), 8, 1, 2, [this](uint32_t s, const ie::Glm5LanePipe::Step& x) { return stage(s, x); }, pipeline) {
+        pipeline_on = pipeline;
+    }
 
     std::string forward(uint32_t lane, uint32_t s, const int32_t* ids, uint32_t T, uint32_t pos0) {
         St& L = st[lane];
@@ -95,13 +131,23 @@ struct FakeModel final : ie::LanesModel {
         return {};
     }
     std::string stage(uint32_t s, const ie::Glm5LanePipe::Step& x) {
+        if (aborted.load()) ++calls_after_abort;
+        const double t0 = now_ms();
         const int a = ++active;
         for (int m = max_active.load(); a > m && !max_active.compare_exchange_weak(m, a);) {}
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         --active;
         if (fail_stage.load() == int(s)) { fail_stage = -1; return "injected failure"; }
         if (s == 0 && x.T > 1) { std::lock_guard<std::mutex> g(mu); pf_log.push_back(x.lane); }
-        return forward(x.lane, s, x.ids, x.T, x.pos0);
+        if (int(x.lane) == hold_lane.load() && x.T > 1 && x.pos0 == hold_pos.load() + (s == 0 ? chunk : 0)) {   // (P4 B34)
+            held_at[s] = true;
+            while (!aborted.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return "stopped at a layer boundary";
+        }
+        if (auto e = layers(x.T); !e.empty()) return e;
+        std::string e = forward(x.lane, s, x.ids, x.T, x.pos0);
+        if (record.load() && x.T > 1) { std::lock_guard<std::mutex> g(mu); tl.emplace_back(s, x.lane, x.pos0, t0, now_ms()); }
+        return e;
     }
     const char* tag() const override { return "fake lanes"; }
     uint32_t n_lanes() const override { return uint32_t(st.size()); }
@@ -133,6 +179,7 @@ struct FakeModel final : ie::LanesModel {
         return shared ? shared_match(*rq.ids) : 0;
     }
     std::string prefix_prepare(uint32_t lane, const ie::LanesRequest& rq, uint32_t& reused, std::string& source) override {
+        ++preps;
         if (prep_sleep_ms) std::this_thread::sleep_for(std::chrono::milliseconds(prep_sleep_ms));
         St& L = st[lane];
         const uint32_t D = ie::q4e_snap_match(L.snap, *rq.ids);
@@ -172,8 +219,11 @@ struct FakeModel final : ie::LanesModel {
         done = 0;
         for (size_t k = 0; k < ch.size(); ++k) {
             if (k > 0 && stop && stop()) break;
-            for (uint32_t s = 0; s < 2; ++s)
+            ++serial_chunks;
+            for (uint32_t s = 0; s < 2; ++s) {
+                if (auto e = layers(ch[k].second); !e.empty()) return e;
                 if (auto e = forward(lane, s, rq.ids->data() + ch[k].first, ch[k].second, ch[k].first); !e.empty()) return e;
+            }
             ++done;
         }
         return {};
@@ -679,6 +729,191 @@ void test_handover_budget() {
         s.shutdown();
     }
 }
+// P4 B33: LanesServe::abort_all (the server's stop) -- every request ends with "abort" at once, nothing new starts on a stage,
+// the pipe's waiting pieces are dropped, a running piece ends at its next layer boundary and shutdown() waits only for it.
+void test_abort_all() {
+    using Clock = std::chrono::steady_clock;
+    auto ms_since = [](Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); };
+    auto pieces = [](FakeModel& m) { std::lock_guard<std::mutex> g(m.mu); return m.pf_log.size(); };
+    // (a) mid-prefill through the pipe: a decoding lane, two new 60-token prompts in 5-row pieces of 20 ms a stage (24 pieces,
+    // ~0.5 s each prompt) beside it; the stop 120 ms in
+    {
+        FakeModel m({4000, 4000, 4000});
+        ie::LanesServe s(m, {});
+        Req d(prompt_of(10, 9300), 3000, 70);
+        std::thread td([&] { d.run(s); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        m.pf_ms = 20;
+        Req p1(prompt_of(60, 9400), 20, 71), p2(prompt_of(60, 9500), 20, 72);
+        std::thread t1([&] { p1.run(s); }), t2([&] { p2.run(s); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+        const size_t before = pieces(m);
+        const auto t0 = Clock::now();
+        const uint32_t held = s.abort_all();
+        const double abort_ms = ms_since(t0);
+        td.join(); t1.join(); t2.join();
+        const double join_ms = ms_since(t0);
+        const uint32_t preps = m.preps.load();
+        Req late(prompt_of(12, 9800), 5, 75);
+        late.run(s);
+        s.shutdown();
+        const double down_ms = ms_since(t0);
+        const size_t after = pieces(m);
+        check(abort_ms < 50, "stop mid-prefill: abort_all does not block (" + std::to_string(int(abort_ms)) + " ms)");
+        check(d.res.finish_reason == "abort" && p1.res.finish_reason == "abort" && p2.res.finish_reason == "abort",
+              "stop mid-prefill: the decoding request and both prefilling ones end with abort (" + d.res.finish_reason + ", " +
+                  p1.res.finish_reason + ", " + p2.res.finish_reason + ")");
+        const std::string dref = text_of(ref_ids(d.ids, 3000, 70, 0));
+        check(!d.res.text.empty() && dref.compare(0, d.res.text.size(), d.res.text) == 0,
+              "stop mid-prefill: the decoding request's ids before the stop == its reference's (" + std::to_string(d.res.completion_tokens) + " ids)");
+        check(join_ms < 200, "stop mid-prefill: every request returned at once, not after the pieces (" + std::to_string(int(join_ms)) + " ms)");
+        check(held <= 2 && m.calls_after_abort.load() <= held,
+              "stop mid-prefill: no stage started a step after the stop beyond the " + std::to_string(held) + " a stage held (" +
+                  std::to_string(m.calls_after_abort.load()) + " stage calls after)");
+        check(before < 24 && after <= before + held + 1 && after < 24,
+              "stop mid-prefill: the waiting pieces were dropped (" + std::to_string(before) + " pieces before the stop, " +
+                  std::to_string(after) + " in all, of 24)");
+        check(down_ms < 400, "stop mid-prefill: shutdown waited only for the held step's next layer boundary (" + std::to_string(int(down_ms)) + " ms)");
+        check(late.res.finish_reason == "abort" && m.preps.load() == preps, "a request after the stop is refused (abort) before any device work");
+        check(m.bad == 0, "stop mid-prefill: no stage saw a wrong position");
+    }
+    // (b) mid-serial-turn: a lone 80-token prompt prefills in the serial turn (16 chunks x 2 stages x 20 ms); the stop 100 ms in
+    // ends its chunk at a layer boundary and no next chunk starts
+    {
+        FakeModel m({400});
+        m.pf_ms = 20;
+        ie::LanesServe s(m, {});
+        Req a(prompt_of(80, 9600), 20, 73);
+        std::thread ta([&] { a.run(s); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        const auto t0 = Clock::now();
+        const uint32_t held = s.abort_all();
+        ta.join();
+        const double join_ms = ms_since(t0);
+        s.shutdown();
+        check(a.res.finish_reason == "abort" && held == 1 && m.serial_chunks.load() < 16 && join_ms < 100,
+              "stop in the serial turn: abort (" + a.res.finish_reason + "), the turn's work counted (" + std::to_string(held) + "), " +
+                  std::to_string(m.serial_chunks.load()) + " of 16 chunks, returned in " + std::to_string(int(join_ms)) + " ms");
+    }
+    // (c) a request waiting for the turn while the holder's (uninterruptible) prefix step runs: refused at once, never prepared
+    {
+        FakeModel m({400, 400});
+        m.prep_sleep_ms = 300;
+        ie::LanesServe s(m, {});
+        Req a(prompt_of(20, 9900), 20, 76), b(prompt_of(20, 9950), 20, 77);
+        std::thread ta([&] { a.run(s); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        std::thread tb([&] { b.run(s); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        const auto t0 = Clock::now();
+        s.abort_all();
+        tb.join();
+        const double b_ms = ms_since(t0);
+        ta.join();
+        s.shutdown();
+        check(b.res.finish_reason == "abort" && b_ms < 100 && m.preps.load() == 1,
+              "stop: a request waiting for the turn is refused at once (" + std::to_string(int(b_ms)) + " ms), never prepared");
+        check(a.res.finish_reason == "abort", "stop: the turn holder ends with abort after its prefix step (" + a.res.finish_reason + ")");
+    }
+    // (d) nothing in flight: 0 steps; the server refuses later requests
+    {
+        FakeModel m({400});
+        ie::LanesServe s(m, {});
+        Req a(prompt_of(15, 9990), 5, 78);
+        a.run(s);
+        const uint32_t held = s.abort_all();
+        check(held == 0 && s.abort_all() == 0, "stop with nothing in flight: 0 steps; abort_all again: 0");
+        Req b(prompt_of(15, 9991), 5, 79);
+        b.run(s);
+        s.shutdown();
+        check(a.res.finish_reason == "length" && b.res.finish_reason == "abort", "stop: a finished request is untouched, a later one refused");
+    }
+}
+
+// P4 B34: the lane pipeline -- a prompt prefilling through the pipe beside a decoding lane. On: its pieces overlap across the
+// two stages (piece k + 1 on stage 0 while piece k is on stage 1); off (B10-B33): they never do. Replies == references either
+// way, every stage sees every lane's pieces in order (the fake refuses a step off its stage's depth), /health counts them.
+void test_lane_pipeline() {
+    for (const bool on : {true, false}) {
+        const std::string tag = on ? "lane pipeline ON" : "lane pipeline OFF";
+        FakeModel m({4000, 4000}, on);
+        m.pf_ms = 3;
+        ie::LanesServe s(m, {});
+        Req d(prompt_of(10, 9700), 400, 80);
+        std::thread td([&] { d.run(s); });
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        m.record = true;
+        Req p(prompt_of(80, 9750), 10, 81);   // 16 pieces of 5 rows through the pipe (another lane decodes)
+        p.run(s);
+        m.record = false;
+        td.join();
+        uint32_t pieces = 0, overlaps = 0;
+        bool order = true;
+        {
+            std::lock_guard<std::mutex> g(m.mu);
+            uint32_t last[2] = {0, 0};
+            bool seen[2] = {false, false};
+            for (const auto& [st, ln, p0, t0, t1] : m.tl) {
+                if (ln != p.res.lane) continue;
+                if (st == 0) ++pieces;
+                if (seen[st] && p0 <= last[st]) order = false;
+                seen[st] = true; last[st] = p0;
+                if (st != 0) continue;
+                for (const auto& [st2, ln2, q0, u0, u1] : m.tl)   // the piece before, on stage 1, at the same time
+                    if (st2 == 1 && ln2 == ln && q0 + m.chunk == p0 && t0 < u1 && u0 < t1) ++overlaps;
+            }
+        }
+        const std::string la = status_field(s, "lookaheads");
+        const bool ok = p.res.text == text_of(ref_ids(p.ids, 10, 81, 0)) && d.res.text == text_of(ref_ids(d.ids, 400, 80, 0));
+        check(ok && m.bad == 0, tag + ": the prompt and the decoding lane == their references");
+        check(pieces == 16 && order, tag + ": the prompt's 16 pieces ran each stage in order");
+        if (on) check(overlaps > 0 && la != "0" && !la.empty(), tag + ": " + std::to_string(overlaps) + " of its pieces ran stage 0 while the piece "
+                                                            "before ran stage 1 (lookaheads " + la + ")");
+        else check(overlaps == 0 && la == "0", tag + ": a lane's pieces never overlapped (lookaheads " + la + ")");
+        s.shutdown();
+    }
+}
+
+// P4 B34 + B33: abort_all while a lane has two pieces in flight -- its piece at 50 held on stage 1 and its lookahead at 55 held
+// on stage 0, beside a decoding lane: every request ends "abort" at once, the pipe drops what waits, nothing new starts on a
+// stage, the two held pieces end at their next layer boundary and shutdown waits only for them.
+void test_abort_pipeline() {
+    using Clock = std::chrono::steady_clock;
+    auto ms_since = [](Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); };
+    FakeModel m({4000, 4000}, true);
+    ie::LanesServe s(m, {});
+    Req d(prompt_of(10, 9800), 3000, 82);
+    std::thread td([&] { d.run(s); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+    m.hold_lane = 1; m.hold_pos = 50;
+    Req p(prompt_of(120, 9850), 20, 83);   // 24 pieces; lane 1 (the decoder holds lane 0)
+    std::thread tp([&] { p.run(s); });
+    for (int i = 0; i < 3000 && !(m.held_at[0].load() && m.held_at[1].load()); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    check(m.held_at[0].load() && m.held_at[1].load(), "abort mid-pipeline: lane 1's piece at 50 holds stage 1, its lookahead at 55 stage 0");
+    size_t before = 0;
+    { std::lock_guard<std::mutex> g(m.mu); before = m.pf_log.size(); }
+    const auto t0 = Clock::now();
+    const uint32_t held = s.abort_all();
+    const double abort_ms = ms_since(t0);
+    td.join(); tp.join();
+    const double join_ms = ms_since(t0);
+    s.shutdown();
+    const double down_ms = ms_since(t0);
+    size_t after = 0;
+    { std::lock_guard<std::mutex> g(m.mu); after = m.pf_log.size(); }
+    check(abort_ms < 50 && join_ms < 200, "abort mid-pipeline: abort_all does not block (" + std::to_string(int(abort_ms)) + " ms), every request returned (" +
+                                              std::to_string(int(join_ms)) + " ms)");
+    check(d.res.finish_reason == "abort" && p.res.finish_reason == "abort", "abort mid-pipeline: both requests end with abort (" +
+                                                                                 d.res.finish_reason + ", " + p.res.finish_reason + ")");
+    const std::string dref = text_of(ref_ids(d.ids, 3000, 82, 0));
+    check(!d.res.text.empty() && dref.compare(0, d.res.text.size(), d.res.text) == 0, "abort mid-pipeline: the decoder's ids so far == its reference's");
+    check(held == 2 && m.calls_after_abort.load() == 0, "abort mid-pipeline: the stages held the lane's two pieces (" + std::to_string(held) +
+                                                            "), no stage started anything after the stop (" + std::to_string(m.calls_after_abort.load()) + ")");
+    check(after == before && after < 24, "abort mid-pipeline: no piece started after the stop (" + std::to_string(after) + " of 24 ran stage 0)");
+    check(down_ms < 400, "abort mid-pipeline: shutdown waited only for the two held pieces' layer boundary (" + std::to_string(int(down_ms)) + " ms)");
+    check(m.bad == 0, "abort mid-pipeline: no stage saw a wrong position");
+}
+
 }  // namespace
 
 int main() {
@@ -692,6 +927,9 @@ int main() {
     test_shared_prefix();
     test_prefill_fifo();
     test_handover_budget();
+    test_abort_all();
+    test_lane_pipeline();
+    test_abort_pipeline();
     std::printf("%s\n", g_fail ? "LANES SERVE TEST: FAIL" : "LANES SERVE TEST: PASS");
     return g_fail ? 1 : 0;
 }

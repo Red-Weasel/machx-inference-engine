@@ -43,10 +43,14 @@ add_library(ie_core
   ops/gemv_iq_raw.cpp
   ops/gemv_fp16.cpp
   ops/gemv_q8dot.cpp
+  ops/gemv_q8_soa_batched_v2.cpp
+  ops/gemv_q8_soa_nd.cpp
+  ops/gemv_q8_soa_g_nd.cpp
   ops/gemv_fp8.cpp
   ${IE_ONEDNN_SRC}
   ops/gemv_q6k.cpp
   ops/gemv_q6_soa.cpp
+  ops/gemv_kq_c32.cpp
   ops/gemv_q4_soa.cpp
   ops/gemv_q2_0_soa.cpp
   ops/gemv_q1_0_soa.cpp
@@ -85,6 +89,9 @@ add_library(ie_core
   ops/moe_qwen3.cpp
   ops/moe_gemma4.cpp
   ops/moe_q8.cpp
+  ops/moe_q8_down_v2.cpp
+  ops/moe_q8_gate_up_v2.cpp
+  ops/moe_q8_decode_v2.cpp
   ops/sampling.cpp
   ops/embedding.cpp
   tokenizer/tokenizer.cpp
@@ -170,6 +177,10 @@ set_source_files_properties(model/ds41_vision.cpp PROPERTIES
   COMPILE_OPTIONS "-fp-model=precise")
 # the MiMo-V2.6 resize plan must round exactly as Python does (docs/mimo26/00_PORT_PLAN.md, P6.1)
 set_source_files_properties(model/mimo26_vision.cpp PROPERTIES
+  COMPILE_OPTIONS "-fp-model=precise")
+# P4 B21: the c32 K-quant GEMV serves T = 1 and the T-row lanes from one template; the precise model keeps the compiler
+# from re-associating a row's float fold differently per bucket (row t of T rows == the T = 1 call, bit for bit).
+set_source_files_properties(ops/gemv_kq_c32.cpp PROPERTIES
   COMPILE_OPTIONS "-fp-model=precise")
 set_source_files_properties(model/deepseek41_engram.cpp PROPERTIES
   COMPILE_OPTIONS "-fopenmp")

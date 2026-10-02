@@ -1,5 +1,27 @@
 # IE Engine — v1 RELEASE
 
+> **Current release: v0.2.6 (October 2026).** This file is the record of the first release, of June 9, 2026, kept as
+> written; its figures are for one Arc Pro B70 and a Q4_K_M model and are not comparable with the two-card figures
+> below. Later releases are described in the README ("New in v0.2.6", "In v0.2.0") and in the GitHub release notes:
+> [v0.2.6](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.6),
+> [v0.2.0](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.0),
+> [v0.1.0](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.1.0).
+>
+> **v0.2.6 in short** (two Arc Pro B70 cards, measured September 29 – October 1, 2026):
+> - Agent swarms on the Qwen3.6-35B-A3B class (Q8_0): a replay of 15 agents that read and write at once, which did
+>   not finish in 336 s before, takes 139.7 s; a shared system prompt is read once, conversations resume in their
+>   lane, both cards work during a deep prefill, short requests go first, and workers keep writing while a long
+>   prompt prefills.
+> - `ie serve` without `--parallel` picks the number of request lanes (`--parallel auto`); `/props` reports
+>   `slot_ctx`; an orderly stop takes 0.43–1.08 s where it took 14.58–49.70 s.
+> - XML `<function=` tool calls are returned as structured `tool_calls`, and thinking as `reasoning_content`, on the
+>   Qwen thinking templates.
+> - Native integer-dot Q8_0 kernels, bit-identical: one request's prefill on the 35B-A3B class takes 34–36 % less
+>   time at 2–8K tokens, and Qwen3.8-27B at 16 lanes goes from 113.8 to 153.5 tok/s.
+> - Native Q6_K / Q5_K on the 27B and 35B-A3B splits: Qwen3.8-27B Q6_K 5.2 → 22.0 tok/s, and Q5_K_M loads (24.0).
+> - Still slow: with 15 agents reading at once an agent decodes at a median 8.1 tok/s (25.9 when 16 only write), and
+>   a deep prefill beside workers that write long replies is about 22 % slower (`IE_Q35MOE_DECODE_QUOTA=0` reverts).
+
 **Date:** 2026-06-09
 **Engine state:** commit `5088da1` + release-checklist fixes
 **Hardware:** Intel Arc Pro B70 (BMG-G31, 32 GB GDDR6, Xe2-HPG, 608 GB/s)

@@ -24,8 +24,22 @@
 //    new sequence (pos0 0, which every stage resets), also after a restart.
 //  * stop() waits until no step is in flight (a callback that keeps resubmitting keeps it waiting), then joins the stage
 //    threads. Called from a stage thread (a done callback) it refuses instead of deadlocking.
+//  * P4 B33: cancel() is for a process stop: every step waiting for a stage is dropped at once (its lane released; one that
+//    a stage already ran is half-stepped and marked failed, as a stage error marks it), a step a stage finishes after it goes
+//    to no other stage and runs no done callback, and every submit is refused until the next start(). It never blocks; it
+//    returns the steps a stage was running then, the only ones a stop() after it still waits for.
 //  * The per-lane host buffers (the step's ids and the residual crossing the stages) are allocated AND touched by the
 //    constructor: build the pipe before loading the model and the pinning floor's MemAvailable check counts them.
+//  * P4 B34 lookahead (a pipe built with `ahead`): submit_ahead queues a lane's NEXT step while its one step in flight is
+//    past stage 0 (on a later stage, queued for it, or between) and not in its callback, at pos0 = that step's end, in the
+//    lane's second buffer set (allocated by the constructor too) -- and only while stage 0 is idle (nothing queued, nothing
+//    running), so a lookahead never delays another step there. The stage queues are FIFO, so every stage runs a lane's
+//    steps in submission order: its launches per card are those of the steps one after another. A lane then holds two
+//    claims; the older step's callback may not resubmit (the next step is in flight already), and when it returns without
+//    one the lookahead is the lane's step in flight. A lookahead is never forced: anything else answers "not taken".
+//    `idle` (start / start_rows) runs unlocked whenever stage 0 is idle and a lookahead may have become possible: on stage
+//    0's thread after it finished a step, and on the last stage's thread after a step there left its lane with one step in
+//    flight past stage 0. Without `ahead` nothing of this exists.
 //
 // Rows mode (P4 B14 phase 1b, start_rows; MiMo B3's group protocol, docs/mimo26/P4_B3_ROWS.md): stage 0 gathers the queued
 // lanes into a GROUP that crosses the stages as a unit, so one card step serves several lanes' decode rows.
@@ -75,8 +89,9 @@ public:
     using RowsStageFn = std::function<std::string(uint32_t stage, std::span<const Step> steps, float* gwide)>;
     // Rows mode: a group of G >= 2 lanes finished its last stage (every position committed); may resubmit each lane once.
     using RowsDoneFn = std::function<void(std::span<const uint32_t> lanes)>;
+    using IdleFn = std::function<void()>;   // P4 B34: stage 0 finished a step and has nothing queued (see the header)
 
-    Glm5LanePipe(uint32_t n_lanes, uint32_t max_T, uint64_t wide_row);
+    Glm5LanePipe(uint32_t n_lanes, uint32_t max_T, uint64_t wide_row, bool ahead = false);
     ~Glm5LanePipe();
     Glm5LanePipe(const Glm5LanePipe&) = delete;
     Glm5LanePipe& operator=(const Glm5LanePipe&) = delete;
@@ -85,10 +100,10 @@ public:
     uint32_t max_T() const { return max_T_; }
     uint64_t host_bytes() const;   // the per-lane buffers the constructor allocated
 
-    std::string start(uint32_t n_stages, StageFn stage, DoneFn done);
+    std::string start(uint32_t n_stages, StageFn stage, DoneFn done, IdleFn idle = {});
     // Rows mode (see the header): max_group 1..16 rows a group, group_cap 0 = AUTO.
     std::string start_rows(uint32_t n_stages, StageFn stage, RowsStageFn rows_stage, DoneFn done, RowsDoneFn rows_done,
-                           uint32_t max_group, uint32_t group_cap);
+                           uint32_t max_group, uint32_t group_cap, IdleFn idle = {});
     bool rows_mode() const;
     // Rows mode: allocate (and touch) the group pool's host buffers now, before a start_rows with the same max_group (which
     // then keeps them); a no-op while running
@@ -96,7 +111,10 @@ public:
     // Rows mode: groups that finished every stage since the pipe's first start_rows (cumulative over resumes), by size
     std::vector<uint64_t> group_sizes() const;
     std::string submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0);
+    // P4 B34 (see the header): taken = queued; "" and not taken = not now; an error = a request no lane state allows
+    std::string submit_ahead(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool& taken);
     std::string stop();
+    uint32_t cancel();   // P4 B33 (see the header): drop the waiting steps; returns the steps a stage is running
     bool running() const { return !th_.empty(); }
     uint32_t lane_pos(uint32_t lane) const;   // the lane's committed position
     uint64_t steps_done() const;              // steps that finished every stage since start
@@ -111,19 +129,31 @@ public:
     std::string error() const;                // the latched stage error ("" = none); stop() returns and clears it
 
 private:
+    // A lane's steps live in slots (1, or 2 with `ahead`): slot s = ids[s * max_T ...], wide[s * max_T * wide_row ...]. The
+    // stage queues hold lane * 2 + slot.
     struct Lane {
         std::vector<int32_t> ids;
         std::vector<float> wide;
-        uint32_t T = 0, pos0 = 0, n_pos = 0;
-        bool in_flight = false, in_cb = false, resub = false;
+        uint32_t T[2] = {0, 0}, pos0[2] = {0, 0}, n_pos = 0;
+        uint32_t nfl = 0;      // claims: steps in flight, one in its callback included (0..2; 2 = a lookahead)
+        uint32_t cur = 0;      // the slot of the older step in flight
+        bool at0 = false;      // P4 B34: a step of the lane waits for or runs stage 0
+        bool in_cb = false, resub = false;
         bool failed = false;   // its last step failed part-way: only pos0 0 (a new sequence) may follow
         std::thread::id cb_tid;
     };
     void stage_loop(uint32_t s);
     void stage_loop_rows(uint32_t s);
     void make_groups(uint32_t max_group);   // (mu held or not running)
+    // the group pool: one group per step that can be past stage 0 at once (a step a lane, two with lookahead slots) + the
+    // one stage 0 forms
+    size_t n_groups() const { return lanes_.size() * (ahead_ ? 2 : 1) + 1; }
+    void drop_claim(Lane& ln, uint32_t slot);   // (mu held) a step leaves the pipe without a callback, or its callback returned
+    int32_t* slot_ids(Lane& ln, uint32_t slot) { return ln.ids.data() + size_t(slot) * max_T_; }
+    float*   slot_wide(Lane& ln, uint32_t slot) { return ln.wide.data() + size_t(slot) * max_T_ * wide_row_; }
     struct Group {
         std::vector<uint32_t> lanes;
+        std::vector<uint32_t> slots;   // (P4 B34) each lane's slot
         std::vector<Step> steps;
         std::vector<float> wide;   // [max_group x wide_row]
     };
@@ -136,15 +166,24 @@ private:
     mutable std::mutex mu_;
     std::condition_variable cv_;
     uint32_t busy_ = 0;                     // lanes with a step in flight (claimed through their callback)
+    uint32_t running_ = 0;                  // P4 B33: steps (or groups) a stage thread holds: in its stage or its callback
+    bool cancel_ = false;                   // P4 B33: cancel() since the last start
     bool stop_ = false;
     std::string err_;
     uint64_t steps_ = 0;
     StageFn stage_;
     DoneFn done_;
+    bool ahead_ = false;                    // P4 B34: two slots a lane (submit_ahead)
+    IdleFn idle_;
+    bool s0_busy_ = false;                  // P4 B34: stage 0 runs a step (or group)
+    // (mu held) P4 B34: stage 0 is idle and the lane may take a lookahead now -- worth calling idle_
+    bool ahead_possible(const Lane& ln) const {
+        return idle_ && !cancel_ && !s0_busy_ && q_[0].empty() && ln.nfl == 1 && !ln.at0 && !ln.in_cb;
+    }
     // rows mode
     bool rows_ = false, pgate_ = false;
     uint32_t max_group_ = 1, group_cap_ = 0;
-    std::vector<Group> groups_;              // pool: n_lanes + 1 (a lane is in at most one group)
+    std::vector<Group> groups_;              // pool: n_groups() (a step is in at most one group)
     std::vector<uint32_t> gfree_;
     std::vector<std::deque<uint32_t>> gq_;   // [stage >= 1] groups waiting for it, FIFO
     std::vector<uint64_t> gsizes_;

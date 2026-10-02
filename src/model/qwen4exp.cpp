@@ -13,6 +13,7 @@
 #include "ie/quant_blocks.hpp"
 #include "ie/qwen4_hc.hpp"
 #include "ie/deepseek4_attn.hpp"
+#include "ie/gemv_q8_soa_v2.hpp"   // P4 B37: the v2 int-dot GEMV selectors
 #include "ie/kernel_profiler.hpp"
 #include "ie/qwen4_quant.hpp"
 #include "ie/q4e_lanes.hpp"
@@ -1586,7 +1587,7 @@ std::string Qwen4ExpModel::logits_rows(uint32_t T, sycl::half* out) {
         quantize_q8_1(q, mixed_, act_q8T_, T * H);
         for (uint32_t t0 = 0; t0 < T; t0 += 16) {
             const uint32_t tn = std::min(16u, T - t0);
-            gemv_q8_0_soa_q8_batched(q,
+            gemv_q8_0_soa_q8_batched_sel(q,
                 static_cast<const uint8_t*>(act_q8T_) +
                     uint64_t(t0) * (H / 32) * sizeof(block_q8_1x),
                 lmh_q8.qs, lmh_q8.d, out + uint64_t(t0) * V, H, V, tn);
@@ -1847,7 +1848,7 @@ std::string Qwen4ExpModel::mtp_draft(int32_t t_next, uint32_t pos, uint32_t K,
                                 H, cfg_.vocab);
         } else if (lmh_q8.qs && qwen4exp_dense_q8()) {
             quantize_q8_1(q, mixed_, act_q8_, H);
-            gemv_q8_0_soa_q8_g(q, act_q8_, lmh_q8.qs, lmh_q8.d, logits_, H, cfg_.vocab);
+            gemv_q8_0_soa_q8_g_sel(q, act_q8_, lmh_q8.qs, lmh_q8.d, logits_, H, cfg_.vocab);
         } else {
             // Draft vocab cap (IE_Q4E_DRAFT_VCAP, default 65536): drafts
             // over a prefix vocab; misses only lower accept rate.
@@ -2193,11 +2194,11 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
         if (T == 1) {
             if (dense_a16()) { gemv_q8_0_soa_f16_g(q, X, Wq.qs, Wq.d, Y, K, N); return; }
             quantize_q8_1(q, X, act_q8_, K);
-            gemv_q8_0_soa_q8_g(q, act_q8_, Wq.qs, Wq.d, Y, K, N);
+            gemv_q8_0_soa_q8_g_sel(q, act_q8_, Wq.qs, Wq.d, Y, K, N);
         } else if (T <= 16) {
             if (dense_a16()) { gemv_q8_0_soa_f16_rows(q, X, Wq.qs, Wq.d, Y, K, N, T); return; }
             quantize_q8_1(q, X, act_q8T_, T * K);
-            gemv_q8_0_soa_q8_batched(q, act_q8T_, Wq.qs, Wq.d, Y, K, N, T);
+            gemv_q8_0_soa_q8_batched_sel(q, act_q8T_, Wq.qs, Wq.d, Y, K, N, T);
         } else {
             // T>16 prefill: oneDNN s8 weight-decompression GEMM reads the
             // int8 SoA plane IN PLACE against the KB-major dt scale plane —
@@ -2467,8 +2468,8 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                                            dn_qkv_, H, CC, T);
                 } else if (T == 1) {
                     quantize_q8_1(q, mixed_, act_q8_, H);
-                    gemv_q8_0_soa_q8_g(q, act_q8_, w.qkv_q8.qs, w.qkv_q8.d,
-                                       dn_qkv_, H, CC);
+                    gemv_q8_0_soa_q8_g_sel(q, act_q8_, w.qkv_q8.qs, w.qkv_q8.d,
+                                           dn_qkv_, H, CC);
                 } else if (T <= 16) {
                     quantize_q8_1(q, mixed_, act_q8T_, T * H);
                     // T_MAX=16 accumulators in the batched kernel — chunk
@@ -2476,7 +2477,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                     // 2026-08-27 when this env path first ran at chunk size).
                     for (uint32_t t0 = 0; t0 < T; t0 += 16) {
                         const uint32_t tn = std::min(16u, T - t0);
-                        gemv_q8_0_soa_q8_batched(q,
+                        gemv_q8_0_soa_q8_batched_sel(q,
                             static_cast<const uint8_t*>(act_q8T_) +
                                 uint64_t(t0) * (H / 32) * sizeof(block_q8_1x),
                             w.qkv_q8.qs, w.qkv_q8.d,
@@ -2551,11 +2552,11 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                     gemv_q8_0_soa_f16_rows(q, mixed_, w.gate_q8.qs, w.gate_q8.d,
                                            dn_z_, H, SI, T);
                 else if (T == 1)
-                    gemv_q8_0_soa_q8_g(q, act_q8_, w.gate_q8.qs, w.gate_q8.d,
-                                       dn_z_, H, SI);
+                    gemv_q8_0_soa_q8_g_sel(q, act_q8_, w.gate_q8.qs, w.gate_q8.d,
+                                           dn_z_, H, SI);
                 else if (T <= 16)
                     for (uint32_t t0 = 0; t0 < T; t0 += 16)
-                        gemv_q8_0_soa_q8_batched(q,
+                        gemv_q8_0_soa_q8_batched_sel(q,
                             static_cast<const uint8_t*>(act_q8T_) +
                                 uint64_t(t0) * (H / 32) * sizeof(block_q8_1x),
                             w.gate_q8.qs, w.gate_q8.d,
@@ -2574,12 +2575,12 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                                            blockout_, SI, H, T);
                 } else if (T == 1) {
                     quantize_q8_1(q, dn_gn_, act_q8_, SI);
-                    gemv_q8_0_soa_q8_g(q, act_q8_, w.out_q8.qs, w.out_q8.d,
-                                       blockout_, SI, H);
+                    gemv_q8_0_soa_q8_g_sel(q, act_q8_, w.out_q8.qs, w.out_q8.d,
+                                           blockout_, SI, H);
                 } else if (T <= 16) {
                     quantize_q8_1(q, dn_gn_, act_q8T_, T * SI);
                     for (uint32_t t0 = 0; t0 < T; t0 += 16)
-                        gemv_q8_0_soa_q8_batched(q,
+                        gemv_q8_0_soa_q8_batched_sel(q,
                             static_cast<const uint8_t*>(act_q8T_) +
                                 uint64_t(t0) * (SI / 32) * sizeof(block_q8_1x),
                             w.out_q8.qs, w.out_q8.d,
@@ -2835,11 +2836,11 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 gemv_q8_0_soa_f16_g(q, sh_h_, w.shd_q8.qs, w.shd_q8.d, sh_y_, SEF, H);
             } else if (w.shg_q8.qs) {
                 quantize_q8_1(q, x, act_q8_, H);
-                gemv_q8_0_soa_q8_g(q, act_q8_, w.shg_q8.qs, w.shg_q8.d, sh_g_, H, SEF);
-                gemv_q8_0_soa_q8_g(q, act_q8_, w.shu_q8.qs, w.shu_q8.d, sh_u_, H, SEF);
+                gemv_q8_0_soa_q8_g_sel(q, act_q8_, w.shg_q8.qs, w.shg_q8.d, sh_g_, H, SEF);
+                gemv_q8_0_soa_q8_g_sel(q, act_q8_, w.shu_q8.qs, w.shu_q8.d, sh_u_, H, SEF);
                 swiglu(q, sh_g_, sh_u_, sh_h_, SEF);
                 quantize_q8_1(q, sh_h_, act_q8_, SEF);
-                gemv_q8_0_soa_q8_g(q, act_q8_, w.shd_q8.qs, w.shd_q8.d, sh_y_, SEF, H);
+                gemv_q8_0_soa_q8_g_sel(q, act_q8_, w.shd_q8.qs, w.shd_q8.d, sh_y_, SEF, H);
             } else {
                 gemv_fp16(q, x, w.ffn_gate_shexp, sh_g_, H, SEF);
                 gemv_fp16(q, x, w.ffn_up_shexp,   sh_u_, H, SEF);
@@ -2902,14 +2903,14 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 // Row-exact int-dot (same leaves as the decode body — the
                 // batched kernel is per-row bit-identical to the T=1 _g).
                 quantize_q8_1(q, mixed_, act_q8T_, T * H);
-                gemv_q8_0_soa_q8_batched(q, act_q8T_, w.shg_q8.qs, w.shg_q8.d,
-                                         moe_gT_, H, SEF, T);
-                gemv_q8_0_soa_q8_batched(q, act_q8T_, w.shu_q8.qs, w.shu_q8.d,
-                                         moe_uT_, H, SEF, T);
+                gemv_q8_0_soa_q8_batched_sel(q, act_q8T_, w.shg_q8.qs, w.shg_q8.d,
+                                             moe_gT_, H, SEF, T);
+                gemv_q8_0_soa_q8_batched_sel(q, act_q8T_, w.shu_q8.qs, w.shu_q8.d,
+                                             moe_uT_, H, SEF, T);
                 swiglu(q, moe_gT_, moe_uT_, moe_hT_, uint64_t(T) * SEF);
                 quantize_q8_1(q, moe_hT_, act_q8T_, T * SEF);
-                gemv_q8_0_soa_q8_batched(q, act_q8T_, w.shd_q8.qs, w.shd_q8.d,
-                                         xg16_, SEF, H, T);
+                gemv_q8_0_soa_q8_batched_sel(q, act_q8T_, w.shd_q8.qs, w.shd_q8.d,
+                                             xg16_, SEF, H, T);
             } else {
                 gemv_fp16_rows(q, mixed_, H, w.ffn_gate_shexp, moe_gT_, SEF, H, SEF, T);
                 gemv_fp16_rows(q, mixed_, H, w.ffn_up_shexp,   moe_uT_, SEF, H, SEF, T);
@@ -3451,11 +3452,11 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                         gemv_q8_0_soa_f16_g(q, sh_h_, w.shd_q8.qs, w.shd_q8.d, sh_y_, SEF, H);
                     } else if (w.shg_q8.qs) {
                         quantize_q8_1(q, x, act_q8_, H);
-                        gemv_q8_0_soa_q8_g(q, act_q8_, w.shg_q8.qs, w.shg_q8.d, sh_g_, H, SEF);
-                        gemv_q8_0_soa_q8_g(q, act_q8_, w.shu_q8.qs, w.shu_q8.d, sh_u_, H, SEF);
+                        gemv_q8_0_soa_q8_g_sel(q, act_q8_, w.shg_q8.qs, w.shg_q8.d, sh_g_, H, SEF);
+                        gemv_q8_0_soa_q8_g_sel(q, act_q8_, w.shu_q8.qs, w.shu_q8.d, sh_u_, H, SEF);
                         swiglu(q, sh_g_, sh_u_, sh_h_, SEF);
                         quantize_q8_1(q, sh_h_, act_q8_, SEF);
-                        gemv_q8_0_soa_q8_g(q, act_q8_, w.shd_q8.qs, w.shd_q8.d, sh_y_, SEF, H);
+                        gemv_q8_0_soa_q8_g_sel(q, act_q8_, w.shd_q8.qs, w.shd_q8.d, sh_y_, SEF, H);
                     } else {
                         gemv_fp16(q, x, w.ffn_gate_shexp, sh_g_, H, SEF);
                         gemv_fp16(q, x, w.ffn_up_shexp,   sh_u_, H, SEF);
@@ -3686,8 +3687,8 @@ std::string Qwen4ExpModel::forward_range(const int32_t* tokens_host, uint32_t T,
                             H, cfg_.vocab);
     } else if (use_q8_lmh && lmh_q8.qs) {
         quantize_q8_1(q, mixed_ + uint64_t(T - 1) * H, act_q8_, H);
-        gemv_q8_0_soa_q8_g(q, act_q8_, lmh_q8.qs, lmh_q8.d,
-                           logits_out ? logits_out : logits_, H, cfg_.vocab);
+        gemv_q8_0_soa_q8_g_sel(q, act_q8_, lmh_q8.qs, lmh_q8.d,
+                               logits_out ? logits_out : logits_, H, cfg_.vocab);
     } else {
         gemv_fp16(q, mixed_ + uint64_t(T - 1) * H, lm_head,
                   logits_out ? logits_out : logits_, H, cfg_.vocab);
@@ -3805,7 +3806,7 @@ std::string Qwen4ExpModel::forward_rows(const uint32_t* lanes, const int32_t* id
     const uint32_t V = cfg_.vocab;
     if (qwen4exp_dense_q8() && lmh_q8.qs) {
         quantize_q8_1(q, mixed_, act_q8T_, G * H);
-        gemv_q8_0_soa_q8_batched(q, act_q8T_, lmh_q8.qs, lmh_q8.d, rows_logits_, H, V, G);
+        gemv_q8_0_soa_q8_batched_sel(q, act_q8T_, lmh_q8.qs, lmh_q8.d, rows_logits_, H, V, G);
     } else {
         for (uint32_t r0 = 0; r0 < G; r0 += 8)
             gemv_fp16_rows(q, mixed_ + uint64_t(r0) * H, H, lm_head, rows_logits_ + uint64_t(r0) * V, V, H, V,
@@ -3831,7 +3832,7 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
     // gemv_fp16_rows would fall back to per-row gemv_fp16; the chunks keep one kernel family for every row).
     auto q8_rows = [&](const sycl::half* X, const Qwen4ExpLayer::Q8W& Wq, sycl::half* Y, uint32_t K, uint32_t N) {
         quantize_q8_1(q, X, act_q8T_, G * K);
-        gemv_q8_0_soa_q8_batched(q, act_q8T_, Wq.qs, Wq.d, Y, K, N, G);
+        gemv_q8_0_soa_q8_batched_sel(q, act_q8T_, Wq.qs, Wq.d, Y, K, N, G);
     };
     auto f16_rows = [&](const sycl::half* X, uint32_t K, const sycl::half* W, sycl::half* Y, uint32_t N) {
         for (uint32_t r0 = 0; r0 < G; r0 += 8)
@@ -3893,7 +3894,7 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
                                 dn_g_ + uint64_t(i) * SVH, dn_beta_ + uint64_t(i) * SVH, st, dn_out_ + uint64_t(i) * SI,
                                 1, 1, SVH, SHD, SHD);
         }
-        if (w.gate_q8.qs) gemv_q8_0_soa_q8_batched(q, act_q8T_, w.gate_q8.qs, w.gate_q8.d, dn_z_, H, SI, G);
+        if (w.gate_q8.qs) gemv_q8_0_soa_q8_batched_sel(q, act_q8T_, w.gate_q8.qs, w.gate_q8.d, dn_z_, H, SI, G);
         else              f16_rows(mixed_, H, w.attn_gate, dn_z_, SI);
         gated_rms_norm(q, dn_out_, dn_z_, w.ssm_norm, dn_gn_, G * SVH, SHD, eps, /*sigmoid_gate=*/true);
         if (w.out_q8.qs) q8_rows(dn_gn_, w.out_q8, blockout_, SI, H);
@@ -4015,11 +4016,11 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
         // shared expert first (its kernels run while the misses stream on copyq_)
         if (w.shg_q8.qs) {
             quantize_q8_1(q, mixed_, act_q8T_, G * H);
-            gemv_q8_0_soa_q8_batched(q, act_q8T_, w.shg_q8.qs, w.shg_q8.d, moe_gT_, H, SEF, G);
-            gemv_q8_0_soa_q8_batched(q, act_q8T_, w.shu_q8.qs, w.shu_q8.d, moe_uT_, H, SEF, G);
+            gemv_q8_0_soa_q8_batched_sel(q, act_q8T_, w.shg_q8.qs, w.shg_q8.d, moe_gT_, H, SEF, G);
+            gemv_q8_0_soa_q8_batched_sel(q, act_q8T_, w.shu_q8.qs, w.shu_q8.d, moe_uT_, H, SEF, G);
             swiglu(q, moe_gT_, moe_uT_, moe_hT_, uint64_t(G) * SEF);
             quantize_q8_1(q, moe_hT_, act_q8T_, G * SEF);
-            gemv_q8_0_soa_q8_batched(q, act_q8T_, w.shd_q8.qs, w.shd_q8.d, xg16_, SEF, H, G);
+            gemv_q8_0_soa_q8_batched_sel(q, act_q8T_, w.shd_q8.qs, w.shd_q8.d, xg16_, SEF, H, G);
         } else {
             f16_rows(mixed_, H, w.ffn_gate_shexp, moe_gT_, SEF);
             f16_rows(mixed_, H, w.ffn_up_shexp, moe_uT_, SEF);

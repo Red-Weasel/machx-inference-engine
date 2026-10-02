@@ -23,9 +23,12 @@
 #include "ie/deltanet_state.hpp"     // DeltaNetState
 #include "ie/gguf.hpp"
 #include "ie/kv_cache.hpp"
+#include "ie/lanes_auto.hpp"         // LanesAutoFit (P4 B30)
+#include "ie/ops.hpp"                // C32Bank (P4 B21)
 #include "ie/qwen36.hpp"             // QwenConfig
 
 #include <sycl/sycl.hpp>
+#include <atomic>
 #include <cstdint>
 #include <span>
 #include <string>
@@ -68,8 +71,12 @@ public:
     // P4 B10 (docs/lanes/LANES_SERVE.md): request lanes for `ie serve --parallel N` on the two-card split. A lane is
     // one sequence's KV + DeltaNet state on every card; lane 0 is the state load() allocated (nothing else changes with one
     // lane). init_lanes sizes every card's workspace for max_rows, then allocates lanes 1..n-1 at lane_ctx positions: refused,
-    // with the numbers, when a card would keep less than reserve_bytes free after them.
-    std::string init_lanes(uint32_t n_lanes, uint32_t lane_ctx, uint32_t max_rows, uint64_t reserve_bytes);
+    // with the numbers, when a card would keep less than reserve_bytes free after them. P4 B30: with `fit` (auto; n_lanes is
+    // then kLanesAuto and unused) it picks n (lanes_auto_fit, up to fit->n_max) from what each card has free, keeping fit->keep
+    // more and, with fit->dn_checkpoint, a DeltaNet checkpoint per lane; fit gets the cards' numbers and the pick (1 = no
+    // lanes allocated).
+    std::string init_lanes(uint32_t n_lanes, uint32_t lane_ctx, uint32_t max_rows, uint64_t reserve_bytes,
+                           LanesAutoFit* fit = nullptr);
     uint32_t    n_lanes() const noexcept { return 1u + uint32_t(lane_kv_.size()); }
     uint32_t    lane_ctx(uint32_t lane) const noexcept { return lane ? lane_ctx_ : max_ctx_; }
     uint64_t    lane_bytes(uint32_t dev) const noexcept { return dev < lane_bytes_.size() ? lane_bytes_[dev] : 0; }
@@ -99,8 +106,15 @@ public:
     std::string rows_off_reason() const;
     bool        rows_ok() const { return rows_off_reason().empty(); }
     sycl::half* rows_logits() const noexcept { return rows_logits_; }
+    // P4 B33 (a process stop; Engine::abort_all): from now on a prefill step (T > 1: forward, forward_stage) starts no new
+    // layer -- the one running ends at its layer boundary, the card's queue is drained (nothing of the step still runs on the
+    // card) and the step returns an error instead of its output; a decode step (T = 1, rows) is unaffected. Any thread;
+    // terminal (never cleared: the process is ending).
+    void        request_abort() noexcept { abort_.store(true, std::memory_order_relaxed); }
 
 private:
+    std::atomic<bool> abort_{false};   // P4 B33 (request_abort)
+    bool aborting(uint32_t T) const noexcept { return T > 1 && abort_.load(std::memory_order_relaxed); }
     // A Q8_0 matrix weight stored PACKED as SoA int8 (no F16 doubling): q8_qs[n*K+k]
     // int8 column-contiguous + q8_d[n*(K/32)+b] fp16 per-32-block scale (de-interleaved
     // from on-disk AoS block_q8_0 — bit-exact). Consumed by gemv_q8_0_soa_q8 (decode) +
@@ -109,7 +123,9 @@ private:
         int8_t*   q8_qs = nullptr;   // [N*K] int8
         uint16_t* q8_d  = nullptr;   // [N*(K/32)] fp16 bits
         uint32_t  K = 0, N = 0;
-        DenseQuantPtr fp;            // fallback when q8_qs == nullptr
+        DenseQuantPtr fp;            // fallback when q8_qs == nullptr and kq.lo == nullptr
+        C32Bank   kq;                // P4 B21: a Q6_K / Q5_K weight in the c32 streams (gemv_kq_c32.cpp); lo null = none
+        bool int_dot() const noexcept { return q8_qs || kq.lo; }   // T = 1 / rows go through an int-dot GEMV
     };
 
     // Per-layer MoE experts: E experts, each a Q8_0-SoA [K,N] matrix laid out
@@ -130,6 +146,8 @@ private:
         uint32_t  K = 0, N = 0, E = 0;
         uint64_t  qs_stride = 0;     // N*K  (per expert)
         uint64_t  d_stride  = 0;     // N*(K/32)
+        // P4 B21: Q6_K / Q5_K experts in the c32 streams over E*N columns (moe_*_c32); lo null = not this path
+        C32Bank   c32;
     };
 
     // Per-layer weights. EITHER linear (DeltaNet) or full-attn populated; the MoE
@@ -165,6 +183,8 @@ private:
         uint32_t T = 0;
         sycl::half *x = nullptr, *x_normed = nullptr, *attn_block = nullptr;
         int32_t* positions = nullptr;
+        int32_t*    ids = nullptr;      // P4 B22: [T] on embed_dev (was a malloc + free per forward)
+        sycl::half* logits = nullptr;   // P4 B22: [vocab] on head_dev (was a malloc + free per forward)
         // full-attn
         sycl::half *qg = nullptr, *q = nullptr, *gate = nullptr;
         sycl::half *k = nullptr, *v = nullptr, *attn_out = nullptr;
@@ -237,9 +257,18 @@ private:
     DeltaNetState& lane_dn(uint32_t lane, uint32_t dev) { return lane ? lane_dn_[lane - 1][dev] : dn_[dev]; }
     std::vector<void*> act_rows_;
     sycl::half*        rows_logits_ = nullptr;
+    // P4 B26: the rows step's decode-attention partials (kMaxRows slices of rows_partials_floats_) and its per-group row
+    // table (kFaDecodeRowsTableBytes), per card with a KV cache (full_attention_fa2_decode_rows; init_lanes allocates
+    // them, owned_)
+    std::vector<float*> rows_partials_;
+    std::vector<void*>  rows_table_;
+    uint64_t            rows_partials_floats_ = 0;
     void        run_layers_rows(uint32_t dev, std::span<const uint32_t> lanes, const uint32_t* pos0);
     // the rows path's dense projection: quantize_q8_1 over G x K + gemv_q8_0_soa_q8_batched (forward_slots' forced route)
     sycl::event srows(uint32_t dev, const sycl::half* A, const SplitW& w, sycl::half* out, uint32_t K, uint32_t N, uint32_t G);
+    // P4 B21: quantize T rows of A into `act` and run the c32 GEMV (T = 1 decode / G rows)
+    sycl::event kq_gemv(uint32_t dev, void* act, const sycl::half* A, const SplitW& w, sycl::half* out, uint32_t K, uint32_t N,
+                        uint32_t T);
 
     // forward()'s pieces (kept in its order): the embedding into card embed_dev's x, one card's layers, the head.
     std::string embed(const int32_t* input_ids, uint32_t T);

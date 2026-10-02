@@ -86,8 +86,27 @@ std::string Engine::ds41_load(const std::string& dir) {
     // P4 B6b (docs/deepseek41/P4_B6B_SERVE.md): --parallel N > 1 = N lanes. Lane 0 keeps --ctx; lanes 1..N-1 hold --slot-ctx
     // positions each (0 = 32,768, capped at --ctx), and their state comes out of the static expert tier (B6a: the forward
     // refuses, with the numbers, when it does not fit). What the lane pipe cannot run is refused here, before the load's work.
-    const uint32_t n_lanes = std::max<uint32_t>(1, opts_.parallel);
-    const uint32_t lane_ctx = n_lanes > 1 ? std::min<uint32_t>(opts_.max_ctx, opts_.slot_ctx ? opts_.slot_ctx : 32768u) : 0u;
+    // P4 B30: no --parallel = the fixed pick (lanes_auto.hpp: 4 lanes at 16K, a placeholder on V4.1), or one lane where the
+    // lanes would be refused below (one card, IE_DS41_SPEC, IE_DS41_PROFILE_OUT, IE_DS41_DUMP_ROUTING, IE_DS41_EP)
+    const bool auto_n = opts_.parallel == kLanesAuto;
+    std::string one_why;
+    if (auto_n) {
+        auto set = [](const char* k) { const char* v = std::getenv(k); return v && *v; };
+        const char* ep = std::getenv("IE_DS41_EP");
+        one_why = b->qs.size() < 2 ? "the lanes need two cards" : spec ? "IE_DS41_SPEC=1"
+                : set("IE_DS41_PROFILE_OUT") ? "IE_DS41_PROFILE_OUT is set" : set("IE_DS41_DUMP_ROUTING") ? "IE_DS41_DUMP_ROUTING is set"
+                : (ep && *ep && std::string(ep) != "0") ? "IE_DS41_EP" : "";
+    }
+    const LanesAutoPlan lp = auto_n ? lanes_auto_plan(LanesArch::kDeepSeek41, uint32_t(b->qs.size()), one_why.empty(), opts_.slot_ctx)
+                                    : LanesAutoPlan{std::max<uint32_t>(1, opts_.parallel), opts_.slot_ctx, false};
+    const uint32_t n_lanes = lp.n;
+    const uint32_t lane_ctx = n_lanes > 1 ? std::min<uint32_t>(opts_.max_ctx, lp.slot_ctx ? lp.slot_ctx : 32768u) : 0u;
+    lane_ctx_ = lane_ctx;   // P4 B38 (0 with one lane)
+    if (auto_n)
+        std::fprintf(stderr, "%s\n", lanes_auto_line("deepseek41", n_lanes, lane_ctx, n_lanes > 1
+            ? "a fixed pick (the lanes come out of the static expert tier; a placeholder, not measured at this pick); the "
+              "forward's lines below give their VRAM"
+            : one_why).c_str());
     if (n_lanes > 1) {
         if (spec) return "deepseek41: --parallel " + std::to_string(n_lanes) + " serves without DSpark speculation (IE_DS41_SPEC=1 is --parallel 1 only)";
         if (const char* po = std::getenv("IE_DS41_PROFILE_OUT"); po && *po) return "deepseek41: IE_DS41_PROFILE_OUT profiles --parallel 1 only (a request's reset of the routing counts would wipe the other lanes')";

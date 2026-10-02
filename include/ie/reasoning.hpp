@@ -40,6 +40,20 @@ inline ReasoningCapabilities reasoning_capabilities(ModelArch arch, std::string_
     }
     return r;
 }
+// P4 B35: Engine::chat renders this model through the ChatML builder (tokenizer.hpp) with a template that opens <think>
+// in the generation prompt -- the Qwen row above, as chat() dispatches it (a dense GGUF reaches the ChatML builder only
+// with a ChatML or unrecognised template: R1-Distill's sentinels take their own path). The model writes
+// "reasoning\n</think>\n\nanswer"; the engine shows the tag (Tokenizer::show_special) and splits the reasoning off
+// there, streamed and not (split_chatml_think).
+inline bool chatml_think_split(ModelArch arch, std::string_view tmpl) {
+    const bool qwen = arch == ModelArch::kQwen35Moe || arch == ModelArch::kQwen35Dense ||
+        arch == ModelArch::kQwen3Dense || arch == ModelArch::kQwen3Moe ||
+        arch == ModelArch::kQwen3Next || arch == ModelArch::kQwen4Exp;
+    if (!qwen || tmpl.find("<think>") == std::string_view::npos) return false;
+    if (!is_dense_arch(arch)) return true;
+    const DenseConfig::TemplateFamily tf = classify_template_family(tmpl);
+    return tf == DenseConfig::TemplateFamily::kChatML || tf == DenseConfig::TemplateFamily::kAuto;
+}
 inline bool known_reasoning_effort(std::string_view v) {
     return v=="low" || v=="medium" || v=="high" || v=="xhigh" || v=="max";
 }

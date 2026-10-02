@@ -57,10 +57,17 @@ struct LanesRequest {
     // restore gives the bytes a cold prefill gives.
     uint32_t share_at = 0;
     bool reply_cache = false;   // P4 B10: after a "stop"/"length" reply, LanesModel::finish runs in a serial turn
+    int32_t think_close = -1;   // P4 B27: the </think> id (-1: none); LanesResult::answer_start
+    // P4 B36 (B): the prompt ends with a user query, so snap_at is that query's end: the conversation's ANCHOR, which the next
+    // query's prompt shares even after the template re-renders the turns between (the arch's snapshot there is kept through
+    // the cache's supersede; Engine::chat sets it)
+    bool anchor = false;
 };
 
 struct LanesResult {
     std::string text, finish_reason, cache_source;
+    // P4 B27: the byte offset in `text` after the first generated </think> (GenerateResult::answer_start); npos when none.
+    size_t answer_start = std::string::npos;
     uint32_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0, lane = 0;
     double   prefill_ms = 0, decode_ms = 0;
 };
@@ -154,6 +161,9 @@ public:
     // P4 B15: host-only -- the prefix prefix_prepare would restore for this prompt now (into any lane; 0 = none). Called from a
     // done callback or by the turn holder, never beside the serial worker's device work (which is what mutates the caches).
     virtual uint32_t cache_peek(const LanesRequest& rq) const { (void)rq; return 0; }
+    // P4 B29: the conversation snapshots the arch's prompt cache took so far (prompt-end + reply; not the shared-prefix
+    // marks, counted by LanesServe), for /health "snapshots". Any thread.
+    virtual uint64_t snapshots() const { return 0; }
     // one id from the lane's logits: first = the prompt's (prompt_end's), else the step that just finished. window = the
     // repetition window (prompt tail + output), seed = rng + the ids sampled before.
     virtual int32_t sample(uint32_t lane, bool first, const LanesSampling& sp, std::span<const int32_t> window,
@@ -196,6 +206,22 @@ public:
         return {};
     }
     virtual std::string pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) = 0;
+    // P4 B34 (the lane pipeline): true = the arch's pipe takes a prefilling lane's next piece while the lane's previous piece
+    // is still on a later card (Glm5LanePipe::submit_ahead); `idle` is then registered with it (card 0 is idle and a lookahead
+    // may have become possible) and LanesServe offers that piece from there through pipe_submit_ahead. Called once, by
+    // LanesServe's constructor. Default: no lookahead (`idle` dropped).
+    virtual bool pipe_lookahead(std::function<void()> idle) { (void)idle; return false; }
+    // taken = queued behind the lane's piece in flight; not taken and "" = not now; an error = a request no lane state allows
+    virtual std::string pipe_submit_ahead(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool& taken) {
+        (void)lane; (void)ids; (void)T; (void)pos0;
+        taken = false;
+        return {};
+    }
+    // P4 B33: the process is stopping (LanesServe::abort_all): drop the pipe's steps that have not started (CardPipe::cancel)
+    // and make the device steps running now end soon (an arch whose prefill forward can stop at a layer boundary asks for it
+    // here). Any thread, never blocks, never from a done callback. Returns the steps a card stage holds -- what the teardown's
+    // pipe_stop still waits for. Default: nothing dropped, 0.
+    virtual uint32_t abort() { return 0; }
     virtual std::string pipe_pause() = 0;          // waits for the steps in flight (the callbacks park their lanes first)
     virtual std::string pipe_resume() = 0;
     virtual bool        pipe_paused() const = 0;
@@ -211,23 +237,30 @@ public:
 // submit). The model's reset_lane calls reset_lane here too: it is what clears a lane's failed mark (a stage error part-way).
 class CardPipe {
 public:
-    CardPipe(uint32_t n_lanes, uint32_t max_rows, uint64_t wide_row, uint32_t n_stages, Glm5LanePipe::StageFn stage)
-        : pipe_(n_lanes, max_rows, wide_row), n_stages_(n_stages), stage_(std::move(stage)) {}
+    // P4 B34: ahead = the lane pipeline's second buffer set per lane (Glm5LanePipe::submit_ahead)
+    CardPipe(uint32_t n_lanes, uint32_t max_rows, uint64_t wide_row, uint32_t n_stages, Glm5LanePipe::StageFn stage, bool ahead = false)
+        : pipe_(n_lanes, max_rows, wide_row, ahead), n_stages_(n_stages), stage_(std::move(stage)) {}
     // P4 B14: with a rows stage, start(done, rows_done) with a rows_done runs the pipe in rows mode (groups of up to
     // max_group 1-row steps, group_cap 0 = AUTO); resume() keeps the mode of the last start.
     CardPipe(uint32_t n_lanes, uint32_t max_rows, uint64_t wide_row, uint32_t n_stages, Glm5LanePipe::StageFn stage,
-             Glm5LanePipe::RowsStageFn rows_stage, uint32_t max_group, uint32_t group_cap)
-        : pipe_(n_lanes, max_rows, wide_row), n_stages_(n_stages), stage_(std::move(stage)), rows_stage_(std::move(rows_stage)),
+             Glm5LanePipe::RowsStageFn rows_stage, uint32_t max_group, uint32_t group_cap, bool ahead = false)
+        : pipe_(n_lanes, max_rows, wide_row, ahead), n_stages_(n_stages), stage_(std::move(stage)), rows_stage_(std::move(rows_stage)),
           max_group_(max_group), group_cap_(group_cap) { pipe_.prepare_rows(max_group); }   // (B14 gate #5: at load)
     std::string start(LanesModel::DoneFn done, LanesModel::RowsDoneFn rows_done = {});
     bool        rows_mode() const { return rows_on_; }
     std::vector<uint64_t> group_sizes() const { return pipe_.group_sizes(); }
     std::string submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0);
+    // P4 B34: the pipe's idle hook for every start / resume from now on; the lookahead submit
+    void        set_idle(Glm5LanePipe::IdleFn idle) { idle_ = std::move(idle); }
+    std::string submit_ahead(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool& taken) {
+        return pipe_.submit_ahead(lane, ids, T, pos0, taken);
+    }
     std::string reset_lane(uint32_t lane);   // the model reset the lane's state (Glm5LanePipe::reset_lane)
     std::string pause();
     std::string resume();
     bool        paused() const { return paused_; }
     std::string stop();
+    uint32_t    cancel() { return pipe_.cancel(); }   // P4 B33: Glm5LanePipe::cancel (a process stop)
     std::string error() const { return pipe_.error(); }
     uint32_t    max_rows() const { return pipe_.max_T(); }
     uint64_t    host_bytes() const { return pipe_.host_bytes(); }
@@ -242,6 +275,7 @@ private:
     uint32_t max_group_ = 1, group_cap_ = 0;
     LanesModel::RowsDoneFn rows_done_;
     bool rows_on_ = false;
+    Glm5LanePipe::IdleFn idle_;   // (P4 B34)
     std::string launch();
 };
 
@@ -264,6 +298,26 @@ public:
         // IE_LANES_HANDOVER_MS=<ms>.
         bool     prefill_fifo = false;
         uint32_t handover_ms = 0;
+        // P4 B34 (3) short-first (off here; the crown sets it from IE_Q35MOE_SHORT_*): a prompt whose pipe part has at most
+        // max(2 x its largest piece, short_rows) rows left is SHORT. A short prompt need not wait for the FIFO window, and a long
+        // prompt's next piece (and its lookahead) waits while another prompt's short work is due -- its pieces, its mark or
+        // prompt-end turn -- until the guard: short_slots short pieces went into the pipe ahead of it, or short_wait_ms passed
+        // since its last piece landed. Only the order of whole pieces across lanes changes: each lane's pieces, their cuts and
+        // their per-card order are the same, so are the bytes.
+        bool     short_first = false;
+        uint32_t short_rows = 16384, short_slots = 2, short_wait_ms = 10000;
+        // P4 B36 (A) re-cut (off here; the crown sets it from IE_Q35MOE_RECUT): a prefilling lane whose plan pieces are larger
+        // than mix_chunk (its plan was made alone) cuts the pieces it has not sent yet into mix_chunk rows -- each plan chunk in
+        // order, so the mark and Tp stay piece ends -- once another lane decodes or prefills a short prompt: a decode step then
+        // waits behind at most a mix_chunk piece per card instead of a whole plan piece. Its bytes are a run's with that cut
+        // sequence; a prompt that runs alone keeps its plan (--parallel 1's pieces).
+        bool     recut = false;
+        // P4 B36 (C) decode quota (0 = off here; the crown sets it from IE_Q35MOE_DECODE_QUOTA / _QUOTA_MAX_MS): a LONG prompt's
+        // next piece (its pipe part, Tp - reused, above max(2 x its largest piece, short_rows): B34 (3)'s threshold over the whole
+        // prompt, so a lead stays long to its end) waits while a decoding lane has made fewer than decode_quota steps since the
+        // prompt's latest piece landed -- a lookahead too -- until quota_max_ms passed since the wait began (the guard). Only the
+        // order of whole pieces across lanes changes, so the bytes are each lane's own pieces'.
+        uint32_t decode_quota = 0, quota_max_ms = 2000;
     };
     LanesServe(LanesModel& m, Options o);
     ~LanesServe();
@@ -273,6 +327,12 @@ public:
     LanesResult run(const LanesRequest& rq, const LanesTokenFn& on_token);
     std::string status_json() const;   // /health fields, a JSON object (Engine::serving_status_json merges it)
     void shutdown();                   // teardown: stop admitting, join the serial worker, stop the pipe. Idempotent.
+    // P4 B33: the process is stopping (Engine::abort_all, from the server's stop). Terminal and non-blocking: every request
+    // ends now with "abort" (a lane whose step is on a card does not wait for it), no new device work starts -- no callback
+    // submits, no turn is taken, the FIFO is emptied, a serial turn's prefill stops before its next chunk -- the pipe drops the steps
+    // that have not started (LanesModel::abort), and later requests are refused. What runs on a card now finishes by itself;
+    // shutdown() waits for it. Returns those steps: the pipe's plus the serial turn's device work (0 or 1). Idempotent.
+    uint32_t abort_all();
 
     struct Lane {
         enum class Phase : uint8_t { kIdle, kPrefill, kPromptReady, kDecode, kDone, kMark };   // kMark: at plan.mark, waits for its turn
@@ -292,8 +352,17 @@ public:
         uint32_t mark_at = 0;                  // P4 B15: plan.mark still due (0 = none)
         bool     reprep = false;               // P4 B15: the FIFO head's cache_peek grew: its request re-runs prefix_prepare
         uint32_t repreps = 0;
+        bool     ahead = false;                // P4 B34: chunks[chunk_at + 1] is in the pipe too (a lookahead, on_idle0)
+        bool     held = false;                 // P4 B34 (3): long, its next piece waits for the short prompts (parked)
+        uint32_t bypass = 0;                   //   short pieces that went into the pipe ahead of it since it was held
+        uint32_t piece_max = 0;                //   its plan's largest piece (the short rule)
+        bool     recut = false;                // P4 B36 (A): its pieces not yet sent were cut to mix_chunk rows
+        bool     qheld = false, qfree = false;  // P4 B36 (C): its next piece waits for the decode quota; the guard let it go
+        uint64_t dsteps = 0;                   //   its decode steps, never reset (the leads' baselines count them)
+        std::vector<uint64_t> qbase;           //   every lane's dsteps when its latest piece landed (or its pipe part began)
+        std::chrono::steady_clock::time_point t_qhold{};   // its quota wait began
         uint64_t tick = 0;
-        std::chrono::steady_clock::time_point t_sub{};
+        std::chrono::steady_clock::time_point t_sub{}, t_ahead{}, t_land{};   // (t_land: its last piece landed, or its pipe part began)
         uint32_t steps = 0, chunks = 0;
         double   cb_ms = 0;
     };
@@ -303,6 +372,20 @@ private:
     void end_lane(Lane& l, const std::string& finish, bool lost);
     bool commit(Lane& l, int32_t id);
     void submit(Lane& l, uint32_t li);
+    void on_idle0();                           // P4 B34: the pipe's idle hook (card 0 is idle: offer a lookahead)
+    // P4 B34 (3) short-first (mu held)
+    bool short_lane(const Lane& l) const;                      // its pipe part has <= max(2 x piece_max, short_rows) rows left
+    bool extends_mark(const Lane& l, const Lane& e) const;     // l's prompt extends e's still-due mark (it waits for it)
+    bool shorts_pending(const Lane& l, uint32_t li) const;     // another lane's short work is due (not waiting for l's mark)
+    bool hold_long(Lane& l, uint32_t li);                      // l's next piece is due: true = it waits (held), else submit it
+    void short_piece_in(uint32_t li);                          // a short piece went into the pipe: the held lanes' guard
+    void maybe_recut(Lane& l, uint32_t li, size_t from);       // P4 B36 (A): the plan's pieces from `from` on (none sent yet)
+    // P4 B36 (C) the decode quota (mu held)
+    bool long_prompt(const Lane& l) const;                     // its pipe part is above max(2 x piece_max, short_rows)
+    void quota_base(Lane& l);                                  // its latest piece landed (or its pipe part began): the baseline
+    bool quota_due(const Lane& l, uint32_t li) const;          // a decoding lane made fewer than decode_quota steps since then
+    bool quota_hold(Lane& l, uint32_t li);                     // l's next piece waits for the decoders (true), until the guard
+    void quota_kick();                                         // decode steps landed: a held lane whose quota is met goes
     void on_done(uint32_t li);
     void on_done_rows(std::span<const uint32_t> lanes);
     void fifo_drop(uint32_t li);               // P4 B15: the lane leaves the prefill FIFO
@@ -311,7 +394,7 @@ private:
     bool step_landed(Lane& l, uint32_t li);
     void step_sampled(Lane& l, uint32_t li, int32_t id, const std::string& err);
     void pipe_failed(const std::string& e);
-    void take_turn(std::unique_lock<std::mutex>& lk);
+    bool take_turn(std::unique_lock<std::mutex>& lk);   // P4 B33: false = stopping, the turn not taken
     void release_turn(std::unique_lock<std::mutex>& lk);
     void poll_pipe(std::unique_lock<std::mutex>& lk);
     int  choose(const std::vector<int32_t>& ids, uint32_t max_tokens) const;
@@ -332,11 +415,19 @@ private:
     std::chrono::steady_clock::time_point pause_t0_{};
     std::atomic<uint64_t> marks_{0};          // (the serial worker counts the marks of a turn's own prefill)
     uint64_t repreps_ = 0, budget_releases_ = 0;
+    uint64_t lookaheads_ = 0;                  // P4 B34: pieces on_idle0 put into the pipe behind their lane's piece
+    // P4 B34 (3): short pieces that went in ahead of a held long lane; guard firings (a held lane's piece released), of
+    // them by the wait
+    uint64_t short_bypass_ = 0, short_guard_ = 0, short_guard_wait_ = 0;
+    uint64_t recuts_ = 0;                      // P4 B36 (A): lanes whose remaining plan was re-cut
+    uint64_t quota_holds_ = 0, quota_guard_ = 0;   // P4 B36 (C): quota waits begun; of them ended by the guard
     uint32_t turn_waiters_ = 0;
     uint64_t tick_ = 0;
     double   step_ms_ = 0;
     uint64_t steps_ = 0, tokens_ = 0, turns_ = 0, handovers_ = 0;
     double   paused_ms_ = 0;
+    uint64_t drains_ = 0;                      // P4 B29: the turns' pipe_pause waits (count, total, longest)
+    double   drain_ms_ = 0, drain_max_ms_ = 0;
     Clock::time_point turn_t0_{};
     // the serial worker: the turn's device work runs on ONE persistent thread (V4.1 B6b: a thread that runs a forward may keep
     // per-thread state for good -- an OpenMP team -- so the HTTP request threads must not run it)

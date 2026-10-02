@@ -37,6 +37,14 @@ class DeviceFleet;          // fwd — from allocator.hpp
 struct FleetPrefixCacheConfig {
     uint32_t max_entries    = 12;     // smaller than the crown's 32 (per-endpoint = N cards)
     uint32_t max_prefix_len = 8192;   // upper bound on a cached prefix length
+    // P4 B29: a per-card byte budget for the snapshots (0 = none, the old rule: allocate, then evict by count). With a budget,
+    // insert evicts LRU endpoints BEFORE it allocates until every card's snapshots + the new one fit, and skips a snapshot
+    // that alone does not fit (never evicting for it), so the cache stays inside VRAM the caller measured as free.
+    uint64_t max_dev_bytes  = 0;
+    // P4 B29 Fix A: an insert that is not a shared prefix drops the non-shared endpoints that are strict prefixes of it (a
+    // conversation's earlier turns: its next turn restores the deeper one), BEFORE the budget / count eviction, so a
+    // conversation holds one entry instead of one per turn. false = every turn's entry stays until the LRU takes it.
+    bool     supersede      = false;
 };
 
 class FleetPrefixCache {
@@ -66,7 +74,8 @@ public:
     };
 
     // Walk the trie along `tokens`; return the deepest endpoint along the prefix.
-    // {0, nullptr, nullptr} if none. Refreshes the matched endpoint's LRU stamp.
+    // {0, nullptr, nullptr} if none. Refreshes the matched endpoint's LRU stamp, and (P4 B36) every anchor endpoint the walk
+    // passes: a conversation's anchor stays as fresh as its turns that restore through it.
     LookupResult find_longest_match(const std::vector<int32_t>& tokens);
     // P4 B15: the depth find_longest_match would return, without touching the LRU stamps (host-only, const).
     uint32_t peek_longest_match(const std::vector<int32_t>& tokens) const;
@@ -74,10 +83,20 @@ public:
     // Snapshot the model's CURRENT per-card state at depth tokens.size() and store
     // it as a new endpoint. LRU-evicts at capacity. No-op if an endpoint already
     // exists at this exact depth+sequence. Per-card alloc is sized to this depth.
+    // shared = a shared prefix (P4 B15's mark): never superseded (P4 B29), and an existing endpoint inserted again as shared
+    // becomes shared.
+    // anchor (P4 B36) = the end of a conversation's last user query (the crown's lanes: LanesRequest::anchor): a later
+    // non-anchor insert does not supersede it, a later anchor insert does (one anchor per conversation); an existing endpoint
+    // inserted again as anchor becomes one.
     template <class Model>
-    std::string insert(Model& m, const std::vector<int32_t>& tokens);
+    std::string insert(Model& m, const std::vector<int32_t>& tokens, bool shared = false, bool anchor = false);
 
     uint32_t n_entries() const noexcept { return uint32_t(endpoints_.size()); }
+    // P4 B29: change the caps after init (the crown split's request lanes size them once their own VRAM is allocated). Takes
+    // effect at the next insert; existing entries are not evicted here.
+    void     set_limits(uint32_t max_entries, uint64_t max_dev_bytes) noexcept { pcfg_.max_entries = max_entries; pcfg_.max_dev_bytes = max_dev_bytes; }
+    void     set_supersede(bool on) noexcept { pcfg_.supersede = on; }
+    const FleetPrefixCacheConfig& config() const noexcept { return pcfg_; }
     uint64_t total_bytes() const noexcept;
     void     clear() noexcept;
 
@@ -85,6 +104,8 @@ private:
     struct Node {
         std::map<int32_t, std::unique_ptr<Node>> children;
         bool     is_endpoint = false;
+        bool     shared      = false;   // P4 B29: a shared-prefix endpoint (never superseded)
+        bool     anchor      = false;   // P4 B36: a last user query's end (superseded only by a later anchor)
         KvVec    kv;                  // [dev] (null per-card if that card has no KV)
         DnVec    dn;                  // [dev] (null per-card if that card has no DN)
         uint64_t depth          = 0;

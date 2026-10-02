@@ -294,6 +294,42 @@ add_executable(gemv_q2_0_soa_test unit/gemv_q2_0_soa_test.cpp)
 target_link_libraries(gemv_q2_0_soa_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME gemv_q2_0_soa_test COMMAND gemv_q2_0_soa_test)
 
+# P4 B21: c32 Q6_K/Q5_K repack == ggml, GEMV vs reference, rows == T=1 bit for bit (`--bench`: 27B shapes GB/s).
+add_executable(gemv_kq_c32_test unit/gemv_kq_c32_test.cpp)
+target_link_libraries(gemv_kq_c32_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME gemv_kq_c32_test COMMAND gemv_kq_c32_test)
+
+# P4 B22: the vec decode partial pass with K/V prefetch == without, byte for byte (`--bench`: time per case).
+add_executable(fa2_vec_pf_test unit/fa2_vec_pf_test.cpp)
+target_link_libraries(fa2_vec_pf_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME fa2_vec_pf_test COMMAND fa2_vec_pf_test)
+
+# P4 B31: the Q8_0 MoE prefill down v2 == v1, byte for byte (`--bench`: device time per launch, `--small`: small cases).
+add_executable(moe_q8_down_v2_test unit/moe_q8_down_v2_test.cpp)
+target_link_libraries(moe_q8_down_v2_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME moe_q8_down_v2_test COMMAND moe_q8_down_v2_test)
+
+# P4 B32 (1): the Q8_0 MoE prefill gate_up v2 == v1, byte for byte (`--bench`: device time per launch, `--small`).
+add_executable(moe_q8_gate_up_v2_test unit/moe_q8_gate_up_v2_test.cpp)
+target_link_libraries(moe_q8_gate_up_v2_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME moe_q8_gate_up_v2_test COMMAND moe_q8_gate_up_v2_test)
+
+# P4 B32 (2): the Q8_0 MoE per-slot (decode + lanes rows) gate_up / down v2 == v1 byte for byte, T = 1..16 rows
+# (`--bench`: device time per launch at T = 1, 2, 4, 8, 16; `--small`).
+add_executable(moe_q8_decode_v2_test unit/moe_q8_decode_v2_test.cpp)
+target_link_libraries(moe_q8_decode_v2_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME moe_q8_decode_v2_test COMMAND moe_q8_decode_v2_test)
+
+# P4 B37 (1): the Q8_0-SoA batched / dual int-dot GEMV v2 == v1 byte for byte, T = 1..33 (`--bench`, `--small`).
+add_executable(gemv_q8_soa_batched_v2_test unit/gemv_q8_soa_batched_v2_test.cpp)
+target_link_libraries(gemv_q8_soa_batched_v2_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME gemv_q8_soa_batched_v2_test COMMAND gemv_q8_soa_batched_v2_test)
+
+# P4 B37 (2) / (3): the T = 1 Q8_0-SoA int-dot GEMVs (_nd, _g_nd) == v1 byte for byte (`--bench`, `--small`).
+add_executable(gemv_q8_soa_nd_test unit/gemv_q8_soa_nd_test.cpp)
+target_link_libraries(gemv_q8_soa_nd_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME gemv_q8_soa_nd_test COMMAND gemv_q8_soa_nd_test)
+
 add_executable(gemv_q1_0_soa_test unit/gemv_q1_0_soa_test.cpp)
 target_link_libraries(gemv_q1_0_soa_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME gemv_q1_0_soa_test COMMAND gemv_q1_0_soa_test)
@@ -456,6 +492,12 @@ add_executable(openai_proto_test unit/openai_proto_test.cpp)
 target_link_libraries(openai_proto_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME openai_proto_test COMMAND openai_proto_test)
 
+# Host-only (no GPU): P4 B27, the Qwen3.6+ XML tool convention -- the renderer against the GGUFs' own chat templates
+# (tests/data/chatml_xml_tools_golden.json, HF jinja reference renders) and the tool-call parser + salvage.
+add_executable(chatml_xml_tools_test unit/chatml_xml_tools_test.cpp)
+target_link_libraries(chatml_xml_tools_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME chatml_xml_tools_test COMMAND chatml_xml_tools_test ${CMAKE_SOURCE_DIR}/tests/data/chatml_xml_tools_golden.json)
+
 # Preflight Task 1: pure dtype-classification predicate (is_loadable_weight_dtype,
 # Global Constraint #4 supported set). Host-only (no GPU, no GGUF) — links ie_core
 # for the symbol, same pattern as openai_proto_test.
@@ -514,6 +556,14 @@ add_executable(q27_lanes_test
   ${CMAKE_SOURCE_DIR}/src/model/glm5_lanes.cpp)
 target_include_directories(q27_lanes_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME q27_lanes_test COMMAND q27_lanes_test)
+
+# Host-only (no GPU, no SYCL): P4 B30, the lane pick of `ie serve` without --parallel (include/ie/lanes_auto.hpp) with fake
+# free-VRAM numbers per arch -- one card / an arch without lanes / a refusing switch = one lane, the measured pick's edges
+# (never above or below what fits; the explicit --parallel admission's rule), the 27B's load-time budget, the load line.
+# Header-only: no ie_core.
+add_executable(lanes_auto_test unit/lanes_auto_test.cpp)
+target_include_directories(lanes_auto_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME lanes_auto_test COMMAND lanes_auto_test)
 
 add_executable(glm5_server_test unit/glm5_server_test.cpp)
 target_link_libraries(glm5_server_test PRIVATE ie_core ie_sycl_flags)

@@ -94,6 +94,13 @@ sycl::event embedding_lookup_q4k(sycl::queue& q,
                                  sycl::half* y,
                                  uint32_t n_tokens, uint32_t hidden,
                                  const std::vector<sycl::event>& deps = {});
+// Q5_K token_embd (P4 B21: the Q5_K_M 27B ships its embedding as Q5_K). Values as ggml dequantize_row_q5_K.
+sycl::event embedding_lookup_q5k(sycl::queue& q,
+                                 const int32_t* token_ids,
+                                 const void* token_embd_q5k,
+                                 sycl::half* y,
+                                 uint32_t n_tokens, uint32_t hidden,
+                                 const std::vector<sycl::event>& deps = {});
 // Q8_0 token_embd (block = fp16 scale + 32 int8). Unblocks full-Q8_0 GGUFs whose
 // embedding ships as Q8_0 (e.g. *-Q8_0 quants). y[i] = d * qs[i].
 // Q2_0 token_embd (Prism ternary 2-bit; block = fp16 d + 32 B qs, 128 w/block).
@@ -671,6 +678,47 @@ sycl::event dequant_q6_soa_to_Bt(sycl::queue& q,
                                  const int8_t* q6_sc, const uint16_t* q6_d,
                                  sycl::half* Bt, uint32_t K, uint32_t N,
                                  const std::vector<sycl::event>& deps = {});
+
+// P4 B21 (gemv_kq_c32.cpp): native Q6_K / Q5_K decode for the 2-card 27B split. "c32" = a load-time per-column repack into
+// 32-element chunks (one Q8_1 activation block each; layout in the .cpp) so a lane owns a chunk, like the Q8_0-SoA kernel.
+// Needs K % 256 == 0. Buffer sizes per weight [K, N]: Q6_K lo N*K/2, hi N*K/4, sc N*K/16, d N*K/256 (fp16);
+// Q5_K lo N*K/2, hi N*K/32 (uint32), sm N*K/32 (uint16), dm N*K/256 (uint32). The quants and scales are the GGUF's bits.
+void repack_q6_K_to_c32(const void* W_blocks, uint32_t K, uint32_t N,
+                        uint8_t* lo, uint8_t* hi, int8_t* sc, uint16_t* d);
+void repack_q5_K_to_c32(const void* W_blocks, uint32_t K, uint32_t N,
+                        uint8_t* lo, uint32_t* hi, uint16_t* sm, uint32_t* dm);
+// y[T, N] (y[t*N + n]) = rows of x_q8 (T block_q8_1x streams of K/32 blocks, quantize_q8_1 over [T, K]) @ W. Any T: T = 1 is
+// the decode GEMV, T 2..16 the request-lane rows / spec verify (the weight is read once for all rows), T > 16 loops in 16s.
+// One kernel template for every T: row t of a T-row call equals the T = 1 call on that row bit for bit.
+sycl::event gemv_q6k_c32_q8(sycl::queue& q, const void* x_q8, const uint8_t* lo, const uint8_t* hi, const int8_t* sc,
+                            const uint16_t* d, sycl::half* y, uint32_t K, uint32_t N, uint32_t T,
+                            const std::vector<sycl::event>& deps = {});
+sycl::event gemv_q5k_c32_q8(sycl::queue& q, const void* x_q8, const uint8_t* lo, const uint32_t* hi, const uint16_t* sm,
+                            const uint32_t* dm, sycl::half* y, uint32_t K, uint32_t N, uint32_t T,
+                            const std::vector<sycl::event>& deps = {});
+// c32 streams -> fp16 Bt[K, N] (prefill: the F16 gemm/oneDNN route, like dequant_q8_0_soa_to_Bt). Values as ggml's dequant.
+sycl::event dequant_q6k_c32_to_Bt(sycl::queue& q, const uint8_t* lo, const uint8_t* hi, const int8_t* sc,
+                                  const uint16_t* d, sycl::half* Bt, uint32_t K, uint32_t N,
+                                  const std::vector<sycl::event>& deps = {});
+sycl::event dequant_q5k_c32_to_Bt(sycl::queue& q, const uint8_t* lo, const uint32_t* hi, const uint16_t* sm,
+                                  const uint32_t* dm, sycl::half* Bt, uint32_t K, uint32_t N,
+                                  const std::vector<sycl::event>& deps = {});
+// P4 B21: c32 expert banks for the qwen35moe crown split. A [K, N, E] expert tensor repacked over E*N columns (expert e's
+// column n = bank column e*N + n). kind 6 = Q6_K streams, 5 = Q5_K streams (types as in repack_q{6,5}_K_to_c32).
+struct C32Bank { const uint8_t* lo = nullptr; const void* hi = nullptr; const void* sc = nullptr; const void* d = nullptr; int kind = 0; };
+// Per token-slot (T*Kt slots; T = 1 decode or the B14 rows), moe_q8.cpp's contract: gate+up fused with silu -> h_out[slot,
+// EFF] (x_q8 = T rows of H/32 blocks; gate and up must share a kind); down -> y_packed[slot, H] = topk_w[slot] * (h . W)
+// (h_q8 = T*Kt rows of EFF/32 blocks); then moe_reduce_q8. A slot's value does not depend on T.
+sycl::event moe_gate_up_silu_c32(sycl::queue& q, const void* x_q8, const C32Bank& g, const C32Bank& u,
+                                 const int32_t* topk_idx, sycl::half* h_out, uint32_t T, uint32_t Kt, uint32_t H, uint32_t EFF);
+sycl::event moe_down_c32(sycl::queue& q, const void* h_q8, const C32Bank& dw, const int32_t* topk_idx,
+                         const sycl::half* topk_w, sycl::half* y_packed, uint32_t T, uint32_t Kt, uint32_t EFF, uint32_t H);
+// Expert-batched prefill over rows sorted by expert (eoff[E+1]), moe_prefill_{gate_up_silu,down}_q8's contract (the down
+// folds sorted_w; moe_prefill_reduce_sum after).
+sycl::event moe_prefill_gate_up_silu_c32(sycl::queue& q, const void* xp_q8, const C32Bank& g, const C32Bank& u,
+                                         const uint32_t* eoff, sycl::half* hp, uint32_t E, uint32_t H, uint32_t EFF);
+sycl::event moe_prefill_down_c32(sycl::queue& q, const void* hq8, const C32Bank& dw, const uint32_t* eoff,
+                                 const sycl::half* sorted_w, sycl::half* out_packed, uint32_t E, uint32_t H, uint32_t EFF);
 
 // ===========================================================================
 // Q2_0 (Prism ternary 2-bit) fast decode via load-time SoA repack
@@ -2312,6 +2360,67 @@ sycl::event full_attention_fa2_decode_vec(sycl::queue& q,
                                           uint32_t max_ctx,
                                           const std::vector<sycl::event>& deps = {},
                                           AttnProfileData* prof = nullptr);
+
+// P4 B26: G decode rows (one token each, each on its OWN KV cache) in ONE launch per pass instead of G serial
+// single-row calls: the request lanes' row step. A plan is built once per group (fa2_decode_rows_plan: the rows' caches,
+// positions, kernel kinds and super geometry are the same for every layer; only the layer's KV slot differs, so the row's
+// cache for slot s is k_base + layer_stride * s) and uploaded to a device table the caller owns
+// (fa2_decode_rows_table_bytes); each layer then runs full_attention_fa2_decode_rows from it. Row i reads q_in + i *
+// n_q_heads * head_dim, k_in / v_in + i * n_kv_heads * head_dim, writes y + i * n_q_heads * head_dim and its own partials
+// slice partials + i * partials_row_floats (>= fa2_decode_rows_partials_floats for the largest max_ctx passed). `kind` picks
+// the kernel exactly as the single-row entry points do: kAuto = full_attention_fa2_decode's choice, kXmx =
+// full_attention_fa2_decode_xmx (its shape gate included), kVec = full_attention_fa2_decode_vec. Rows of one kind share a
+// launch; every work-group runs the single-row kernel's code on its row's cache / context / super geometry, so the bytes
+// (y, partials, the appended cache rows) equal the per-row calls' (tests/unit/fa2_vec_pf_test --rows).
+// IE_FA2_COMBINE_SPLIT=0 (the original combines), more than kFaDecodeRowsMax rows or a slice too small for a row make
+// the plan run the per-row calls instead (plan.batched == false).
+enum class FaDecodeKind : uint8_t { kAuto = 0, kXmx = 1, kVec = 2 };
+struct FaDecodeRow {
+    sycl::half* k_base = nullptr;    // the cache's layer 0: [n_kv_heads, max_ctx, head_dim]; layer slot s at + layer_stride * s
+    sycl::half* v_base = nullptr;
+    uint64_t layer_stride = 0;       // halves per layer slot (0 = a single layer)
+    uint32_t start_pos = 0;          // the row's token position (ctx_len = start_pos + 1)
+    uint32_t max_ctx = 0;            // its cache's rows
+    FaDecodeKind kind = FaDecodeKind::kAuto;
+};
+constexpr uint32_t kFaDecodeRowsMax = 16;
+// One kernel kind's rows (the device table holds three: tiled, XMX, vec). Read by the kernels with uniform loads.
+struct FaDecodeRowsDesc {
+    sycl::half* k_base[kFaDecodeRowsMax];
+    sycl::half* v_base[kFaDecodeRowsMax];
+    uint64_t layer_stride[kFaDecodeRowsMax];
+    uint32_t start_pos[kFaDecodeRowsMax];
+    uint32_t max_ctx[kFaDecodeRowsMax];
+    uint32_t n_super[kFaDecodeRowsMax];   // the row's n_super_chunks (tiled / vec) or n_super (XMX)
+    uint32_t cpw[kFaDecodeRowsMax];       // the row's CHUNKS_PER_WG
+    uint32_t idx[kFaDecodeRowsMax];       // the caller's row index: its q_in / k_in / v_in / y / partials slot
+    uint32_t n;
+};
+constexpr size_t kFaDecodeRowsTableBytes = 3 * sizeof(FaDecodeRowsDesc);
+struct FaDecodeRowsPlan {
+    FaDecodeRowsDesc desc[3] = {};                // host copies: 0 tiled, 1 XMX, 2 vec
+    uint32_t n_wgs[3] = {0, 0, 0};                // partial-pass work-groups per kind
+    const FaDecodeRowsDesc* table = nullptr;      // the device copy of desc[0..2]
+    FaDecodeRow rows[kFaDecodeRowsMax] = {};      // for the per-row calls when !batched
+    uint32_t n_rows = 0, n_q_heads = 0, n_kv_heads = 0, head_dim = 0, csplit = 0;
+    uint64_t partials_row_floats = 0;
+    bool batched = false;
+};
+uint64_t fa2_decode_rows_partials_floats(uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim, uint32_t max_ctx);
+// Builds the plan and, when it batches, uploads its table to table_dev (kFaDecodeRowsTableBytes, device memory) and
+// waits for the copy. Returns plan.batched.
+bool fa2_decode_rows_plan(sycl::queue& q, const FaDecodeRow* rows, uint32_t n_rows, uint32_t n_q_heads, uint32_t n_kv_heads,
+                          uint32_t head_dim, uint64_t partials_row_floats, void* table_dev, FaDecodeRowsPlan& plan);
+sycl::event full_attention_fa2_decode_rows(sycl::queue& q,
+                                           const FaDecodeRowsPlan& plan,
+                                           const sycl::half* q_in,
+                                           const sycl::half* k_in,
+                                           const sycl::half* v_in,
+                                           sycl::half* y,
+                                           float* partials,
+                                           uint32_t layer_slot,
+                                           const std::vector<sycl::event>& deps = {},
+                                           AttnProfileData* prof = nullptr);
 
 // Latency-optimized FA-2 split-K decode: identical algorithm & partials format
 // to full_attention_fa2_decode, but the inner KV loop is BLOCKED (B positions per

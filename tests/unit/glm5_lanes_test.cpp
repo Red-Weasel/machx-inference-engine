@@ -8,6 +8,7 @@
 #include "ie/glm5_lanes.hpp"
 #include "ie/glm5_server.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -331,6 +332,337 @@ int main() {
         check(!p2.start_rows(1, stage, nullptr, nullptr, nullptr, 16, 0).empty(), "start_rows without a rows stage is refused");
         check(!p2.start_rows(1, stage, [](uint32_t, std::span<const ie::Glm5LanePipe::Step>, float*) { return std::string(); },
                              nullptr, nullptr, 17, 0).empty(), "start_rows with more than 16 rows a group is refused");
+    }
+    // ---- P4 B33: cancel() -- the waiting steps dropped, the held one finishes its stage and goes no further -----------------
+    // A stage can be held on a gate; every stage call and every callback is recorded. (a) lane 0's step held on stage 0, lanes 1
+    // and 2 waiting for stage 0; (b) lane 0's step held on stage 1, lane 1's waiting for stage 1 (it ran stage 0).
+    for (const uint32_t hold_stage : {0u, 1u}) {
+        const std::string tag_s = "cancel, a step held on stage " + std::to_string(hold_stage);
+        ie::Glm5LanePipe pipe(3, 4, 1);
+        std::mutex mu;
+        std::vector<std::pair<uint32_t, uint32_t>> calls;   // (stage, lane)
+        std::atomic<int> cbs{0};
+        std::atomic<bool> held{false}, release{false};
+        auto stage = [&](uint32_t s, const ie::Glm5LanePipe::Step& st) -> std::string {
+            { std::lock_guard<std::mutex> lk(mu); calls.emplace_back(s, st.lane); }
+            if (s == hold_stage && st.lane == 0) {
+                held = true;
+                while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return {};
+        };
+        check(pipe.start(2, stage, [&](uint32_t, uint32_t, uint32_t) { ++cbs; }).empty(), "start (" + tag_s + ")");
+        const int32_t ids[3] = {1, 2, 3};
+        check(pipe.submit(0, ids, 3, 0).empty(), "lane 0 submits (" + tag_s + ")");
+        for (int i = 0; i < 2000 && !held.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        check(held.load(), "lane 0's step is held on stage " + std::to_string(hold_stage));
+        pipe.submit(1, ids, 3, 0);
+        if (hold_stage == 0) pipe.submit(2, ids, 3, 0);
+        else   // lane 1 runs stage 0 and waits for stage 1 (held by lane 0)
+            for (int i = 0; i < 2000; ++i) {
+                { std::lock_guard<std::mutex> lk(mu); if (calls.size() >= 3) break; }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        const uint32_t h = pipe.cancel();
+        check(h == 1, "cancel returns the one step a stage holds (" + std::to_string(h) + ", " + tag_s + ")");
+        const std::string refused = pipe.submit(2, ids, 1, 0);
+        check(refused.find("cancelled") != std::string::npos, "submit after cancel is refused: " + refused);
+        check(pipe.cancel() == 1, "cancel again: the held step is still the only one");
+        release = true;
+        const auto t0 = std::chrono::steady_clock::now();
+        const std::string e = pipe.stop();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        check(e.empty() && ms < 1000, "stop after cancel returns once the held step's stage is done (" + std::to_string(int(ms)) + " ms)");
+        std::vector<std::pair<uint32_t, uint32_t>> want{{0, 0}};
+        if (hold_stage == 1) want = {{0, 0}, {1, 0}, {0, 1}};
+        { std::lock_guard<std::mutex> lk(mu); std::sort(calls.begin(), calls.end()); std::sort(want.begin(), want.end());
+          check(calls == want, "only the held step's stage(s) ran: nothing waiting started after cancel (" + std::to_string(calls.size()) +
+                               " stage calls, " + tag_s + ")"); }
+        check(cbs.load() == 0, "no done callback ran after cancel (" + tag_s + ")");
+        // a step dropped after a stage ran it is half-stepped (failed, like a stage error); one dropped before stage 0 is not
+        if (hold_stage == 0) {
+            const std::string f0 = pipe.set_lane_pos(0, 3);
+            check(f0.find("failed part-way") != std::string::npos, "the held lane, stopped after stage 0, is marked failed: " + f0);
+            check(pipe.set_lane_pos(1, 0).empty() && pipe.set_lane_pos(2, 0).empty(), "lanes dropped before stage 0 are not marked failed");
+        } else {
+            check(pipe.lane_pos(0) == 3, "the held step finished the last stage: its position is committed (" + std::to_string(pipe.lane_pos(0)) + ")");
+            const std::string f1 = pipe.set_lane_pos(1, 3);
+            check(f1.find("failed part-way") != std::string::npos, "lane 1, dropped between the stages, is marked failed: " + f1);
+        }
+        cbs = 0;
+        check(pipe.start(2, [](uint32_t, const ie::Glm5LanePipe::Step&) { return std::string(); },
+                         [&](uint32_t, uint32_t, uint32_t) { ++cbs; }).empty() &&
+              pipe.submit(2, ids, 3, 0).empty() && pipe.stop().empty() && cbs.load() == 1,
+              "a new start clears the cancel: a step runs and calls back (" + tag_s + ")");
+    }
+    // rows mode: a prefill piece held on stage 1, a decode group of lanes 1 + 2 waiting for stage 1 (both queued while the piece
+    // was held on stage 0, so stage 0 forms them into one group)
+    {
+        ie::Glm5LanePipe pipe(4, 4, 1);
+        std::mutex mu;
+        std::vector<std::string> calls;
+        std::atomic<int> cbs{0};
+        std::atomic<bool> at0{false}, go0{false}, held{false}, release{false};
+        auto stage = [&](uint32_t s, const ie::Glm5LanePipe::Step& st) -> std::string {
+            { std::lock_guard<std::mutex> lk(mu); calls.push_back("s" + std::to_string(s) + " lane " + std::to_string(st.lane)); }
+            if (s == 0 && st.lane == 0) { at0 = true; while (!go0.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+            if (s == 1 && st.lane == 0) { held = true; while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+            return {};
+        };
+        auto rows_stage = [&](uint32_t s, std::span<const ie::Glm5LanePipe::Step> st, float*) -> std::string {
+            std::lock_guard<std::mutex> lk(mu);
+            calls.push_back("s" + std::to_string(s) + " group of " + std::to_string(st.size()));
+            return {};
+        };
+        for (uint32_t l = 1; l < 4; ++l) pipe.set_lane_pos(l, 5);   // lanes 1-3 decode at 5
+        check(pipe.start_rows(2, stage, rows_stage, [&](uint32_t, uint32_t, uint32_t) { ++cbs; },
+                              [&](std::span<const uint32_t>) { ++cbs; }, 16, 2).empty(), "start_rows (cancel)");
+        const int32_t ids[3] = {1, 2, 3};
+        pipe.submit(0, ids, 3, 0);
+        for (int i = 0; i < 2000 && !at0.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        pipe.submit(1, ids, 1, 5);
+        pipe.submit(2, ids, 1, 5);
+        go0 = true;
+        for (int i = 0; i < 2000; ++i) {   // the piece is held on stage 1 and the group of lanes 1 + 2 ran stage 0
+            if (!held.load()) { std::this_thread::sleep_for(std::chrono::milliseconds(1)); continue; }
+            { std::lock_guard<std::mutex> lk(mu); if (std::find(calls.begin(), calls.end(), "s0 group of 2") != calls.end()) break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const uint32_t h = pipe.cancel();
+        check(held.load() && h == 1, "rows: cancel returns the held prefill piece (" + std::to_string(h) + ")");
+        check(pipe.submit(3, ids, 1, 5).find("cancelled") != std::string::npos, "rows: a submit after cancel is refused");
+        release = true;
+        check(pipe.stop().empty(), "rows: stop after cancel");
+        { std::lock_guard<std::mutex> lk(mu);
+          check(calls.size() == 3 && std::count(calls.begin(), calls.end(), "s1 group of 2") == 0,
+                "rows: the waiting group never ran stage 1 (" + std::to_string(calls.size()) + " stage calls)"); }
+        check(cbs.load() == 0, "rows: no callback ran after cancel");
+        check(pipe.lane_pos(0) == 3 && pipe.set_lane_pos(1, 6).find("failed part-way") != std::string::npos &&
+              pipe.set_lane_pos(2, 6).find("failed part-way") != std::string::npos,
+              "rows: the held piece committed its position; the dropped group's lanes are marked failed");
+        check(pipe.cancel() == 0, "cancel on a stopped pipe: 0");
+    }
+    // ---- P4 B34: lookahead -- a lane's next step runs stage 0 while its step before runs stage 1 ---------------------------
+    // Lane 0 prefills N pieces of 3 rows. As the serve module does: the done callback submits the next piece only when none is
+    // in flight, and the idle hook (stage 0 finished a step with nothing queued) offers it as a lookahead. Stage 1 is slower,
+    // so without the lookahead stage 0 would idle between pieces. Stage 0 writes a (lane, pos0) pattern into the step's
+    // residual and stage 1 checks it: the lane's two slots never mix. Rows mode adds lanes 1 and 2 decoding 1-row steps.
+    for (const bool rows : {false, true}) {
+        using Clock = std::chrono::steady_clock;
+        const std::string tag_s = rows ? "rows mode, beside 2 decoding lanes" : "per lane";
+        const uint32_t N = 12, Tp = 3, wide_row = 4, n_lanes = rows ? 3 : 1, dec_steps = 40;
+        ie::Glm5LanePipe pipe(n_lanes, 8, wide_row, /*ahead=*/true);
+        std::mutex mu;
+        uint32_t next = 0, inflight = 0, lookaheads = 0;   // (mu) lane 0's next piece, its pieces in flight
+        std::vector<uint32_t> landed, dec_n(n_lanes, 0);
+        std::vector<std::pair<double, double>> iv[2];      // per stage: lane 0's piece k ran (t0, t1)
+        iv[0].assign(N, {0, 0}); iv[1].assign(N, {0, 0});
+        std::atomic<uint32_t> bad{0};
+        std::string err;
+        const int32_t ids[3] = {1, 2, 3};
+        const auto tb = Clock::now();
+        auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - tb).count(); };
+        auto pattern = [&](uint32_t s, uint32_t lane, uint32_t pos0, float* w, uint32_t T) {
+            const float tag = float(lane * 100000 + pos0 * 10);
+            for (uint32_t r = 0; r < T * wide_row; ++r) { if (s > 0 && w[r] != tag + float(s - 1)) ++bad; w[r] = tag + float(s); }
+        };
+        auto stage = [&](uint32_t s, const ie::Glm5LanePipe::Step& st) -> std::string {
+            const double t0 = ms();
+            pattern(s, st.lane, st.pos0, st.wide, st.T);
+            std::this_thread::sleep_for(std::chrono::milliseconds(st.T > 1 ? (s == 1 ? 6 : 4) : 1));
+            if (st.lane == 0) { std::lock_guard<std::mutex> lk(mu); iv[s][st.pos0 / Tp] = {t0, ms()}; }
+            return {};
+        };
+        auto rows_stage = [&](uint32_t s, std::span<const ie::Glm5LanePipe::Step> st, float* gw) -> std::string {
+            for (size_t i = 0; i < st.size(); ++i) pattern(s, st[i].lane, st[i].pos0, gw + i * wide_row, 1);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            return {};
+        };
+        auto decode_next = [&](uint32_t lane) {   // (mu held) lanes 1, 2: the next 1-row step from their callback
+            if (++dec_n[lane] >= dec_steps) return;
+            const int32_t id = 1;
+            if (auto e = pipe.submit(lane, &id, 1, pipe.lane_pos(lane)); !e.empty() && err.empty()) err = e;
+        };
+        auto done = [&](uint32_t lane, uint32_t, uint32_t pos0) {
+            std::lock_guard<std::mutex> lk(mu);
+            if (lane != 0) { decode_next(lane); return; }
+            landed.push_back(pos0);
+            if (--inflight == 0 && next < N) {
+                if (auto e = pipe.submit(0, ids, Tp, next * Tp); !e.empty()) { if (err.empty()) err = e; }
+                else { ++next; ++inflight; }
+            }
+        };
+        auto rows_done = [&](std::span<const uint32_t> ls) { std::lock_guard<std::mutex> lk(mu); for (uint32_t l : ls) decode_next(l); };
+        auto idle = [&] {
+            std::lock_guard<std::mutex> lk(mu);
+            if (inflight != 1 || next >= N) return;
+            bool taken = false;
+            if (auto e = pipe.submit_ahead(0, ids, Tp, next * Tp, taken); !e.empty() && err.empty()) err = e;
+            if (taken) { ++next; ++inflight; ++lookaheads; }
+        };
+        const std::string se = rows ? pipe.start_rows(2, stage, rows_stage, done, rows_done, 16, 0, idle) : pipe.start(2, stage, done, idle);
+        check(se.empty(), "lookahead (" + tag_s + "): start");
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            const int32_t id = 1;
+            for (uint32_t l = 1; l < n_lanes; ++l) { pipe.set_lane_pos(l, 5); pipe.submit(l, &id, 1, 5); }
+            check(pipe.submit(0, ids, Tp, 0).empty(), "lookahead (" + tag_s + "): lane 0's first piece");
+            next = 1; inflight = 1;
+        }
+        for (int i = 0; i < 4000; ++i) {
+            { std::lock_guard<std::mutex> lk(mu); if (landed.size() >= N) break; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const std::string e = pipe.stop();
+        bool in_order = landed.size() == N, stage_order = true, overlap = false;
+        for (uint32_t k = 0; k < landed.size(); ++k) in_order = in_order && landed[k] == k * Tp;
+        for (uint32_t s = 0; s < 2; ++s)
+            for (uint32_t k = 1; k < N; ++k) stage_order = stage_order && iv[s][k].first >= iv[s][k - 1].second;
+        for (uint32_t k = 0; k + 1 < N; ++k)   // piece k + 1 on stage 0 while piece k is on stage 1
+            overlap = overlap || (iv[0][k + 1].first < iv[1][k].second && iv[1][k].first < iv[0][k + 1].second);
+        check(e.empty() && err.empty(), "lookahead (" + tag_s + "): no error" + e + err);
+        check(in_order && pipe.lane_pos(0) == N * Tp, "lookahead (" + tag_s + "): lane 0's " + std::to_string(N) +
+                                                          " pieces landed in order at contiguous positions (pos " + std::to_string(pipe.lane_pos(0)) + ")");
+        check(stage_order, "lookahead (" + tag_s + "): each stage ran lane 0's pieces one after another, in order");
+        check(bad == 0, "lookahead (" + tag_s + "): every stage read its step's own residual (the two slots never mixed)");
+        check(lookaheads >= N / 2 && overlap, "lookahead (" + tag_s + "): " + std::to_string(lookaheads) + " of " + std::to_string(N - 1) +
+                                               " next pieces went in as lookaheads; a piece ran stage 0 beside the piece before on stage 1");
+        if (rows) check(dec_n[1] == dec_steps && dec_n[2] == dec_steps && pipe.lane_pos(1) == 5 + dec_steps,
+                        "lookahead (rows): the decoding lanes ran every step beside it");
+    }
+    // ---- P4 B34: submit_ahead's rules, and the callback's resubmit with a lookahead in flight -------------------------------
+    {
+        ie::Glm5LanePipe plain(1, 4, 1);
+        const int32_t ids[4] = {1, 2, 3, 4};
+        bool taken = true;
+        check(!plain.submit_ahead(0, ids, 1, 1, taken).empty() && !taken, "submit_ahead on a pipe without lookahead slots: an error");
+        ie::Glm5LanePipe pipe(2, 4, 1, /*ahead=*/true);
+        check(pipe.host_bytes() == 2 * plain.host_bytes() * 2, "lookahead slots: two buffer sets a lane (" + std::to_string(pipe.host_bytes()) + " B)");
+        check(pipe.submit_ahead(0, ids, 2, 2, taken).empty() && !taken, "submit_ahead before start: not taken");
+        std::atomic<int> gate0{0}, gate1{0};   // 1 = hold the stage
+        std::atomic<bool> at0{false}, at1{false};
+        std::mutex mu;
+        std::vector<std::string> seen;
+        std::vector<uint32_t> landed;
+        auto stage = [&](uint32_t s, const ie::Glm5LanePipe::Step& st) -> std::string {
+            if (st.lane != 0) return {};
+            std::atomic<int>& g = s == 0 ? gate0 : gate1;
+            (s == 0 ? at0 : at1) = true;
+            while (g.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            (s == 0 ? at0 : at1) = false;
+            return {};
+        };
+        auto done = [&](uint32_t lane, uint32_t T, uint32_t pos0) {
+            std::lock_guard<std::mutex> lk(mu);
+            landed.push_back(pos0);
+            if (lane != 0) return;
+            bool tk = true;
+            if (pos0 == 0) seen.push_back("resub:" + pipe.submit(0, ids, 1, pos0 + T));   // B is in flight behind it
+            else seen.push_back("ahead-in-cb:" + pipe.submit_ahead(0, ids, 1, pos0 + T, tk) + (tk ? "taken" : "not taken"));
+        };
+        auto wait_for = [](std::atomic<bool>& f) { for (int i = 0; i < 2000 && !f.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1)); return f.load(); };
+        check(pipe.start(2, stage, done).empty(), "start (lookahead rules)");
+        check(pipe.submit_ahead(0, ids, 2, 2, taken).empty() && !taken, "submit_ahead with no step in flight: not taken");
+        gate0 = 1; gate1 = 1;
+        check(pipe.submit(0, ids, 2, 0).empty() && wait_for(at0), "step A (2 rows at 0) held on stage 0");
+        check(pipe.submit_ahead(0, ids, 2, 2, taken).empty() && !taken, "submit_ahead while the step is on stage 0: not taken");
+        gate0 = 0;
+        check(wait_for(at1), "step A held on stage 1");
+        check(!pipe.submit_ahead(0, ids, 2, 3, taken).empty() && !taken, "submit_ahead at a pos0 that is not A's end: an error");
+        check(!pipe.submit_ahead(0, ids, 5, 2, taken).empty() && !taken, "submit_ahead above max_T: an error");
+        check(pipe.submit_ahead(0, ids, 2, 2, taken).empty() && taken, "submit_ahead behind A (2 rows at 2): taken");
+        check(pipe.submit_ahead(0, ids, 1, 4, taken).empty() && !taken, "a second lookahead (two steps in flight): not taken");
+        check(pipe.submit(0, ids, 1, 4).find("in flight") != std::string::npos, "a fresh submit of the lane: refused");
+        check(pipe.submit(1, ids, 1, 0).empty(), "another lane submits");
+        gate1 = 0;
+        const std::string e = pipe.stop();
+        check(e.empty(), "stop: " + e);
+        check(seen.size() == 2 && seen[0].find("lookahead") != std::string::npos,
+              "A's callback resubmit with B in flight: refused (" + (seen.empty() ? std::string() : seen[0]) + ")");
+        check(seen.size() == 2 && seen[1] == "ahead-in-cb:not taken", "submit_ahead from B's own callback: not taken");
+        check(pipe.lane_pos(0) == 4 && pipe.steps_done() == 3, "A then B committed (lane 0 at 4), 3 steps in all");
+    }
+    // ---- P4 B34: cancel with two steps of a lane in flight -----------------------------------------------------------------
+    // A held on stage 1; its lookahead B either held on stage 0, or done with stage 0 and waiting for stage 1 behind A (the
+    // idle hook's second call = B's hand-off to stage 1 is done: the first is A's).
+    for (const bool b_held : {true, false}) {
+        const std::string tag_s = b_held ? "B held on stage 0" : "B waiting for stage 1";
+        ie::Glm5LanePipe pipe(1, 4, 1, /*ahead=*/true);
+        const int32_t ids[4] = {1, 2, 3, 4};
+        std::atomic<bool> held0{false}, held1{false}, release{false};
+        std::atomic<int> cbs{0}, calls{0}, idles{0};
+        auto stage = [&](uint32_t s, const ie::Glm5LanePipe::Step& st) -> std::string {
+            ++calls;
+            if ((s == 1 && st.pos0 == 0) || (s == 0 && b_held && st.pos0 == 2)) {
+                (s == 0 ? held0 : held1) = true;
+                while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            return {};
+        };
+        auto wait_for = [](auto&& ok) { for (int i = 0; i < 2000 && !ok(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1)); return ok(); };
+        check(pipe.start(2, stage, [&](uint32_t, uint32_t, uint32_t) { ++cbs; }, [&] { ++idles; }).empty(), "start (" + tag_s + ")");
+        pipe.submit(0, ids, 2, 0);
+        check(wait_for([&] { return held1.load() && idles.load() == 1; }), "A held on stage 1 (" + tag_s + ")");
+        bool taken = false;
+        check(pipe.submit_ahead(0, ids, 2, 2, taken).empty() && taken, "B (A's lookahead) taken (" + tag_s + ")");
+        check(b_held ? wait_for([&] { return held0.load(); }) : wait_for([&] { return idles.load() == 2; }),
+              b_held ? "B held on stage 0" : "B ran stage 0 and waits for stage 1");
+        const int calls0 = calls.load();
+        const uint32_t h = pipe.cancel();
+        check(h == (b_held ? 2u : 1u), "cancel returns the steps the stages hold (" + std::to_string(h) + ", " + tag_s + ")");
+        release = true;
+        check(pipe.stop().empty() && cbs.load() == 0, "stop after cancel returns; no callback ran (" + tag_s + ")");
+        check(calls.load() == calls0, "nothing waiting started after the cancel (" + tag_s + ")");
+        check(pipe.lane_pos(0) == 2, "A finished stage 1: lane 0 committed 2 (" + tag_s + ")");
+        const std::string f0 = pipe.set_lane_pos(0, 2);
+        check(f0.find("failed part-way") != std::string::npos, "B ran stage 0 and went no further: lane 0 marked failed (" + tag_s + ")");
+    }
+    // ---- P4 B34: a lookahead never delays another step at stage 0 -----------------------------------------------------------
+    {
+        ie::Glm5LanePipe pipe(2, 4, 1, /*ahead=*/true);
+        const int32_t ids[4] = {1, 2, 3, 4};
+        std::atomic<bool> held0{false}, held1{false}, release0{false}, release1{false};
+        auto stage = [&](uint32_t s, const ie::Glm5LanePipe::Step& st) -> std::string {
+            if (s == 1 && st.lane == 0) { held1 = true; while (!release1.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+            if (s == 0 && st.lane == 1) { held0 = true; while (!release0.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1)); }
+            return {};
+        };
+        auto wait_for = [](std::atomic<bool>& f) { for (int i = 0; i < 2000 && !f.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1)); return f.load(); };
+        check(pipe.start(2, stage, [](uint32_t, uint32_t, uint32_t) {}).empty(), "start (stage 0 busy)");
+        pipe.submit(0, ids, 2, 0);
+        check(wait_for(held1), "lane 0's A held on stage 1");
+        pipe.submit(1, ids, 2, 0);
+        check(wait_for(held0), "lane 1's step running on stage 0");
+        bool taken = true;
+        check(pipe.submit_ahead(0, ids, 2, 2, taken).empty() && !taken, "submit_ahead while stage 0 runs another step: not taken");
+        release0 = true; release1 = true;
+        check(pipe.stop().empty() && pipe.lane_pos(0) == 2 && pipe.lane_pos(1) == 2, "both steps finished");
+    }
+    // ---- P4 B34: a stage error under a lookahead -- A fails on stage 1 while B is in flight behind it ----------------------
+    {
+        ie::Glm5LanePipe pipe(1, 4, 1, /*ahead=*/true);
+        const int32_t ids[4] = {1, 2, 3, 4};
+        std::atomic<bool> held{false}, release{false};
+        auto stage = [&](uint32_t s, const ie::Glm5LanePipe::Step& st) -> std::string {
+            if (s == 1 && st.pos0 == 0) {
+                held = true;
+                while (!release.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                return "boom";
+            }
+            return {};
+        };
+        check(pipe.start(2, stage, [](uint32_t, uint32_t, uint32_t) {}).empty(), "start (error under a lookahead)");
+        pipe.submit(0, ids, 2, 0);
+        for (int i = 0; i < 2000 && !held.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        bool taken = false;
+        check(pipe.submit_ahead(0, ids, 2, 2, taken).empty() && taken, "B taken behind A");
+        release = true;
+        const std::string e = pipe.stop();
+        check(e.find("boom") != std::string::npos && e.find("lane 0 at 0") != std::string::npos, "stop returns A's error: " + e);
+        check(pipe.start(2, [](uint32_t, const ie::Glm5LanePipe::Step&) { return std::string(); }, nullptr).empty() &&
+              pipe.submit(0, ids, 1, pipe.lane_pos(0)).find("failed part-way") != std::string::npos &&
+              pipe.submit(0, ids, 1, 0).empty() && pipe.stop().empty(),
+              "after the error the lane takes only a new sequence (the claims of A and B both released)");
     }
     // ---- per-lane VRAM: GLM-5.3-Flash's layout (full layers 3, 7, ..., 43; stages [0, 23) and [23, 45)) -----------------
     {

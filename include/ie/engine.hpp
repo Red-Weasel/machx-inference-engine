@@ -21,6 +21,7 @@
 #include "ie/gemma4.hpp"
 #include "ie/gguf.hpp"
 #include "ie/kv_cache.hpp"
+#include "ie/lanes_auto.hpp"
 #include "ie/prefix_cache.hpp"
 #include "ie/fleet_prefix_cache.hpp"
 #include "ie/model_config.hpp"
@@ -145,6 +146,7 @@ struct SamplingParams {
 // The largest --parallel (EngineOptions::parallel) the engine admits (P4 B14): each arch's own load-time check then refuses a
 // lane count that does not fit, with the numbers. The 27B split path's forward_slots has the same cap (Qwen35SplitModel::kMaxSlots).
 inline constexpr uint32_t kMaxParallel = 16;
+static_assert(kLanesAutoMax == kMaxParallel, "the auto lane pick's cap (ie/lanes_auto.hpp) is --parallel's");
 
 struct EngineOptions {
     uint32_t max_ctx       = 8192;
@@ -158,6 +160,9 @@ struct EngineOptions {
                                      // (joint-step scheduler over per-slot state
                                      // banks), other archs take whole-generation
                                      // FIFO turns. CLI: --parallel.
+                                     // kLanesAuto (0, `ie serve`'s default since P4 B30):
+                                     // the load picks N (ie/lanes_auto.hpp) and
+                                     // parallel() reports the pick.
     uint32_t slot_ctx      = 0;      // per-slot ctx budget for the decode banks
                                      // (--parallel>1, split path). 0 = auto:
                                      // min(max_ctx, 65536). Each of the `parallel`
@@ -187,9 +192,18 @@ struct GenerateResult {
     std::string text;
     // deepseek4 (docs/deepseek4/72 Phase L): the completion parsed by the
     // model's own format — reasoning split off, tool calls as an OpenAI-format
-    // JSON array ("" when none).  Other archs leave both empty.
+    // JSON array ("" when none).  The Qwen ChatML path fills them too
+    // (finish_chatml_reply: P4 B27's XML calls, P4 B35's reasoning).
     std::string reasoning_content;
     std::string tool_calls_json;
+    // P4 B27: the byte offset in the decoded reply where the text generated AFTER
+    // the model's first </think> begins (the decode's length up to and including
+    // that token: P4 B35 shows the tag for the Qwen thinking templates, other
+    // models' decode drops it); std::string::npos when the reply generated no
+    // </think>. Set by the serial loops and the request lanes; only the ChatML
+    // tool-call parse reads it (finish_chatml_reply), before the split moves the
+    // reasoning out of `text`.
+    size_t      answer_start      = std::string::npos;
     uint32_t    prompt_tokens     = 0;
     uint32_t    cached_tokens     = 0; // prompt tokens served from the prefix cache
     uint32_t    completion_tokens = 0;
@@ -243,6 +257,9 @@ public:
     static bool mimo26_dir(const std::string& path);
     uint32_t  max_ctx() const noexcept { return opts_.max_ctx; }
     uint32_t  parallel() const noexcept { return opts_.parallel; }
+    // P4 B38: the positions each of the request lanes 1..N-1 holds (lane 0 holds max_ctx); 0 with one lane. /props reports
+    // it as slot_ctx, so a client sizes a sub-agent to its lane, not to the lead's window.
+    uint32_t  slot_ctx() const noexcept { return lane_ctx_; }
     uint32_t  vocab()   const noexcept {
         // deepseek4 first: its config is inside the opaque Ds4Bundle, so the
         // count is cached here at load (and none of the branches below apply).
@@ -280,11 +297,14 @@ public:
                             const TokenCallback& on_token = {},
                             uint32_t cache_prefix_len = 0,
                             bool reply_cache = false,
-                            uint32_t shared_prefix_len = 0);
+                            uint32_t shared_prefix_len = 0,
+                            bool anchor = false);
     // P4 B15: shared_prefix_len = the conversation-independent prefix (the system prompt + tools, from the chat template;
     // chat() sets it when the prompt cache is on, it is >= IE_SHARED_PREFIX_MIN tokens and IE_SHARED_PREFIX != 0). The crown
     // split and Flash-Next split their prefill there (at --parallel 1 and on the lanes alike, so the two agree); the crown
     // snapshots it into its prompt cache and Flash-Next's lanes into their shared host store, restorable into any lane.
+    // P4 B36: anchor = the prompt ends with a user query (chat() sets it), so cache_prefix_len is that query's end: the crown's
+    // lanes keep their snapshot there through the cache's supersede (LanesRequest::anchor, IE_Q35MOE_ANCHOR).
 
     // `tools_json`: raw OpenAI `tools` array; empty = no tools (template
     // output byte-identical to the pre-tools behavior).
@@ -294,6 +314,19 @@ public:
                         bool enable_thinking = true,
                         std::string_view tools_json = {},
                         std::string_view reasoning_effort = {});
+    // P4 B33: the server is stopping (a signal or POST /admin/shutdown). Terminal and non-blocking: every generation in flight
+    // ends with "abort" as soon as it can, without waiting for queued device work -- on the request lanes (crown, 27B,
+    // Flash-Next) at once: the lane pipe's steps that have not started are dropped and no new piece, turn or callback starts
+    // (LanesServe::abort_all); on the crown split a running prefill step also ends at its next layer boundary
+    // (Qwen35MoeSplitModel::request_abort), at --parallel 1 too, where the prefill loop then aborts after that chunk.
+    // What already runs on a card finishes by itself; the engine's destructor waits for it before it frees. Returns the
+    // device steps that were running (what the stop still waits for), for the server's "[ie] stopped in" line. Archs with
+    // their own serving loops (DeepSeek-V4.1, MiMo-V2.6) keep stopping through the token callback.
+    uint32_t abort_all();
+    // P4 B35: chat() splits this model's reasoning off at its </think> (a Qwen thinking template, reasoning.hpp
+    // chatml_think_split), which the decoded text shows: with thinking on, the reasoning comes back in
+    // GenerateResult::reasoning_content, and the server streams it as reasoning_content (ChatmlThinkStream).
+    bool chatml_thinking() const noexcept { return chatml_think_; }
     // Metadata-only admission validation; safe before sending HTTP/SSE headers.
     std::string reasoning_effort_error(std::string_view effort) const;
     // A string GGUF key's value ("" when absent, not a string, or for the directory-loaded DeepSeek-V4.1 / MiMo-V2.6):
@@ -334,6 +367,7 @@ private:
             return inflight.load(std::memory_order_relaxed) > 1;
         }
     } gate_;
+    std::atomic<bool> stopping_{false};   // P4 B33: abort_all() was called (generate's prefill loop aborts after its chunk)
 
     // --- Joint-step decode scheduler (decode-throughput campaign, Phase 2b).
     // Spawned when --parallel>1 on the 27B split path. Request threads prefill
@@ -528,7 +562,8 @@ private:
     // Q27LanesModel); requests run through q35m_generate_lanes (the same front half)
     std::string    q27_lanes_init();
     GenerateResult q35m_generate_lanes(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token,
-                                       uint32_t cache_prefix_len, bool reply_cache, uint32_t shared_prefix_len = 0);
+                                       uint32_t cache_prefix_len, bool reply_cache, uint32_t shared_prefix_len = 0,
+                                       bool anchor = false);
     sycl::event glm5_forward(sycl::queue& q, const int32_t* ids, uint32_t T, uint32_t pos);
     GgufReader      gguf_;
     DeviceAllocator alloc_;
@@ -549,6 +584,7 @@ private:
     bool            prompt_cache_on_ = false;
     Tokenizer       tok_;
     EngineOptions   opts_;
+    uint32_t        lane_ctx_ = 0;   // P4 B38: see slot_ctx()
     // Multi-GPU tensor-parallel path (dense archs, opts.n_gpus > 1). When tp_ is
     // set, the single-GPU dense_/kv_ are NOT loaded; tp_model_ owns the split
     // weights + per-card KV, and forward_step bounces logits into d_logits_.
@@ -581,7 +617,8 @@ private:
     // FIRST: its pipe and serial worker stop before the state they drive goes.
     std::unique_ptr<Q35mLanes> q35m_;
     // P4 B18: the 27B split's request lanes (--parallel N > 1 unless IE_QWEN35_LANES=0 / --spec / --int8-kv); the same ordering
-    // rule as q35m_. q27_share_: IE_QWEN35_SHARED_PREFIX=1 (the shared-prefix split and snapshot, --parallel 1 AND the lanes).
+    // rule as q35m_. q27_share_: on unless IE_QWEN35_SHARED_PREFIX=0 (the shared-prefix split and snapshot on the piece grid,
+    // --parallel 1 AND the lanes; P4 B25).
     std::unique_ptr<Q35mLanes> q27_;
     bool q27_share_ = false;
     // DeepSeek-V4-Flash. Owns the bound model (which points into gguf_'s mmap),
@@ -668,8 +705,20 @@ private:
     // <tool_call>/</tool_call> ids: preserved through skip-special decode so
     // text-embedded tool calls survive into the OpenAI response content.
     int32_t         tool_call_ids_[2] = {-1, -1};
+    // P4 B27: </think> (-1 when the vocab has none); GenerateResult::answer_start.
+    int32_t         think_close_id_ = -1;
+    size_t          reply_answer_start(std::span<const int32_t> generated) const;
+    bool            chatml_think_ = false;   // P4 B35: chatml_thinking(); set at load, with tok_.show_special(</think>)
 };
 
 size_t utf8_complete_prefix_len(std::string_view s);
+
+// P4 B27 / B28 / B35: Engine::chat's ChatML reply after generate() (host-only: tests/unit/chatml_xml_tools_test).
+// `xml_tools`: the template teaches the XML tool form (ChatmlXmlTools::enabled); with tools given and a <tool_call> in
+// the text, the calls are parsed out -- with `think_open` (the generation prompt opened <think>) only the text from
+// r.answer_start on (B27), or, for a reply with no </think> that ended on its own, the calls that end it (B28);
+// thinking off: the whole reply. `think_split` (thinking on with a template chatml_think_split names): then the
+// reasoning moves to r.reasoning_content and r.text keeps the answer (split_chatml_think, after the calls are out).
+void finish_chatml_reply(GenerateResult& r, std::string_view tools_json, bool xml_tools, bool think_open, bool think_split);
 
 }  // namespace ie

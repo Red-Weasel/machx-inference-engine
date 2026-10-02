@@ -381,6 +381,7 @@ public:
     bool        rows() const override { return rows_; }
     std::string pipe_start_rows(DoneFn done, RowsDoneFn rows_done) override { return pipe_.start(std::move(done), std::move(rows_done)); }
     std::string pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) override { return pipe_.submit(lane, ids, T, pos0); }
+    uint32_t    abort() override { return pipe_.cancel(); }   // P4 B33 (its forward has no layer-boundary stop)
     std::string pipe_pause() override { return pipe_.pause(); }
     std::string pipe_resume() override { return pipe_.resume(); }
     bool        pipe_paused() const override { return pipe_.paused(); }
@@ -841,14 +842,23 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             // lanes 1..N-1 at --slot-ctx, 0 = 65,536; Engine::q27_lanes_init after the tokenizer). IE_QWEN35_LANES=0 keeps the
             // joint-step path (slot banks + BatchStepper), and so does --spec (spec_generate runs on the live state, which the
             // lanes use as lane 0). (--int8-kv with --parallel > 1 is refused at the CLI; init_lanes refuses it too.)
-            const bool q27_lanes = opts.parallel > 1 && !e->spec_ &&
-                                   [] { const char* v = std::getenv("IE_QWEN35_LANES"); return !(v && *v == '0'); }();
+            const bool q27_lanes_on = !e->spec_ &&
+                                      [] { const char* v = std::getenv("IE_QWEN35_LANES"); return !(v && *v == '0'); }();
+            // P4 B30: no --parallel = lanes (never the joint-step path), as many as the [budget] check below allows and then
+            // init_lanes finds free (lanes_auto.hpp)
+            const bool q27_auto = opts.parallel == kLanesAuto &&
+                                  lanes_auto_plan(LanesArch::kQwen35Split, e->fleet_.size(), q27_lanes_on && e->fleet_.size() == 2,
+                                                  opts.slot_ctx).measure;
+            const bool q27_lanes = (opts.parallel > 1 && q27_lanes_on) || q27_auto;
+            uint32_t q27_budget_n = 1;   // (auto: the most lanes the [budget] check allows)
             if (opts.parallel > 1 && !q27_lanes)
                 std::fprintf(stderr, "[qwen35split] --parallel %u: the joint-step path (%s)\n", opts.parallel,
                              e->spec_ ? "--spec" : "IE_QWEN35_LANES=0");
-            // IE_QWEN35_SHARED_PREFIX=1: the shared-prefix split + snapshot at --parallel 1 AND on the lanes (off: --parallel 1's
-            // prefill as before B18, and the lanes match it)
-            e->q27_share_ = std::getenv("IE_QWEN35_SHARED_PREFIX") && std::string(std::getenv("IE_QWEN35_SHARED_PREFIX")) == "1";
+            // The shared-prefix split + snapshot at --parallel 1 AND on the lanes, ON by default like the crown and Flash-Next
+            // (P4 B25: the cut sits on the prefill piece grid, q27_share_cut, so --parallel 1's bytes are the cache-off path's;
+            // release gate F1 failed a2046bf's unaligned cut). IE_QWEN35_SHARED_PREFIX=0: --parallel 1's prefill as before B18,
+            // and the lanes match it.
+            e->q27_share_ = [] { const char* v = std::getenv("IE_QWEN35_SHARED_PREFIX"); return !(v && *v == '0'); }();
             // --- Load-time VRAM budget check (added after the 2026-08-26
             // desktop crash). This stack has NO free-VRAM query and driver
             // OOM at run time is NOT graceful — it killed the xe driver and
@@ -859,31 +869,29 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             // cache at its configured caps + a flat workspace reserve. ---
             {
                 auto& model = e->qwen35_split_model_;
-                const uint32_t n_par = std::max<uint32_t>(opts.parallel, 1u);
                 uint32_t sctx = opts.slot_ctx ? opts.slot_ctx : 65536u;
                 sctx = std::min<uint32_t>(sctx, opts.max_ctx);
                 const std::vector<uint64_t> wbytes = model.device_bytes();
-                bool over = false;
-                std::string detail;
-                for (uint32_t d = 0; d < e->fleet_.size(); ++d) {
-                    const uint64_t gmem = e->fleet_.dev(d).device()
+                const uint64_t reserve = uint64_t(2) << 30;   // workspaces/partials/logits
+                // card d's worst case but the banks; a bank = kv_slot + dnb (P4 B30: the auto pick and the check share it)
+                struct Budget { uint64_t gmem = 0, weights = 0, kv_live = 0, kv_slot = 0, dnb = 0, cache = 0; };
+                auto budget_of = [&](uint32_t d) {
+                    Budget b;
+                    b.gmem = e->fleet_.dev(d).device()
                         .get_info<sycl::info::device::global_mem_size>();
-                    uint64_t kv_live = 0, kv_slot = 0, dnb = 0;
+                    b.weights = d < wbytes.size() ? wbytes[d] : 0;
                     if (model.dev_has_kv(d)) {
                         const auto& kc = model.kv_cache(d).config();
                         const uint64_t per_tok = uint64_t(kc.n_layers_full) *
                             kc.n_kv_heads * kc.head_dim * 2 /*K+V*/ * 2 /*fp16*/;
-                        kv_live = per_tok * kc.max_ctx;
-                        kv_slot = per_tok * sctx;
+                        b.kv_live = per_tok * kc.max_ctx;
+                        b.kv_slot = per_tok * sctx;
                     }
                     if (model.dev_has_dn(d)) {
                         const auto& dn = model.dn_state(d);
-                        dnb = dn.state_elems_per_layer() * dn.config().n_layers_linear * 4 +
-                              dn.conv_elems_per_layer()  * dn.config().n_layers_linear * 2;
+                        b.dnb = dn.state_elems_per_layer() * dn.config().n_layers_linear * 4 +
+                                dn.conv_elems_per_layer()  * dn.config().n_layers_linear * 2;
                     }
-                    // (the lanes: n_par - 1 extra, lane 0 is the live state; the joint step: n_par banks)
-                    const uint64_t banks = (n_par > 1) ? (q27_lanes ? n_par - 1 : n_par) * (kv_slot + dnb) : 0;
-                    uint64_t cache = 0;
                     if (e->prompt_cache_on_) {
                         const uint64_t ep_tok = std::min<uint64_t>(
                             e->split_cache_cfg_.max_prefix_len, opts.max_ctx);
@@ -893,21 +901,36 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                             per_tok = uint64_t(kc.n_layers_full) * kc.n_kv_heads *
                                       kc.head_dim * 2 * 2;
                         }
-                        cache = uint64_t(e->split_cache_cfg_.max_entries) *
-                                (per_tok * ep_tok + dnb);
+                        b.cache = uint64_t(e->split_cache_cfg_.max_entries) *
+                                  (per_tok * ep_tok + b.dnb);
                     }
-                    const uint64_t reserve = uint64_t(2) << 30;   // workspaces/partials/logits
-                    const uint64_t total = (d < wbytes.size() ? wbytes[d] : 0) +
-                                           kv_live + dnb + banks + cache + reserve;
+                    return b;
+                };
+                uint32_t n_par = std::max<uint32_t>(opts.parallel, 1u);
+                if (q27_auto) {   // P4 B30: the most lanes, up to 16, whose banks keep every card within the 92 % below
+                    std::vector<LanesCardRoom> room;
+                    for (uint32_t d = 0; d < e->fleet_.size(); ++d) {
+                        const Budget b = budget_of(d);
+                        room.push_back(q27_budget_room(b.gmem, b.weights + b.kv_live + b.dnb + b.cache + reserve, b.kv_slot + b.dnb));
+                    }
+                    n_par = q27_budget_n = lanes_auto_fit(room, kLanesAutoMax);
+                }
+                bool over = false;
+                std::string detail;
+                for (uint32_t d = 0; d < e->fleet_.size(); ++d) {
+                    const Budget b = budget_of(d);
+                    // (the lanes: n_par - 1 extra, lane 0 is the live state; the joint step: n_par banks)
+                    const uint64_t banks = (n_par > 1) ? (q27_lanes ? n_par - 1 : n_par) * (b.kv_slot + b.dnb) : 0;
+                    const uint64_t total = b.weights + b.kv_live + b.dnb + banks + b.cache + reserve;
                     char line[256];
                     std::snprintf(line, sizeof line,
                         "[budget] card %u: weights %.1f + kv %.1f + banks %.1f + "
                         "cache-max %.1f + reserve 2.0 = %.1f GB of %.1f GB\n",
-                        d, (d < wbytes.size() ? wbytes[d] : 0) / 1e9, kv_live / 1e9,
-                        banks / 1e9, cache / 1e9, total / 1e9, gmem / 1e9);
+                        d, b.weights / 1e9, b.kv_live / 1e9,
+                        banks / 1e9, b.cache / 1e9, total / 1e9, b.gmem / 1e9);
                     std::fputs(line, stderr);
                     detail += line;
-                    if (double(total) > 0.92 * double(gmem)) over = true;
+                    if (double(total) > 0.92 * double(b.gmem)) over = true;
                 }
                 if (over) {
                     err = "VRAM budget: worst case exceeds 92% of a card — refusing "
@@ -926,12 +949,31 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             if (q27_lanes) {
                 constexpr uint64_t kReserve = 1536ull << 20;   // per card, left free after the lanes (the crown's pick, not measured)
                 const uint32_t pf = q27_prefill_chunk(opts.max_ctx, std::getenv("IE_QWEN35_PREFILL_CHUNK"));
-                if (auto m = e->qwen35_split_model_.init_lanes(opts.parallel, q27_lane_ctx(opts.slot_ctx, opts.max_ctx), pf, kReserve);
+                const uint32_t lane_ctx = q27_lane_ctx(opts.slot_ctx, opts.max_ctx);
+                LanesAutoFit fit;   // P4 B30 auto: init_lanes picks, within the budget's bound, what the free VRAM holds
+                fit.n_max = q27_budget_n;
+                if (auto m = e->qwen35_split_model_.init_lanes(opts.parallel, lane_ctx, pf, kReserve,
+                                                               q27_auto && q27_budget_n > 1 ? &fit : nullptr);
                     !m.empty()) {
-                    err = "qwen35 split --parallel " + std::to_string(opts.parallel) + ": " + m +
+                    err = "qwen35 split --parallel " + (q27_auto ? std::string("auto") : std::to_string(opts.parallel)) + ": " + m +
                           " (IE_QWEN35_LANES=0 serves them through the joint-step path)";
                     return nullptr;
                 }
+                e->lane_ctx_ = e->qwen35_split_model_.n_lanes() > 1 ? lane_ctx : 0u;   // P4 B38
+                if (q27_auto) {
+                    opts.parallel = e->opts_.parallel = e->qwen35_split_model_.n_lanes();
+                    std::fprintf(stderr, "%s\n", (q27_budget_n > 1
+                        ? lanes_auto_line("qwen35", opts.parallel, lane_ctx, "the most, up to the " + std::to_string(q27_budget_n) +
+                                          " the [budget] check above allows, that the free VRAM holds beside the 1.50 GiB "
+                                          "reserve, the logits and the rows partials", fit.cards)
+                        : lanes_auto_line("qwen35", 1, 0, "the [budget] check above has no room for a lane at ctx " +
+                                                              std::to_string(lane_ctx))).c_str());
+                }
+            } else if (opts.parallel == kLanesAuto) {   // P4 B30: no lanes on this load
+                opts.parallel = e->opts_.parallel = 1;
+                std::fprintf(stderr, "%s\n", lanes_auto_line("qwen35", 1, 0, e->spec_ ? "--spec (the joint-step path is explicit only)"
+                                                                     : !q27_lanes_on ? "IE_QWEN35_LANES=0"
+                                                                                     : "the lanes need the two-card split").c_str());
             } else if (opts.parallel > 1) {
                 uint32_t sctx = opts.slot_ctx ? opts.slot_ctx : 65536u;
                 sctx = std::min<uint32_t>(sctx, opts.max_ctx);
@@ -1246,17 +1288,36 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         }
         // P4 B10: --parallel N > 1 = N request lanes on the two cards (lanes 1..N-1 at --slot-ctx, 0 = 32,768), served together
         // by the lanes module (Engine::q35m_lanes_init, after the tokenizer). IE_Q35MOE_LANES=0 keeps the one-at-a-time path.
-        if (opts.parallel > 1 && [] { const char* v = std::getenv("IE_Q35MOE_LANES"); return !(v && *v == '0'); }()) {
+        // P4 B30: no --parallel = the most lanes, up to 16, that fit at the default lane ctx (init_lanes measures), keeping each
+        // lane's sticky checkpoint (P4 B29) and, with the prompt cache on, kLanesAutoCacheFloor for its snapshots
+        const bool q35m_lanes_on = [] { const char* v = std::getenv("IE_Q35MOE_LANES"); return !(v && *v == '0'); }();
+        const bool q35m_auto = opts.parallel == kLanesAuto &&
+                               lanes_auto_plan(LanesArch::kCrownSplit, e->fleet_.size(), q35m_lanes_on && e->fleet_.size() == 2,
+                                               opts.slot_ctx).measure;
+        if ((opts.parallel > 1 && q35m_lanes_on) || q35m_auto) {
             constexpr uint64_t kReserve = 1536ull << 20;   // per card, left free after the lanes (a pick, unverified)
             const uint32_t pf = q35m_prefill_chunk(opts.max_ctx, std::getenv("IE_QWEN36_NO_MOE_ONEDNN"),
                                                    std::getenv("IE_QWEN36_MOE_ONEDNN"), std::getenv("IE_QWEN35_PREFILL_CHUNK"));
-            if (auto m = e->qwen35moe_split_model_.init_lanes(opts.parallel, q4e_lane_ctx(opts.slot_ctx, opts.max_ctx), pf,
-                                                               kReserve); !m.empty()) {
-                err = "qwen35moe --parallel " + std::to_string(opts.parallel) + ": " + m +
+            const uint32_t lane_ctx = q4e_lane_ctx(opts.slot_ctx, opts.max_ctx);
+            LanesAutoFit fit;
+            fit.dn_checkpoint = [] { const char* v = std::getenv("IE_Q35MOE_STICKY_LANES"); return !(v && *v == '0'); }();
+            fit.keep = e->prompt_cache_on_ ? kLanesAutoCacheFloor : 0;
+            if (auto m = e->qwen35moe_split_model_.init_lanes(opts.parallel, lane_ctx, pf, kReserve, q35m_auto ? &fit : nullptr);
+                !m.empty()) {
+                err = "qwen35moe --parallel " + (q35m_auto ? std::string("auto") : std::to_string(opts.parallel)) + ": " + m +
                       " (IE_Q35MOE_LANES=0 serves the requests one at a time)";
                 return nullptr;
             }
-        }
+            e->lane_ctx_ = e->qwen35moe_split_model_.n_lanes() > 1 ? lane_ctx : 0u;   // P4 B38
+            if (q35m_auto)
+                std::fprintf(stderr, "%s\n", lanes_auto_line("qwen35moe", fit.n, lane_ctx, std::string("the most, up to 16, that fit; ") +
+                    "kept = the 1.50 GiB reserve + the rows buffers" +
+                    (fit.keep ? " + " + std::to_string(fit.keep >> 20) + " MiB for the prompt cache's snapshots" : "") +
+                    (fit.dn_checkpoint ? ", and a sticky checkpoint per lane" : ""), fit.cards).c_str());
+        } else if (opts.parallel == kLanesAuto)
+            std::fprintf(stderr, "%s\n", lanes_auto_line("qwen35moe", 1, 0, q35m_lanes_on ? "the lanes need two cards"
+                                                                                         : "IE_Q35MOE_LANES=0").c_str());
+        if (opts.parallel == kLanesAuto) opts.parallel = e->opts_.parallel = e->qwen35moe_split_model_.n_lanes();
         vocab = e->qwen35moe_split_model_.config().vocab;
     } else if (e->arch_ == ModelArch::kGlm5Next) {
         auto* b=(e->glm5_=std::make_unique<Glm5Bundle>()).get();
@@ -1405,8 +1466,21 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         // P4 B8: --parallel N > 1 on two cards = N request lanes per stage (lanes 1..N-1 at --slot-ctx, out of the expert
         // cache) served by the lanes module. One card, or IE_Q4E_LANES=0, keeps the time-sliced path.
         const bool lanes_off = [] { const char* v = std::getenv("IE_Q4E_LANES"); return v && *v == '0'; }();
+        // P4 B30: no --parallel = the fixed pick (lanes_auto.hpp: 4 lanes at 16K, a placeholder here), their state out of the
+        // expert cache; one lane where the lanes would not run (one card, IE_Q4E_LANES=0, IE_P2P)
+        uint32_t q4e_slot_ctx = opts.slot_ctx;
+        if (opts.parallel == kLanesAuto) {
+            const LanesAutoPlan p = lanes_auto_plan(LanesArch::kFlashNext, b->split ? 2u : 1u, !lanes_off && !q4e_p2p, opts.slot_ctx);
+            opts.parallel = e->opts_.parallel = p.n;
+            q4e_slot_ctx = p.slot_ctx;
+            std::fprintf(stderr, "%s\n", lanes_auto_line("qwen4exp", p.n, q4e_lane_ctx(p.slot_ctx, opts.max_ctx),
+                p.n > 1 ? "a fixed pick (the lanes come out of the expert cache; a placeholder, not measured at this pick); the "
+                          "lane line below gives their VRAM"
+                : !b->split ? "the lanes need two cards" : lanes_off ? "IE_Q4E_LANES=0" : "IE_P2P (the lanes run the host handoff)").c_str());
+        }
         const uint32_t n_lanes = (opts.parallel > 1 && b->split && !lanes_off) ? opts.parallel : 1u;
-        const uint32_t lane_ctx = q4e_lane_ctx(opts.slot_ctx, opts.max_ctx);
+        const uint32_t lane_ctx = q4e_lane_ctx(q4e_slot_ctx, opts.max_ctx);
+        e->lane_ctx_ = n_lanes > 1 ? lane_ctx : 0u;   // P4 B38
         if (n_lanes > 1 && q4e_p2p) {
             err = "qwen4exp: --parallel " + std::to_string(opts.parallel) + " request lanes run the host handoff; unset IE_P2P "
                   "(or IE_Q4E_LANES=0 for the time-sliced path)";
@@ -1786,6 +1860,14 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
     }
     e->tool_call_ids_[0] = e->tok_.find_token("<tool_call>");
     e->tool_call_ids_[1] = e->tok_.find_token("</tool_call>");
+    e->think_close_id_   = e->tok_.find_token("</think>");   // P4 B27: GenerateResult::answer_start
+    // P4 B35: a Qwen thinking template -- its </think> shows in every decoded reply (the request lanes' detok uses this
+    // tokenizer too), so Engine::chat and the server can split the reasoning off there
+    if (const auto* ct = e->gguf_.find_kv("tokenizer.chat_template");
+        e->think_close_id_ >= 0 && ct && ct->type == GgufValueType::kString && chatml_think_split(e->arch_, ct->as_string())) {
+        e->tok_.show_special(e->think_close_id_);
+        e->chatml_think_ = true;
+    }
     if (e->tool_call_ids_[0] == -1 || e->tool_call_ids_[1] == -1)
         fprintf(stderr, "[ie] warning: model vocab lacks <tool_call> markers;"
                         " tool-call text may lose framing\n");
@@ -1829,6 +1911,13 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
     // P4 B18: the 27B split's request lanes likewise
     if (e->qwen35_split_ && e->qwen35_split_model_.n_lanes() > 1)
         if (auto m = e->q27_lanes_init(); !m.empty()) { err = m; return nullptr; }
+    // P4 B30: the archs (and loads) without request lanes serve one request at a time under auto; the lanes archs picked above
+    if (e->opts_.parallel == kLanesAuto) {
+        e->opts_.parallel = 1;
+        const auto* a = e->gguf_.find_kv("general.architecture");
+        std::fprintf(stderr, "%s\n", lanes_auto_line(a ? std::string(a->as_string()).c_str() : "this model", 1, 0,
+                                                     "no request lanes for this arch on this load").c_str());
+    }
     return e;
 }
 
@@ -2371,13 +2460,16 @@ class Q35mLanesModel final : public LanesModel {
 public:
     // P4 B14: rows = the pipe groups the decoding lanes' 1-row steps (up to 16 a group; group_cap 0 = AUTO, one group per
     // card) and a group runs as one card step (Qwen35MoeSplitModel::forward_stage_rows); off: today's per-lane pipe.
+    // P4 B34: pipeline = the lane pipeline (a lane's next prefill piece on card 0 while card 1 runs the piece before; a second
+    // residual buffer per lane); off: one piece of a lane in the pipe at a time (B10-B33).
     Q35mLanesModel(Qwen35MoeSplitModel& m, FleetPrefixCache* cache, const Tokenizer& tok, const int32_t* stop_ids,
-                   const int32_t* tool_ids, uint32_t pf_chunk, bool rows, uint32_t group_cap)
+                   const int32_t* tool_ids, uint32_t pf_chunk, bool rows, uint32_t group_cap, bool pipeline)
         : m_(m), cache_(cache), tok_(tok), pf_chunk_(pf_chunk), H_(m.config().hidden), V_(m.config().vocab), rows_(rows),
+          pipeline_(pipeline),
           pipe_(m.n_lanes(), pf_chunk, H_ / 2, 2,   // the residual [T, hidden] fp16 = hidden / 2 floats a row
                 [this](uint32_t s, const Glm5LanePipe::Step& st) { return stage(s, st); },
                 [this](uint32_t s, std::span<const Glm5LanePipe::Step> steps, float* gw) { return stage_rows(s, steps, gw); },
-                Qwen35MoeSplitModel::kMaxRows, group_cap) {
+                Qwen35MoeSplitModel::kMaxRows, group_cap, pipeline) {
         stop_[0] = tok.eos_token_id(); stop_[1] = stop_ids[0]; stop_[2] = stop_ids[1];
         tool_[0] = tool_ids[0]; tool_[1] = tool_ids[1];
     }
@@ -2417,20 +2509,67 @@ public:
         return {};
     }
     uint64_t host_bytes() const { return pipe_.host_bytes() + 2 * uint64_t(pf_chunk_) * H_ * sizeof(sycl::half); }
+    bool pipeline() const { return pipeline_; }
 
     const char* tag() const override { return "q35m lanes"; }
     uint32_t n_lanes() const override { return m_.n_lanes(); }
     // the engine's rule: a prompt must be below ctx - 8, and the reply fits in ctx - 8 - prompt
     uint32_t lane_cap(uint32_t lane) const override { const uint32_t c = m_.lane_ctx(lane); return c > 8 ? c - 8 : 0; }
-    // The prompt cache is shared by every lane (a restore copies into the lane), so no lane's own state serves more than
-    // another's: the choice is the reply room, then the smallest capacity, then the least recently used.
-    uint32_t own_match(uint32_t, std::span<const int32_t>) const override { return 0; }
-    bool occupied(uint32_t) const override { return false; }
-    uint32_t last_end(uint32_t) const override { return 0; }
+    // P4 B29 Fix B (q35m_lanes.hpp Q35mSticky): a lane whose in-place checkpoint the prompt extends is preferred; otherwise an
+    // empty lane, then the smallest capacity, then the least recently used. Sticky off: no lane serves more than another
+    // (every restore is the shared cache's).
+    uint32_t own_match(uint32_t lane, std::span<const int32_t> ids) const override { return sticky_.match(lane, ids); }
+    bool occupied(uint32_t lane) const override { return sticky_.end(lane) > 0; }
+    uint32_t last_end(uint32_t lane) const override { return sticky_.end(lane); }
+
+    // P4 B29 Fix B: the per-lane DeltaNet + conv checkpoints (one DeltaNetState per lane per card that has DeltaNet layers),
+    // allocated once at load when every card keeps `reserve` free after them. IE_Q35MOE_STICKY_LANES=0 = none. A message =
+    // sticky lanes off (not an error).
+    std::string init_sticky(uint64_t reserve) {
+        if (const char* v = std::getenv("IE_Q35MOE_STICKY_LANES"); v && *v == '0') return "IE_Q35MOE_STICKY_LANES=0";
+        const uint32_t n = m_.n_lanes();
+        for (uint32_t dev = 0; dev < 2; ++dev) {
+            if (!m_.dev_has_dn(dev)) continue;
+            m_.select_lane(0);
+            const DeltaNetState& d = m_.dn_state(dev);
+            const uint64_t need = uint64_t(n) * d.config().n_layers_linear *
+                                  (d.state_elems_per_layer() * sizeof(float) + d.conv_elems_per_layer() * sizeof(sycl::half));
+            const sycl::device dv = m_.fleet()->dev(dev).device();
+            if (!dv.has(sycl::aspect::ext_intel_free_memory)) return "card " + std::to_string(dev) + " does not report free memory";
+            const uint64_t fr = dv.get_info<sycl::ext::intel::info::device::free_memory>();
+            if (fr < need + reserve)
+                return "card " + std::to_string(dev) + " has " + std::to_string(fr >> 20) + " MiB free; the checkpoints need " +
+                       std::to_string(need >> 20) + " MiB + the " + std::to_string(reserve >> 20) + " MiB reserve";
+            ck_mib_ = std::max<uint64_t>(ck_mib_, need >> 20);
+        }
+        ckdn_.resize(uint64_t(n) * 2);
+        for (uint32_t l = 0; l < n; ++l) {
+            m_.select_lane(l);
+            for (uint32_t dev = 0; dev < 2; ++dev) {
+                if (!m_.dev_has_dn(dev)) continue;
+                auto c = std::make_unique<DeltaNetState>();
+                if (auto e = c->init(m_.fleet()->dev(dev), m_.dn_state(dev).config()); !e.empty()) {
+                    ckdn_.clear();
+                    return "lane " + std::to_string(l) + " card " + std::to_string(dev) + " checkpoint: " + e;
+                }
+                ckdn_[uint64_t(l) * 2 + dev] = std::move(c);
+            }
+        }
+        sticky_.resize(n);
+        sticky_.on = true;
+        return {};
+    }
+    uint64_t sticky_mib() const { return ck_mib_; }
 
     std::string prefix_prepare(uint32_t lane, const LanesRequest& rq, uint32_t& reused, std::string& source) override {
         source.clear();   // (--parallel 1 reports no cache source on this arch)
         m_.select_lane(lane);
+        // P4 B29 Fix B: the lane's own checkpoint, in place, when it serves at least as much as the shared cache would
+        if (const uint32_t own = sticky_.match(lane, *rq.ids); Q35mSticky::own_wins(own, cache_peek(rq))) {
+            if (auto e = restore_own(lane, own); e.empty()) { reused = own; return {}; }
+            else std::fprintf(stderr, "[q35m lanes] lane %u in-place restore at %u: %s; the cache or a full prefill\n", lane, own, e.c_str());
+        }
+        sticky_.drop(lane);   // the lane's rows are about to be overwritten (a cache restore or a new sequence)
         reused = cache_ ? fleet_cache_restore(m_, *cache_, *rq.ids, "crown-split-cache") : 0;
         if (!reused) m_.reset_state();   // a new sequence (a failed restore's half-copied state goes too)
         return {};
@@ -2445,7 +2584,7 @@ public:
         const auto t0 = std::chrono::steady_clock::now();
         m_.select_lane(lane);
         const std::vector<int32_t> pref(rq.ids->begin(), rq.ids->begin() + pos);
-        const std::string e = cache_->insert(m_, pref);
+        const std::string e = cache_->insert(m_, pref, /*shared=*/true);   // (P4 B29: never superseded)
         std::fprintf(stderr, "[crown-split-cache] lane %u shared prefix %u: %s (%.1f ms)\n", lane, pos, e.empty() ? "inserted" : e.c_str(),
                      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
         return e;
@@ -2461,6 +2600,9 @@ public:
         m_.select_lane(lane);
         return run_chunks(lane, rq.ids->data(), chunks, stop, done);
     }
+    // P4 B36 (B): IE_Q35MOE_ANCHOR (on unless 0): a prompt that ends with a user query snapshots as the conversation's anchor
+    void set_anchor(bool on) { anchor_ = on; }
+    bool anchor() const { return anchor_; }
     // --parallel 1's insert at the snapshot boundary (when [reused, snap_at) was prefilled), then the rest of the prompt
     std::string prompt_end(uint32_t lane, const LanesRequest& rq, uint32_t Tp, uint32_t reused, bool kept) override {
         m_.select_lane(lane);
@@ -2468,7 +2610,17 @@ public:
         const uint32_t T = uint32_t(ids.size());
         if (cache_ && rq.snap_at > reused && Tp == rq.snap_at) {
             const std::vector<int32_t> pref(ids.begin(), ids.begin() + Tp);
-            if (auto e = cache_->insert(m_, pref); !e.empty()) std::fprintf(stderr, "[crown-split-cache] insert: %s\n", e.c_str());
+            if (auto e = cache_->insert(m_, pref, /*shared=*/false, /*anchor=*/anchor_ && rq.anchor); !e.empty())
+                std::fprintf(stderr, "[crown-split-cache] insert: %s\n", e.c_str());
+            else ++snaps_;   // P4 B29: /health "snapshots" (a success is not logged per insert)
+        }
+        // P4 B29 Fix B: the lane's in-place checkpoint at the same boundary (its DeltaNet + conv state; its KV rows stay)
+        if (sticky_.on && rq.snap_at > reused && Tp == rq.snap_at) {
+            std::string e;
+            for (uint32_t dev = 0; dev < 2 && e.empty(); ++dev)
+                if (m_.dev_has_dn(dev)) e = ckdn_[uint64_t(lane) * 2 + dev]->copy_from(m_.fleet()->dev(dev).queue(), m_.dn_state(dev));
+            if (e.empty()) sticky_.set(lane, ids, Tp);
+            else { sticky_.drop(lane); std::fprintf(stderr, "[q35m lanes] lane %u checkpoint at %u: %s\n", lane, Tp, e.c_str()); }
         }
         if (Tp < T) {
             std::vector<LanesChunk> rest;
@@ -2484,6 +2636,7 @@ public:
         // the pipe's record first (position 0, a failed step's mark cleared; P4 B9): no device state, and it must happen even
         // when the model's reset below throws (the B9 gate's finding 1)
         const std::string pe = pipe_.reset_lane(lane);
+        sticky_.drop(lane);   // (P4 B29)
         try {
             m_.select_lane(lane);
             m_.reset_state();
@@ -2512,10 +2665,11 @@ public:
             return "reply snapshot: the lane holds " + std::to_string(pos) + " positions, prompt ++ reply is " + std::to_string(full.size());
         const std::string e = cache_->insert(m_, full);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        if (e.empty()) std::fprintf(stderr, "[crown-split-cache] reply snapshot at depth %zu (%.1f ms)\n", full.size(), ms);
+        if (e.empty()) { ++snaps_; std::fprintf(stderr, "[crown-split-cache] reply snapshot at depth %zu (%.1f ms)\n", full.size(), ms); }
         else           std::fprintf(stderr, "[crown-split-cache] reply snapshot skipped: %s\n", e.c_str());
         return {};
     }
+    uint64_t snapshots() const override { return snaps_.load(); }
     int32_t sample(uint32_t lane, bool first, const LanesSampling& sp, std::span<const int32_t> window, uint64_t seed,
                    std::string& err) override {
         sycl::queue& q = hq();
@@ -2568,6 +2722,20 @@ public:
     bool        rows() const override { return rows_; }
     std::string pipe_start_rows(DoneFn done, RowsDoneFn rows_done) override { return pipe_.start(std::move(done), std::move(rows_done)); }
     std::string pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) override { return pipe_.submit(lane, ids, T, pos0); }
+    // P4 B34: the lane pipeline. Two pieces of one lane in flight touch different cards' state (forward_stage: card 0's KV,
+    // DeltaNet + conv state and workspace for piece k + 1 while card 1's run piece k, as run_chunks has them), and each in its
+    // own residual buffer (the pipe's two slots a lane); per card the lane's launches stay in piece order.
+    bool pipe_lookahead(std::function<void()> idle) override {
+        if (!pipeline_) return false;
+        pipe_.set_idle(std::move(idle));
+        return true;
+    }
+    std::string pipe_submit_ahead(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool& taken) override {
+        return pipe_.submit_ahead(lane, ids, T, pos0, taken);
+    }
+    // P4 B33: the steps not started are dropped; a prefill step running on a card (a pipe stage's or the serial turn's
+    // run_chunks) ends at its next layer boundary (Qwen35MoeSplitModel::request_abort)
+    uint32_t    abort() override { const uint32_t held = pipe_.cancel(); m_.request_abort(); return held; }
     std::string pipe_pause() override { return pipe_.pause(); }
     std::string pipe_resume() override { return pipe_.resume(); }
     bool        pipe_paused() const override { return pipe_.paused(); }
@@ -2636,11 +2804,34 @@ private:
         return err;
     }
 
+    // P4 B29 Fix B: the selected lane back to its checkpoint at `depth`: the DeltaNet + conv state copied back on every card
+    // that has DeltaNet layers, every full-attention layer's KV length set to `depth` (its rows below are the lane's own)
+    std::string restore_own(uint32_t lane, uint32_t depth) {
+        for (uint32_t dev = 0; dev < 2; ++dev) {
+            if (m_.dev_has_dn(dev)) {
+                const DeltaNetState* c = ckdn_[uint64_t(lane) * 2 + dev].get();
+                if (!c) return "no checkpoint on card " + std::to_string(dev);
+                if (auto e = m_.dn_state(dev).copy_from(m_.fleet()->dev(dev).queue(), *c); !e.empty()) return e;
+            }
+            if (m_.dev_has_kv(dev)) {
+                KvCache& kv = m_.kv_cache(dev);
+                for (uint32_t li = 0; li < kv.config().n_layers_full; ++li) kv.set_length(li, depth);
+            }
+        }
+        return {};
+    }
+
     Qwen35MoeSplitModel& m_;
     FleetPrefixCache* cache_;   // null = the prompt cache is off
+    std::atomic<uint64_t> snaps_{0};   // P4 B29: successful prompt-end + reply snapshots
+    Q35mSticky sticky_;                // P4 B29 Fix B (off until init_sticky)
+    std::vector<std::unique_ptr<DeltaNetState>> ckdn_;   // [lane * 2 + card] the in-place checkpoints
+    uint64_t ck_mib_ = 0;
     const Tokenizer& tok_;
     uint32_t pf_chunk_, H_, V_;
     bool rows_;
+    bool pipeline_;                        // P4 B34
+    bool anchor_ = false;                  // P4 B36 (B)
     CardPipe pipe_;
     std::vector<sycl::half> xb_[2];
     int32_t stop_[3] = {-1, -1, -1};
@@ -2666,9 +2857,71 @@ std::string Engine::q35m_lanes_init() {
     uint32_t gcap = 0;
     if (const char* v = std::getenv("IE_Q35MOE_GROUP_LANES"))
         gcap = uint32_t(std::clamp(std::atoi(v), 0, int(Qwen35MoeSplitModel::kMaxRows)));
+    // P4 B34: the lane pipeline on by default; IE_Q35MOE_LANE_PIPELINE=0 = one piece of a lane in the pipe at a time (B10-B33)
+    const char* lpv = std::getenv("IE_Q35MOE_LANE_PIPELINE");
+    const bool lpipe = !(lpv && std::string(lpv) == "0");
     auto lm = std::make_unique<Q35mLanesModel>(m, prompt_cache_on_ ? &fleet_cache_ : nullptr, tok_, stop_ids_, tool_call_ids_, pf,
-                                               rows, gcap);
+                                               rows, gcap, lpipe);
     if (auto e = lm->init(); !e.empty()) return e;
+    // P4 B29 Fix B: sticky lanes (per-lane in-place checkpoints), allocated BEFORE the prompt cache measures its budget
+    if (auto e = lm->init_sticky(1536ull << 20); e.empty())
+        std::fprintf(stderr, "[qwen35moe] sticky lanes ON: a conversation's next turn restores in place on its own lane (%u lanes x "
+                             "a DeltaNet checkpoint, %llu MiB per card; IE_Q35MOE_STICKY_LANES=0 = off)\n", m.n_lanes(),
+                     (unsigned long long)lm->sticky_mib());
+    else std::fprintf(stderr, "[qwen35moe] sticky lanes OFF (%s)\n", e.c_str());
+    // P4 B36 (B): the anchor, on with the prompt cache (IE_Q35MOE_ANCHOR=0 = off): a prompt that ends with a user query keeps its
+    // snapshot (that query's end) through the supersede, so the conversation's next query restores at least that far. The B35
+    // gate's tool loop: a new query after 4 tool rounds restored 0 tokens on v0.2.2 and v0.2.3 -- the template re-renders the
+    // turns after the old query and the supersede had dropped round 1's snapshot. A conversation can then hold 2 entries (its
+    // anchor + its latest turn): the entry cap below counts 2 a lane; the VRAM budget is unchanged.
+    const char* anv = std::getenv("IE_Q35MOE_ANCHOR");
+    lm->set_anchor(prompt_cache_on_ && !(anv && std::string(anv) == "0"));
+    // P4 B29: the prompt cache sized for the lanes. The load's cap (12 entries) is below a swarm's working set (16+ conversations
+    // plus shared prefixes: the 2026-09-30 swarm restored only the 1,087-token system prefix on most follow-ups, and the lead's
+    // 54K conversation was gone by its next turn). Now max(12, lanes + 8) entries (2 x lanes + 8 with the anchor; P4 B36;
+    // IE_PROMPT_CACHE_MAX_ENTRIES still wins),
+    // under a per-card byte budget = the free VRAM measured here, after the lanes, minus the lanes' 1.5 GiB reserve
+    // (IE_PROMPT_CACHE_VRAM_MIB overrides): insert evicts LRU before it allocates, so the snapshots never take the reserve.
+    // IE_Q35MOE_LANES_CACHE=0 = the load's rule (12 entries or the env's, no budget). No free-memory query = the load's rule.
+    if (prompt_cache_on_ && [] { const char* v = std::getenv("IE_Q35MOE_LANES_CACHE"); return !(v && *v == '0'); }()) {
+        constexpr uint64_t kReserve = 1536ull << 20;   // = init_lanes' reserve (the load's kReserve)
+        uint32_t ents = std::max<uint32_t>(12u, (lm->anchor() ? 2u : 1u) * m.n_lanes() + 8u);
+        if (const char* s = std::getenv("IE_PROMPT_CACHE_MAX_ENTRIES"))
+            if (unsigned v = unsigned(std::atoi(s))) ents = v;
+        const uint32_t ents0 = fleet_cache_.config().max_entries;
+        uint64_t budget = UINT64_MAX, free_min = UINT64_MAX;
+        bool query = true;
+        for (uint32_t d = 0; d < 2 && budget; ++d) {
+            const sycl::device dv = m.fleet()->dev(d).device();
+            if (!dv.has(sycl::aspect::ext_intel_free_memory)) { budget = 0; query = false; break; }
+            const uint64_t fr = dv.get_info<sycl::ext::intel::info::device::free_memory>();
+            free_min = std::min(free_min, fr);
+            budget = std::min(budget, fr > kReserve ? fr - kReserve : 0);
+        }
+        if (const char* s = std::getenv("IE_PROMPT_CACHE_VRAM_MIB"))
+            if (unsigned v = unsigned(std::atoi(s))) budget = uint64_t(v) << 20;
+        if (budget && budget != UINT64_MAX) {
+            fleet_cache_.set_limits(ents, budget);
+            std::fprintf(stderr, "[qwen35moe] prompt cache for the lanes: up to %u entries in %.2f GiB of snapshots per card (%.2f GiB "
+                                 "free after the lanes, %.2f reserved); IE_Q35MOE_LANES_CACHE=0 = %u entries, no budget\n",
+                         ents, budget / 1073741824.0, free_min == UINT64_MAX ? 0.0 : free_min / 1073741824.0,
+                         kReserve / 1073741824.0, ents0);
+        } else {
+            std::fprintf(stderr, "[qwen35moe] prompt cache for the lanes: no VRAM budget (%s); %u entries, as loaded\n",
+                         query ? "no free VRAM past the reserve" : "no free-memory query", ents0);
+        }
+    }
+    // P4 B29 Fix A: a conversation snapshot drops that conversation's earlier ones (FleetPrefixCacheConfig::supersede), so 15
+    // workers hold ~15 entries, not one per turn (the gate's 15 of 45 follow-ups lost to the LRU). IE_Q35MOE_CACHE_SUPERSEDE=0
+    // = off. The marks (shared prefixes) are never superseded.
+    if (prompt_cache_on_) {
+        const char* v = std::getenv("IE_Q35MOE_CACHE_SUPERSEDE");
+        fleet_cache_.set_supersede(!(v && *v == '0'));
+        std::fprintf(stderr, "[qwen35moe] prompt cache: a conversation snapshot supersedes its earlier turns %s "
+                             "(IE_Q35MOE_CACHE_SUPERSEDE=0 = off)\n", fleet_cache_.config().supersede ? "ON" : "OFF");
+        std::fprintf(stderr, "[qwen35moe] prompt cache: the anchor (a conversation's last user query's end, kept until its next query) %s "
+                             "(IE_Q35MOE_ANCHOR=0 = off)\n", lm->anchor() ? "ON" : "OFF");
+    }
     std::fprintf(stderr, "[qwen35moe] %u request lanes (lane 0 ctx %u, lanes 1..%u ctx %u; %.3f + %.3f GiB VRAM per extra lane, "
                          "prefill pieces of %u rows, host %.2f GiB): ie serve --parallel decodes them together through the card pipe\n",
                  m.n_lanes(), m.lane_ctx(0), m.n_lanes() - 1, m.lane_ctx(1), m.lane_bytes(0) / 1073741824.0,
@@ -2678,12 +2931,73 @@ std::string Engine::q35m_lanes_init() {
                            gcap ? std::to_string(gcap).c_str() : "AUTO (one group per card)");
     else std::fprintf(stderr, "[qwen35moe] lane rows OFF (%s): one lane a card step\n",
                       rows_why.empty() ? "IE_Q35MOE_ROWS=0" : rows_why.c_str());
+    std::fprintf(stderr, "[qwen35moe] lane pipeline %s (IE_Q35MOE_LANE_PIPELINE=0 = a lane's pieces one at a time)\n",
+                 lm->pipeline() ? "ON: a prefilling lane's next piece goes onto card 0 while card 1 runs the piece before, when "
+                                  "card 0 is idle" : "OFF");
     LanesServe::Options so;
+    // P4 B29: a prompt that starts while other lanes run goes through the pipe in pieces of at most 2,048 rows (default on), so
+    // the decoding lanes' groups step between pieces instead of queueing behind an 8,192-row piece per card (the 2026-09-30
+    // swarm: decode 0.2-1.5 tok/s per lane beside deep pieces). A capped piece computes other bits than the plan's pieces
+    // (lanes_serve.hpp); a prompt prefilled alone (its serial turn) is untouched, and --parallel 1 does not use the lanes.
+    // IE_Q35MOE_MIX_CHUNK=<rows> sets the cap, 0 = off (the plan's 8,192-row pieces, B10-B28).
+    // P4 B36 (D): 512, not 2,048 -- the B36 gate (2026-10-01, abliterated 35B at Dream's flags): the swarm replay 142.7-144.6 s vs
+    // 155.8-158.0 (aggregate +8 %), the b2 lead -8 %, its workers' first token 13 s instead of 53 s, the longest drain ~1 s.
+    so.mix_chunk = std::min<uint32_t>(512u, pf);
     if (const char* v = std::getenv("IE_Q35MOE_MIX_CHUNK")) so.mix_chunk = uint32_t(std::max(0, std::atoi(v)));
     if (const char* v = std::getenv("IE_Q35MOE_STEP_TRACE")) so.trace = *v == '1';
+    // P4 B29: the prefill FIFO on by default on this arch (LanesServe reads IE_LANES_PREFILL_FIFO=0 over it): prompts' pieces go
+    // through the pipe one prompt at a time in arrival order, and a queued prompt that shares an earlier one's still-due shared
+    // prefix waits for its mark and restores it. Off, the 2026-09-30 wave of 15 workers with one identical 30,181-token system
+    // prefix prefilled it 15 times at once (0 cached each, 723-734 s, 41 tok/s per lane). B15 st1-st3 (this split, --parallel 8)
+    // measured the FIFO's decoders 82 vs 35 tokens in a burst of 4 new ~13K prompts, burst TTFTs 45-91 s vs 52 s.
+    so.prefill_fifo = true;
+    std::fprintf(stderr, "[qwen35moe] a prompt arriving beside running lanes prefills in pieces of %s (IE_Q35MOE_MIX_CHUNK; 0 = the "
+                         "plan's %u-row pieces)\n", so.mix_chunk ? (std::to_string(so.mix_chunk) + " rows").c_str() : "the plan's rows", pf);
+    // P4 B34 (3): short-first on by default (LanesServe::Options). The 2026-10-01 B33 gate's Dream-shaped run (an 80K lead + 6
+    // ~2.2K workers): the FIFO held 5 of 6 workers behind the lead and each worker piece queued behind a 7-15 s lead piece per
+    // card (worker 1's first token at 48.7 s). IE_Q35MOE_SHORT_FIRST=0 = the FIFO window and arrival order alone (B15-B34 (2)).
+    const char* sfv = std::getenv("IE_Q35MOE_SHORT_FIRST");
+    so.short_first = !(sfv && std::string(sfv) == "0");
+    if (const char* v = std::getenv("IE_Q35MOE_SHORT_ROWS")) so.short_rows = uint32_t(std::max(1, std::atoi(v)));
+    if (const char* v = std::getenv("IE_Q35MOE_SHORT_SLOTS")) so.short_slots = uint32_t(std::max(1, std::atoi(v)));
+    if (const char* v = std::getenv("IE_Q35MOE_SHORT_WAIT_MS")) so.short_wait_ms = uint32_t(std::max(0, std::atoi(v)));
+    if (so.short_first)
+        std::fprintf(stderr, "[qwen35moe] short-first ON: a prompt with at most max(2 pieces, %u) rows left skips the prefill FIFO's window "
+                             "and goes ahead of a long prompt's next piece, which waits at most %u short pieces or %u ms "
+                             "(IE_Q35MOE_SHORT_ROWS / _SLOTS / _WAIT_MS; IE_Q35MOE_SHORT_FIRST=0 = off)\n",
+                     so.short_rows, so.short_slots, so.short_wait_ms);
+    else std::fprintf(stderr, "[qwen35moe] short-first OFF (IE_Q35MOE_SHORT_FIRST=0)\n");
+    // P4 B36 (A): re-cut on by default (LanesServe::Options). The B34 gate's b2 shape: while an 80K lead (planned alone, 8192-row
+    // pieces) prefilled, its 6 workers decoded at 0.42-0.51 tok/s, each step behind a whole lead piece per card, and finished
+    // only when the lead's prefill did. IE_Q35MOE_RECUT=0 = a lane keeps its plan's pieces (B29-B34). Needs the mix cap.
+    const char* rcv = std::getenv("IE_Q35MOE_RECUT");
+    so.recut = so.mix_chunk > 0 && !(rcv && std::string(rcv) == "0");
+    std::fprintf(stderr, "[qwen35moe] re-cut %s (IE_Q35MOE_RECUT=0 = off)\n",
+                 so.recut ? ("ON: a prompt planned alone cuts its remaining pieces to " + std::to_string(so.mix_chunk) +
+                             " rows once another lane decodes or prefills a short prompt").c_str()
+                          : (so.mix_chunk ? "OFF" : "OFF (IE_Q35MOE_MIX_CHUNK=0)"));
+    // P4 B36 (C): the decode quota on by default (LanesServe::Options). The B34 gate's b2 trace: each card ran one lead piece,
+    // then the decode groups, then the next lead piece, so a worker got one token per lead piece (~0.06 tok/s at 24-65K depth
+    // with 8192-row pieces). Now a long prompt's next piece waits until every decoding lane made IE_Q35MOE_DECODE_QUOTA steps
+    // (default 32 since B36 (D); 0 = off) since its latest piece landed, at most IE_Q35MOE_QUOTA_MAX_MS (default 2000) a wait.
+    // P4 B36 (D): 32, not 8 -- the B36 gate's grids (80K lead + 6 workers, mix 512): with 1,200-token workers quota 32 gave them
+    // 11.6 tok/s during the lead's prefill and finished them in 116 s (quota 0: 0.51 tok/s, 187.5 s; quota 8: 258 s), the lead
+    // +32 % vs quota 0 and less than quota 8 / 16 cost; with short tool-call-sized turns the lead was 3 % faster than v0.2.3 and
+    // the workers done in ~30 s instead of 179 s. A pause's cost is mostly fixed (the lead loses its two-card overlap), so a
+    // larger quota buys more worker tokens per pause. The swarm replay never engages it (no long prompt).
+    so.decode_quota = 32;
+    if (const char* v = std::getenv("IE_Q35MOE_DECODE_QUOTA")) so.decode_quota = uint32_t(std::max(0, std::atoi(v)));
+    if (const char* v = std::getenv("IE_Q35MOE_QUOTA_MAX_MS")) so.quota_max_ms = uint32_t(std::max(0, std::atoi(v)));
+    if (so.decode_quota)
+        std::fprintf(stderr, "[qwen35moe] decode quota ON: a long prompt's next piece waits until every decoding lane made %u steps since "
+                             "its latest piece landed, at most %u ms (IE_Q35MOE_DECODE_QUOTA / _QUOTA_MAX_MS; IE_Q35MOE_DECODE_QUOTA=0 = off)\n",
+                     so.decode_quota, so.quota_max_ms);
+    else std::fprintf(stderr, "[qwen35moe] decode quota OFF (IE_Q35MOE_DECODE_QUOTA=0)\n");
     q35m_ = std::make_unique<Q35mLanes>();
     q35m_->lanes = std::move(lm);
     q35m_->serve = std::make_unique<LanesServe>(*q35m_->lanes, so);
+    std::fprintf(stderr, "[qwen35moe] prefill FIFO %s (IE_LANES_PREFILL_FIFO=0 = every waiting prompt's pieces at once, B10-B28)\n",
+                 [] { const char* v = std::getenv("IE_LANES_PREFILL_FIFO"); return v && *v == '0'; }() ? "OFF" : "ON");
     return {};
 }
 
@@ -2692,7 +3006,7 @@ std::string Engine::q35m_lanes_init() {
 // of the generation gate. The reply snapshot --parallel 1 inserts after a reply (the gen-cache endpoint, when chat() passes
 // reply_cache) is Q35mLanesModel::finish, in a serial turn after the reply.
 GenerateResult Engine::q35m_generate_lanes(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token,
-                                           uint32_t cache_prefix_len, bool reply_cache, uint32_t shared_prefix_len) {
+                                           uint32_t cache_prefix_len, bool reply_cache, uint32_t shared_prefix_len, bool anchor) {
     GenerateResult res;
     const auto ids = tok_.encode(prompt, /*allow_special=*/true);
     res.prompt_tokens = uint32_t(ids.size());
@@ -2709,14 +3023,17 @@ GenerateResult Engine::q35m_generate_lanes(const std::string& prompt, const Samp
     // --parallel 1's snapshot boundary: the stable conversation depth when the cache is on, else the whole prompt (no insert)
     rq.snap_at = (prompt_cache_on_ && cache_prefix_len > 0) ? std::min<uint32_t>(cache_prefix_len, uint32_t(ids.size()))
                                                             : uint32_t(ids.size());
-    // P4 B15: --parallel 1's shared-prefix boundary (the same rule: below the snapshot boundary, the cache on; the 27B only with
-    // IE_QWEN35_SHARED_PREFIX=1, P4 B18)
+    // P4 B15: --parallel 1's shared-prefix boundary (the same rule: below the snapshot boundary, the cache on; the 27B unless
+    // IE_QWEN35_SHARED_PREFIX=0, P4 B18 / B25 -- its model rounds it onto the piece grid, q27_prefill_ops)
     rq.share_at = (q35m_ || q27_share_) ? shared_prefix_boundary(shared_prefix_len, rq.snap_at, prompt_cache_on_) : 0u;
     // --parallel 1's reply snapshot rule (the gen-cache): the caller asks, the cache is on, IE_NO_GEN_CACHE unset
     rq.reply_cache = reply_cache && prompt_cache_on_ && std::getenv("IE_NO_GEN_CACHE") == nullptr;
+    rq.think_close = think_close_id_;   // P4 B27
+    rq.anchor = anchor && prompt_cache_on_ && cache_prefix_len > 0;   // P4 B36 (B): snap_at is the last user query's end
     if (rq.sp.max_tokens == 0) { res.finish_reason = "length"; return res; }   // --parallel 1: zero steps
     const LanesResult lr = (q35m_ ? q35m_->serve : q27_->serve)->run(rq, on_token);   // (P4 B18: the 27B's lanes too)
     res.text = lr.text;
+    res.answer_start = lr.answer_start;
     res.finish_reason = lr.finish_reason;
     res.cached_tokens = lr.cached_tokens;
     res.completion_tokens = lr.completion_tokens;
@@ -2805,7 +3122,7 @@ public:
         return {};
     }
     LanesPlan plan(const LanesRequest& rq, uint32_t reused) override { return q27_plan(ops(rq, reused), reused, uint32_t(rq.ids->size())); }
-    // the shared prefix [0, pos) into the prompt cache (--parallel 1's insert at share_at, IE_QWEN35_SHARED_PREFIX=1)
+    // the shared prefix [0, pos) into the prompt cache (--parallel 1's insert at the grid cut of share_at; IE_QWEN35_SHARED_PREFIX=0 off)
     std::string mark(uint32_t lane, const LanesRequest& rq, uint32_t pos) override {
         if (!cache_) return {};
         m_.select_lane(lane);
@@ -2923,6 +3240,7 @@ public:
     bool        rows() const override { return rows_; }
     std::string pipe_start_rows(DoneFn done, RowsDoneFn rows_done) override { return pipe_.start(std::move(done), std::move(rows_done)); }
     std::string pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) override { return pipe_.submit(lane, ids, T, pos0); }
+    uint32_t    abort() override { return pipe_.cancel(); }   // P4 B33 (its forward has no layer-boundary stop)
     std::string pipe_pause() override { return pipe_.pause(); }
     std::string pipe_resume() override { return pipe_.resume(); }
     bool        pipe_paused() const override { return pipe_.paused(); }
@@ -3052,8 +3370,8 @@ std::string Engine::q27_lanes_init() {
                            gcap ? std::to_string(gcap).c_str() : "AUTO (one group per card)");
     else std::fprintf(stderr, "[qwen35split] lane rows OFF (%s): one lane a card step\n",
                       rows_why.empty() ? "IE_QWEN35_ROWS=0" : rows_why.c_str());
-    if (q27_share_) std::fprintf(stderr, "[qwen35split] shared-prefix cache ON (IE_QWEN35_SHARED_PREFIX=1: --parallel 1 splits its "
-                                         "prefill there too)\n");
+    if (q27_share_) std::fprintf(stderr, "[qwen35split] shared-prefix cache ON (--parallel 1 splits its prefill there too, on the "
+                                         "%u-row piece grid; IE_QWEN35_SHARED_PREFIX=0 = off)\n", pf);
     LanesServe::Options so;
     if (const char* v = std::getenv("IE_QWEN35_STEP_TRACE")) so.trace = *v == '1';
     q27_ = std::make_unique<Q35mLanes>();
@@ -3067,11 +3385,12 @@ GenerateResult Engine::generate(const std::string& prompt,
                                 const TokenCallback& on_token,
                                 uint32_t cache_prefix_len,
                                 bool reply_cache,
-                                uint32_t shared_prefix_len) {
+                                uint32_t shared_prefix_len,
+                                bool anchor) {
     if (arch_ == ModelArch::kDeepSeek41) return ds41_generate(prompt, sp, on_token);
     if (arch_ == ModelArch::kMimo26) return mimo26_generate(prompt, sp, on_token);
     if (q4e_ && q4e_->serve) return q4e_generate_lanes(prompt, sp, on_token, cache_prefix_len, shared_prefix_len);
-    if (q35m_ && q35m_->serve) return q35m_generate_lanes(prompt, sp, on_token, cache_prefix_len, reply_cache, shared_prefix_len);
+    if (q35m_ && q35m_->serve) return q35m_generate_lanes(prompt, sp, on_token, cache_prefix_len, reply_cache, shared_prefix_len, anchor);
     if (q27_ && q27_->serve) return q35m_generate_lanes(prompt, sp, on_token, cache_prefix_len, reply_cache, shared_prefix_len);   // P4 B18
     GenerateResult res;
     auto& q = alloc_.queue();
@@ -3238,6 +3557,7 @@ GenerateResult Engine::generate(const std::string& prompt,
             (unsigned long long)stats.accepted, (unsigned long long)stats.bonus, stats.tau);
         if (on_token && decoded_all.size() > emitted)
             on_token(std::string_view(decoded_all).substr(emitted));
+        res.answer_start = reply_answer_start(generated);   // P4 B27
         res.text = std::move(decoded_all);
         res.completion_tokens = uint32_t(generated.size());
         return res;
@@ -3331,6 +3651,7 @@ GenerateResult Engine::generate(const std::string& prompt,
         if (on_token && decoded_all.size() > emitted)
             on_token(std::string_view(decoded_all).substr(emitted));
         res.prompt_tokens = P0;
+        res.answer_start = reply_answer_start(generated);   // P4 B27
         res.text = std::move(decoded_all);
         res.completion_tokens = uint32_t(generated.size());
         return res;
@@ -3420,6 +3741,7 @@ GenerateResult Engine::generate(const std::string& prompt,
             std::fprintf(stderr, "[spec] %s\n", serr.c_str());
         if (on_token && decoded_all.size() > emitted)
             on_token(std::string_view(decoded_all).substr(emitted));
+        res.answer_start = reply_answer_start(generated);   // P4 B27
         res.text = std::move(decoded_all);
         res.completion_tokens = uint32_t(generated.size());
         return res;
@@ -3494,6 +3816,7 @@ GenerateResult Engine::generate(const std::string& prompt,
             std::fprintf(stderr, "[spec] %s\n", serr.c_str());
         if (on_token && decoded_all.size() > emitted)
             on_token(std::string_view(decoded_all).substr(emitted));
+        res.answer_start = reply_answer_start(generated);   // P4 B27
         res.text = std::move(decoded_all);
         res.completion_tokens = uint32_t(generated.size());
         return res;
@@ -3730,10 +4053,19 @@ GenerateResult Engine::generate(const std::string& prompt,
     // P4 B15: the shared-prefix boundary (the system prompt + tools; chat() computes it). The crown split and Flash-Next split
     // their prefill there exactly as their request lanes do (Q35mLanesModel / Q4eLanesModel::plan), so --parallel 1 and a lane
     // cut the same pieces; the crown also snapshots it into fleet_cache_ (restorable by any later prompt that extends it).
-    // Other archs ignore it. A vision request: none (image rows cannot be told apart by their ids).
-    const uint32_t share_at = ((qwen35moe_split_ || q4e_ || (qwen35_split_ && q27_share_)) && !q4e_vis_active_ && !ds4_vis_active_)
-        ? shared_prefix_boundary(shared_prefix_len, snap_at, prompt_cache_on_) : 0u;
+    // Other archs ignore it. A vision request: none (image rows cannot be told apart by their ids). P4 B25: the 27B cuts on its
+    // piece grid (q27_share_cut: the pieces of the uncut, cache-off prefill; its lanes round the same way).
+    const uint32_t share_at = [&] {
+        const uint32_t s = ((qwen35moe_split_ || q4e_ || (qwen35_split_ && q27_share_)) && !q4e_vis_active_ && !ds4_vis_active_)
+            ? shared_prefix_boundary(shared_prefix_len, snap_at, prompt_cache_on_) : 0u;
+        return qwen35_split_ ? q27_share_cut(s, pf_chunk) : s;
+    }();
     uint32_t pos = restored;            // cache restore (if any) already loaded [0..restored)
+    // P4 B25: with the 27B's cut in play, the ranges [restored, cut) and [cut, snap_at) take the pipelined kind of the uncut range
+    // (q27_pk_base: a restore of the shared prefix itself = the cache-off path's cold prefill from 0), so a 1-row last piece runs
+    // the same kernels as with the cache off; forward_pipelined takes a range of any length. The lanes plan the same kinds.
+    const bool q27_pk = qwen35_split_ && share_at > 0 && snap_at > restored &&
+                        snap_at - q27_pk_base(restored, share_at) > pf_chunk;
     // Per-request suspend buffer (host RAM) for gate yields — 27B split only.
     HostSlotStash slot_stash;
     // qwen4exp per-generation slots (A + B stage when split): same yield
@@ -3753,7 +4085,7 @@ GenerateResult Engine::generate(const std::string& prompt,
     std::string slot_err;               // fatal yield failure (unstash after handoff)
     bool pf_abort = false;              // client left during prefill (liveness probe)
     const auto t_pf0 = std::chrono::steady_clock::now();
-    auto prefill_to = [&](uint32_t end) {
+    auto prefill_to = [&](uint32_t end, bool whole_pk = false) {   // whole_pk: P4 B25, the 27B's cut ranges (q27_pk above)
         if (pf_abort) return;   // client left during an earlier range: nothing more runs
         // 27B-split PIPELINED prefill — DEFAULT ON since the 2026-08-15 A/B: 9K-token
         // prompt pp 219.5 → 424.7 (+93%, near the theoretical 2×), byte-identical
@@ -3769,7 +4101,7 @@ GenerateResult Engine::generate(const std::string& prompt,
         // Contended gate → take the serial chunk loop below instead: it has
         // yield points between chunks, the pipelined range does not.
         if (split_pipeline && qwen35_split_ && !gate_.contended() &&
-            end > pos && (end - pos) > pf_chunk) {
+            end > pos && (whole_pk || (end - pos) > pf_chunk)) {
             if (auto m = qwen35_split_model_.forward_pipelined(
                     ids.data() + pos, end - pos, pos, /*reset_kv=*/(pos == 0),
                     pf_chunk, tp_logits_host_.data()); m.empty()) {
@@ -3817,6 +4149,9 @@ GenerateResult Engine::generate(const std::string& prompt,
             forward_step(q, d_ids_ + pos, n, pos).wait();
             pos += n;
             if (!glm5_err_.empty()) { slot_err="glm5next: "+glm5_err_; break; }
+            // P4 B33: the server is stopping (abort_all): nothing more of this prompt runs -- the chunk may have stopped at a
+            // layer boundary (the crown split), so no snapshot and no first token either
+            if (stopping_.load(std::memory_order_relaxed)) { pf_abort = true; break; }
             // Client-liveness probe between chunks: an EMPTY fragment asks the
             // callback whether to continue, so a caller that disconnected during
             // a long prefill stops it here instead of after the first token.
@@ -3862,19 +4197,19 @@ GenerateResult Engine::generate(const std::string& prompt,
         }
     };
     if (share_at > restored) {
-        prefill_to(share_at);
+        prefill_to(share_at, q27_pk);
         if ((qwen35moe_split_ || qwen35_split_) && !pf_abort && slot_err.empty() && pos == share_at) {
             const auto t_s = std::chrono::steady_clock::now();
             const std::vector<int32_t> pref(ids.begin(), ids.begin() + share_at);
             const std::string m = qwen35moe_split_ ? fleet_cache_.insert(qwen35moe_split_model_, pref)
-                                                   : fleet_cache_.insert(qwen35_split_model_, pref);   // (P4 B18, opt-in)
+                                                   : fleet_cache_.insert(qwen35_split_model_, pref);   // (P4 B18; B25: the grid cut)
             std::fprintf(stderr, qwen35moe_split_ ? "[crown-split-cache] shared prefix %u: %s (%.1f ms)\n"
                                                   : "[27b-split-cache] shared prefix %u: %s (%.1f ms)\n", share_at,
                          m.empty() ? "inserted" : m.c_str(),
                          std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_s).count());
         }
     }
-    prefill_to(snap_at);
+    prefill_to(snap_at, q27_pk);
     // Snapshot the boundary state (kv_/dn_ or per-card kv_[dev]/dn_[dev] now hold
     // [0..snap_at)) — only if we actually prefilled new tokens up to it (snap_at >
     // restored). This else-if chain MIRRORS the restore dispatch above so exactly one
@@ -4106,6 +4441,7 @@ GenerateResult Engine::generate(const std::string& prompt,
         stepper_.cv.notify_all();             // wake the stepper past our slot
         if (on_token && decoded_all.size() > emitted)
             on_token(std::string_view(decoded_all).substr(emitted));
+        res.answer_start = reply_answer_start(generated);   // P4 B27
         res.text = std::move(decoded_all);
         res.completion_tokens = uint32_t(generated.size());
         res.finish_reason = fin.empty() ? "length" : fin;
@@ -4337,9 +4673,10 @@ GenerateResult Engine::generate(const std::string& prompt,
     // whitespace-only text despite producing tokens is the exact signature of
     // the 2026-08-25 agent failures (825/964 tokens decoded, nothing
     // delivered). Dump the evidence unconditionally — it is rare, cheap, and
-    // undiagnosable after the fact without the ids.
-    if (!generated.empty() &&
-        decoded_all.find_first_not_of(" \t\r\n") == std::string::npos) {
+    // undiagnosable after the fact without the ids. (P4 B35: a shown </think> is no text either.)
+    const auto blank = [](std::string_view s) { return s.find_first_not_of(" \t\r\n") == std::string_view::npos; };
+    const ChatmlThinkSplit shown = chatml_think_ ? split_chatml_think(decoded_all) : ChatmlThinkSplit{};
+    if (!generated.empty() && (chatml_think_ ? blank(shown.reasoning) && blank(shown.content) : blank(decoded_all))) {
         const std::string raw =
             tok_.decode(generated, /*skip_special=*/false, std::span<const int32_t>{});
         std::fprintf(stderr,
@@ -4395,9 +4732,24 @@ GenerateResult Engine::generate(const std::string& prompt,
             }
         }
     }
+    res.answer_start = reply_answer_start(generated);   // P4 B27
     res.text = std::move(decoded_all);
     res.completion_tokens = uint32_t(generated.size());
     return res;
+}
+
+// P4 B27: GenerateResult::answer_start -- the decoded length of the reply up to and
+// including its first </think> (the skip-special decode drops the tag, or shows it
+// for the Qwen thinking templates since P4 B35: either way the prefix's length is the
+// byte offset where the answer begins; the per-token decode makes the prefix's text a
+// byte prefix of the whole reply's). npos: none.
+size_t Engine::reply_answer_start(std::span<const int32_t> generated) const {
+    if (think_close_id_ < 0) return std::string::npos;
+    for (size_t k = 0; k < generated.size(); ++k)
+        if (generated[k] == think_close_id_)
+            return tok_.decode(generated.first(k + 1), /*skip_special=*/true,
+                               /*keep_special=*/std::span<const int32_t>(tool_call_ids_, 2)).size();
+    return std::string::npos;
 }
 
 // deepseek4 (docs/deepseek4/72 Phase L): the decode loop kept the special
@@ -4455,6 +4807,19 @@ std::string Engine::serving_status_json() const {
     return {};
 }
 
+// P4 B33 (engine.hpp): the lanes first (their pipes drop what has not started), then the crown model's layer-boundary stop for
+// --parallel 1. A gate-based generation (--parallel 1) counts as one step: the gate runs one generation's device work at a time.
+uint32_t Engine::abort_all() {
+    if (stopping_.exchange(true)) return 0;
+    uint32_t held = 0;
+    bool lanes = false;
+    for (LanesServe* s : {q4e_ ? q4e_->serve.get() : nullptr, q35m_ ? q35m_->serve.get() : nullptr, q27_ ? q27_->serve.get() : nullptr})
+        if (s) { held += s->abort_all(); lanes = true; }
+    if (qwen35moe_split_) qwen35moe_split_model_.request_abort();
+    if (!lanes && gate_.inflight.load(std::memory_order_relaxed) > 0) held += 1;
+    return held;
+}
+
 // P4 B8 (docs/qwen4exp/P4_B8_LANES.md): Flash-Next at --parallel N > 1 on two cards. generate()'s front half as it is at
 // --parallel 1 (the prompt's ids, the context refusal, the sampler's seed, the snapshot boundary), then the request runs on a
 // lane through the shared lanes module instead of the gate + time-slicing.
@@ -4476,9 +4841,11 @@ GenerateResult Engine::q4e_generate_lanes(const std::string& prompt, const Sampl
     rq.snap_at = cache_prefix_len > 0 ? std::min<uint32_t>(cache_prefix_len, uint32_t(ids.size())) : uint32_t(ids.size());
     rq.share_at = shared_prefix_boundary(shared_prefix_len, rq.snap_at, prompt_cache_on_);   // P4 B15 (--parallel 1's rule)
     // (--parallel 1 caps the reply at max_ctx - 8 - prompt; a lane caps it at its own capacity the same way)
+    rq.think_close = think_close_id_;   // P4 B27
     if (rq.sp.max_tokens == 0) { res.finish_reason = "length"; return res; }   // --parallel 1: zero steps
     const LanesResult lr = q4e_->serve->run(rq, on_token);
     res.text = lr.text;
+    res.answer_start = lr.answer_start;
     res.finish_reason = lr.finish_reason;
     res.cached_tokens = lr.cached_tokens;
     res.completion_tokens = lr.completion_tokens;
@@ -4788,6 +5155,22 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
                               "elaboration.";
         // medium (or unknown): no injection, matching the vendor template.
     }
+    // P4 B27: the model's own tool convention, read from the template (tokenizer.hpp
+    // ChatmlXmlTools): a template teaching <function=NAME> gets its XML tools block
+    // and history form, and its completion is parsed back below. IE_QWEN_TOOLS_JSON=1
+    // keeps the Qwen3 JSON preamble (the A/B). No tools: nothing changes.
+    ChatmlXmlTools xml_tools = (ct && ct->type == GgufValueType::kString)
+        ? chatml_xml_tools_from_template(ct->as_string()) : ChatmlXmlTools{};
+    if (const char* v = std::getenv("IE_QWEN_TOOLS_JSON"); v && *v == '1') xml_tools.enabled = false;
+    if (!tools_json.empty()) {
+        static bool logged = false;
+        if (!logged) {
+            logged = true;
+            std::fprintf(stderr, "[chat] tools: %s\n", xml_tools.enabled
+                ? "the template's <function= XML form (IE_QWEN_TOOLS_JSON=1 = the Qwen3 JSON preamble)"
+                : "the Qwen3 JSON preamble");
+        }
+    }
     std::span<const ChatTurn> render_turns = turns;
     // Vision (qwen4exp, docs/qwen4/16_vision_port.md §4): decode each image NOW
     // (its merged grid sets the pad-run length), stash pixels for generate()'s
@@ -4832,7 +5215,7 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
     }
     const std::string full = build_chatml_prompt(render_turns, /*add_generation_prompt=*/true,
                                                  enable_thinking, tools_json, model_has_think,
-                                                 effort_preamble);
+                                                 effort_preamble, xml_tools);
     // Stable conversation boundary = the same render WITHOUT the generation prompt /
     // think suffix. That's the prefix the NEXT turn shares, so the prompt cache snapshots
     // there (the gen-prompt/think suffix is re-prefilled fresh each turn — a few tokens).
@@ -4840,7 +5223,7 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
     if (prompt_cache_on_) {
         const std::string stable = build_chatml_prompt(render_turns, /*add_generation_prompt=*/false,
                                                        enable_thinking, tools_json, model_has_think,
-                                                       effort_preamble);
+                                                       effort_preamble, xml_tools);
         cache_prefix_len = uint32_t(tok_.encode(stable, /*allow_special=*/true).size());
     }
     // P4 B15: the SHARED prefix = the leading system turn(s) + the tools block (rendered alone, no generation prompt): what
@@ -4852,7 +5235,8 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
         while (n_sys < render_turns.size() && render_turns[n_sys].role == "system") ++n_sys;
         if (n_sys > 0 || !tools_json.empty()) {
             const std::string sys = build_chatml_prompt(render_turns.subspan(0, n_sys), /*add_generation_prompt=*/false,
-                                                        enable_thinking, tools_json, model_has_think, effort_preamble);
+                                                        enable_thinking, tools_json, model_has_think, effort_preamble,
+                                                        xml_tools);
             const auto sys_ids = tok_.encode(sys, /*allow_special=*/true);
             const auto full_ids = tok_.encode(full, /*allow_special=*/true);
             shared_prefix_len = shared_prefix_accept(sys_ids, full_ids, shared_prefix_min(std::getenv("IE_SHARED_PREFIX_MIN")));
@@ -4863,7 +5247,56 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
     // true for plain ChatML (non-thinking models such as Qwen3-Coder), false for
     // thinking-capable templates, whose generation prompt adds a <think> block
     // (empty when thinking is off) that history never carries.
-    return generate(full, sp, on_token, cache_prefix_len, /*reply_cache=*/!model_has_think, shared_prefix_len);
+    // P4 B36 (B): the prompt ends with a user query (not a tool result), so cache_prefix_len is that query's end -- the depth the
+    // conversation's next query still shares after the template re-renders the turns between (the crown's lanes keep it)
+    const bool query_last = !render_turns.empty() && render_turns.back().role == "user";
+    GenerateResult r = generate(full, sp, on_token, cache_prefix_len, /*reply_cache=*/!model_has_think, shared_prefix_len, query_last);
+    // P4 B27 / B28: the XML tool calls; P4 B35: then, thinking on with a Qwen thinking template, the reasoning split off
+    finish_chatml_reply(r, tools_json, xml_tools.enabled, model_has_think && enable_thinking, chatml_think_ && enable_thinking);
+    return r;
+}
+
+// P4 B27: the XML tool calls (JSON blocks and the salvageable hybrids too) become
+// structured tool_calls here; the server then hands them out as such (stream and
+// not). With thinking on the reasoning is still part of r.text here, so only the
+// text generated after the model's </think> is parsed: a block the model merely
+// quotes while thinking is never a call, and a reply that never closed its
+// reasoning holds none. Blocks examined and rejected (quoted, unknown function, cut
+// off) leave "[]": the verdict is authoritative, the server's JSON parser does not
+// run on this text.
+void finish_chatml_reply(GenerateResult& r, std::string_view tools_json, bool xml_tools, bool think_open, bool think_split) {
+    if (xml_tools && !tools_json.empty() && r.text.find("<tool_call>") != std::string::npos) {
+        const size_t start = think_open ? r.answer_start : 0;
+        // P4 B28: no </think> was generated (the model skipped the tag) but the reply
+        // ended on its own: the complete call(s) that END it are accepted
+        // (parse_chatml_xml_tail_calls); a length-capped reply stays text.
+        const bool tail = start == std::string::npos && r.finish_reason == "stop";
+        ChatmlToolCalls pc = tail ? parse_chatml_xml_tail_calls(r.text, tools_json)
+                                  : parse_chatml_xml_tool_calls(r.text, tools_json, start);
+        size_t n_calls = 0;
+        if (!pc.tool_calls_json.empty()) {
+            const nlohmann::json c = nlohmann::json::parse(pc.tool_calls_json, nullptr, /*allow_exceptions=*/false);
+            if (c.is_array()) n_calls = c.size();
+        }
+        std::fprintf(stderr, "[chat] xml tools: answer_start %s of %zu bytes, finish %s, %s: %zu call(s)\n",
+                     start == std::string::npos ? "none" : std::to_string(start).c_str(), r.text.size(),
+                     r.finish_reason.c_str(), tail ? "tail scan" : start == std::string::npos ? "no scan" : "answer scan",
+                     n_calls);
+        if (!pc.tool_calls_json.empty()) {
+            r.text = std::move(pc.content);
+            r.tool_calls_json = std::move(pc.tool_calls_json);
+        } else {
+            r.tool_calls_json = "[]";
+        }
+    }
+    // P4 B35: the reasoning -- the text before the model's first </think>, which the decode shows for these templates
+    // -- goes to reasoning_content and r.text keeps the answer. After the calls are taken out: a block quoted while
+    // reasoning stays in the reasoning, and the text before B28's tail calls (no </think>) is reasoning too.
+    if (think_split) {
+        ChatmlThinkSplit s = split_chatml_think(r.text);
+        r.reasoning_content = std::move(s.reasoning);
+        r.text = std::move(s.content);
+    }
 }
 
 }  // namespace ie

@@ -15,6 +15,7 @@ struct LaunchOptions {
     std::string host = "127.0.0.1";
     uint16_t port = 11435;
     uint32_t max_queue = 8;   // requests allowed to WAIT for a generation slot; beyond → HTTP 429
+    bool max_queue_set = false;   // --max-queue given (P4 B30: else serve_max_queue picks the default)
     double vram_reserve_gib = -1;   // --vram-reserve-gib: VRAM the auto expert tier leaves free per card (mimo_v2, deepseek41); -1 = the engine default
     std::vector<uint32_t> cards;    // --cards: physical cards this process may use (ascending, unique); empty = every card (today's default)
 };
@@ -51,6 +52,7 @@ inline std::vector<uint32_t> parse_card_list(const std::string& v) {
 inline LaunchOptions parse_launch_options(const std::vector<std::string>& args) {
     LaunchOptions out;
     out.engine.n_gpus = 0;
+    out.engine.parallel = kLanesAuto;   // P4 B30: no --parallel = the load picks the lanes (ie/lanes_auto.hpp)
     out.defaults = oai::server_defaults_from_environment();
     auto& e = out.engine;
     auto& s = out.defaults.sampling;
@@ -122,8 +124,11 @@ inline LaunchOptions parse_launch_options(const std::vector<std::string>& args) 
         }
         else if (flag == "--prefill-chunk") e.prefill_chunk = uint32_t(integer(1, INT32_MAX));
         else if (flag == "--vram-reserve-gib") out.vram_reserve_gib = double(number(0, 24));
-        else if (flag == "--parallel") e.parallel = uint32_t(integer(1, kMaxParallel));
-        else if (flag == "--max-queue") out.max_queue = uint32_t(integer(0, 1024));
+        else if (flag == "--parallel") {   // P4 B30: "auto" = the default
+            if (i + 1 < args.size() && args[i + 1] == "auto") { ++i; e.parallel = kLanesAuto; }
+            else e.parallel = uint32_t(integer(1, kMaxParallel));
+        }
+        else if (flag == "--max-queue") { out.max_queue = uint32_t(integer(0, 1024)); out.max_queue_set = true; }
         else if (flag == "--slot-ctx") e.slot_ctx = uint32_t(integer(0, INT32_MAX));
         else if (flag == "--int8-kv") e.int8_kv = true;
         else if (flag == "--spec") e.spec = true;
@@ -135,6 +140,7 @@ inline LaunchOptions parse_launch_options(const std::vector<std::string>& args) 
     }
     if (e.parallel > 1 && e.int8_kv)
         throw std::runtime_error("--parallel > 1 does not support --int8-kv");
+    if (e.parallel == kLanesAuto && e.int8_kv) e.parallel = 1;   // P4 B30: the lanes refuse --int8-kv, so auto = one lane
     if (e.slot_ctx > 0 && e.slot_ctx < 9)
         throw std::runtime_error("--slot-ctx must be 0 (automatic) or at least 9");
     if (e.slot_ctx > e.max_ctx)
@@ -143,5 +149,11 @@ inline LaunchOptions parse_launch_options(const std::vector<std::string>& args) 
         throw std::runtime_error("--gpus " + std::to_string(e.n_gpus) + " exceeds the " +
                                  std::to_string(out.cards.size()) + " card(s) chosen with --cards");
     return out;
+}
+
+// P4 B30: the --max-queue a server keeps with `lanes` request lanes running: the flag when given, 8 beside an explicit
+// --parallel (as before), else lanes + 8 -- the load picked N, so N + 8 may wait behind the N running.
+inline uint32_t serve_max_queue(const LaunchOptions& l, uint32_t lanes) {
+    return l.max_queue_set || l.engine.parallel != kLanesAuto ? l.max_queue : lanes + 8;
 }
 } // namespace ie

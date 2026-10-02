@@ -17,6 +17,18 @@
 
 namespace ie {
 
+namespace {
+// P4 B29: a snapshot's device bytes, as KvCache::init / DeltaNetState::init allocate them (fp16 K + V, the int8 shadow + its
+// scales when on; the recurrent fp32 state + the fp16 conv state)
+uint64_t fpc_kv_bytes(const KvCacheConfig& c) {
+    const uint64_t rows = uint64_t(c.n_layers_full) * c.n_kv_heads * c.max_ctx;
+    return 2 * rows * c.head_dim * sizeof(sycl::half) + (c.use_int8 ? 2 * (rows * c.head_dim + rows * sizeof(sycl::half)) : 0);
+}
+uint64_t fpc_dn_bytes(const DeltaNetState& d) {
+    return uint64_t(d.config().n_layers_linear) * (d.state_elems_per_layer() * sizeof(float) + d.conv_elems_per_layer() * sizeof(sycl::half));
+}
+}  // namespace
+
 FleetPrefixCache::~FleetPrefixCache() { clear(); }
 
 template <class Model>
@@ -55,6 +67,7 @@ FleetPrefixCache::LookupResult FleetPrefixCache::find_longest_match(
         if (it == cur->children.end()) break;
         cur = it->second.get();
         if (cur->is_endpoint) best_endpoint = cur;
+        if (cur->is_endpoint && cur->anchor) cur->last_access_us = ++tick_;   // (P4 B36: the anchors along the prompt stay fresh)
     }
 
     if (best_endpoint) {
@@ -125,7 +138,7 @@ void FleetPrefixCache::prune(const std::vector<int32_t>& tokens) {
 
 template <class Model>
 std::string FleetPrefixCache::insert(Model& m,
-                                     const std::vector<int32_t>& tokens) {
+                                     const std::vector<int32_t>& tokens, bool shared, bool anchor) {
     if (!fleet_) return "FleetPrefixCache::insert: not initialized";
     if (tokens.empty()) return "FleetPrefixCache::insert: empty token list";
     if (tokens.size() > pcfg_.max_prefix_len)
@@ -141,10 +154,61 @@ std::string FleetPrefixCache::insert(Model& m,
         // Idempotent: refresh access timestamp, don't re-snapshot.
         ++tick_;
         node->last_access_us = tick_;
+        node->shared = node->shared || shared;
+        node->anchor = node->anchor || anchor;   // (P4 B36)
         return {};
     }
 
     const uint32_t N = uint32_t(tokens.size());
+
+    // P4 B29 Fix A: the non-shared endpoints strictly above this one on its path are this conversation's earlier turns, which
+    // this snapshot supersedes: drop them first (so the budget / count eviction below does not take another conversation's live
+    // entry in their place). Collected first: an eviction prunes the trie, but never `node` (protect_) nor its ancestors (each
+    // still leads to `node`). P4 B36: an anchor is superseded only by a later anchor (the conversation's new last query).
+    if (pcfg_.supersede && !shared) {
+        std::vector<Node*> up;
+        Node* cur = root_.get();
+        for (size_t i = 0; cur && i + 1 < tokens.size(); ++i) {
+            auto it = cur->children.find(tokens[i]);
+            if (it == cur->children.end()) break;
+            cur = it->second.get();
+            if (cur->is_endpoint && !cur->shared && (anchor || !cur->anchor)) up.push_back(cur);
+        }
+        protect_ = node;
+        for (Node* n : up) evict_endpoint(n);
+        protect_ = nullptr;
+    }
+
+    // P4 B29: with a per-card budget, make room FIRST (LRU), so the snapshot is never allocated beside a full budget; a
+    // snapshot that alone exceeds the budget is skipped without evicting anything.
+    if (pcfg_.max_dev_bytes) {
+        std::vector<uint64_t> need(n_dev_, 0);
+        for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+            if (m.dev_has_kv(dev)) { KvCacheConfig kc = m.kv_cache(dev).config(); kc.max_ctx = N; need[dev] += fpc_kv_bytes(kc); }
+            if (m.dev_has_dn(dev)) need[dev] += fpc_dn_bytes(m.dn_state(dev));
+            if (need[dev] > pcfg_.max_dev_bytes)
+                return "skipped: the snapshot needs " + std::to_string(need[dev] >> 20) + " MiB on card " + std::to_string(dev) +
+                       ", over the cache's " + std::to_string(pcfg_.max_dev_bytes >> 20) + " MiB budget";
+        }
+        auto over = [&] {
+            for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+                uint64_t used = need[dev];
+                for (const Node* ep : endpoints_) {
+                    if (dev < ep->kv.size() && ep->kv[dev]) used += fpc_kv_bytes(ep->kv[dev]->config());
+                    if (dev < ep->dn.size() && ep->dn[dev]) used += fpc_dn_bytes(*ep->dn[dev]);
+                }
+                if (used > pcfg_.max_dev_bytes) return true;
+            }
+            return false;
+        };
+        protect_ = node;
+        while (over()) {
+            Node* victim = lru_endpoint(node);
+            if (!victim) break;
+            evict_endpoint(victim);
+        }
+        protect_ = nullptr;
+    }
 
     // Build the per-card snapshot vectors into LOCALS first; only commit to the
     // node on full success so a mid-loop alloc failure (OOM) frees cleanly and
@@ -187,6 +251,8 @@ std::string FleetPrefixCache::insert(Model& m,
     node->kv = std::move(kv_snap);
     node->dn = std::move(dn_snap);
     node->is_endpoint = true;
+    node->shared = shared;
+    node->anchor = anchor;
     node->path = tokens;
     prune_on_fail.armed = false;
     ++tick_;
@@ -225,26 +291,26 @@ void FleetPrefixCache::clear() noexcept {
 template std::string FleetPrefixCache::init<Qwen3NextModel>(
     Qwen3NextModel&, const FleetPrefixCacheConfig&);
 template std::string FleetPrefixCache::insert<Qwen3NextModel>(
-    Qwen3NextModel&, const std::vector<int32_t>&);
+    Qwen3NextModel&, const std::vector<int32_t>&, bool, bool);
 template std::string FleetPrefixCache::init<Qwen35MoeSplitModel>(
     Qwen35MoeSplitModel&, const FleetPrefixCacheConfig&);
 template std::string FleetPrefixCache::insert<Qwen35MoeSplitModel>(
-    Qwen35MoeSplitModel&, const std::vector<int32_t>&);
+    Qwen35MoeSplitModel&, const std::vector<int32_t>&, bool, bool);
 template std::string FleetPrefixCache::init<GptOssTpModel>(
     GptOssTpModel&, const FleetPrefixCacheConfig&);
 template std::string FleetPrefixCache::insert<GptOssTpModel>(
-    GptOssTpModel&, const std::vector<int32_t>&);
+    GptOssTpModel&, const std::vector<int32_t>&, bool, bool);
 template std::string FleetPrefixCache::init<Qwen3MoeSplitModel>(
     Qwen3MoeSplitModel&, const FleetPrefixCacheConfig&);
 template std::string FleetPrefixCache::insert<Qwen3MoeSplitModel>(
-    Qwen3MoeSplitModel&, const std::vector<int32_t>&);
+    Qwen3MoeSplitModel&, const std::vector<int32_t>&, bool, bool);
 template std::string FleetPrefixCache::init<Qwen3MoeTpModel>(
     Qwen3MoeTpModel&, const FleetPrefixCacheConfig&);
 template std::string FleetPrefixCache::insert<Qwen3MoeTpModel>(
-    Qwen3MoeTpModel&, const std::vector<int32_t>&);
+    Qwen3MoeTpModel&, const std::vector<int32_t>&, bool, bool);
 template std::string FleetPrefixCache::init<Qwen35SplitModel>(
     Qwen35SplitModel&, const FleetPrefixCacheConfig&);
 template std::string FleetPrefixCache::insert<Qwen35SplitModel>(
-    Qwen35SplitModel&, const std::vector<int32_t>&);
+    Qwen35SplitModel&, const std::vector<int32_t>&, bool, bool);
 
 }  // namespace ie

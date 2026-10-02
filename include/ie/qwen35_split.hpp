@@ -25,6 +25,7 @@
 #include "ie/deltanet_state.hpp"     // DeltaNetState
 #include "ie/gguf.hpp"
 #include "ie/kv_cache.hpp"
+#include "ie/lanes_auto.hpp"         // LanesAutoFit (P4 B30)
 #include "ie/model_config.hpp"       // Qwen35Config
 #include "ie/qwen35_dense.hpp"       // MtpHead + Qwen35SpecCheckpoint (spec-decode)
 
@@ -101,7 +102,10 @@ public:
     // every card; lane 0 is the state load() allocated at --ctx (nothing changes with one lane). init_lanes sizes every card's
     // workspace for max(max_rows, kMaxRows), then allocates lanes 1..n-1 at lane_ctx positions: refused, with the numbers, when a
     // card would keep less than reserve_bytes free after them (q35m_lanes_fit). Refuses --int8-kv (the rows path is fp16 KV).
-    std::string init_lanes(uint32_t n_lanes, uint32_t lane_ctx, uint32_t max_rows, uint64_t reserve_bytes);
+    // P4 B30: with `fit` (auto; n_lanes is then kLanesAuto and unused) it picks n (lanes_auto_fit, up to fit->n_max) from what
+    // each card has free, keeping fit->keep more; fit gets the cards' numbers and the pick (1 = no lanes allocated).
+    std::string init_lanes(uint32_t n_lanes, uint32_t lane_ctx, uint32_t max_rows, uint64_t reserve_bytes,
+                           LanesAutoFit* fit = nullptr);
     uint32_t    n_lanes() const noexcept { return 1u + uint32_t(lane_kv_.size()); }
     uint32_t    lane_ctx(uint32_t lane) const noexcept { return lane ? lane_ctx_ : max_ctx_; }
     uint64_t    lane_bytes(uint32_t dev) const noexcept { return dev < lane_bytes_.size() ? lane_bytes_[dev] : 0; }
@@ -191,13 +195,22 @@ private:
     // (no F16 doubling → ~13.5 GB/card): q8_qs[n*K+k] int8 column-contiguous +
     // q8_d[n*(K/32)+b] fp16 per-32-block scale (de-interleaved from on-disk AoS
     // block_q8_0 — bit-exact, no requant). Consumed by gemv_q8_0_soa_q8 on decode
-    // and a SoA→fp16 dequant + gemm_fp16 on prefill. Non-Q8_0 tensors (Q4_K/Q6_K
-    // packed, Q5_K→F16) fall back to `fp` (q8_qs == nullptr). See sgemv().
+    // and a SoA→fp16 dequant + gemm_fp16 on prefill. Q6_K/Q5_K → the c32 repack (kq,
+    // P4 B21); other tensors (Q4_K packed, F16) fall back to `fp`. See sgemv().
     struct SplitW {
         int8_t*   q8_qs = nullptr;   // [N*K] int8 (Q8_0-SoA)
         uint16_t* q8_d  = nullptr;   // [N*(K/32)] fp16 bits
         uint32_t  K = 0, N = 0;
-        DenseQuantPtr fp;            // fallback when q8_qs == nullptr
+        DenseQuantPtr fp;            // fallback when q8_qs == nullptr and kq == kCount
+        // P4 B21: a Q6_K / Q5_K weight repacked at load into the c32 streams (gemv_kq_c32.cpp) -- kq names the type
+        // (kQ6_K: kq_hi uint8 2-bit plane, kq_sc int8 per 16, kq_d fp16 per 256; kQ5_K: kq_hi uint32 1-bit plane, kq_sc
+        // uint16 scale|min per 32, kq_d uint32 d|dmin per 256). T = 1 and the rows run gemv_q{6,5}k_c32_q8; prefill dequants.
+        DType     kq = DType::kCount;
+        uint8_t*  kq_lo = nullptr;
+        void*     kq_hi = nullptr;
+        void*     kq_sc = nullptr;
+        void*     kq_d  = nullptr;
+        bool int_dot() const noexcept { return q8_qs || kq_lo; }   // the batched int-dot rows route covers it
     };
 
     // Per-layer weights. EITHER linear (DeltaNet) or full-attn populated; the FFN
@@ -294,10 +307,15 @@ private:
 
     // Q8_0-SoA aware GEMV: out[T,N] = A[T,K] @ W. Decode (T==1) int-dot; prefill
     // dequant-to-fp16 + gemm; non-Q8_0 → dense::gemv_q_T. Runs on dev's queue.
+    // act_ready (P4 B21, T == 1 only): act_q8_[dev] already holds quantize_q8_1(A) from the previous sgemv on the same A
+    // (q/k/v, gate/up): skip the identical re-quantize launch.
     sycl::event sgemv(uint32_t dev, const sycl::half* A, const SplitW& w,
-                      sycl::half* out, uint32_t K, uint32_t N, uint32_t T);
+                      sycl::half* out, uint32_t K, uint32_t N, uint32_t T, bool act_ready = false);
     // P4 B18: sgemv with its spec-verify route (T 2..16, Q8_0-SoA: the batched int-dot) whatever spec_verify_gemv_ says
     sycl::event sgemv_rows(uint32_t dev, const sycl::half* A, const SplitW& w, sycl::half* out, uint32_t K, uint32_t N, uint32_t T);
+    // P4 B21: quantize the T activation rows and run the c32 K-quant GEMV (any T; T = 1 is the decode kernel's instance)
+    sycl::event kq_gemv(uint32_t dev, const sycl::half* A, const SplitW& w, sycl::half* out, uint32_t K, uint32_t N, uint32_t T,
+                        bool act_ready = false);
 
     // Enqueue one card's full layer stage for a prefill chunk (no waits/prof/ckpt;
     // used by forward_pipelined — the serial forward keeps its own validated loop).
@@ -316,6 +334,12 @@ private:
     uint32_t    max_ctx_ = 0, lane_ctx_ = 0;
     sycl::half* lane_logits_ = nullptr;                    // [vocab] on head_dev
     sycl::half* rows_logits_ = nullptr;                    // [kMaxRows x vocab] on head_dev
+    // P4 B26: the rows step's decode-attention partials (kMaxRows slices of rows_partials_floats_) and its per-group row
+    // table (kFaDecodeRowsTableBytes), per card with a KV cache (full_attention_fa2_decode_rows; init_lanes allocates
+    // them, owned_)
+    std::vector<float*> rows_partials_;
+    std::vector<void*>  rows_table_;
+    uint64_t            rows_partials_floats_ = 0;
     KvCache&       kv_at(uint32_t dev) { return cur_[dev] ? lane_kv_[cur_[dev] - 1][dev] : kv_[dev]; }
     DeltaNetState& dn_at(uint32_t dev) { return cur_[dev] ? lane_dn_[cur_[dev] - 1][dev] : dn_[dev]; }
     KvCache&       lane_kv(uint32_t lane, uint32_t dev) { return lane ? lane_kv_[lane - 1][dev] : kv_[dev]; }

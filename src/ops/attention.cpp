@@ -102,12 +102,272 @@
 #ifndef IE_FA2_TARGET_SUPER
 #define IE_FA2_TARGET_SUPER 64
 #endif
+#include <sycl/ext/oneapi/experimental/prefetch.hpp>
 
 namespace ie {
 
 namespace {
 
 constexpr int SG_SIZE = 16;
+
+// P4 B22: the vec decode partial pass is latency bound (B22 PROFILE: ~100 GB/s at 32K, each step's K load -> score ->
+// V load chain waits on DRAM). IE_FA2_VEC_PF = how many KV positions ahead each step prefetches its K / V rows into L1
+// (default 8 = 4 steps, the best of 8/16/32/64 in fa2_vec_pf_test --bench; 0 = none). A prefetch changes no arithmetic, so the result is bit-identical. Read once.
+uint32_t fa2_vec_pf_look() {
+    static const uint32_t v = [] {
+        const char* s = std::getenv("IE_FA2_VEC_PF");
+        if (!s) return 8u;
+        const int n = std::atoi(s);
+        return n > 0 && n <= 256 ? uint32_t(n) : 0u;
+    }();
+    return v;
+}
+
+// P4 B22: the SLM-tiled FA2 decode partial pass (fa2_decode_fp16_impl_, the 35B's hd-256 decode) loads a chunk's K/V
+// tile, then computes on it: the tile load waits on DRAM with nothing to overlap. IE_FA2_TILE_PF=1 (default) makes
+// the work-group prefetch the NEXT chunk's K/V rows into L1 right after its tile load, so that DRAM time overlaps
+// this chunk's compute. Prefetch changes no arithmetic: bit-identical. 0 = off. Read once.
+bool fa2_tile_pf_on() {
+    static const bool v = [] { const char* s = std::getenv("IE_FA2_TILE_PF"); return !s || std::atoi(s) != 0; }();
+    return v;
+}
+
+// P4 B24: the split-K decode combine pass, widened. The SLM-tiled, vec and XMX decode kernels fold their
+// [super][q_head][head_dim + 2] partials with one loop: a 16-lane subgroup per q head, serial over the supers, each lane
+// owning head_dim / 16 output dims. At 33K on the 27B that is 24 subgroups x 104 supers (XMX) with every iteration
+// waiting on its loads: 0.91 ms per card per token (B23 decode-prof; the vec combine's 64 supers 0.37 ms).
+// fa2_combine_wide_ launches n_q_heads x split subgroups, each owning head_dim / split dims (dpl = head_dim / (16 split)
+// per lane). Every output element keeps EXACTLY the arithmetic it had: the same serial fmax over the supers for m_global,
+// the same l_global and out += w * p chains in the same super order, the same 1 / l and fp16 store -- only which lane
+// computes it moves, so the result is bit-identical to the original kernels (fa2_vec_pf_test --combine).
+// IE_FA2_COMBINE_SPLIT = subgroups per q head; 0 = the original kernels (the A/B). It must divide head_dim / 16 (else the
+// original kernel runs) and is clamped so a lane owns >= 1 dim. Read once.
+constexpr uint32_t kFa2CombineSplitDefault = 16;
+uint32_t fa2_combine_split(uint32_t head_dim) {
+    static const uint32_t v = [] {
+        const char* s = std::getenv("IE_FA2_COMBINE_SPLIT");
+        if (!s) return kFa2CombineSplitDefault;
+        const int n = std::atoi(s);
+        return n > 0 ? uint32_t(n) : 0u;
+    }();
+    const uint32_t dmax = head_dim / SG_SIZE;
+    const uint32_t s = std::min(v, dmax);
+    return (s && dmax % s == 0) ? s : 0;
+}
+
+// IE_FA2_COMBINE_UNROLL=0 turns off the load hoisting in fa2_combine_wide_ (below); the arithmetic order is the same
+// either way, this only moves the loads. Read once.
+constexpr uint32_t kFa2CombineU = 8;
+bool fa2_combine_unroll() {
+    static const bool v = [] { const char* s = std::getenv("IE_FA2_COMBINE_UNROLL"); return !s || std::atoi(s) != 0; }();
+    return v;
+}
+
+// kMinusInf: m_global starts at -inf (tiled, XMX) or -3.0e38f (vec); kGuardL: the vec kernel's l_global > 0 guard.
+// With the split the loop is still a serial chain (load -> exp -> FMA, one super per step, ~0.6 us each on this GPU:
+// the in-order EU issues the next super's loads only after this super's arithmetic). The hoisted form loads kFa2CombineU
+// supers' m / l / p into registers first and then applies them in the SAME serial order; `reassociate(off)` on that
+// block keeps the (default -fp-model=fast) compiler from re-treeing the chain it can now see. The tail (n_partials %
+// kFa2CombineU, and every case with fewer supers) is the plain loop.
+template <bool kMinusInf, bool kGuardL>
+sycl::event fa2_combine_wide_(sycl::queue& q, const char* name, const sycl::event& dep, const float* partials_scratch,
+                              sycl::half* y, uint32_t n_partials, uint32_t n_q_heads, uint32_t head_dim, uint32_t split) {
+    return ie::ps(q, name, [&](sycl::handler& h) {
+        h.depends_on(dep);
+        const uint32_t dpl = head_dim / (SG_SIZE * split);
+        const bool hoist = fa2_combine_unroll() && dpl <= 2;   // register budget: U x (2 + dpl) floats
+        constexpr uint32_t U = kFa2CombineU;
+        h.parallel_for(sycl::nd_range<1>(uint64_t(n_q_heads) * split * SG_SIZE, SG_SIZE),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const uint32_t g    = uint32_t(it.get_group(0));
+            const uint32_t qh   = g / split;
+            const uint32_t d0   = (g % split) * (SG_SIZE * dpl) + uint32_t(it.get_local_id(0)) * dpl;
+            const uint64_t stride = uint64_t(n_q_heads) * (uint64_t(head_dim) + 2);   // one super
+            const float* P = partials_scratch + uint64_t(qh) * (uint64_t(head_dim) + 2);
+            float m_global = kMinusInf ? -std::numeric_limits<float>::infinity() : -3.0e38f;
+            uint32_t c = 0;
+            if (hoist) {
+                #pragma clang fp reassociate(off)
+                for (; c + U <= n_partials; c += U) {
+                    float mc[U];
+                    #pragma unroll
+                    for (uint32_t u = 0; u < U; ++u) mc[u] = P[(c + u) * stride];
+                    #pragma unroll
+                    for (uint32_t u = 0; u < U; ++u) m_global = sycl::fmax(m_global, mc[u]);
+                }
+            }
+            for (; c < n_partials; ++c) {
+                const uint64_t base = (uint64_t(c) * n_q_heads + qh) * (uint64_t(head_dim) + 2);
+                m_global = sycl::fmax(m_global, partials_scratch[base + 0]);
+            }
+            float l_global = 0.f;
+            float out_local[16];
+            #pragma unroll
+            for (uint32_t d_loc = 0; d_loc < dpl; ++d_loc) out_local[d_loc] = 0.f;
+            c = 0;
+            if (hoist) {
+                #pragma clang fp reassociate(off)
+                for (; c + U <= n_partials; c += U) {
+                    float mc[U], lc[U], pv[U][2];
+                    #pragma unroll
+                    for (uint32_t u = 0; u < U; ++u) {
+                        const float* Pc = P + (c + u) * stride;
+                        mc[u] = Pc[0];
+                        lc[u] = Pc[1];
+                        #pragma unroll
+                        for (uint32_t d_loc = 0; d_loc < dpl; ++d_loc) pv[u][d_loc] = Pc[2 + d0 + d_loc];
+                    }
+                    #pragma unroll
+                    for (uint32_t u = 0; u < U; ++u) {
+                        const float w = sycl::native::exp(mc[u] - m_global);
+                        l_global += lc[u] * w;
+                        #pragma unroll
+                        for (uint32_t d_loc = 0; d_loc < dpl; ++d_loc) out_local[d_loc] += w * pv[u][d_loc];
+                    }
+                }
+            }
+            for (; c < n_partials; ++c) {
+                const uint64_t base = (uint64_t(c) * n_q_heads + qh) * (uint64_t(head_dim) + 2);
+                const float m_c = partials_scratch[base + 0];
+                const float l_c = partials_scratch[base + 1];
+                const float w   = sycl::native::exp(m_c - m_global);
+                l_global += l_c * w;
+                #pragma unroll
+                for (uint32_t d_loc = 0; d_loc < dpl; ++d_loc)
+                    out_local[d_loc] += w * partials_scratch[base + 2 + d0 + d_loc];
+            }
+            const float inv_l = kGuardL ? (l_global > 0.f ? 1.0f / l_global : 0.f) : 1.0f / l_global;
+            #pragma unroll
+            for (uint32_t d_loc = 0; d_loc < dpl; ++d_loc) {
+                const uint64_t y_off = uint64_t(qh) * head_dim + d0 + d_loc;
+                y[y_off] = sycl::half(out_local[d_loc] * inv_l);
+            }
+        });
+    });
+}
+
+// P4 B26: the per-row table of a rows-batched decode-attention launch (full_attention_fa2_decode_rows) is a DEVICE-resident
+// FaDecodeRowsDesc, uploaded once per group by fa2_decode_rows_plan; a work-group reads its row with a few uniform loads.
+// (A by-value kernel argument was tried first: IGC copies the 584-byte struct into private memory per thread and indexes
+// it there, -20 % on the tiled kernel.) Row j's super count / chunks per work-group are the single-row kernel's values,
+// computed on the host with the same formulas (fa2_rows_supers_ / fa2_xmx_n_super), so the WG's (kv, super) geometry is
+// exactly the per-row launch's.
+struct FaRowsWg {   // one work-group's row (and, for the partial pass, its kv head and super within the row)
+    sycl::half* k = nullptr;
+    sycl::half* v = nullptr;
+    uint32_t start_pos = 0, max_ctx = 0, n_super = 0, cpw = 0, idx = 0, kv = 0, super = 0;
+};
+// Row j's fields; its cache for the layer slot li.
+inline FaRowsWg fa_rows_at(const FaDecodeRowsDesc* D, uint32_t j, uint32_t li) {
+    FaRowsWg w;
+    w.k = D->k_base[j] + D->layer_stride[j] * li;
+    w.v = D->v_base[j] + D->layer_stride[j] * li;
+    w.start_pos = D->start_pos[j]; w.max_ctx = D->max_ctx[j];
+    w.n_super = D->n_super[j]; w.cpw = D->cpw[j]; w.idx = D->idx[j];
+    return w;
+}
+// The partial pass: work-group g of the launch (rows in table order, each n_kv_heads x n_super[j] groups, kv-major like
+// the single-row launch's kv * n_super + super) -> its row and, within the row, kv = local / n_super, super = local % n_super.
+inline FaRowsWg fa_rows_wg(const FaDecodeRowsDesc* D, uint32_t g, uint32_t n_kv_heads, uint32_t li) {
+    uint32_t off = 0, j = 0, local = 0;
+    const uint32_t n = D->n;
+    for (uint32_t r = 0; r < n; ++r) {
+        const uint32_t nw = n_kv_heads * D->n_super[r];
+        if (g < off + nw) { j = r; local = g - off; break; }
+        off += nw;
+    }
+    FaRowsWg w = fa_rows_at(D, j, li);
+    w.kv = local / w.n_super;
+    w.super = local % w.n_super;
+    return w;
+}
+
+// P4 B26: fa2_combine_wide_ per row -- (row, q head, split) work-groups, the row's n_partials, its partials slice and its
+// y rows. The body is the wide combine's, statement for statement (the same serial chains in the same super order).
+template <bool kMinusInf, bool kGuardL>
+sycl::event fa2_combine_wide_rows_(sycl::queue& q, const char* name, const sycl::event& dep, const float* partials,
+                                   uint64_t row_floats, sycl::half* y, const FaDecodeRowsDesc* D, uint32_t n_rows,
+                                   uint32_t n_q_heads, uint32_t head_dim, uint32_t split) {
+    return ie::ps(q, name, [&](sycl::handler& h) {
+        h.depends_on(dep);
+        const uint32_t dpl = head_dim / (SG_SIZE * split);
+        const bool hoist = fa2_combine_unroll() && dpl <= 2;   // register budget: U x (2 + dpl) floats
+        constexpr uint32_t U = kFa2CombineU;
+        const uint32_t per_row = n_q_heads * split;
+        h.parallel_for(sycl::nd_range<1>(uint64_t(n_rows) * per_row * SG_SIZE, SG_SIZE),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const uint32_t gg = uint32_t(it.get_group(0));
+            const uint32_t j  = gg / per_row;
+            const uint32_t g  = gg - j * per_row;
+            const uint32_t n_partials = D->n_super[j];
+            const uint32_t ridx = D->idx[j];
+            const float* partials_scratch = partials + uint64_t(ridx) * row_floats;
+            sycl::half* yr = y + uint64_t(ridx) * n_q_heads * head_dim;
+            const uint32_t qh   = g / split;
+            const uint32_t d0   = (g % split) * (SG_SIZE * dpl) + uint32_t(it.get_local_id(0)) * dpl;
+            const uint64_t stride = uint64_t(n_q_heads) * (uint64_t(head_dim) + 2);   // one super
+            const float* P = partials_scratch + uint64_t(qh) * (uint64_t(head_dim) + 2);
+            float m_global = kMinusInf ? -std::numeric_limits<float>::infinity() : -3.0e38f;
+            uint32_t c = 0;
+            if (hoist) {
+                #pragma clang fp reassociate(off)
+                for (; c + U <= n_partials; c += U) {
+                    float mc[U];
+                    #pragma unroll
+                    for (uint32_t u = 0; u < U; ++u) mc[u] = P[(c + u) * stride];
+                    #pragma unroll
+                    for (uint32_t u = 0; u < U; ++u) m_global = sycl::fmax(m_global, mc[u]);
+                }
+            }
+            for (; c < n_partials; ++c) {
+                const uint64_t base = (uint64_t(c) * n_q_heads + qh) * (uint64_t(head_dim) + 2);
+                m_global = sycl::fmax(m_global, partials_scratch[base + 0]);
+            }
+            float l_global = 0.f;
+            float out_local[16];
+            #pragma unroll
+            for (uint32_t d_loc = 0; d_loc < dpl; ++d_loc) out_local[d_loc] = 0.f;
+            c = 0;
+            if (hoist) {
+                #pragma clang fp reassociate(off)
+                for (; c + U <= n_partials; c += U) {
+                    float mc[U], lc[U], pv[U][2];
+                    #pragma unroll
+                    for (uint32_t u = 0; u < U; ++u) {
+                        const float* Pc = P + (c + u) * stride;
+                        mc[u] = Pc[0];
+                        lc[u] = Pc[1];
+                        #pragma unroll
+                        for (uint32_t d_loc = 0; d_loc < dpl; ++d_loc) pv[u][d_loc] = Pc[2 + d0 + d_loc];
+                    }
+                    #pragma unroll
+                    for (uint32_t u = 0; u < U; ++u) {
+                        const float w = sycl::native::exp(mc[u] - m_global);
+                        l_global += lc[u] * w;
+                        #pragma unroll
+                        for (uint32_t d_loc = 0; d_loc < dpl; ++d_loc) out_local[d_loc] += w * pv[u][d_loc];
+                    }
+                }
+            }
+            for (; c < n_partials; ++c) {
+                const uint64_t base = (uint64_t(c) * n_q_heads + qh) * (uint64_t(head_dim) + 2);
+                const float m_c = partials_scratch[base + 0];
+                const float l_c = partials_scratch[base + 1];
+                const float w   = sycl::native::exp(m_c - m_global);
+                l_global += l_c * w;
+                #pragma unroll
+                for (uint32_t d_loc = 0; d_loc < dpl; ++d_loc)
+                    out_local[d_loc] += w * partials_scratch[base + 2 + d0 + d_loc];
+            }
+            const float inv_l = kGuardL ? (l_global > 0.f ? 1.0f / l_global : 0.f) : 1.0f / l_global;
+            #pragma unroll
+            for (uint32_t d_loc = 0; d_loc < dpl; ++d_loc) {
+                const uint64_t y_off = uint64_t(qh) * head_dim + d0 + d_loc;
+                yr[y_off] = sycl::half(out_local[d_loc] * inv_l);
+            }
+        });
+    });
+}
 
 // Deterministic SG-wide sum for SG_SIZE=16: butterfly XOR with fixed mask
 // order 8, 4, 2, 1.  Every lane gets the full sum.  Used by full_attention
@@ -714,6 +974,7 @@ static sycl::event fa2_decode_fp16_impl_(sycl::queue& q,
         const uint32_t WG_ITEMS = gqa * SG_SIZE;          // 8 × 16 = 128
         const uint32_t dpl = head_dim / SG_SIZE;          // 16
         const float scale = 1.0f / sycl::sqrt(float(head_dim));
+        const bool tile_pf = fa2_tile_pf_on();            // P4 B22
 
         h.parallel_for(sycl::nd_range<2>({uint64_t(n_kv_heads) * n_super_chunks, WG_ITEMS},
                                           {1, WG_ITEMS}),
@@ -761,6 +1022,20 @@ static sycl::event fa2_decode_fp16_impl_(sycl::queue& q,
                     V_slm[i] = v_cache[off];
                 }
                 sycl::group_barrier(it.get_group());
+                // P4 B22: prefetch the next chunk's rows (64 B lines, K then V) while this chunk computes.
+                if (tile_pf && cc + 1 < CHUNKS_PER_WG && chunk + 1 < n_chunks) {
+                    namespace sx = sycl::ext::oneapi::experimental;
+                    const uint32_t nstart = chunk_start + Bc;
+                    const uint32_t nrows  = sycl::min(nstart + Bc, ctx_len) - nstart;
+                    const uint32_t lpr    = head_dim * uint32_t(sizeof(sycl::half)) / 64u;   // lines per row
+                    const uint32_t nl     = nrows * lpr;
+                    const sycl::half* kb = k_cache + (uint64_t(kv) * max_ctx + nstart) * head_dim;
+                    const sycl::half* vb = v_cache + (uint64_t(kv) * max_ctx + nstart) * head_dim;
+                    for (uint32_t j = lid; j < 2u * nl; j += WG_ITEMS) {
+                        const sycl::half* p = (j < nl ? kb : vb) + uint64_t(j < nl ? j : j - nl) * 32u;
+                        sx::prefetch(const_cast<sycl::half*>(p), 32u, sx::properties{sx::prefetch_hint_L1});
+                    }
+                }
 
                 for (uint32_t i = 0; i < chunk_n; ++i) {
                     float partial = 0.f;
@@ -801,7 +1076,11 @@ static sycl::event fa2_decode_fp16_impl_(sycl::queue& q,
 
     // 3. Combine pass: now iterates over n_super_chunks (not n_chunks).
     const uint32_t n_partials = n_super_chunks;
-    auto combine_evt = ie::ps(q, "fa2_combine_fp16", [&](sycl::handler& h) {
+    const uint32_t csplit = fa2_combine_split(head_dim);   // P4 B24: 0 = the original combine below
+    sycl::event combine_evt = csplit
+        ? fa2_combine_wide_<true, false>(q, "fa2_combine_fp16_wide", partial_evt, partials_scratch, y, n_partials,
+                                         n_q_heads, head_dim, csplit)
+        : ie::ps(q, "fa2_combine_fp16", [&](sycl::handler& h) {
         h.depends_on(partial_evt);
         const uint32_t dpl = head_dim / SG_SIZE;
         h.parallel_for(sycl::nd_range<1>(uint64_t(n_q_heads) * SG_SIZE, SG_SIZE),
@@ -1107,7 +1386,11 @@ sycl::event full_attention_fa2_decode_xmx(sycl::queue& q,
     // 3. Combine — the fp16 kernel's combine pass, copied (same formula, same
     //    partials layout) so the SIMD16 kernel above stays byte-identical.
     const uint32_t n_partials = n_super;
-    auto combine_evt = ie::ps(q, "fa2_xmx_combine", [&](sycl::handler& h) {
+    const uint32_t csplit = fa2_combine_split(head_dim);   // P4 B24: 0 = the original combine below
+    sycl::event combine_evt = csplit
+        ? fa2_combine_wide_<true, false>(q, "fa2_xmx_combine_wide", partial_evt, partials_scratch, y, n_partials,
+                                         n_q_heads, head_dim, csplit)
+        : ie::ps(q, "fa2_xmx_combine", [&](sycl::handler& h) {
         h.depends_on(partial_evt);
         const uint32_t dpl = head_dim / SG_SIZE;
         h.parallel_for(sycl::nd_range<1>(uint64_t(n_q_heads) * SG_SIZE, SG_SIZE),
@@ -1683,6 +1966,7 @@ sycl::event full_attention_fa2_decode_vec(sycl::queue& q,
         // SLM: per-subgroup softmax weights for one POS_PER_STEP-batch of scores.
         // Layout: [sg_id][POS_PER_STEP]. Tiny (gqa*2 floats).
         sycl::local_accessor<float, 1> KQ_slm({uint64_t(gqa) * POS_PER_STEP}, h);
+        const uint32_t pf_look = fa2_vec_pf_look();   // P4 B22
 
         h.parallel_for(sycl::nd_range<2>({uint64_t(n_kv_heads) * n_super_chunks, WG_ITEMS},
                                           {1, WG_ITEMS}),
@@ -1740,6 +2024,20 @@ sycl::event full_attention_fa2_decode_vec(sycl::queue& q,
 
                 // Score POS_PER_STEP positions per step; defer the softmax update.
                 for (uint32_t p0 = 0; p0 < chunk_n; p0 += POS_PER_STEP) {
+                    if (pf_look) {   // P4 B22: this lane's K slice and V slices pf_look positions ahead (valid rows only)
+                        namespace sx = sycl::ext::oneapi::experimental;
+                        const uint32_t ap = chunk_start + p0 + pf_look;
+                        if (ap + lane_kq_group < ctx_len)
+                            sx::prefetch(const_cast<sycl::half*>(k_cache) +
+                                             (uint64_t(kv) * max_ctx + ap + lane_kq_group) * head_dim + lane_in_kq * DPL_KQ,
+                                         DPL_KQ, sx::properties{sx::prefetch_hint_L1});
+                        #pragma unroll
+                        for (uint32_t pp = 0; pp < POS_PER_STEP; ++pp)
+                            if (ap + pp < ctx_len)
+                                sx::prefetch(const_cast<sycl::half*>(v_cache) +
+                                                 (uint64_t(kv) * max_ctx + ap + pp) * head_dim + out_dim0,
+                                             VPL, sx::properties{sx::prefetch_hint_L1});
+                    }
                     // ---- Pass A: raw dots into register, narrow butterfly reduce,
                     //              running max via register fmax (OFF softmax chain).
                     const uint32_t pos = p0 + lane_kq_group;      // position this lane scores
@@ -1831,7 +2129,11 @@ sycl::event full_attention_fa2_decode_vec(sycl::queue& q,
 
     // 3. Combine pass — identical layout to v1/v2 (global-max rescale + normalize).
     const uint32_t n_partials = n_super_chunks;
-    auto combine_evt = ie::ps(q, "fa2_combine_fp16_vec", [&](sycl::handler& h) {
+    const uint32_t csplit = fa2_combine_split(head_dim);   // P4 B24: 0 = the original combine below
+    sycl::event combine_evt = csplit
+        ? fa2_combine_wide_<false, true>(q, "fa2_combine_fp16_vec_wide", partial_evt, partials_scratch, y, n_partials,
+                                         n_q_heads, head_dim, csplit)
+        : ie::ps(q, "fa2_combine_fp16_vec", [&](sycl::handler& h) {
         h.depends_on(partial_evt);
         const uint32_t dpl = head_dim / SG_SIZE;
         h.parallel_for(sycl::nd_range<1>(uint64_t(n_q_heads) * SG_SIZE, SG_SIZE),
@@ -1876,6 +2178,695 @@ sycl::event full_attention_fa2_decode_vec(sycl::queue& q,
         prof->combine_ns += dur(combine_evt);
     }
     return combine_evt;
+}
+
+// ===========================================================================
+// P4 B26: full_attention_fa2_decode_rows -- G decode rows in one launch per pass.
+// ===========================================================================
+// One rows launcher per kernel kind (tiled = fa2_decode_fp16_impl_, XMX, vec). Each is the single-row function with its
+// three passes over the rows table: the append pass writes every row's token row (the XMX one also its 15 zero rows);
+// the partial pass launches sum_j n_kv_heads x n_super[j] work-groups, each running the single-row kernel's work-group
+// body (copied statement for statement) on its row's cache, context and super geometry; the combine is
+// fa2_combine_wide_rows_. The single-row kernels above are left untouched (IE_Q35_ROWS_ATTN=0 in the models is the A/B).
+namespace {
+
+// The tiled / vec super split (fa2_decode_fp16_impl_ and full_attention_fa2_decode_vec compute exactly this).
+inline void fa2_rows_supers_(uint32_t ctx_len, uint32_t& n_super, uint32_t& cpw) {
+    constexpr uint32_t Bc = 64;
+    constexpr uint32_t TARGET_SUPER = IE_FA2_TARGET_SUPER;
+    const uint32_t n_chunks = (ctx_len + Bc - 1) / Bc;
+    cpw = std::max<uint32_t>(1u, (n_chunks + TARGET_SUPER - 1) / TARGET_SUPER);
+    n_super = (n_chunks + cpw - 1) / cpw;
+}
+// full_attention_fa2_decode_xmx's shape gate (it runs the tiled kernel outside it), as one predicate.
+inline bool fa2_xmx_kernel_ok_(uint32_t start_pos, uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim, uint32_t max_ctx) {
+    const uint32_t gqa = n_kv_heads ? n_q_heads / n_kv_heads : 0;
+    return !(gqa == 0 || gqa > 8 || n_q_heads % n_kv_heads != 0 || head_dim % 16 != 0 || head_dim > 256 || start_pos + 16 > max_ctx);
+}
+uint32_t fa2_rows_wgs_(const FaDecodeRowsDesc& D, uint32_t n_kv_heads) {
+    uint32_t n = 0;
+    for (uint32_t j = 0; j < D.n; ++j) n += n_kv_heads * D.n_super[j];
+    return n;
+}
+void fa2_rows_prof_(AttnProfileData* prof, const sycl::event& a, const sycl::event& p, const sycl::event& c) {
+    if (!prof) return;
+    sycl::event(c).wait();
+    auto dur = [](const sycl::event& e) -> uint64_t {
+        return e.get_profiling_info<sycl::info::event_profiling::command_end>()
+             - e.get_profiling_info<sycl::info::event_profiling::command_start>();
+    };
+    prof->append_ns  += dur(a);
+    prof->partial_ns += dur(p);
+    prof->combine_ns += dur(c);
+}
+
+// --- tiled rows (fa2_decode_fp16_impl_ per row) ---
+sycl::event fa2_rows_tiled_(sycl::queue& q, const sycl::half* q_all, const sycl::half* k_all, const sycl::half* v_all,
+                            sycl::half* y, float* partials, uint64_t row_floats, const FaDecodeRowsDesc* D,
+                            uint32_t n_rows, uint32_t n_wgs, uint32_t li,
+                            uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim, uint32_t csplit,
+                            const std::vector<sycl::event>& deps, AttnProfileData* prof) {
+    constexpr uint32_t Bc = 64;
+    const uint32_t gqa = n_q_heads / n_kv_heads;
+    const uint32_t N_q = n_q_heads * head_dim, N_kv = n_kv_heads * head_dim;
+
+    auto append_evt = ie::ps(q, "fa2_rows_append_fp16", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        const uint32_t per_row = n_kv_heads * head_dim;
+        const uint32_t total = n_rows * per_row;
+        constexpr uint32_t WG = 256;
+        const uint32_t global = ((total + WG - 1) / WG) * WG;
+        h.parallel_for(sycl::nd_range<1>(global, WG),
+                       [=](sycl::nd_item<1> it) {
+            const uint32_t gid = uint32_t(it.get_global_id(0));
+            if (gid >= total) return;
+            const uint32_t j   = gid / per_row;
+            const uint32_t idx = gid - j * per_row;
+            const FaRowsWg rw = fa_rows_at(D, j, li);
+            const uint32_t d  = idx % head_dim;
+            const uint32_t kv = idx / head_dim;
+            const uint64_t in_off  = uint64_t(rw.idx) * N_kv + uint64_t(kv) * head_dim + d;
+            const uint64_t out_off = (uint64_t(kv) * rw.max_ctx + rw.start_pos) * head_dim + d;
+            rw.k[out_off] = k_all[in_off];
+            rw.v[out_off] = v_all[in_off];
+        });
+    });
+
+    auto partial_evt = ie::ps(q, "fa2_rows_partial_fp16", [&](sycl::handler& h) {
+        h.depends_on(append_evt);
+        sycl::local_accessor<sycl::half, 1> K_slm({uint64_t(Bc) * head_dim}, h);
+        sycl::local_accessor<sycl::half, 1> V_slm({uint64_t(Bc) * head_dim}, h);
+
+        const uint32_t WG_ITEMS = gqa * SG_SIZE;          // 8 × 16 = 128
+        const uint32_t dpl = head_dim / SG_SIZE;          // 16
+        const float scale = 1.0f / sycl::sqrt(float(head_dim));
+        const bool tile_pf = fa2_tile_pf_on();            // P4 B22
+
+        h.parallel_for(sycl::nd_range<2>({uint64_t(n_wgs), WG_ITEMS},
+                                          {1, WG_ITEMS}),
+                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const FaRowsWg rw = fa_rows_wg(D, uint32_t(it.get_group(0)), n_kv_heads, li);
+            const uint32_t kv          = rw.kv;
+            const uint32_t super       = rw.super;
+            const sycl::half* k_cache  = rw.k;
+            const sycl::half* v_cache  = rw.v;
+            const uint32_t max_ctx     = rw.max_ctx;
+            const uint32_t ctx_len     = rw.start_pos + 1;
+            const uint32_t n_chunks    = (ctx_len + Bc - 1) / Bc;
+            const uint32_t CHUNKS_PER_WG = rw.cpw;
+            const sycl::half* q_in     = q_all + uint64_t(rw.idx) * N_q;
+            float* partials_scratch    = partials + uint64_t(rw.idx) * row_floats;
+            const uint32_t lid         = uint32_t(it.get_local_id(1));
+            const uint32_t sg_id       = lid / SG_SIZE;
+            const uint32_t lane        = lid % SG_SIZE;
+            const uint32_t my_q        = kv * gqa + sg_id;
+            auto sg = it.get_sub_group();
+
+            // Per-SG q (registered in private memory); per-lane dpl dims.
+            float q_vals[16];
+            #pragma unroll
+            for (uint32_t d_loc = 0; d_loc < dpl; ++d_loc) {
+                q_vals[d_loc] = float(q_in[uint64_t(my_q) * head_dim + lane * dpl + d_loc]);
+            }
+            float m = -std::numeric_limits<float>::infinity();
+            float l = 0.f;
+            float out_local[16];
+            #pragma unroll
+            for (uint32_t d_loc = 0; d_loc < dpl; ++d_loc) out_local[d_loc] = 0.f;
+
+            // Loop CHUNKS_PER_WG inner chunks, accumulating into local m, l, out.
+            const uint32_t hd_log2 = 31 - sycl::clz(head_dim);
+            const uint32_t hd_mask = head_dim - 1;
+            const uint32_t chunk_first = super * CHUNKS_PER_WG;
+            for (uint32_t cc = 0; cc < CHUNKS_PER_WG; ++cc) {
+                const uint32_t chunk = chunk_first + cc;
+                if (chunk >= n_chunks) break;
+
+                const uint32_t chunk_start = chunk * Bc;
+                const uint32_t chunk_end   = sycl::min(chunk_start + Bc, ctx_len);
+                const uint32_t chunk_n     = chunk_end - chunk_start;
+
+                const uint32_t tile_size = chunk_n * head_dim;
+                for (uint32_t i = lid; i < tile_size; i += WG_ITEMS) {
+                    const uint32_t tk = i >> hd_log2;
+                    const uint32_t d  = i & hd_mask;
+                    const uint64_t off =
+                        (uint64_t(kv) * max_ctx + chunk_start + tk) * head_dim + d;
+                    K_slm[i] = k_cache[off];
+                    V_slm[i] = v_cache[off];
+                }
+                sycl::group_barrier(it.get_group());
+                // P4 B22: prefetch the next chunk's rows (64 B lines, K then V) while this chunk computes.
+                if (tile_pf && cc + 1 < CHUNKS_PER_WG && chunk + 1 < n_chunks) {
+                    namespace sx = sycl::ext::oneapi::experimental;
+                    const uint32_t nstart = chunk_start + Bc;
+                    const uint32_t nrows  = sycl::min(nstart + Bc, ctx_len) - nstart;
+                    const uint32_t lpr    = head_dim * uint32_t(sizeof(sycl::half)) / 64u;   // lines per row
+                    const uint32_t nl     = nrows * lpr;
+                    const sycl::half* kb = k_cache + (uint64_t(kv) * max_ctx + nstart) * head_dim;
+                    const sycl::half* vb = v_cache + (uint64_t(kv) * max_ctx + nstart) * head_dim;
+                    for (uint32_t j = lid; j < 2u * nl; j += WG_ITEMS) {
+                        const sycl::half* p = (j < nl ? kb : vb) + uint64_t(j < nl ? j : j - nl) * 32u;
+                        sx::prefetch(const_cast<sycl::half*>(p), 32u, sx::properties{sx::prefetch_hint_L1});
+                    }
+                }
+
+                for (uint32_t i = 0; i < chunk_n; ++i) {
+                    float partial = 0.f;
+                    #pragma unroll
+                    for (uint32_t d_loc = 0; d_loc < dpl; ++d_loc) {
+                        partial += q_vals[d_loc] *
+                                   float(K_slm[i * head_dim + lane * dpl + d_loc]);
+                    }
+                    const float s_i =
+                        sycl::reduce_over_group(sg, partial, sycl::plus<float>()) * scale;
+                    const float m_new = sycl::fmax(m, s_i);
+                    const float alpha = sycl::native::exp(m - m_new);
+                    const float e     = sycl::native::exp(s_i - m_new);
+                    #pragma unroll
+                    for (uint32_t d_loc = 0; d_loc < dpl; ++d_loc) {
+                        out_local[d_loc] = out_local[d_loc] * alpha +
+                                           e * float(V_slm[i * head_dim + lane * dpl + d_loc]);
+                    }
+                    l = l * alpha + e;
+                    m = m_new;
+                }
+                sycl::group_barrier(it.get_group());  // before next K tile load
+            }
+
+            // Write one super-partial per (super, my_q).
+            const uint64_t base =
+                (uint64_t(super) * n_q_heads + my_q) * (uint64_t(head_dim) + 2);
+            if (lane == 0) {
+                partials_scratch[base + 0] = m;
+                partials_scratch[base + 1] = l;
+            }
+            #pragma unroll
+            for (uint32_t d_loc = 0; d_loc < dpl; ++d_loc) {
+                partials_scratch[base + 2 + lane * dpl + d_loc] = out_local[d_loc];
+            }
+        });
+    });
+
+    sycl::event combine_evt = fa2_combine_wide_rows_<true, false>(q, "fa2_rows_combine_fp16_wide", partial_evt, partials,
+                                                                  row_floats, y, D, n_rows, n_q_heads, head_dim, csplit);
+    fa2_rows_prof_(prof, append_evt, partial_evt, combine_evt);
+    return combine_evt;
+}
+
+// --- XMX rows (full_attention_fa2_decode_xmx per row; every row passed its shape gate) ---
+sycl::event fa2_rows_xmx_(sycl::queue& q, const sycl::half* q_all, const sycl::half* k_all, const sycl::half* v_all,
+                          sycl::half* y, float* partials, uint64_t row_floats, const FaDecodeRowsDesc* D,
+                          uint32_t n_rows, uint32_t n_wgs, uint32_t li,
+                          uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim, uint32_t csplit,
+                          const std::vector<sycl::event>& deps, AttnProfileData* prof) {
+    namespace mat = sycl::ext::oneapi::experimental::matrix;
+    using fp16 = sycl::half;
+    constexpr uint32_t TM = 8, TN = 16, TK = 16;
+    constexpr uint32_t KB = 16;                       // keys per block == TN
+    const uint32_t gqa = n_q_heads / n_kv_heads;
+    constexpr uint32_t Bc = 64;
+    const uint32_t hd = head_dim;
+    const uint32_t ND = hd / TN;                      // O tiles per row block (<= 16)
+    const uint32_t N_q = n_q_heads * head_dim, N_kv = n_kv_heads * head_dim;
+
+    auto append_evt = ie::ps(q, "fa2_rows_xmx_append", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        const uint32_t row_elems = n_kv_heads * head_dim;
+        const uint32_t per_row = KB * row_elems;
+        const uint32_t total = n_rows * per_row;
+        constexpr uint32_t WG = 256;
+        const uint32_t global = ((total + WG - 1) / WG) * WG;
+        h.parallel_for(sycl::nd_range<1>(global, WG), [=](sycl::nd_item<1> it) {
+            const uint32_t gid = uint32_t(it.get_global_id(0));
+            if (gid >= total) return;
+            const uint32_t j   = gid / per_row;
+            const uint32_t idx = gid - j * per_row;
+            const FaRowsWg rw = fa_rows_at(D, j, li);
+            const uint32_t r   = idx / row_elems;            // 0 = the token, 1..15 = zeroed
+            const uint32_t rem = idx - r * row_elems;
+            const uint32_t d  = rem % head_dim;
+            const uint32_t kv = rem / head_dim;
+            const uint64_t out_off = (uint64_t(kv) * rw.max_ctx + rw.start_pos + r) * head_dim + d;
+            if (r == 0) {
+                const uint64_t in_off = uint64_t(rw.idx) * N_kv + uint64_t(kv) * head_dim + d;
+                rw.k[out_off] = k_all[in_off];
+                rw.v[out_off] = v_all[in_off];
+            } else {
+                rw.k[out_off] = fp16(0);
+                rw.v[out_off] = fp16(0);
+            }
+        });
+    });
+
+    auto partial_evt = ie::ps(q, "fa2_rows_xmx_partial", [&](sycl::handler& h) {
+        h.depends_on(append_evt);
+        sycl::local_accessor<fp16, 1>  Q_slm(TM * hd, h);      // [8 × hd] zero-padded rows
+        sycl::local_accessor<float, 1> O_slm(TM * hd, h);      // [8 × hd] running output
+        sycl::local_accessor<float, 1> S_slm(TM * KB, h);      // [8 × 16] scores
+        sycl::local_accessor<fp16, 1>  P_slm(TM * KB, h);      // [8 × 16] softmax weights
+        sycl::local_accessor<float, 1> m_slm(TM, h), l_slm(TM, h), a_slm(TM, h);
+        const float scale = 1.0f / sycl::sqrt(float(head_dim));
+        const uint32_t n_q = n_q_heads;
+        h.parallel_for(sycl::nd_range<1>(uint64_t(n_wgs) * SG_SIZE, SG_SIZE),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const FaRowsWg rw = fa_rows_wg(D, uint32_t(it.get_group(0)), n_kv_heads, li);
+            const uint32_t kv    = rw.kv;
+            const uint32_t super = rw.super;
+            const sycl::half* k_cache = rw.k;
+            const sycl::half* v_cache = rw.v;
+            const uint32_t max_ctx  = rw.max_ctx;
+            const uint32_t ctx_len  = rw.start_pos + 1;
+            const uint32_t n_blocks = (ctx_len + KB - 1) / KB;
+            const uint32_t blocks_per_super = rw.cpw * (Bc / KB);
+            const sycl::half* q_in  = q_all + uint64_t(rw.idx) * N_q;
+            float* partials_scratch = partials + uint64_t(rw.idx) * row_floats;
+            const uint32_t lane  = uint32_t(it.get_local_id(0));
+            auto sg = it.get_sub_group();
+            auto Qp  = Q_slm.get_multi_ptr<sycl::access::decorated::no>();
+            auto Op  = O_slm.get_multi_ptr<sycl::access::decorated::no>();
+            auto Sp  = S_slm.get_multi_ptr<sycl::access::decorated::no>();
+            auto Pp  = P_slm.get_multi_ptr<sycl::access::decorated::no>();
+            // Q tile: rows 0..gqa-1 = the q heads sharing kv; rows >= gqa = 0.
+            // 8 halves per step (hd % 16 == 0, so every row is whole vec8s).
+            for (uint32_t i8 = lane; i8 < TM * hd / 8; i8 += SG_SIZE) {
+                const uint32_t i = i8 * 8, r = i / hd, d = i % hd;
+                sycl::vec<fp16, 8> v(fp16(0));
+                if (r < gqa)
+                    v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                       sycl::access::decorated::no>(
+                                  q_in + uint64_t(kv * gqa + r) * hd + d));
+                v.store(0, Qp + i);
+            }
+            if (lane < TM) { m_slm[lane] = -std::numeric_limits<float>::infinity(); l_slm[lane] = 0.f; }
+            for (uint32_t i = lane; i < TM * hd; i += SG_SIZE) O_slm[i] = 0.f;
+            sycl::group_barrier(it.get_group());
+
+            const uint32_t blk0 = super * blocks_per_super;
+            const uint32_t blk1 = sycl::min(blk0 + blocks_per_super, n_blocks);
+            // (every super has >= 1 block: super*CHUNKS_PER_WG < n_chunks by construction)
+            const fp16* Kbase = k_cache + uint64_t(kv) * max_ctx * hd;
+            const fp16* Vbase = v_cache + uint64_t(kv) * max_ctx * hd;
+            for (uint32_t b = blk0; b < blk1; ++b) {
+                const uint32_t key0 = b * KB;
+                const uint32_t klen = sycl::min(KB, ctx_len - key0);
+                // (a) S = Q · K^T : A = Q[8 × hd] row_major (SLM), B = K^T col_major
+                //     straight from the cache: element (k=dim, n=key) at K[(key0+n)*hd + kk+k].
+                //     Keys >= ctx_len in the last block are the zeroed rows (masked below).
+                mat::joint_matrix<sycl::sub_group, float, mat::use::accumulator, TM, TN> S;
+                mat::joint_matrix_fill(sg, S, 0.0f);
+                for (uint32_t kk = 0; kk < hd; kk += TK) {
+                    mat::joint_matrix<sycl::sub_group, fp16, mat::use::a, TM, TK, mat::layout::row_major> a_tile;
+                    mat::joint_matrix<sycl::sub_group, fp16, mat::use::b, TK, TN, mat::layout::col_major> b_tile;
+                    mat::joint_matrix_load(sg, a_tile, Qp + kk, /*stride=*/hd);
+                    mat::joint_matrix_load(sg, b_tile,
+                        sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                 sycl::access::decorated::no>(Kbase + uint64_t(key0) * hd + kk),
+                        /*stride=*/hd);
+                    mat::joint_matrix_mad(sg, S, a_tile, b_tile, S);
+                }
+                mat::joint_matrix_store(sg, S, Sp, /*stride=*/KB, mat::layout::row_major);
+                sycl::group_barrier(it.get_group());
+                // (b) online softmax: lane r < 8 owns row r (16 columns), rescales
+                //     its row of O by alpha (FA-2) before the P·V accumulate.
+                if (lane < TM) {
+                    const uint32_t r = lane;
+                    const float m_old = m_slm[r];
+                    float row_m = m_old;
+                    for (uint32_t c = 0; c < KB; ++c) {
+                        const float sv = (r < gqa && c < klen) ? S_slm[r * KB + c] * scale
+                                                               : -std::numeric_limits<float>::infinity();
+                        S_slm[r * KB + c] = sv;
+                        row_m = sycl::fmax(row_m, sv);
+                    }
+                    const float alpha = (m_old == -std::numeric_limits<float>::infinity())
+                                        ? 0.f : sycl::native::exp(m_old - row_m);
+                    float row_l = 0.f;
+                    for (uint32_t c = 0; c < KB; ++c) {
+                        const float sv = S_slm[r * KB + c];
+                        const float e = (sv == -std::numeric_limits<float>::infinity())
+                                        ? 0.f : sycl::native::exp(sv - row_m);
+                        const fp16 p = fp16(e);
+                        P_slm[r * KB + c] = p;
+                        row_l += float(p);   // the normalizer sums the SAME fp16 weights the MAD uses
+                    }
+                    l_slm[r] = l_slm[r] * alpha + row_l;
+                    m_slm[r] = row_m;
+                    // Padding rows (r >= gqa) stay all-zero and are never written out;
+                    // give them alpha 1 so they never force the rescale below.
+                    a_slm[r] = (r < gqa) ? alpha : 1.0f;
+                }
+                sycl::group_barrier(it.get_group());
+                // FA-2 rescale of O by alpha. Skipped when no row's max moved (the
+                // steady state after the first blocks) — every lane reads the same
+                // eight alphas, so the test and the barrier inside are uniform.
+                {
+                    bool rescale = false;
+                    for (uint32_t r = 0; r < TM; ++r) rescale |= (a_slm[r] != 1.0f);
+                    if (rescale) {
+                        for (uint32_t i = lane; i < TM * hd; i += SG_SIZE) O_slm[i] *= a_slm[i / hd];
+                        sycl::group_barrier(it.get_group());
+                    }
+                }
+                // (c) O += P · V : A = P[8 × 16] (SLM), B = V rows row_major straight
+                //     from the cache; accumulator seeded from / stored to O_slm.
+                for (uint32_t t = 0; t < ND; ++t) {
+                    mat::joint_matrix<sycl::sub_group, float, mat::use::accumulator, TM, TN> acc;
+                    mat::joint_matrix_load(sg, acc, Op + t * TN, /*stride=*/hd, mat::layout::row_major);
+                    mat::joint_matrix<sycl::sub_group, fp16, mat::use::a, TM, TK, mat::layout::row_major> p_tile;
+                    mat::joint_matrix<sycl::sub_group, fp16, mat::use::b, TK, TN, mat::layout::row_major> v_tile;
+                    mat::joint_matrix_load(sg, p_tile, Pp, /*stride=*/KB);
+                    mat::joint_matrix_load(sg, v_tile,
+                        sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                 sycl::access::decorated::no>(Vbase + uint64_t(key0) * hd + t * TN),
+                        /*stride=*/hd);
+                    mat::joint_matrix_mad(sg, acc, p_tile, v_tile, acc);
+                    mat::joint_matrix_store(sg, acc, Op + t * TN, /*stride=*/hd, mat::layout::row_major);
+                }
+                sycl::group_barrier(it.get_group());   // S/P/O SLM reuse next block
+            }
+            // Super-partial for each real q row: [super][q_head][hd+2].
+            for (uint32_t i = lane; i < gqa * hd; i += SG_SIZE) {
+                const uint32_t r = i / hd, d = i % hd;
+                const uint32_t my_q = kv * gqa + r;
+                const uint64_t base = (uint64_t(super) * n_q + my_q) * (uint64_t(hd) + 2);
+                partials_scratch[base + 2 + d] = O_slm[i];
+            }
+            if (lane < gqa) {
+                const uint32_t my_q = kv * gqa + lane;
+                const uint64_t base = (uint64_t(super) * n_q + my_q) * (uint64_t(hd) + 2);
+                partials_scratch[base + 0] = m_slm[lane];
+                partials_scratch[base + 1] = l_slm[lane];
+            }
+        });
+    });
+
+    sycl::event combine_evt = fa2_combine_wide_rows_<true, false>(q, "fa2_rows_xmx_combine_wide", partial_evt, partials,
+                                                                  row_floats, y, D, n_rows, n_q_heads, head_dim, csplit);
+    fa2_rows_prof_(prof, append_evt, partial_evt, combine_evt);
+    return combine_evt;
+}
+
+// --- vec rows (full_attention_fa2_decode_vec per row) ---
+sycl::event fa2_rows_vec_(sycl::queue& q, const sycl::half* q_all, const sycl::half* k_all, const sycl::half* v_all,
+                          sycl::half* y, float* partials, uint64_t row_floats, const FaDecodeRowsDesc* D,
+                          uint32_t n_rows, uint32_t n_wgs, uint32_t li,
+                          uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim, uint32_t csplit,
+                          const std::vector<sycl::event>& deps, AttnProfileData* prof) {
+    constexpr uint32_t Bc = 64;
+    const uint32_t gqa = n_q_heads / n_kv_heads;
+    const uint32_t N_q = n_q_heads * head_dim, N_kv = n_kv_heads * head_dim;
+
+    auto append_evt = ie::ps(q, "fa2_rows_append_fp16", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        const uint32_t per_row = n_kv_heads * head_dim;
+        const uint32_t total = n_rows * per_row;
+        constexpr uint32_t WG = 256;
+        const uint32_t global = ((total + WG - 1) / WG) * WG;
+        h.parallel_for(sycl::nd_range<1>(global, WG), [=](sycl::nd_item<1> it) {
+            const uint32_t gid = uint32_t(it.get_global_id(0));
+            if (gid >= total) return;
+            const uint32_t j   = gid / per_row;
+            const uint32_t idx = gid - j * per_row;
+            const FaRowsWg rw = fa_rows_at(D, j, li);
+            const uint32_t d  = idx % head_dim;
+            const uint32_t kv = idx / head_dim;
+            const uint64_t in_off  = uint64_t(rw.idx) * N_kv + uint64_t(kv) * head_dim + d;
+            const uint64_t out_off = (uint64_t(kv) * rw.max_ctx + rw.start_pos) * head_dim + d;
+            rw.k[out_off] = k_all[in_off];
+            rw.v[out_off] = v_all[in_off];
+        });
+    });
+
+    auto partial_evt = ie::ps(q, "fa2_rows_partial_fp16_vec", [&](sycl::handler& h) {
+        h.depends_on(append_evt);
+
+        constexpr uint32_t NTH_KQ = 8;
+        constexpr uint32_t NTH_V  = 8;
+        const uint32_t WG_ITEMS = gqa * SG_SIZE;           // gqa subgroups / WG
+        const uint32_t POS_PER_STEP = SG_SIZE / NTH_KQ;    // = 2
+        const uint32_t DPL_KQ = head_dim / NTH_KQ;         // 16 dims/lane for the dot
+        const uint32_t VPL    = head_dim / SG_SIZE;        // 8 out-dims/lane (distinct)
+        const float scale = 1.0f / sycl::sqrt(float(head_dim));
+
+        sycl::local_accessor<float, 1> KQ_slm({uint64_t(gqa) * POS_PER_STEP}, h);
+        const uint32_t pf_look = fa2_vec_pf_look();   // P4 B22
+
+        h.parallel_for(sycl::nd_range<2>({uint64_t(n_wgs), WG_ITEMS},
+                                          {1, WG_ITEMS}),
+                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const FaRowsWg rw = fa_rows_wg(D, uint32_t(it.get_group(0)), n_kv_heads, li);
+            const uint32_t kv          = rw.kv;
+            const uint32_t super       = rw.super;
+            const sycl::half* k_cache  = rw.k;
+            const sycl::half* v_cache  = rw.v;
+            const uint32_t max_ctx     = rw.max_ctx;
+            const uint32_t ctx_len     = rw.start_pos + 1;
+            const uint32_t n_chunks    = (ctx_len + Bc - 1) / Bc;
+            const uint32_t CHUNKS_PER_WG = rw.cpw;
+            const sycl::half* q_in     = q_all + uint64_t(rw.idx) * N_q;
+            float* partials_scratch    = partials + uint64_t(rw.idx) * row_floats;
+            const uint32_t lid         = uint32_t(it.get_local_id(1));
+            const uint32_t sg_id       = lid / SG_SIZE;
+            const uint32_t lane        = lid % SG_SIZE;
+            const uint32_t my_q        = kv * gqa + sg_id;
+            auto sg = it.get_sub_group();
+
+            const uint32_t lane_kq_group = lane / NTH_KQ;   // 0..POS_PER_STEP-1
+            const uint32_t lane_in_kq    = lane % NTH_KQ;   // 0..NTH_KQ-1
+            const uint32_t out_dim0     = lane * VPL;       // this lane's first out-dim
+            (void)NTH_V;
+
+            float q_vals[64];
+            #pragma unroll
+            for (uint32_t d_loc = 0; d_loc < DPL_KQ; ++d_loc) {
+                q_vals[d_loc] = float(q_in[uint64_t(my_q) * head_dim
+                                           + lane_in_kq * DPL_KQ + d_loc]) * scale;
+            }
+
+            // Output accumulator: this lane owns out-dims [lane_in_v*VPL, +VPL).
+            float m = -3.0e38f;                 // -FLT_MAX/2, not -inf (NaN on step 0)
+            float l = 0.f;
+            float out_local[16];
+            #pragma unroll
+            for (uint32_t d_loc = 0; d_loc < VPL; ++d_loc) out_local[d_loc] = 0.f;
+
+            const uint32_t chunk_first = super * CHUNKS_PER_WG;
+            for (uint32_t cc = 0; cc < CHUNKS_PER_WG; ++cc) {
+                const uint32_t chunk = chunk_first + cc;
+                if (chunk >= n_chunks) break;
+                const uint32_t chunk_start = chunk * Bc;
+                const uint32_t chunk_end   = sycl::min(chunk_start + Bc, ctx_len);
+                const uint32_t chunk_n     = chunk_end - chunk_start;
+
+                // Score POS_PER_STEP positions per step; defer the softmax update.
+                for (uint32_t p0 = 0; p0 < chunk_n; p0 += POS_PER_STEP) {
+                    if (pf_look) {   // P4 B22: this lane's K slice and V slices pf_look positions ahead (valid rows only)
+                        namespace sx = sycl::ext::oneapi::experimental;
+                        const uint32_t ap = chunk_start + p0 + pf_look;
+                        if (ap + lane_kq_group < ctx_len)
+                            sx::prefetch(const_cast<sycl::half*>(k_cache) +
+                                             (uint64_t(kv) * max_ctx + ap + lane_kq_group) * head_dim + lane_in_kq * DPL_KQ,
+                                         DPL_KQ, sx::properties{sx::prefetch_hint_L1});
+                        #pragma unroll
+                        for (uint32_t pp = 0; pp < POS_PER_STEP; ++pp)
+                            if (ap + pp < ctx_len)
+                                sx::prefetch(const_cast<sycl::half*>(v_cache) +
+                                                 (uint64_t(kv) * max_ctx + ap + pp) * head_dim + out_dim0,
+                                             VPL, sx::properties{sx::prefetch_hint_L1});
+                    }
+                    // ---- Pass A: raw dots into register, narrow butterfly reduce,
+                    //              running max via register fmax (OFF softmax chain).
+                    const uint32_t pos = p0 + lane_kq_group;      // position this lane scores
+                    float s_lane = -3.0e38f;
+                    if (pos < chunk_n) {
+                        const uint64_t kbase =
+                            (uint64_t(kv) * max_ctx + chunk_start + pos) * head_dim
+                            + lane_in_kq * DPL_KQ;
+                        float acc = 0.f;
+                        // Vectorized 16B K load (sycl::vec<half,8>), DPL_KQ=16 = 2 vecs.
+                        #pragma unroll
+                        for (uint32_t v8 = 0; v8 < DPL_KQ; v8 += 8) {
+                            sycl::vec<sycl::half, 8> kv8;
+                            kv8.load(0, sycl::address_space_cast<
+                                            sycl::access::address_space::global_space,
+                                            sycl::access::decorated::no>(
+                                            const_cast<const sycl::half*>(k_cache) + kbase + v8));
+                            #pragma unroll
+                            for (uint32_t e = 0; e < 8; ++e)
+                                acc += q_vals[v8 + e] * float(kv8[e]);
+                        }
+                        // Narrow width-NTH_KQ butterfly reduce (xor 4,2,1 for NTH_KQ=8).
+                        #pragma unroll
+                        for (uint32_t off = NTH_KQ >> 1; off > 0; off >>= 1)
+                            acc += sycl::permute_group_by_xor(sg, acc, off);
+                        s_lane = acc;     // every lane in the 8-group now has the full dot
+                    }
+                    // Broadcast each group's score to SLM so all lanes can read both.
+                    // lane_in_kq==0 of each group writes its group's score.
+                    if (pos < chunk_n && lane_in_kq == 0)
+                        KQ_slm[sg_id * POS_PER_STEP + lane_kq_group] = s_lane;
+                    sycl::group_barrier(sg);
+
+                    // Tile max over the POS_PER_STEP scores (register fmax, no exp).
+                    const uint32_t ntile = sycl::min(POS_PER_STEP, chunk_n - p0);
+                    float tile_max = -3.0e38f;
+                    #pragma unroll
+                    for (uint32_t pp = 0; pp < POS_PER_STEP; ++pp)
+                        if (pp < ntile)
+                            tile_max = sycl::fmax(tile_max,
+                                                  KQ_slm[sg_id * POS_PER_STEP + pp]);
+
+                    // ---- One online-softmax rescale of m/l/VKQ for the tile.
+                    const float m_new = sycl::fmax(m, tile_max);
+                    const float alpha = sycl::native::exp(m - m_new);   // old-accum rescale
+                    #pragma unroll
+                    for (uint32_t d_loc = 0; d_loc < VPL; ++d_loc)
+                        out_local[d_loc] *= alpha;                      // BEFORE P@V
+                    l *= alpha;
+
+                    // ---- Pass B: P@V — pure per-lane FMA, weight from SLM, V from HBM.
+                    for (uint32_t pp = 0; pp < ntile; ++pp) {
+                        const float e =
+                            sycl::native::exp(KQ_slm[sg_id * POS_PER_STEP + pp] - m_new);
+                        l += e;
+                        const uint64_t vbase =
+                            (uint64_t(kv) * max_ctx + chunk_start + p0 + pp) * head_dim
+                            + out_dim0;
+                        #pragma unroll
+                        for (uint32_t v8 = 0; v8 < VPL; v8 += 8) {
+                            sycl::vec<sycl::half, 8> vv8;
+                            vv8.load(0, sycl::address_space_cast<
+                                            sycl::access::address_space::global_space,
+                                            sycl::access::decorated::no>(
+                                            const_cast<const sycl::half*>(v_cache) + vbase + v8));
+                            #pragma unroll
+                            for (uint32_t ee = 0; ee < 8; ++ee)
+                                out_local[v8 + ee] += e * float(vv8[ee]);
+                        }
+                    }
+                    m = m_new;
+                    sycl::group_barrier(sg);   // KQ_slm reuse next iter
+                }
+            }
+
+            // Write one UNNORMALIZED super-partial per (super, my_q).
+            const uint64_t base =
+                (uint64_t(super) * n_q_heads + my_q) * (uint64_t(head_dim) + 2);
+            if (lane == 0) { partials_scratch[base + 0] = m; partials_scratch[base + 1] = l; }
+            #pragma unroll
+            for (uint32_t d_loc = 0; d_loc < VPL; ++d_loc)
+                partials_scratch[base + 2 + out_dim0 + d_loc] = out_local[d_loc];
+        });
+    });
+
+    sycl::event combine_evt = fa2_combine_wide_rows_<false, true>(q, "fa2_rows_combine_fp16_vec_wide", partial_evt, partials,
+                                                                  row_floats, y, D, n_rows, n_q_heads, head_dim, csplit);
+    fa2_rows_prof_(prof, append_evt, partial_evt, combine_evt);
+    return combine_evt;
+}
+
+}  // namespace
+
+uint64_t fa2_decode_rows_partials_floats(uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim, uint32_t max_ctx) {
+    // tiled / vec: <= IE_FA2_TARGET_SUPER supers; XMX: <= kFa2XmxTargetSubgroups / n_kv_heads; both <= the 64-key chunks.
+    const uint32_t n_chunks_max = (max_ctx + 63) / 64;
+    const uint32_t xmx_max = std::max<uint32_t>(1u, kFa2XmxTargetSubgroups / std::max<uint32_t>(n_kv_heads, 1u));
+    const uint32_t s = std::min<uint32_t>(n_chunks_max, std::max<uint32_t>(IE_FA2_TARGET_SUPER, xmx_max));
+    return uint64_t(s) * n_q_heads * (uint64_t(head_dim) + 2);
+}
+
+bool fa2_decode_rows_plan(sycl::queue& q, const FaDecodeRow* rows, uint32_t n_rows, uint32_t n_q_heads, uint32_t n_kv_heads,
+                          uint32_t head_dim, uint64_t partials_row_floats, void* table_dev, FaDecodeRowsPlan& plan) {
+    plan = FaDecodeRowsPlan{};
+    plan.n_rows = std::min<uint32_t>(n_rows, kFaDecodeRowsMax);
+    plan.n_q_heads = n_q_heads; plan.n_kv_heads = n_kv_heads; plan.head_dim = head_dim;
+    plan.partials_row_floats = partials_row_floats;
+    plan.csplit = fa2_combine_split(head_dim);
+    for (uint32_t i = 0; i < plan.n_rows; ++i) plan.rows[i] = rows[i];
+    const uint64_t super_floats = uint64_t(n_q_heads) * (uint64_t(head_dim) + 2);
+    bool batched = plan.csplit != 0 && n_rows >= 1 && n_rows <= kFaDecodeRowsMax && table_dev != nullptr;
+    // Resolve every row's kernel exactly as its single-row entry point would (0 tiled, 1 XMX, 2 vec).
+    for (uint32_t i = 0; batched && i < n_rows; ++i) {
+        const FaDecodeRow& r = rows[i];
+        uint32_t kind = 0;
+        if (r.kind == FaDecodeKind::kVec) kind = 2;
+        else if (r.kind == FaDecodeKind::kXmx) kind = fa2_xmx_kernel_ok_(r.start_pos, n_q_heads, n_kv_heads, head_dim, r.max_ctx) ? 1 : 0;
+        else kind = (fa2_decode_xmx_on() && fa2_decode_xmx_shape_ok(r.start_pos, n_q_heads, n_kv_heads, head_dim, r.max_ctx)) ? 1 : 0;
+        uint32_t n_super = 0, cpw = 0;
+        const uint32_t ctx_len = r.start_pos + 1;
+        if (kind == 1) {
+            const uint32_t n_chunks = (ctx_len + 63) / 64;
+            n_super = fa2_xmx_n_super(ctx_len, n_kv_heads);
+            cpw = (n_chunks + n_super - 1) / n_super;
+        } else {
+            fa2_rows_supers_(ctx_len, n_super, cpw);
+        }
+        if (uint64_t(n_super) * super_floats > partials_row_floats) { batched = false; break; }
+        FaDecodeRowsDesc& d = plan.desc[kind];
+        d.k_base[d.n] = r.k_base; d.v_base[d.n] = r.v_base; d.layer_stride[d.n] = r.layer_stride;
+        d.start_pos[d.n] = r.start_pos; d.max_ctx[d.n] = r.max_ctx;
+        d.n_super[d.n] = n_super; d.cpw[d.n] = cpw; d.idx[d.n] = i;
+        ++d.n;
+    }
+    plan.batched = batched;
+    if (!batched) return false;
+    for (uint32_t k = 0; k < 3; ++k) plan.n_wgs[k] = fa2_rows_wgs_(plan.desc[k], n_kv_heads);
+    plan.table = static_cast<const FaDecodeRowsDesc*>(table_dev);
+    q.memcpy(table_dev, plan.desc, sizeof(plan.desc)).wait();
+    return true;
+}
+
+sycl::event full_attention_fa2_decode_rows(sycl::queue& q,
+                                           const FaDecodeRowsPlan& plan,
+                                           const sycl::half* q_in,
+                                           const sycl::half* k_in,
+                                           const sycl::half* v_in,
+                                           sycl::half* y,
+                                           float* partials,
+                                           uint32_t layer_slot,
+                                           const std::vector<sycl::event>& deps,
+                                           AttnProfileData* prof) {
+    const uint32_t n_q_heads = plan.n_q_heads, n_kv_heads = plan.n_kv_heads, head_dim = plan.head_dim;
+    const uint32_t N_q = n_q_heads * head_dim, N_kv = n_kv_heads * head_dim;
+    const uint64_t row_floats = plan.partials_row_floats;
+    sycl::event e = empty_event(q, deps);
+    if (!plan.batched) {   // the per-row calls (IE_FA2_COMBINE_SPLIT=0, too many rows, or a slice too small)
+        for (uint32_t i = 0; i < plan.n_rows; ++i) {
+            const FaDecodeRow& r = plan.rows[i];
+            sycl::half* kc = r.k_base + r.layer_stride * layer_slot;
+            sycl::half* vc = r.v_base + r.layer_stride * layer_slot;
+            const sycl::half* qi = q_in + uint64_t(i) * N_q;
+            const sycl::half* ki = k_in + uint64_t(i) * N_kv;
+            const sycl::half* vi = v_in + uint64_t(i) * N_kv;
+            sycl::half* yi = y + uint64_t(i) * N_q;
+            float* pi = partials + uint64_t(i) * row_floats;
+            const std::vector<sycl::event> d1{e};
+            if (r.kind == FaDecodeKind::kXmx)
+                e = full_attention_fa2_decode_xmx(q, qi, ki, vi, kc, vc, yi, pi, r.start_pos, n_q_heads, n_kv_heads, head_dim, r.max_ctx, d1, prof);
+            else if (r.kind == FaDecodeKind::kVec)
+                e = full_attention_fa2_decode_vec(q, qi, ki, vi, kc, vc, yi, pi, r.start_pos, n_q_heads, n_kv_heads, head_dim, r.max_ctx, d1, prof);
+            else
+                e = full_attention_fa2_decode(q, qi, ki, vi, kc, vc, yi, pi, r.start_pos, n_q_heads, n_kv_heads, head_dim, r.max_ctx, d1, prof);
+        }
+        return e;
+    }
+    for (uint32_t kind = 0; kind < 3; ++kind) {
+        const FaDecodeRowsDesc& d = plan.desc[kind];
+        if (d.n == 0) continue;
+        const FaDecodeRowsDesc* dd = plan.table + kind;
+        const std::vector<sycl::event> d1{e};
+        if (kind == 1)
+            e = fa2_rows_xmx_(q, q_in, k_in, v_in, y, partials, row_floats, dd, d.n, plan.n_wgs[kind], layer_slot,
+                              n_q_heads, n_kv_heads, head_dim, plan.csplit, d1, prof);
+        else if (kind == 2)
+            e = fa2_rows_vec_(q, q_in, k_in, v_in, y, partials, row_floats, dd, d.n, plan.n_wgs[kind], layer_slot,
+                              n_q_heads, n_kv_heads, head_dim, plan.csplit, d1, prof);
+        else
+            e = fa2_rows_tiled_(q, q_in, k_in, v_in, y, partials, row_floats, dd, d.n, plan.n_wgs[kind], layer_slot,
+                                n_q_heads, n_kv_heads, head_dim, plan.csplit, d1, prof);
+    }
+    return e;
 }
 
 // =====================================================================

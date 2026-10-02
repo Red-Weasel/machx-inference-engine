@@ -257,7 +257,23 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "qwen35_split load: %s\n", err.c_str()); return 1;
             }
             tp_logits.resize(qcfg.dense.vocab);
-            std::printf("  27B split  : %u cards (Q8_0-SoA packed)\n", fleet.size());
+            {   // the packing the split chose per matrix dtype (Q8_0 -> Q8_0-SoA, Q6_K/Q5_K -> c32, P4 B21; else dense fallback)
+                bool q8 = false, q6 = false, q5 = false, other = false;
+                for (const auto& t : g.tensors()) {
+                    const std::string_view n = t.name;
+                    if (t.n_dims != 2 || n.substr(0, 4) != "blk." || n.find("norm") != std::string_view::npos ||
+                        n.find("ssm_alpha") != std::string_view::npos || n.find("ssm_beta") != std::string_view::npos) continue;
+                    if (t.dtype == ie::DType::kQ8_0) q8 = true;
+                    else if (t.dtype == ie::DType::kQ6_K) q6 = true;
+                    else if (t.dtype == ie::DType::kQ5_K) q5 = true;
+                    else other = true;
+                }
+                std::string pk;
+                if (q8) pk += "Q8_0-SoA";
+                if (q6 || q5) pk += std::string(pk.empty() ? "" : " + ") + (q6 && q5 ? "Q6_K/Q5_K c32" : q6 ? "Q6_K c32" : "Q5_K c32");
+                if (other) pk += std::string(pk.empty() ? "" : " + ") + "dense fallback";
+                std::printf("  27B split  : %u cards (%s packed)\n", fleet.size(), pk.c_str());
+            }
         } else if (auto err = q35model.load(alloc, g, qcfg); !err.empty()) {
             std::fprintf(stderr, "model.load: %s\n", err.c_str()); return 1;
         }

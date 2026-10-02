@@ -94,7 +94,7 @@ without them and logged as a WARNING.
 | `--stop` | Repeat up to four times for literal stop strings |
 | `--threads` | 1–1024; CPU expert work on advertised backends, not HTTP workers |
 | `--prefill-chunk` | Positive prompt batch size; affects workspace allocation |
-| `--parallel`, `--slot-ctx` | Request slots and per-slot context; architecture restrictions apply |
+| `--parallel`, `--slot-ctx` | Request lanes and the context of each lane after the first; `--parallel auto` (the default since v0.2.6) lets the load pick the count; architecture restrictions apply |
 | `--thinking` | `on` or `off`; selects the supported thinking template |
 | `--reasoning-effort` | Exact model-specific level advertised by `capabilities` |
 | `--no-prompt-cache` | Disables reuse on backends that support it |
@@ -123,6 +123,21 @@ server default; explicit CLI and request settings take precedence. Capability
 reporting also reflects the reasoning/thinking environment defaults, including
 the older Qwen `IE_REASONING_EFFORT` override.
 
+On the Qwen thinking templates (Qwen3.8-Flash, Qwen3.8-27B, the Qwen3.6-35B-A3B class), a reply with thinking on is
+split since v0.2.6: the text before the model's `</think>` is returned as `reasoning_content` and the text after it as
+`content`, streamed (`delta.reasoning_content`, then `delta.content`) and non-streamed alike. Before, the reasoning
+arrived in `content` and `reasoning_content` was empty. A reply cut off before `</think>` is all `reasoning_content`
+with an empty `content`, the rule DeepSeek-V4 / V4.1, MiMo and GLM already follow. Stop sequences count from the start
+of `content`. With thinking off nothing changes.
+
+Models whose GGUF chat template teaches the `<function=` XML tool form (Qwen3.8-27B, the 35B-A3B class; read from
+the template, not the architecture) are prompted with that template's own tools block, and their XML calls come back
+as structured `tool_calls` with parameters typed by the request's schema. Calls are taken only from the text after
+`</think>`; a reply that ends with a complete call and never closed its reasoning is accepted when its finish reason
+is `stop`; a function name the request does not list is rejected. A complete call block in the answer is taken as a
+call even when prose follows it. `IE_QWEN_TOOLS_JSON=1` restores the Qwen3 JSON tool preamble. Each examined reply
+logs one `[chat] xml tools:` line with where the answer starts and how many calls were parsed.
+
 GLM's vendor template always opens a thinking block. MachX's `--thinking off`
 uses a local empty closed thinking block to prompt a direct answer; it is not
 a native vendor on/off flag. Its effort choices are independently documented
@@ -150,18 +165,50 @@ sized to its depth; `IE_PROMPT_CACHE_MAX_ENTRIES` caps the count and
 (Gemma-4, Qwen3.8-Flash-Next, DeepSeek-V4 host slots) and GLM (no prompt cache)
 are unchanged.
 
+With request lanes on the Qwen3.6-35B-A3B class (v0.2.6), the prompt cache is sized for the lanes: up to
+max(12, 2 × lanes + 8) entries inside a per-card VRAM budget (each card's free VRAM after the lanes, less a 1.5 GiB
+reserve), and an insert evicts least-recently-used entries before it allocates. A conversation's new snapshot
+replaces that conversation's older ones (`IE_Q35MOE_CACHE_SUPERSEDE=0` keeps them), except the one at its last user
+query's end, which is kept as an anchor so a new query after a tool loop restores up to there (`IE_Q35MOE_ANCHOR=0`
+turns that off). Each lane also keeps a checkpoint of its own conversation and restores the next turn in place
+(`IE_Q35MOE_STICKY_LANES=0` turns that off). `IE_Q35MOE_LANES_CACHE=0` returns to 12 entries with no budget;
+`IE_PROMPT_CACHE_MAX_ENTRIES` and `IE_PROMPT_CACHE_VRAM_MIB` override the two limits. The load log prints the entry
+count, the budget and each rule's state.
+
 ## Admission, health and shutdown
 
-`ie serve` runs up to `--parallel N` generations at once (default 1; only the
-Qwen3.6-27B two-card split actually batches, every other architecture takes
-whole-generation FIFO turns). At most `--max-queue M` further requests wait for
-a slot (default 8); beyond that the server answers **HTTP 429** immediately
+`ie serve` runs up to `--parallel N` generations at once. On
+MiMo-V2.6-Flash, DeepSeek-V4.1-Flash, Qwen3.8-Flash, the Qwen3.6-35B-A3B class and
+Qwen3.8-27B, N up to 16 request lanes decode concurrently; each model checks at load
+whether N lanes fit and refuses a count that does not (README, "Several requests at
+once: request lanes"). Every other architecture takes whole-generation FIFO turns.
+
+Since v0.2.6 the default is `--parallel auto` (the same as leaving the flag out): the
+load picks the count and logs one `[lanes] auto ...` line with the reason. The 35B-A3B
+class and the Qwen3.8-27B on their two-card splits take the most lanes, up to 16, that
+their free VRAM holds at the default `--slot-ctx` (the 27B also within its load-time
+budget); MiMo-V2.6-Flash, DeepSeek-V4.1-Flash and Qwen3.8-Flash take 4 lanes at
+`--slot-ctx 16384` (an explicit `--slot-ctx` wins); one card, `--int8-kv`, `ie run`, a
+switch that turns the lanes off or refuses them, and every other architecture take 1.
+An explicit `--parallel N` loads exactly as before. A layout file's `parallel` key
+takes a number only: leave it out for the pick. `ie capabilities` still reports
+`defaults.parallel` as 1.
+
+At most `--max-queue M` further requests wait for
+a slot (default 8, or the pick + 8 when the load picked the count); beyond that the server answers **HTTP 429** immediately
 with `Retry-After: 1` and `{"error":{"code":"queue_full"}}`, so a burst can
 never exhaust the HTTP worker pool. The pool is sized `parallel + max_queue + 4`
 so `/health`, `/props` and the 429s themselves are always answered.
 
+`GET /props` returns `default_generation_settings.n_ctx` (the server's context), `total_slots`
+(the request lanes this load runs, the pick included) and, since v0.2.6, `slot_ctx`: the
+positions each lane after the first holds (lane 0 holds `n_ctx`), 0 with one lane. A client
+that runs sub-agents on the lanes can size each one's context from it.
+
 `GET /health` returns `{"status":"ok","inflight":..,"queued":..,"parallel":..,"max_queue":..}`
-with 200 while the device is healthy. If a forward ever reports a lost or reset
+with 200 while the device is healthy. With request lanes on the 35B-A3B class, Qwen3.8-27B
+and Qwen3.8-Flash it also carries the lanes' counters; v0.2.6 adds `snapshots`, `drains` / `drain_ms` / `drain_max_ms`, `lookaheads`,
+`short_bypass`, `short_guard`, `short_guard_wait`, `recuts`, `quota_holds` and `quota_guard`. If a forward ever reports a lost or reset
 device (`DEVICE_LOST`, "device lost", `DEVICE_RESET` in the error text), the
 server latches the fault: `/health` turns **503** `{"status":"unhealthy","reason":..}`
 and every generation is refused with 503 `code:"device_lost"` until the process
@@ -193,8 +240,65 @@ closes, `run_openai_server` returns and every destructor runs (pinned host
 arenas, device memory). A second signal while stopping exits immediately.
 `POST /admin/shutdown` (loopback only) does the same without a signal.
 
+Since v0.2.6 a stop on the request lanes of the 35B-A3B class, Qwen3.8-27B and
+Qwen3.8-Flash no longer waits for queued work: every request ends at once with
+finish reason `abort`, the steps waiting for a card are dropped, and the process
+waits only for the steps already on a card. A running 35B-A3B prefill piece stops
+at its next layer; on the 27B and Qwen3.8-Flash a running piece finishes its card's
+part. The log ends with `[ie] stopped in X.X s (waited for N in-flight GPU steps)`.
+Measured on October 1, 2026, stop request to process exit: 0.43 s where the previous
+build took 14.58 s (4 lanes mid-prefill), 1.08 s where it took 49.70 s (16 lanes, an
+80K-token prompt mid-prefill), 0.45–0.53 s on the release's defaults, 0.82 s on the
+27B and 3.08 s on Qwen3.8-Flash, with no GPU fault and a clean restart after the
+35B-A3B stops. The bound is one layer of the running prefill piece and was measured
+down to 43K tokens of depth. Give a server that time: killing a process that still
+has work on a card can leave the GPU faulting. DeepSeek-V4.1-Flash and
+MiMo-V2.6-Flash stop as before, at the next token.
+
 Image inputs are refused with an error when the server runs `--parallel > 1`:
-per-request image staging is engine-global and not slot-safe.
+per-request image staging is engine-global and not slot-safe. (DeepSeek-V4.1-Flash
+takes images on its lanes.) Since v0.2.6 a load of MiMo-V2.6-Flash or Qwen3.8-Flash
+without `--parallel` has 4 lanes, so pass `--parallel 1` to serve images on them.
+
+## Request lanes on the 35B-A3B class: scheduling switches (v0.2.6)
+
+These are read once per process and apply to the `qwen35moe` two-card split with more
+than one lane. The load log prints each rule's state. Measurements are in the README,
+"New in v0.2.6".
+
+| Switch | Default | Effect of the other value |
+|---|---|---|
+| `IE_LANES_PREFILL_FIFO` | on for this class (off on Qwen3.8-Flash and Qwen3.8-27B) | `=0`: every waiting prompt's pieces at once, so agents that share a prompt each read it; `=1` turns it on for the other two |
+| `IE_Q35MOE_NO_FA2_TILE` | unset: tiled prefill attention from `IE_Q35MOE_FA2_TILE_MINCTX` (6144) positions | set to any value, `0` included: the previous kernel and its exact output |
+| `IE_Q35MOE_LANE_PIPELINE` | on: a lane's next prefill piece enters card 0 while card 1 runs the piece before | `=0`: one piece of a lane at a time |
+| `IE_Q35MOE_SHORT_FIRST` | on: a prompt with at most `IE_Q35MOE_SHORT_ROWS` (16384) rows left goes ahead of a long prompt's next piece, which waits for at most `IE_Q35MOE_SHORT_SLOTS` (2) short pieces or `IE_Q35MOE_SHORT_WAIT_MS` (10000) ms | `=0`: the FIFO window and arrival order alone |
+| `IE_Q35MOE_MIX_CHUNK` | 512: the rows of a prefill piece while another lane is busy | `=<rows>`; `=0`: the plan's 8,192-row pieces (re-cut is then off) |
+| `IE_Q35MOE_RECUT` | on: a prompt that started alone cuts its remaining pieces to the cap once another lane decodes or reads a short prompt | `=0`: it keeps its pieces |
+| `IE_Q35MOE_DECODE_QUOTA` | 32: a long prompt's next piece waits until every decoding lane made this many steps, for at most `IE_Q35MOE_QUOTA_MAX_MS` (2000) ms | `=0`: no wait; a deep prefill is fastest and the other lanes decode slowly beside it |
+| `IE_Q35MOE_STICKY_LANES`, `IE_Q35MOE_LANES_CACHE`, `IE_Q35MOE_CACHE_SUPERSEDE`, `IE_Q35MOE_ANCHOR` | on | `=0` each: see "Prompt cache" above |
+| `IE_LANES_TRACE` | off | `=1`: one log line per card step (a prefill piece's or a decode group's rows, its time, the idle gap before) |
+
+A prompt longer than one piece that arrives beside running lanes, or that is re-cut, is
+read in other pieces than the same prompt alone and can give other bits. Prompts that
+start and run alone, prompts of up to one piece, and `--parallel 1` are unchanged.
+
+## Kernel switches (v0.2.6)
+
+Each new kernel sits beside the one it replaces; `=0` selects the previous kernel.
+
+| Switch | Kernel | Output |
+|---|---|---|
+| `IE_Q8_MOE_DOWN_V2`, `IE_Q8_MOE_GATEUP_V2`, `IE_Q8_MOE_DECODE_V2` | Q8_0 MoE prefill down, prefill gate+up, and decode / lane rows on the 35B-A3B class, with the native integer dot | bit-identical |
+| `IE_Q8_SOA_BATCHED_V2`, `IE_Q8_SOA_GEMV_ND`, `IE_Q8_SOA_GEMV_G_ND` | Q8_0 GEMVs for 2–16 rows and for one token on Qwen3.8-27B, the 35B-A3B class and Qwen3.8-Flash, with the native integer dot | bit-identical |
+| `IE_Q35_XMX_DECODE` | XMX decode attention at head size 256 from `IE_Q35_XMX_DECODE_MIN` (4096) tokens of context, 27B and 35B-A3B splits | not bit-identical; perplexity within 0.002 nats |
+| `IE_FA2_VEC_PF`, `IE_FA2_TILE_PF`, `IE_FA2_COMBINE_SPLIT` | K/V prefetch (8 positions ahead; next tile) and the widened combine pass (16) in decode attention | bit-identical |
+| `IE_Q35_ROWS_ATTN` | the lane rows' decode attention in one launch per pass | bit-identical |
+| `IE_QWEN35_SPLIT_KQ` | native Q6_K / Q5_K on the 27B and 35B-A3B splits | `=0`: the previous fallbacks |
+| `IE_Q35MOE_SHEXP_GATE_V0` | `=1` selects the previous shared-expert gate kernel (35B-A3B class) | bit-identical |
+| `IE_DECODE_PROF` | `=1` prints a per-token decode breakdown on the 27B and 35B-A3B splits | diagnostic |
+
+The first request after an upgrade compiles the new kernels once (measured: 4.87 s to the
+first token on the 35B-A3B class, 6.95 s on Qwen3.8-Flash); the result is cached on disk.
 
 ## Historical memory observation, September 5
 

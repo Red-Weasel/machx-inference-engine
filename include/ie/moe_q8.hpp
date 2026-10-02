@@ -30,6 +30,21 @@ sycl::event moe_down_q8(sycl::queue& q, const void* h_q8,
                         sycl::half* y_packed, uint32_t T, uint32_t K,
                         uint32_t E_ffn, uint32_t H);
 
+// P4 B32 (2): stage 1 / 2 v2 (moe_q8_decode_v2.cpp), the same contracts and BIT-IDENTICAL output; moe_gate_up_silu_q8
+// and moe_down_q8 run them unless IE_Q8_MOE_DECODE_V2=0. Native integer dot, 2 (gate_up) / 4 (down) columns per subgroup.
+sycl::event moe_gate_up_silu_q8_v2(sycl::queue& q, const void* x_q8,
+                                   const int8_t* g_qs, const uint16_t* g_d,
+                                   const int8_t* u_qs, const uint16_t* u_d,
+                                   uint64_t qs_stride, uint64_t d_stride,
+                                   const int32_t* topk_idx, sycl::half* h_out,
+                                   uint32_t T, uint32_t K, uint32_t H, uint32_t E_ffn);
+sycl::event moe_down_q8_v2(sycl::queue& q, const void* h_q8,
+                           const int8_t* d_qs, const uint16_t* d_d,
+                           uint64_t qs_stride, uint64_t d_stride,
+                           const int32_t* topk_idx, const sycl::half* topk_w,
+                           sycl::half* y_packed, uint32_t T, uint32_t K,
+                           uint32_t E_ffn, uint32_t H);
+
 // Stage 3: y[T,H] = sum_k y_packed[(t*K+k), :].
 sycl::event moe_reduce_q8(sycl::queue& q, const sycl::half* y_packed, sycl::half* y,
                           uint32_t T, uint32_t K, uint32_t H);
@@ -57,6 +72,17 @@ sycl::event moe_prefill_gate_up_silu_q8(sycl::queue& q, const void* xq8_packed,
                                         uint32_t E, uint32_t H, uint32_t E_ffn,
                                         const std::vector<sycl::event>& deps = {});
 
+// P4 B32 (1): Stage 1 v2 (moe_q8_gate_up_v2.cpp), the same contract and BIT-IDENTICAL output;
+// moe_prefill_gate_up_silu_q8 runs it unless IE_Q8_MOE_GATEUP_V2=0. Native integer dot, 2 column pairs per subgroup.
+sycl::event moe_prefill_gate_up_silu_q8_v2(sycl::queue& q, const void* xq8_packed,
+                                           const int8_t* g_qs, const uint16_t* g_d,
+                                           const int8_t* u_qs, const uint16_t* u_d,
+                                           uint64_t qs_stride, uint64_t d_stride,
+                                           const uint32_t* expert_offsets,
+                                           sycl::half* h_packed,
+                                           uint32_t E, uint32_t H, uint32_t E_ffn,
+                                           const std::vector<sycl::event>& deps = {});
+
 // Stage 2 (batched): out_packed[TK, H] = sorted_w · (down · h) over expert-sorted
 // block_q8_1x rows (hq8_packed = TK rows of E_ffn/32 blocks). down SoA planes:
 // col n, K-index k → qs[e*qs_stride + n*E_ffn + k], scale d[e*d_stride + n*(E_ffn/32)+b].
@@ -70,6 +96,17 @@ sycl::event moe_prefill_down_q8(sycl::queue& q, const void* hq8_packed,
                                 sycl::half* out_packed,
                                 uint32_t E, uint32_t H, uint32_t E_ffn,
                                 const std::vector<sycl::event>& deps = {});
+
+// P4 B31: Stage 2 v2 (moe_q8_down_v2.cpp), the same contract and BIT-IDENTICAL output; moe_prefill_down_q8 runs it
+// unless IE_Q8_MOE_DOWN_V2=0. Native integer dot, weights in registers, 4 output columns per subgroup.
+sycl::event moe_prefill_down_q8_v2(sycl::queue& q, const void* hq8_packed,
+                                   const int8_t* d_qs, const uint16_t* d_d,
+                                   uint64_t qs_stride, uint64_t d_stride,
+                                   const uint32_t* expert_offsets,
+                                   const sycl::half* sorted_w,
+                                   sycl::half* out_packed,
+                                   uint32_t E, uint32_t H, uint32_t E_ffn,
+                                   const std::vector<sycl::event>& deps = {});
 
 // Stage 3 (batched): y[T,H] = Σ_kslot out_packed[tk_to_packed[t,kslot], :]. The
 // weight is already in out_packed → pure sum (mirrors moe_reduce_q8 but gathers

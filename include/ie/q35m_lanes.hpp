@@ -12,10 +12,42 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <span>
 #include <string>
 #include <vector>
 
 namespace ie {
+
+// P4 B29 Fix B: sticky lanes (IE_Q35MOE_STICKY_LANES=0 = off). Per lane, the prompt tokens of its in-place checkpoint: the
+// lane's own KV rows below that depth (no other conversation wrote them since) and a copy of its DeltaNet + conv state taken
+// exactly there (Q35mLanesModel::prompt_end, at the snapshot boundary). A next turn whose prompt strictly extends those tokens
+// restores in place -- the copy back into the lane, every full-attention layer's KV length set to the depth -- when that serves
+// at least as much as the shared prompt cache; the lane's choice (own_match / occupied / last_end) prefers it. Any other use
+// of the lane (a cache restore, a new sequence, a reset) drops the checkpoint first. Host-only bookkeeping; the device copies
+// are the model's.
+struct Q35mSticky {
+    bool on = false;
+    std::vector<std::vector<int32_t>> ck;   // [lane] the checkpoint's tokens (empty = none)
+    void resize(uint32_t n) { ck.assign(n, {}); }
+    // the depth the lane restores in place for `ids`: its checkpoint when that is a STRICT prefix of ids (>= 1 row is left to
+    // prefill: the DeltaNet rule), else 0
+    uint32_t match(uint32_t lane, std::span<const int32_t> ids) const {
+        if (!on || lane >= ck.size()) return 0;
+        const std::vector<int32_t>& c = ck[lane];
+        if (c.empty() || c.size() >= ids.size()) return 0;
+        for (size_t i = 0; i < c.size(); ++i)
+            if (c[i] != ids[i]) return 0;
+        return uint32_t(c.size());
+    }
+    // the restore source: the lane's own checkpoint when it serves at least as much as the cache would
+    static bool own_wins(uint32_t own, uint32_t cache) { return own > 0 && own >= cache; }
+    void set(uint32_t lane, std::span<const int32_t> ids, uint32_t depth) {
+        if (on && lane < ck.size() && depth <= ids.size()) ck[lane].assign(ids.begin(), ids.begin() + depth);
+    }
+    // sticky off (IE_Q35MOE_STICKY_LANES=0 or the load fallback) never calls resize(): no rows to read or clear
+    void drop(uint32_t lane) { if (lane < ck.size()) ck[lane].clear(); }
+    uint32_t end(uint32_t lane) const { return on && lane < ck.size() ? uint32_t(ck[lane].size()) : 0u; }
+};
 
 // One card's per-lane state shape (what Qwen35MoeSplitModel::load allocates per card: KvCache + DeltaNetState).
 struct Q35mLaneShape {

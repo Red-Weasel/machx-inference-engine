@@ -73,6 +73,11 @@ public:
     //   so OpenAI clients can recover text-embedded tool calls).
     std::string decode(std::span<const int32_t> ids, bool skip_special = false,
                        std::span<const int32_t> keep_special = {}) const;
+    // P4 B35: a special id decode() writes out even when skip_special is set, as if every call listed it in
+    // keep_special. Engine::load shows a Qwen thinking template's </think> (reasoning.hpp chatml_think_split): every
+    // decoded reply -- the serial loops' and the request lanes' detok alike -- then carries the reasoning boundary that
+    // Engine::chat and the server split at. Set at load, before any decode runs.
+    void show_special(int32_t id) { shown_special_.push_back(id); }
 
 private:
     void               build_byte_maps();
@@ -104,6 +109,7 @@ private:
 
     // Sorted special-token strings for greedy match in encode().
     std::vector<std::pair<std::string, int32_t>>      special_text_;
+    std::vector<int32_t>                              shown_special_;   // P4 B35: show_special
 
     int32_t bos_id_     = -1;
     int32_t eos_id_     = -1;
@@ -213,12 +219,113 @@ struct ChatTurn {
 // preamble / system content — exactly where the vendor template puts it. A
 // standalone system turn is created if the conversation has none. Empty =
 // no injection (Qwen3.6-and-earlier templates, effort "medium", thinking off).
+// `xml`: P4 B27, the model's own tool convention (below). Engaged only when
+// `xml.enabled` AND tools are present; every other render is byte-identical.
+//
+// P4 B27: the Qwen3.6+ GGUF chat templates (qwen35 27B, qwen35moe 35B-A3B) teach
+// the XML tool convention, not the Qwen3 JSON one:
+//   <tool_call>\n<function=NAME>\n<parameter=K>\nV\n</parameter>\n</function>\n</tool_call>
+// Rendering the JSON preamble to such a model makes it blend the two forms
+// (`<name="read_file", "arguments": {...}}`: 0/16 structured calls on the Dream
+// explorer request). With `enabled` and tools present, build_chatml_prompt renders
+// the template's tools block (HF `tool | tojson` = Python json.dumps separators,
+// key order kept), puts the system text AFTER it, trims every message like the
+// template, renders assistant tool_calls history in the XML form and the
+// template's <think> history rule. `think_all_history`: the 27B template
+// (`preserve_thinking is undefined`) carries <think>…</think> on EVERY assistant
+// turn; the 35B only on turns after the last user query.
+struct ChatmlXmlTools {
+    bool enabled = false;
+    bool think_all_history = false;
+};
+// Read from the GGUF `tokenizer.chat_template` text: enabled iff it contains
+// "<function=". Never inspects the arch.
+ChatmlXmlTools chatml_xml_tools_from_template(std::string_view chat_template);
+
 std::string build_chatml_prompt(std::span<const ChatTurn> turns,
                                 bool add_generation_prompt = true,
                                 bool enable_thinking      = true,
                                 std::string_view tools_json = {},
                                 bool model_has_think      = true,
-                                std::string_view reasoning_preamble = {});
+                                std::string_view reasoning_preamble = {},
+                                ChatmlXmlTools xml = {});
+
+// P4 B27: parse the model's tool calls back into OpenAI tool_calls. Only the text
+// from `answer_start` on is scanned (the reasoning generated before the model's
+// </think>: never; npos = no answer span at all, nothing is parsed); the text
+// before it goes into `content` verbatim. Each <tool_call> block, one of:
+//   * `<function=NAME>` + `<parameter=K>\nV\n</parameter>`*: the value typed by the
+//     tool's JSON schema (`tools_json`, the OpenAI array): string stays text;
+//     boolean takes true / false in any case (the models write Python's True);
+//     integer / number parse as JSON, then as plain digits ("02"); object / array
+//     parse as JSON, then with Python's single quotes swapped; a type list such
+//     as ["string","null"] is string when it lists string; an unknown type parses
+//     only JSON-looking text.
+//   * the Qwen3 JSON form `{"name": "f", "arguments": {..}}` (a mixed reply keeps
+//     every call in order);
+//   * the hybrids the 35B wrote under the JSON preamble (`<name="f", "arguments": {..}}`,
+//     `{"name="f",arguments={..}}`, `<name>f</name><arguments>{..}</arguments>`):
+//     the name after `name`, the brace-balanced object after `arguments`.
+// A function name not in `tools_json` is rejected (a quoted example, a salvage
+// from prose). Rejected / cut-off blocks stay in `content` verbatim, never a
+// phantom call. `tool_calls_json` = "" when no call was accepted (then `content`
+// is `text` unchanged).
+struct ChatmlToolCalls {
+    std::string content;
+    std::string tool_calls_json;
+};
+ChatmlToolCalls parse_chatml_xml_tool_calls(std::string_view text, std::string_view tools_json,
+                                            size_t answer_start = 0);
+
+// P4 B28: the reply never closed its reasoning (thinking on, no </think> generated:
+// answer_start npos -- the models sometimes skip the tag and write the call straight
+// after the reasoning) yet ended on its own. Accepted: the maximal run of complete
+// <tool_call> blocks that ENDS the reply (nothing but whitespace between and after
+// them, every block accepted by the rules above); the text before the run is
+// `content`. A block followed by more text (one quoted while reasoning) is never a
+// call; a cut-off block leaves the whole reply as text. The caller applies the
+// finish rule: a length-capped reply is never scanned this way.
+ChatmlToolCalls parse_chatml_xml_tail_calls(std::string_view text, std::string_view tools_json);
+
+// P4 B35: a Qwen thinking reply split into its reasoning and its answer. The template opens <think> in the prompt, so
+// the model writes "reasoning\n</think>\n\nanswer" (the engine shows the tag: Tokenizer::show_special). Split as the
+// templates split such a reply themselves (the 35B's history render: content.split('</think>')[0].rstrip('\n') ...
+// .lstrip('\n') / content.split('</think>')[-1].lstrip('\n')): `reasoning` = the text before the first </think>, its
+// '\n's stripped on both sides; `content` = the text after it, its leading '\n's stripped (a later </think> stays in
+// it). No </think> -- the reply was cut off inside its reasoning by max_tokens, or the model never wrote the tag -- is
+// all reasoning and an empty content: what the stream has sent by then, and the rule of the engine's other thinking
+// paths (DeepSeek-V4 / V4.1, MiMo, GLM).
+struct ChatmlThinkSplit {
+    std::string reasoning;
+    std::string content;
+};
+ChatmlThinkSplit split_chatml_think(std::string_view text);
+
+// P4 B35: split_chatml_think as the reply streams (the server). After each fragment, update() with the whole reply so
+// far; the reasoning ready to send is [reason_begin(), reason_end()) -- send from max(what was sent, reason_begin()).
+// While the reasoning is open, held back: its trailing '\n's, the last bytes that could still start a </think> or a
+// <tool_call>, and everything from its first <tool_call> on (a reply that never closes its reasoning can end in tool
+// calls the engine takes out, B28; the block is reasoning once a </think> follows it). closed(): the </think> came; the
+// content begins at content_begin(), past the '\n's after the tag (it moves on as they arrive, up to the first other
+// byte). A reply that ends with its reasoning open: send rest_of(the engine's reasoning, what was sent) -- the engine's
+// split of its final text (its calls taken out) beyond the part already sent, of which the sent part is a prefix.
+class ChatmlThinkStream {
+public:
+    void   update(std::string_view text);
+    size_t reason_begin() const noexcept { return begin_; }
+    size_t reason_end() const noexcept { return end_; }
+    bool   closed() const noexcept { return close_ != std::string_view::npos; }
+    size_t content_begin() const noexcept { return content_; }
+    std::string_view rest_of(std::string_view engine_reasoning, size_t sent) const noexcept;
+
+private:
+    size_t seen_    = 0;                          // the text's size at the last update (the scans resume near it)
+    size_t begin_   = 0;
+    size_t end_     = 0;
+    size_t content_ = 0;
+    size_t close_   = std::string_view::npos;     // the first </think>
+    size_t tool_    = std::string_view::npos;     // the first <tool_call>
+};
 
 // P3a: Llama 3.x Instruct chat template (llama.cpp llama-chat.cpp LLAMA_3):
 //   <|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>

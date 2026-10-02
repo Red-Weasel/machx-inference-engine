@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <malloc.h>
 #include <filesystem>
 #include <memory>
@@ -32,8 +33,12 @@ namespace ie {
 // second signal while stopping hard-exits: nothing must be able to wedge the
 // shutdown behind a stuck forward.
 static std::atomic<int> g_signal{0};
+static std::atomic<int64_t> g_stop_ns{0};   // P4 B33: when the stop arrived, CLOCK_MONOTONIC ns (= std::chrono::steady_clock)
 static void on_stop_signal(int sig) {
     if (g_signal.exchange(sig) != 0) _exit(128 + sig);
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);   // (async-signal-safe)
+    g_stop_ns.store(int64_t(ts.tv_sec) * 1000000000 + ts.tv_nsec);
 }
 
 // After every generation, hand the heap's free pages back to the OS. A request's transient buffers (prefill chunks,
@@ -160,7 +165,7 @@ static void note_http_thread() {
 
 int run_openai_server(Engine& eng, const std::string& model_id,
                       const std::string& host, int port, uint32_t max_queue,
-                      const std::string& root_id) {
+                      const std::string& root_id, ServerStop* stop) {
     httplib::Server srv;
     // Admission bound: up to eng.parallel() generations in flight at once (the
     // engine's internal FIFO gate owns the actual GPU serialization and
@@ -230,6 +235,9 @@ int run_openai_server(Engine& eng, const std::string& model_id,
         if (req.remote_addr != "127.0.0.1" && req.remote_addr != "::1") { res.status = 403; return; }
         res.set_content("{\"status\":\"stopping\"}", "application/json");
         std::fprintf(stderr, "[ie] shutdown requested by %s\n", req.remote_addr.c_str());
+        int64_t none = 0;   // (P4 B33: the stop's start, unless a signal came first)
+        g_stop_ns.compare_exchange_strong(none, std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                    std::chrono::steady_clock::now().time_since_epoch()).count());
         admin_stop.store(true);   // the watcher thread below does the orderly stop
     });
     // Liveness a supervisor can act on: 200 while the device is healthy, 503
@@ -263,7 +271,8 @@ int run_openai_server(Engine& eng, const std::string& model_id,
         res.set_content(
             "{\"default_generation_settings\":{\"n_ctx\":" +
                 std::to_string(eng.max_ctx()) + "},\"total_slots\":" +
-                std::to_string(eng.parallel()) + ",\"prompt_cache_slots\":" + std::to_string(eng.prompt_cache_slots()) +
+                std::to_string(eng.parallel()) + ",\"slot_ctx\":" + std::to_string(eng.slot_ctx()) +   // P4 B38: lanes 1..N-1 (0: one lane)
+                ",\"prompt_cache_slots\":" + std::to_string(eng.prompt_cache_slots()) +
                 ",\"memory_residency\":" + eng.memory_residency_json() +
                 ",\"vision\":" + eng.vision_status_json() + "}",   // readiness of THIS load (P11), beside the arch flag in /capabilities
             "application/json");
@@ -321,8 +330,10 @@ int run_openai_server(Engine& eng, const std::string& model_id,
             try {
             // `stop` sequences (Phase L): watched on the streamed text; for a
             // deepseek4 thinking request only the part after </think> counts.
+            // (P4 B35: and a Qwen thinking template's, whose text now shows the tag)
             const bool separate_thinking_ns =
-                (eng.arch() == ModelArch::kDeepSeek4 || eng.arch() == ModelArch::kGlm5Next || eng.arch() == ModelArch::kDeepSeek41 || eng.arch() == ModelArch::kMimo26)
+                (eng.arch() == ModelArch::kDeepSeek4 || eng.arch() == ModelArch::kGlm5Next || eng.arch() == ModelArch::kDeepSeek41 || eng.arch() == ModelArch::kMimo26 ||
+                 eng.chatml_thinking())
                 && cr.enable_thinking;
             std::string acc_ns;
             bool stopped_ns = false;
@@ -340,6 +351,8 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                         const size_t p = acc_ns.find("</think>");
                         if (p == std::string::npos) return true;
                         cs = p + 8;
+                        // P4 B35: a Qwen thinking reply's content starts past the '\n's after the tag (split_chatml_think)
+                        if (eng.chatml_thinking()) while (cs < acc_ns.size() && acc_ns[cs] == '\n') ++cs;
                     }
                     // a forming tool-call block is never cut by a stop sequence
                     // (the stream path holds it back the same way)
@@ -478,7 +491,12 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 const bool structured = ds4 || eng.arch() == ModelArch::kGlm5Next || eng.arch() == ModelArch::kDeepSeek41 || mimo;
                 const std::string DSML_OPEN = ds41 ? "<｜DSML｜" : "<｜DSML｜tool_calls";
                 static const std::string THINK_CLOSE = "</think>";
-                bool   in_reason       = structured && cr.enable_thinking;
+                // P4 B35: a Qwen thinking template with thinking on: the text before the model's first </think> (which
+                // the engine's text shows) goes out as delta.reasoning_content, then the content -- split_chatml_think's
+                // rule, as the reply grows (ChatmlThinkStream); Engine::chat returns the same split
+                const bool think = eng.chatml_thinking() && cr.enable_thinking;
+                ChatmlThinkStream think_stream;
+                bool   in_reason       = (structured || think) && cr.enable_thinking;
                 bool   in_dsml         = false;   // the held-back block is a DSML tool call
                 size_t content_start   = 0;   // where content begins in `acc`
                 size_t reason_streamed = 0;
@@ -558,7 +576,20 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                         // can never flip sink_alive: poll the socket instead.
                         if (harmony) return bool(sink.is_writable());   // buffered → emit r.text at end
                         acc += t;
-                        if (in_reason) {
+                        if (in_reason && think) {
+                            think_stream.update(acc);
+                            reason_streamed = std::max(reason_streamed, think_stream.reason_begin());
+                            flush_reason_to(think_stream.reason_end());
+                            if (!think_stream.closed()) return sink_alive;
+                            if (!sink_alive) return false;
+                            in_reason     = false;
+                            content_start = think_stream.content_begin();
+                            streamed      = content_start;
+                        } else if (think && streamed == content_start) {   // the content's leading '\n's, as they arrive
+                            think_stream.update(acc);
+                            content_start = think_stream.content_begin();
+                            streamed      = content_start;
+                        } else if (in_reason) {
                             const size_t p = acc.find(THINK_CLOSE);
                             if (p == std::string::npos) {   // hold the tag's length back
                                 flush_reason_to(acc.size() > THINK_CLOSE.size()
@@ -632,18 +663,41 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 // Harmony (gpt-oss) reassembles from the engine's post-processed
                 // r.text — the final-channel answer, or the canonical <tool_call>
                 // Engine::chat produced; other arches use the streamed accumulator.
-                std::string tcframe = stopped ? std::string{} : (structured && !r.tool_calls_json.empty())
+                // P4 B35: a Qwen thinking reply that never closed its reasoning (cut off, or B28's calls with no
+                // </think>): the rest of the engine's reasoning (its calls taken out) goes out before the calls
+                if (think && in_reason && !stopped) {
+                    const std::string_view rest = think_stream.rest_of(r.reasoning_content, reason_streamed);
+                    if (!rest.empty()) {
+                        auto f = vit(oai::chat_chunk_sse_reasoning(model_id, id, created, rest));
+                        if (sink.write(f.data(), f.size())) reason_streamed += rest.size();
+                        else sink_alive = false;
+                    }
+                }
+                // P4 B27: an engine-parsed tool_calls_json (ds4 / glm5 / ds41 / mimo, and the
+                // Qwen XML form) is the structured frame on every arch.
+                // P4 B35: of a split reply the server's own parser sees the content only, as the non-stream body does
+                const std::string parse_text = harmony ? r.text : !think ? acc : in_reason ? std::string() : acc.substr(content_start);
+                std::string tcframe = stopped ? std::string{} : !r.tool_calls_json.empty()
                     ? oai::chat_chunk_sse_tool_calls_json(model_id, id, created, r.tool_calls_json)
-                    : (ds41 || mimo) ? std::string{} : oai::chat_chunk_sse_tool_calls(model_id, id, created, harmony ? r.text : acc);
+                    : (ds41 || mimo) ? std::string{} : oai::chat_chunk_sse_tool_calls(model_id, id, created, parse_text);
                 std::string fin_reason = stopped ? "stop" : r.finish_reason;
                 if (!tcframe.empty()) {
+                    // P4 B27: the Qwen XML path's r.text is the reply outside its calls, and the prefix
+                    // streamed before the hold-back began is its prefix; the rest (a block the model
+                    // quoted while thinking, prose between or after the calls) goes out as content, not dropped.
+                    // (P4 B35: a split reply's r.text is its content, streamed from content_start)
+                    if (!structured && !harmony && !r.tool_calls_json.empty() && r.text.size() > streamed - content_start) {
+                        auto c = vit(oai::chat_chunk_sse(model_id, id, created,
+                                                         std::string_view(r.text).substr(streamed - content_start), ""));
+                        sink.write(c.data(), c.size());
+                    }
                     sink.write(tcframe.data(), tcframe.size());
                     fin_reason = "tool_calls";
                 } else if (harmony) {
                     auto c = oai::chat_chunk_sse(model_id, id, created, r.text, "");
                     sink.write(c.data(), c.size());
                 } else if (!stopped) {
-                    if (in_reason) flush_reason_to(acc.size());   // cut off inside the reasoning
+                    if (in_reason) { if (!think) flush_reason_to(acc.size()); }   // cut off inside the reasoning (P4 B35: sent above)
                     else if (in_dsml) {
                         // a DSML tool-call block the engine could not parse (cut by
                         // max_tokens): mirror ds4_finish_completion — the prose before
@@ -743,6 +797,15 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                          sig ? ("signal " + std::to_string(sig)).c_str() : "admin shutdown",
                          adm.inflight(), adm.queued());
             adm.shutdown();   // in-flight generations abort at their next token
+            // P4 B33: ... and the engine ends them now: no new device work, queued work dropped; only the steps already on a
+            // card are waited for (the engine's teardown), so the stop takes seconds, not the queued prefill pieces' minutes
+            const uint32_t steps = eng.abort_all();
+            if (stop) {
+                const int64_t ns = g_stop_ns.load();
+                stop->requested = true;
+                stop->t0 = ns ? std::chrono::steady_clock::time_point(std::chrono::nanoseconds(ns)) : std::chrono::steady_clock::now();
+                stop->gpu_steps = steps;
+            }
             srv.stop();
             return;
         }

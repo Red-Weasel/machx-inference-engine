@@ -24,12 +24,12 @@ const char* USAGE =
   "usage: ie <run|serve> <model.gguf> [--ctx N] [--port P] [--host H] [--gpus N]\n"
   "                                [--prefill-chunk N] [--spec] [--parallel N] [--temp F]\n"
   "                                [--vram-reserve-gib F]\n"
-  "                                (--parallel N = 1..16 concurrent generations, default 1;\n"
-  "                                 what >1 does depends on the arch: `ie serve --help`.\n"
+  "                                (--parallel N|auto = 1..16 concurrent generations, default auto:\n"
+  "                                 the load picks N; what >1 does depends on the arch: `ie serve --help`.\n"
   "                                 Not yet compatible with --int8-kv.)\n"
   "                                (--max-queue N = requests allowed to WAIT for a generation\n"
   "                                 slot; beyond that the server answers HTTP 429 at once.\n"
-  "                                 Default 8. /health reports inflight/queued.)\n"
+  "                                 Default 8; N + 8 with --parallel auto. /health reports inflight/queued.)\n"
   "                                (--prefill-chunk = tokens per prefill forward, default 256.\n"
   "                                 --vram-reserve-gib = GiB the auto expert tier leaves free per card\n"
   "                                 (mimo_v2, deepseek41; default 1.5; raise it for very long contexts).\n"
@@ -206,7 +206,9 @@ int main(int argc, char** argv) {
                 sp.cards = s.launch.cards;
                 sp.argv = {self, "serve", "--config", abs_config, "--server", s.name};
                 sp.restart_on_failure = s.restart_on_failure;
-                sp.slots = s.launch.engine.parallel + s.launch.max_queue;
+                // P4 B30: an auto child's lanes are known once it has loaded: the front's pool for the most it can pick
+                const uint32_t par = s.launch.engine.parallel == ie::kLanesAuto ? ie::kMaxParallel : s.launch.engine.parallel;
+                sp.slots = par + ie::serve_max_queue(s.launch, par);
                 if (s.name == layout.default_server) so.default_index = int(i);
                 specs.push_back(std::move(sp));
             }
@@ -371,13 +373,23 @@ int main(int argc, char** argv) {
     std::string err;
     err=ie::server_reasoning_error(model_path,launch.defaults.reasoning_effort);
     if(!err.empty()){std::fprintf(stderr,"invalid model setting: %s\n",err.c_str());return 2;}
+    if (cmd == "run" && opts.parallel == ie::kLanesAuto) opts.parallel = 1;   // P4 B30: a terminal chat has one conversation
     auto eng = ie::Engine::load(model_path, opts, err);
     if (!eng) { std::fprintf(stderr, "load failed: %s\n", err.c_str()); return 1; }
 
-    if (cmd == "serve")
-        return ie::run_openai_server(*eng, served_name.empty() ? ie::model_id_from_path(model_path) : served_name,
-                                     host, port, launch.max_queue,
-                                     served_name.empty() ? std::string() : ie::model_id_from_path(model_path));
+    if (cmd == "serve") {
+        ie::ServerStop stop;
+        const int rc = ie::run_openai_server(*eng, served_name.empty() ? ie::model_id_from_path(model_path) : served_name,
+                                             host, port, ie::serve_max_queue(launch, eng->parallel()),
+                                             served_name.empty() ? std::string() : ie::model_id_from_path(model_path), &stop);
+        // P4 B33: the engine goes here (it waits for the device steps still running, then frees), so the stop's line counts
+        // everything up to the exit
+        eng.reset();
+        if (stop.requested)
+            std::fprintf(stderr, "[ie] stopped in %.1f s (waited for %u in-flight GPU steps)\n",
+                         std::chrono::duration<double>(std::chrono::steady_clock::now() - stop.t0).count(), stop.gpu_steps);
+        return rc;
+    }
 
     // cmd == "run"
     std::vector<ie::ChatTurn> turns;

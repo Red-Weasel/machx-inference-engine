@@ -33,7 +33,7 @@ the kernel driver.
 ```
 Models land in `./models` on the host.
 
-> **Which quant to grab.** Best-tested: **`Q4_K_M`, `Q6_K`, `Q8_0`** (and **`MXFP4`** for gpt-oss). If a model fails to load, try one of those first — some quant × architecture combinations (e.g. certain `Q5_K` builds) aren't supported yet. The curated `ie pull` names already use known-good quants.
+> **Which quant to grab.** Best-tested: **`Q4_K_M`, `Q6_K`, `Q8_0`** (and **`MXFP4`** for gpt-oss). If a model fails to load, try one of those first — some quant × architecture combinations (e.g. certain `Q5_K` builds) aren't supported yet. The curated `ie pull` names already use known-good quants. In a v0.2.6 source build, the two-card Qwen3.8-27B split runs `Q6_K` and `Q5_K_M` natively (22.0 and 24.0 tok/s against 17.2 for `Q8_0`, one request, September 29, 2026).
 
 ## 3. Serve (OpenAI-compatible, port 11435)
 ```bash
@@ -42,6 +42,14 @@ Models land in `./models` on the host.
 Multi-GPU: `--gpus 2` (layer-split; add `IE_QWEN3MOE_TP=1` for tensor-parallel on
 qwen3moe). Long context: `--ctx 32768`.
 
+Several requests at once (source builds from v0.2.6; the prebuilt image predates it): without
+`--parallel`, the load picks how many requests it serves at once and logs why (`[lanes] auto ...`).
+That is 1 on one card and on most architectures, up to 16 on the two-card Qwen3.6-35B-A3B-class and
+Qwen3.8-27B splits, and 4 on MiMo-V2.6-Flash, DeepSeek-V4.1-Flash and Qwen3.8-Flash. `--parallel N`
+sets the count and `--parallel 1` is the one-request server (needed for images on MiMo-V2.6-Flash and
+Qwen3.8-Flash). `curl localhost:11435/props` shows `total_slots` and `slot_ctx`, the positions of each
+lane after the first.
+
 ## 4. Use it
 ```bash
 curl http://localhost:11435/v1/chat/completions \
@@ -49,6 +57,11 @@ curl http://localhost:11435/v1/chat/completions \
   -d '{"model":"local","messages":[{"role":"user","content":"Hello!"}]}'
 ```
 Point **Hermes** or any OpenAI client at `http://localhost:11435/v1`.
+
+Stop it with `curl -X POST http://localhost:11435/admin/shutdown` (or SIGTERM / Ctrl-C) and let it exit by
+itself: from v0.2.6 a stop was measured at 0.43–3.08 s on the request lanes of the Qwen3.6-35B-A3B class,
+Qwen3.8-27B and Qwen3.8-Flash, and the log ends with `[ie] stopped in X.X s`. Do not kill a server that still
+has work on a card.
 
 ---
 
@@ -71,6 +84,9 @@ cmake -S . -B build -G Ninja && cmake --build build -j
   you set it). Mount or persist `~/.cache` in a container to keep repeat loads free.
   An AOT build (`IE_SYCL_TARGET=intel_gpu_bmg_g31` at configure) removes the
   first-use compile entirely for the B70.
+  After an upgrade, the first request compiles the kernels that changed, once: with v0.2.6's new kernels
+  that was 4.87 s to the first token on a Qwen3.6-35B-A3B-class model and 6.95 s on Qwen3.8-Flash, then
+  normal on every later start.
 - The runtime image is slim (~1.3 GB): it copies only the ~11 oneAPI libs the engine
   and the Level-Zero adapter actually need, not the full 1.2 GB oneAPI runtime.
 - `--gpus` picks single vs multi automatically when omitted (VRAM-aware).

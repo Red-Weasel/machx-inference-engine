@@ -17,6 +17,9 @@
 #include "ie/kernel_profiler.hpp"
 #include "ie/quant_blocks.hpp"
 
+#include <cstdlib>
+#include <string>
+
 namespace ie {
 namespace {
 
@@ -40,6 +43,12 @@ constexpr int SG_SIZE  = 16;
 constexpr int N_PER_WG = 32;
 constexpr int WG_ITEMS = N_PER_WG * SG_SIZE;   // 512
 
+// P4 B32 (2): the per-slot kernels' v2 (moe_q8_decode_v2.cpp, bit-identical) unless IE_Q8_MOE_DECODE_V2=0. Read once.
+bool decode_v2() {
+    static const bool v = [] { const char* e = std::getenv("IE_Q8_MOE_DECODE_V2"); return !(e && *e && std::string(e) == "0"); }();
+    return v;
+}
+
 }  // namespace
 
 sycl::event moe_gate_up_silu_q8(sycl::queue& q, const void* x_q8,
@@ -48,6 +57,8 @@ sycl::event moe_gate_up_silu_q8(sycl::queue& q, const void* x_q8,
                                 uint64_t qs_stride, uint64_t d_stride,
                                 const int32_t* topk_idx, sycl::half* h_out,
                                 uint32_t T, uint32_t K, uint32_t H, uint32_t E_ffn) {
+    if (decode_v2())
+        return moe_gate_up_silu_q8_v2(q, x_q8, g_qs, g_d, u_qs, u_d, qs_stride, d_stride, topk_idx, h_out, T, K, H, E_ffn);
     const uint32_t bpc = H / 32;                          // act blocks per row
     const uint32_t col_wgs = (E_ffn + N_PER_WG - 1) / N_PER_WG;
     const uint64_t n_wgs = uint64_t(T) * K * col_wgs;
@@ -105,6 +116,8 @@ sycl::event moe_down_q8(sycl::queue& q, const void* h_q8,
                         const int32_t* topk_idx, const sycl::half* topk_w,
                         sycl::half* y_packed, uint32_t T, uint32_t K,
                         uint32_t E_ffn, uint32_t H) {
+    if (decode_v2())
+        return moe_down_q8_v2(q, h_q8, d_qs, d_d, qs_stride, d_stride, topk_idx, topk_w, y_packed, T, K, E_ffn, H);
     const uint32_t bpc = E_ffn / 32;
     const uint32_t col_wgs = (H + N_PER_WG - 1) / N_PER_WG;
     const uint64_t n_wgs = uint64_t(T) * K * col_wgs;
@@ -190,6 +203,11 @@ sycl::event moe_prefill_gate_up_silu_q8(sycl::queue& q, const void* xq8_packed,
                                         sycl::half* h_packed,
                                         uint32_t E, uint32_t H, uint32_t E_ffn,
                                         const std::vector<sycl::event>& deps) {
+    // P4 B32 (1): v2 (moe_q8_gate_up_v2.cpp, bit-identical) unless IE_Q8_MOE_GATEUP_V2=0. Read once.
+    static const bool v2 = [] { const char* e = std::getenv("IE_Q8_MOE_GATEUP_V2"); return !(e && *e && std::string(e) == "0"); }();
+    if (v2)
+        return moe_prefill_gate_up_silu_q8_v2(q, xq8_packed, g_qs, g_d, u_qs, u_d, qs_stride, d_stride,
+                                              expert_offsets, h_packed, E, H, E_ffn, deps);
     const uint32_t bpc        = H / 32;                       // weight blocks / col
     const uint32_t q8_per_row = H / 32;                       // activation blocks / row
     const uint32_t n_blk_per_lane = (q8_per_row + SG_SIZE - 1) / SG_SIZE;
@@ -282,6 +300,11 @@ sycl::event moe_prefill_down_q8(sycl::queue& q, const void* hq8_packed,
                                 sycl::half* out_packed,
                                 uint32_t E, uint32_t H, uint32_t E_ffn,
                                 const std::vector<sycl::event>& deps) {
+    // P4 B31: v2 (moe_q8_down_v2.cpp, bit-identical) unless IE_Q8_MOE_DOWN_V2=0. Read once.
+    static const bool v2 = [] { const char* e = std::getenv("IE_Q8_MOE_DOWN_V2"); return !(e && *e && std::string(e) == "0"); }();
+    if (v2)
+        return moe_prefill_down_q8_v2(q, hq8_packed, d_qs, d_d, qs_stride, d_stride, expert_offsets,
+                                      sorted_w, out_packed, E, H, E_ffn, deps);
     const uint32_t bpc        = E_ffn / 32;                  // weight blocks / col
     const uint32_t q8_per_row = E_ffn / 32;                  // activation blocks / row
     const uint32_t n_blk_per_lane = (q8_per_row + SG_SIZE - 1) / SG_SIZE;

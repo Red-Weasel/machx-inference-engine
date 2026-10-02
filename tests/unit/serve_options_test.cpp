@@ -13,7 +13,8 @@ int main() {
             {"--stop", ""}, {"--thinking", "maybe"}, {"--unknown"}, {"--temp"},
             {"--reasoning-effort","ultra"}, {"--reasoning-effort"},
             {"--int8-kv", "--parallel", "2"}, {"--max-queue", "-1"},
-            {"--max-queue", "2000"}, {"--max-queue"}}) {
+            {"--max-queue", "2000"}, {"--max-queue"},
+            {"--parallel"}, {"--parallel", "AUTO"}, {"--parallel", "auto4"}, {"--parallel", ""}}) {
         bool rejected = false;
         try { (void)ie::parse_launch_options(args); }
         catch (const std::exception&) { rejected = true; }
@@ -25,7 +26,26 @@ int main() {
     static_assert(ie::kMaxParallel == 16);
     auto minimal = ie::parse_launch_options({"--ctx", "9", "--slot-ctx", "9"});
     assert(minimal.engine.max_ctx == 9 && minimal.engine.slot_ctx == 9);
-    assert(minimal.max_queue == 8);
+    assert(minimal.max_queue == 8 && !minimal.max_queue_set);
+    // P4 B30: no --parallel = auto (the load picks N, ie/lanes_auto.hpp); --parallel auto = the same; the last flag wins;
+    // an explicit N is passed through as given (the loop above); --int8-kv makes auto one lane (the lanes refuse it)
+    assert(minimal.engine.parallel == ie::kLanesAuto && ie::parse_launch_options({}).engine.parallel == ie::kLanesAuto);
+    assert(ie::parse_launch_options({"--parallel", "auto"}).engine.parallel == ie::kLanesAuto);
+    assert(ie::parse_launch_options({"--parallel", "4", "--parallel", "auto"}).engine.parallel == ie::kLanesAuto);
+    assert(ie::parse_launch_options({"--parallel", "auto", "--parallel", "4"}).engine.parallel == 4);
+    assert(ie::parse_launch_options({"--parallel", "auto", "--ctx", "4096"}).engine.max_ctx == 4096);   // "auto" took its value
+    assert(ie::parse_launch_options({"--int8-kv"}).engine.parallel == 1);
+    assert(ie::parse_launch_options({"--parallel", "auto", "--int8-kv"}).engine.parallel == 1);
+    assert(ie::EngineOptions{}.parallel == 1);   // tools that build EngineOptions themselves keep one lane
+    // --max-queue: the flag when given; 8 beside an explicit --parallel (as before); N + 8 when the load picked N
+    assert(ie::serve_max_queue(minimal, 16) == 24 && ie::serve_max_queue(minimal, 4) == 12 && ie::serve_max_queue(minimal, 1) == 9);
+    for (uint32_t n : {1u, 4u, 16u}) {
+        assert(ie::serve_max_queue(ie::parse_launch_options({"--parallel", "4"}), n) == 8);
+        assert(ie::serve_max_queue(ie::parse_launch_options({"--parallel", "1"}), n) == 8);
+        assert(ie::serve_max_queue(ie::parse_launch_options({"--max-queue", "3"}), n) == 3);
+        assert(ie::serve_max_queue(ie::parse_launch_options({"--max-queue", "0", "--parallel", "auto"}), n) == 0);
+        assert(ie::serve_max_queue(ie::parse_launch_options({"--parallel", "2", "--max-queue", "40"}), n) == 40);
+    }
     auto p = ie::parse_launch_options({"--ctx", "200000", "--gpus", "2",
         "--temp", "0", "--top-k", "0", "--top-p", "1", "--min-p", ".1",
         "--repeat-penalty", "1.2", "--repeat-last-n", "256",

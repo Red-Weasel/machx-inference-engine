@@ -3,6 +3,7 @@
 // helpers, gated 2026-09-26), with the arch's work behind LanesModel.
 #include "ie/lanes_serve.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -35,12 +36,50 @@ std::string CardPipe::start(LanesModel::DoneFn done, LanesModel::RowsDoneFn rows
     return launch();
 }
 
+// P4 B29: IE_LANES_TRACE=1 -- one stderr line per card step (a prefill piece's rows, or a decode step / group's rows), its time
+// and the card's idle gap before it: where the swarm's card time goes. Off = the stages as given (no wrapper).
+namespace {
+struct CardTrace {
+    std::mutex mu;
+    Clock::time_point last[8]{};
+    void line(uint32_t s, uint32_t G, uint32_t T, uint32_t lane, uint32_t pos0, Clock::time_point t0) {
+        const Clock::time_point t1 = Clock::now();
+        std::lock_guard<std::mutex> lk(mu);
+        const double gap = s < 8 && last[s].time_since_epoch().count() ? std::chrono::duration<double, std::milli>(t0 - last[s]).count() : 0.0;
+        if (s < 8) last[s] = t1;
+        if (T > 1) std::fprintf(stderr, "[lanes card] card %u prefill %u rows lane %u at %u: %.1f ms (idle %.1f ms before)\n", s, T, lane,
+                                pos0, std::chrono::duration<double, std::milli>(t1 - t0).count(), gap);
+        else       std::fprintf(stderr, "[lanes card] card %u decode %u row(s): %.1f ms (idle %.1f ms before)\n", s, G,
+                                std::chrono::duration<double, std::milli>(t1 - t0).count(), gap);
+    }
+};
+bool lanes_trace_on() { static const bool on = [] { const char* v = std::getenv("IE_LANES_TRACE"); return v && *v == '1'; }(); return on; }
+}  // namespace
+
 std::string CardPipe::launch() {
     LanesModel::DoneFn* d = &done_;
-    if (!rows_on_) return pipe_.start(n_stages_, stage_, [d](uint32_t lane, uint32_t, uint32_t) { (*d)(lane); });
+    Glm5LanePipe::StageFn st = stage_;
+    Glm5LanePipe::RowsStageFn rst = rows_stage_;
+    if (lanes_trace_on()) {
+        static CardTrace tr;
+        st = [f = stage_](uint32_t s, const Glm5LanePipe::Step& x) {
+            const auto t0 = Clock::now();
+            std::string e = f(s, x);
+            tr.line(s, 1, x.T, x.lane, x.pos0, t0);
+            return e;
+        };
+        if (rows_stage_)
+            rst = [f = rows_stage_](uint32_t s, std::span<const Glm5LanePipe::Step> xs, float* gw) {
+                const auto t0 = Clock::now();
+                std::string e = f(s, xs, gw);
+                tr.line(s, uint32_t(xs.size()), 1, 0, 0, t0);
+                return e;
+            };
+    }
+    if (!rows_on_) return pipe_.start(n_stages_, st, [d](uint32_t lane, uint32_t, uint32_t) { (*d)(lane); }, idle_);
     LanesModel::RowsDoneFn* rd = &rows_done_;
-    return pipe_.start_rows(n_stages_, stage_, rows_stage_, [d](uint32_t lane, uint32_t, uint32_t) { (*d)(lane); },
-                            [rd](std::span<const uint32_t> lanes) { (*rd)(lanes); }, max_group_, group_cap_);
+    return pipe_.start_rows(n_stages_, st, rst, [d](uint32_t lane, uint32_t, uint32_t) { (*d)(lane); },
+                            [rd](std::span<const uint32_t> lanes) { (*rd)(lanes); }, max_group_, group_cap_, idle_);
 }
 
 std::string CardPipe::submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) {
@@ -78,6 +117,7 @@ LanesServe::LanesServe(LanesModel& m, Options o) : m_(m), o_(o), lanes_(m.n_lane
     for (uint32_t i = 0; i < lanes_.size(); ++i) lanes_[i].cap = m.lane_cap(i);
     if (const char* v = std::getenv("IE_LANES_PREFILL_FIFO")) o_.prefill_fifo = *v != '0';
     if (const char* v = std::getenv("IE_LANES_HANDOVER_MS")) o_.handover_ms = uint32_t(std::max(0, std::atoi(v)));
+    (void)m_.pipe_lookahead([this] { on_idle0(); });   // P4 B34 (an arch without the lane pipeline drops it)
 }
 
 LanesServe::~LanesServe() { shutdown(); }
@@ -90,6 +130,24 @@ void LanesServe::shutdown() {
     wcv_.notify_all();
     if (worker_.joinable()) worker_.join();
     if (auto e = m_.pipe_stop(); !e.empty()) std::fprintf(stderr, "[%s] teardown pipe_stop: %s\n", m_.tag(), e.c_str());
+}
+
+// P4 B33 (see the header). The serial turn's prefill sees stopping_ through its `stop` (run_chunks asks it before each chunk);
+// a request in any wait wakes on the notify and finds its lane done or take_turn refusing.
+uint32_t LanesServe::abort_all() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (stopping_) return 0;
+    stopping_ = true;
+    uint32_t held = m_.abort();
+    {
+        std::lock_guard<std::mutex> wl(wmu_);   // (lock order mu_ -> wmu_: serial() never holds wmu_ while it takes mu_)
+        if (wjob_) ++held;
+    }
+    for (Lane& l : lanes_)
+        if (l.busy && l.phase != Lane::Phase::kDone) { l.want_stop = true; end_lane(l, "abort", false); }
+    fifo_.clear();
+    cv_.notify_all();
+    return held;
 }
 
 uint32_t LanesServe::busy() const { uint32_t n = 0; for (const auto& l : lanes_) n += l.busy; return n; }
@@ -124,27 +182,149 @@ bool LanesServe::fifo_waiting(uint32_t li) const {
 // shared-prefix snapshot) is flagged for its request to re-run prefix_prepare in a turn (once); an entry whose prompt extends
 // an earlier running entry's still-due mark (the same new system prompt) waits for that mark instead of prefilling it too;
 // otherwise a parked entry's next piece goes into the running pipe. Only from a done callback or by the turn holder:
-// cache_peek never runs beside the serial worker's device work.
+// cache_peek never runs beside the serial worker's device work. P4 B34 (3) short-first: a short entry runs past the window
+// too, and a long entry's next piece may wait for the short prompts (hold_long).
 void LanesServe::fifo_kick() {
     constexpr size_t kWindow = 2;
-    for (size_t i = 0; i < fifo_.size() && i < kWindow && !stopping_;) {
+    for (size_t i = 0; i < fifo_.size() && (i < kWindow || o_.short_first) && !stopping_;) {
         const uint32_t h = fifo_[i];
         Lane& l = lanes_[h];
         if (!l.busy || (l.phase != Lane::Phase::kPrefill && l.phase != Lane::Phase::kMark)) { fifo_.erase(fifo_.begin() + long(i)); continue; }
+        if (i >= kWindow && (l.phase != Lane::Phase::kPrefill || !short_lane(l))) { ++i; continue; }   // (P4 B34 (3))
         if (l.phase == Lane::Phase::kMark || !l.parked || l.reprep) { ++i; continue; }   // in the pipe, at its mark, re-preparing
         if (l.want_stop) { end_lane(l, "abort", false); continue; }                       // (drops it)
         if (l.chunk_at == 0 && l.repreps == 0) {
             if (m_.cache_peek(*l.rq) > l.reused) { l.reprep = true; cv_.notify_all(); ++i; continue; }
             bool wait_mark = false;   // an earlier entry is prefilling the same shared prefix: restore it once it is marked
-            for (size_t j = 0; j < i && !wait_mark; ++j) {
-                const Lane& e = lanes_[fifo_[j]];
-                const uint32_t mk = e.mark_at;
-                wait_mark = mk && l.rq->ids->size() > mk && std::equal(e.rq->ids->begin(), e.rq->ids->begin() + mk, l.rq->ids->begin());
-            }
+            for (size_t j = 0; j < i && !wait_mark; ++j) wait_mark = extends_mark(l, lanes_[fifo_[j]]);
             if (wait_mark) { ++i; continue; }
         }
-        if (piping_ && !pause_) { submit(l, h); cv_.notify_all(); }
+        if (piping_ && !pause_ && !hold_long(l, h)) { submit(l, h); cv_.notify_all(); }
         ++i;
+    }
+}
+
+// ---- P4 B34 (3): short-first (mu held throughout) ----------------------------------------------------------------------------
+
+bool LanesServe::short_lane(const Lane& l) const {
+    const uint32_t left = l.plan.Tp > l.pos ? l.plan.Tp - l.pos : 0u;
+    return left <= std::max(2u * l.piece_max, o_.short_rows);
+}
+
+bool LanesServe::extends_mark(const Lane& l, const Lane& e) const {
+    const uint32_t mk = e.mark_at;
+    return mk && l.rq->ids->size() > mk && std::equal(e.rq->ids->begin(), e.rq->ids->begin() + mk, l.rq->ids->begin());
+}
+
+// Short work another lane has due: its pieces (in the pipe or parked for it), its mark or prompt-end turn. A prompt that has
+// not started and waits for l's own mark (the same shared prefix) does not count: l must reach that mark first.
+bool LanesServe::shorts_pending(const Lane& l, uint32_t li) const {
+    for (uint32_t k = 0; k < lanes_.size(); ++k) {
+        const Lane& s = lanes_[k];
+        if (k == li || !s.busy || !short_lane(s)) continue;
+        if (s.phase == Lane::Phase::kPromptReady || s.phase == Lane::Phase::kMark) return true;
+        if (s.phase != Lane::Phase::kPrefill) continue;
+        if (s.parked && s.chunk_at == 0 && s.repreps == 0 && extends_mark(s, l)) continue;
+        return true;
+    }
+    return false;
+}
+
+// A long prefilling lane's next piece is due: it waits (true; held, its caller parks it) while short work is due elsewhere,
+// until the guard -- short_slots short pieces went in ahead of it, or short_wait_ms since its last piece landed. P4 B36 (C):
+// first, while the decode quota holds it (so short-first's guard is not counted for a lane that waits for the decoders).
+bool LanesServe::hold_long(Lane& l, uint32_t li) {
+    if (quota_hold(l, li)) return true;
+    if (!o_.short_first || l.phase != Lane::Phase::kPrefill || short_lane(l) || !shorts_pending(l, li)) return false;
+    if (l.held && l.bypass >= o_.short_slots) { ++short_guard_; return false; }
+    if (ms_since(l.t_land) >= double(o_.short_wait_ms)) { ++short_guard_; ++short_guard_wait_; return false; }
+    if (!l.held) { l.held = true; l.bypass = 0; }
+    return true;
+}
+
+// A short prompt's piece went into the pipe: one more slot ahead of every held lane; a held lane that saw short_slots of them
+// gets its next piece now, behind this one (P4 B36 (C): unless the decode quota holds it; it then goes at the quota's release).
+void LanesServe::short_piece_in(uint32_t li) {
+    bool ahead_of = false;
+    for (uint32_t k = 0; k < lanes_.size(); ++k) {
+        Lane& h = lanes_[k];
+        if (k == li || !h.held) continue;
+        ahead_of = true;
+        if (++h.bypass >= o_.short_slots && h.parked && !h.want_stop && piping_ && !pause_ && !stopping_ && !quota_hold(h, k)) {
+            ++short_guard_; submit(h, k);
+        }
+    }
+    if (ahead_of) ++short_bypass_;
+}
+
+// ---- P4 B36 (A): re-cut (mu held) ---------------------------------------------------------------------------------------------
+
+// Options::recut: the lane's plan pieces from `from` on (none of them sent yet) become mix_chunk-row pieces, each plan chunk cut
+// in order, once another lane is decoding or prefilling a short prompt (also one at its mark or prompt end). Once: no re-grow.
+void LanesServe::maybe_recut(Lane& l, uint32_t li, size_t from) {
+    if (!o_.recut || !o_.mix_chunk || l.recut || l.piece_max <= o_.mix_chunk || l.phase != Lane::Phase::kPrefill) return;
+    bool active = false;
+    for (uint32_t k = 0; k < lanes_.size() && !active; ++k) {
+        const Lane& s = lanes_[k];
+        if (k == li || !s.busy || s.phase == Lane::Phase::kDone) continue;
+        active = s.phase == Lane::Phase::kDecode || short_lane(s);
+    }
+    if (!active) return;
+    std::vector<LanesChunk> cut(l.plan.chunks.begin(), l.plan.chunks.begin() + long(from));
+    for (size_t i = from; i < l.plan.chunks.size(); ++i)
+        for (uint32_t q = 0; q < l.plan.chunks[i].second; q += o_.mix_chunk)
+            cut.emplace_back(l.plan.chunks[i].first + q, std::min(o_.mix_chunk, l.plan.chunks[i].second - q));
+    std::fprintf(stderr, "[%s] lane %u re-cut at %u: %zu plan piece(s) left -> %zu of at most %u rows (another lane is decoding or "
+                         "prefilling a short prompt)\n", m_.tag(), li, from < l.plan.chunks.size() ? l.plan.chunks[from].first : l.pos,
+                 l.plan.chunks.size() - from, cut.size() - from, o_.mix_chunk);
+    l.plan.chunks.swap(cut);
+    l.recut = true; l.piece_max = o_.mix_chunk; ++recuts_;
+}
+
+// ---- P4 B36 (C): the decode quota (mu held throughout) ------------------------------------------------------------------------
+
+// A long prompt: its whole pipe part above B34 (3)'s short threshold, so a lead stays long to its last (deepest) piece
+bool LanesServe::long_prompt(const Lane& l) const {
+    const uint32_t part = l.plan.Tp > l.reused ? l.plan.Tp - l.reused : 0u;
+    return part > std::max(2u * l.piece_max, o_.short_rows);
+}
+
+void LanesServe::quota_base(Lane& l) {
+    if (!o_.decode_quota) return;
+    l.qbase.resize(lanes_.size());
+    for (size_t k = 0; k < lanes_.size(); ++k) l.qbase[k] = lanes_[k].dsteps;
+}
+
+// Options::decode_quota: a long prefilling lane owes the decoding lanes their steps -- one made fewer than decode_quota since
+// the lane's latest piece landed (a lane that began decoding since counts its steps from then)
+bool LanesServe::quota_due(const Lane& l, uint32_t li) const {
+    if (!o_.decode_quota || l.phase != Lane::Phase::kPrefill || !long_prompt(l)) return false;
+    for (uint32_t d = 0; d < lanes_.size(); ++d) {
+        const Lane& x = lanes_[d];
+        if (d == li || !x.busy || x.phase != Lane::Phase::kDecode) continue;
+        if (x.dsteps - (d < l.qbase.size() ? l.qbase[d] : x.dsteps) < o_.decode_quota) return true;
+    }
+    return false;
+}
+
+// l's next piece is due: it waits (true) while quota_due, until the guard -- quota_max_ms since the wait began. The wait ends
+// with the piece's submit; once the guard fired the piece goes regardless.
+bool LanesServe::quota_hold(Lane& l, uint32_t li) {
+    if (l.qfree || !quota_due(l, li)) return false;
+    if (!l.qheld) { l.qheld = true; l.t_qhold = Clock::now(); ++quota_holds_; return true; }
+    if (ms_since(l.t_qhold) >= double(o_.quota_max_ms)) { l.qfree = true; ++quota_guard_; return false; }
+    return true;
+}
+
+// Decode steps landed and the decoders' next steps are in: a lane held for the quota whose decoders made their steps (or
+// whose guard passed) takes its next piece, behind them on card 0
+void LanesServe::quota_kick() {
+    if (!o_.decode_quota || !piping_ || pause_ || stopping_) return;
+    for (uint32_t k = 0; k < lanes_.size(); ++k) {
+        Lane& h = lanes_[k];
+        if (!h.busy || !h.qheld || !h.parked || h.want_stop || h.reprep || h.phase != Lane::Phase::kPrefill || hold_long(h, k)) continue;
+        submit(h, k);
+        cv_.notify_all();
     }
 }
 
@@ -164,9 +344,12 @@ bool LanesServe::commit(Lane& l, int32_t id) {
 // The lane's next step into the running pipe (mu held): its plan's next prefill piece, or a decode step [next]. A refused
 // submit ends the request (the pipe refuses every step after a stage error).
 void LanesServe::submit(Lane& l, uint32_t li) {
-    l.parked = false; l.t_sub = Clock::now();
+    l.parked = false; l.held = false; l.bypass = 0; l.t_sub = Clock::now();
+    l.qheld = l.qfree = false;   // (P4 B36 (C): its quota wait, if any, ends here)
     std::string e;
-    if (l.phase == Lane::Phase::kPrefill) {
+    const bool prefill = l.phase == Lane::Phase::kPrefill;
+    if (prefill) {
+        maybe_recut(l, li, l.chunk_at);   // (P4 B36 (A): nothing of the lane is in the pipe now)
         const auto [p0, t] = l.plan.chunks[l.chunk_at];
         l.pend = t; ++l.chunks;
         e = m_.pipe_submit(li, l.rq->ids->data() + p0, t, p0);
@@ -175,6 +358,40 @@ void LanesServe::submit(Lane& l, uint32_t li) {
         e = m_.pipe_submit(li, &l.next, 1, l.pos);
     }
     if (!e.empty()) end_lane(l, std::string("error: ") + m_.tag() + " lane " + std::to_string(li) + ": " + e, true);
+    else if (prefill && o_.short_first && short_lane(l)) short_piece_in(li);   // (P4 B34 (3))
+}
+
+// P4 B34: card 0 is idle (the pipe's idle hook: on card 0's stage thread after it finished a step, or on card 1's after a step
+// there left a lane with one piece past card 0). The oldest prefilling lane whose one piece in flight has left card 0 sends its
+// next piece now (the pipe checks that, and takes it only into an idle card 0), so card 0 runs it beside card 1's run of the
+// piece before -- run_chunks' overlap, per lane: decode groups and every other piece keep their places. Not past the lane's
+// mark or plan, and not while a turn is due (a lane at its prompt end or mark, a re-prepare: the turn's drain would wait for
+// the lookahead on both cards). Not taking it changes nothing.
+void LanesServe::on_idle0() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (!piping_ || pause_ || stopping_) return;
+    for (const Lane& l : lanes_)
+        if (l.busy && (l.phase == Lane::Phase::kPromptReady || l.phase == Lane::Phase::kMark || l.reprep)) return;
+    auto offer = [&](uint32_t li) {
+        Lane& l = lanes_[li];
+        if (!l.busy || l.phase != Lane::Phase::kPrefill || l.parked || l.want_stop || l.ahead) return false;
+        const size_t k = l.chunk_at;   // the piece in flight
+        if (k + 1 >= l.plan.chunks.size() || (l.mark_at && l.plan.chunks[k].first + l.plan.chunks[k].second == l.mark_at)) return false;
+        const bool shrt = o_.short_first && short_lane(l);
+        if (o_.short_first && !shrt && shorts_pending(l, li)) return false;   // (P4 B34 (3): a long lane's next piece waits)
+        if (quota_due(l, li)) return false;                                   // (P4 B36 (C): no lookahead owing the decoders)
+        maybe_recut(l, li, k + 1);   // (P4 B36 (A): piece k is in the pipe, the rest not yet)
+        const auto [p0, t] = l.plan.chunks[k + 1];
+        bool taken = false;
+        if (const std::string e = m_.pipe_submit_ahead(li, l.rq->ids->data() + p0, t, p0, taken); !e.empty())
+            std::fprintf(stderr, "[%s] lane %u lookahead at %u: %s\n", m_.tag(), li, p0, e.c_str());
+        if (!taken) return false;
+        l.ahead = true; l.t_ahead = Clock::now(); ++l.chunks; ++lookaheads_;
+        if (shrt) short_piece_in(li);
+        return true;
+    };
+    for (uint32_t li : fifo_) if (offer(li)) return;   // (P4 B15: the FIFO's order first)
+    for (uint32_t li = 0; li < lanes_.size(); ++li) if (offer(li)) return;
 }
 
 int32_t LanesServe::sample_into(Lane& l, uint32_t li, bool first, std::string& err) {
@@ -196,6 +413,7 @@ void LanesServe::on_done(uint32_t li) {
     std::string err;
     const int32_t id = sample_into(l, li, false, err);
     step_sampled(l, li, id, err);
+    quota_kick();   // (P4 B36 (C))
 }
 
 // P4 B14 rows mode: a group's done callback (the last stage's thread) -- per lane the head of on_done, ONE sample_rows over
@@ -211,6 +429,11 @@ void LanesServe::on_done_rows(std::span<const uint32_t> lanes) {
         if (!l.busy || l.phase == Lane::Phase::kDone) continue;
         if (step_landed(l, li)) dec.push_back(li);
     }
+    // (P4 B36 (C): a prefill piece that landed in this group counts the decoders' quota from after the group's decode rows,
+    // which ran beside it)
+    if (o_.decode_quota && dec.size() < lanes.size())
+        for (uint32_t li : lanes)
+            if (lanes_[li].busy && lanes_[li].phase == Lane::Phase::kPrefill) quota_base(lanes_[li]);
     if (!dec.empty()) {
         std::vector<const LanesSampling*> sps;
         std::vector<std::span<const int32_t>> wins;
@@ -227,6 +450,7 @@ void LanesServe::on_done_rows(std::span<const uint32_t> lanes) {
         try { err = m_.sample_rows(dec, sps, wins, seeds, picks); }
         catch (const std::exception& x) { err = std::string("threw: ") + x.what(); }
         for (size_t i = 0; i < dec.size(); ++i) step_sampled(lanes_[dec[i]], dec[i], picks[i], err);
+        quota_kick();   // (P4 B36 (C): after the group's next steps went in)
     }
     const double ms = ms_since(t_cb);
     for (uint32_t li : lanes) lanes_[li].cb_ms += ms;
@@ -243,6 +467,15 @@ bool LanesServe::step_landed(Lane& l, uint32_t li) {
     if (prefill) {
         l.pos = l.plan.chunks[l.chunk_at].first + l.plan.chunks[l.chunk_at].second;
         ++l.chunk_at;
+        l.t_land = Clock::now();   // (P4 B34 (3): the short-first guard's wait counts from here)
+        quota_base(l);             // (P4 B36 (C): the decoders' quota counts from here)
+        if (l.ahead) {   // P4 B34: the next piece is in the pipe already (on_idle0) and is now the lane's step in flight. A
+                         // lookahead never passes the mark or the plan's end, and the lane cannot end with a piece in flight:
+                         // its mark, prompt end, a client that left and a pause all wait for that piece to land.
+            l.ahead = false; l.t_sub = l.t_ahead; l.pend = l.plan.chunks[l.chunk_at].second;
+            cv_.notify_all();                                             // (the request thread's liveness probe)
+            return false;
+        }
         if (l.mark_at && l.pos == l.mark_at && l.chunk_at < l.plan.chunks.size()) {   // P4 B15: the mark, in its request's turn
             if (l.want_stop) end_lane(l, "abort", false);
             else l.phase = Lane::Phase::kMark;
@@ -251,7 +484,7 @@ bool LanesServe::step_landed(Lane& l, uint32_t li) {
         }
         if (l.chunk_at < l.plan.chunks.size()) {
             if (l.want_stop) end_lane(l, "abort", false);               // the client left during the prompt
-            else if (pause_ || stopping_) l.parked = true;
+            else if (pause_ || stopping_ || hold_long(l, li)) l.parked = true;   // (P4 B34 (3): or held for the short prompts)
             else submit(l, li);
             cv_.notify_all();                                             // (the request thread's liveness probe)
             return false;
@@ -262,7 +495,7 @@ bool LanesServe::step_landed(Lane& l, uint32_t li) {
         cv_.notify_all();
         return false;
     }
-    ++steps_; ++l.steps;
+    ++steps_; ++l.steps; ++l.dsteps;
     step_ms_ = steps_ == 1 ? step : 0.9 * step_ms_ + 0.1 * step;
     l.pos += 1;
     return true;
@@ -290,23 +523,35 @@ void LanesServe::pipe_failed(const std::string& e) {
 
 // The serial turn (lk holds mu; returns with it held): after the current holder, the pipe PAUSED -- the callbacks park their
 // lanes at their next completion and pipe_pause waits for the steps in flight. A stage error stops the pipe (the next release
-// starts a new one) and fails every running request.
-void LanesServe::take_turn(std::unique_lock<std::mutex>& lk) {
+// starts a new one) and fails every running request. P4 B33: false once the engine is stopping (abort_all): the turn is not
+// taken (or given back when the stop came during the drain) and the caller skips its device work.
+bool LanesServe::take_turn(std::unique_lock<std::mutex>& lk) {
     ++turn_waiters_;
-    cv_.wait(lk, [&] { return !turn_busy_; });
+    cv_.wait(lk, [&] { return !turn_busy_ || stopping_; });
     --turn_waiters_;
+    if (stopping_) return false;
     turn_busy_ = true;
     if (piping_) {
         pause_ = true;
         paused_valid_ = true; pause_t0_ = Clock::now();   // (P4 B15: the handover budget counts from here)
+        const uint32_t dec = decoding(), act = busy();
         lk.unlock();
         std::string e = m_.pipe_pause();
         if (!e.empty()) (void)m_.pipe_stop();   // (returns the same error and clears it)
         lk.lock();
+        // P4 B29: the drain (the steps in flight finishing before the turn's serial work may start), always counted for /health
+        const double dms = ms_since(pause_t0_);
+        drain_ms_ += dms; drain_max_ms_ = std::max(drain_max_ms_, dms); ++drains_;
+        if (lanes_trace_on())
+            std::fprintf(stderr, "[%s drain] turn %llu: pipe_pause %.1f ms (%u lane(s) busy, %u decoding, %u waiting for the turn)\n",
+                         m_.tag(), (unsigned long long)turns_ + 1, dms, act, dec, turn_waiters_);
         piping_ = false; pause_ = false;
-        if (!e.empty()) pipe_failed(e);
+        // (P4 B33: a stop during the drain -- the error is a step cut at a layer boundary, every lane already ended by abort_all)
+        if (!e.empty() && !stopping_) pipe_failed(e);
     }
     ++turns_; turn_t0_ = Clock::now();
+    if (stopping_) { release_turn(lk); return false; }   // (P4 B33: the stop came while the pipe drained)
+    return true;
 }
 
 // Releases the turn (lk holds mu). Another request waiting for it takes it with the pipe still paused (no drain between the
@@ -341,7 +586,7 @@ void LanesServe::release_turn(std::unique_lock<std::mutex>& lk) {
             while (!fifo_.empty()) end_lane(lanes_[fifo_.front()], std::string("error: ") + m_.tag() + " pipe: " + e, true);
         } else {
             piping_ = true; paused_valid_ = false;
-            for (uint32_t li : due) submit(lanes_[li], li);
+            for (uint32_t li : due) if (!hold_long(lanes_[li], li)) submit(lanes_[li], li);   // (P4 B34 (3): a held lane stays parked)
             fifo_kick();
         }
     }
@@ -352,8 +597,7 @@ void LanesServe::release_turn(std::unique_lock<std::mutex>& lk) {
 // A stage error whose step ran no callback (a lone failing lane) is seen from the request threads' waits
 void LanesServe::poll_pipe(std::unique_lock<std::mutex>& lk) {
     if (!piping_ || m_.pipe_error().empty()) return;
-    take_turn(lk);
-    release_turn(lk);
+    if (take_turn(lk)) release_turn(lk);
 }
 
 int LanesServe::choose(const std::vector<int32_t>& ids, uint32_t max_tokens) const {
@@ -434,8 +678,7 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
             lk.unlock(); const bool ok = alive(); lk.lock();
             if (!ok) { r.finish_reason = "abort"; return r; }
         }
-        if (stopping_) { r.finish_reason = "abort"; return r; }
-        take_turn(lk);
+        if (stopping_ || !take_turn(lk)) { r.finish_reason = "abort"; return r; }
         li = choose(ids, rq.sp.max_tokens);
         if (li >= 0) break;
         release_turn(lk);
@@ -444,7 +687,7 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     r.lane = lane;
     Lane& l = lanes_[lane];
     l.busy = true; l.phase = Lane::Phase::kPrefill; l.rq = &rq; l.finish.clear();
-    l.want_stop = l.lost = l.parked = l.kept = false;
+    l.want_stop = l.lost = l.parked = l.kept = l.ahead = l.held = l.recut = l.qheld = l.qfree = false; l.bypass = 0;
     l.outbox.clear(); l.out.clear(); l.pend = 0; l.next = -1; l.steps = l.chunks = 0; l.cb_ms = 0;
     l.hist.assign(ids.begin(), ids.end());
     l.max_new = lanes_reply_budget(T, rq.sp.max_tokens, l.cap); l.n_new = 0;   // (T < l.cap)
@@ -501,6 +744,8 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
                 for (uint32_t q = 0; q < t; q += o_.mix_chunk) cut.emplace_back(p0 + q, std::min(o_.mix_chunk, t - q));
             l.plan.chunks.swap(cut);
         }
+        l.piece_max = 0;                                               // (P4 B34 (3): the short rule's piece size)
+        for (const auto& c : l.plan.chunks) l.piece_max = std::max(l.piece_max, c.second);
         if (alone_now || l.plan.chunks.empty()) {
             size_t done = 0;
             const std::span<const LanesChunk> all(l.plan.chunks);
@@ -527,6 +772,7 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     // (mu held, the turn held) after prep: the lane ends, is ready for its first id, or waits for its pieces
     auto after_prep = [&](const std::string& we, bool initial) {
         r.cached_tokens = reused;
+        if (l.phase == Lane::Phase::kDone) return;                     // (P4 B33: abort_all ended it while the turn ran)
         if (!we.empty() && e.empty()) e = we;
         if (!pe.empty()) end_lane(l, "error: prefix cache: " + pe, true);
         else if (!e.empty()) end_lane(l, "error: " + e, true);
@@ -540,6 +786,8 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
             else { l.next = first; l.phase = Lane::Phase::kDecode; l.parked = true; }   // the release submits its first decode step
         } else {
             l.parked = true;                                           // the next prefill piece is due: the release submits it
+            l.t_land = Clock::now();                                   // (P4 B34 (3): the short-first guard's wait)
+            quota_base(l);                                             // (P4 B36 (C): the decoders' quota)
             if (initial && o_.prefill_fifo && l.phase == Lane::Phase::kPrefill) fifo_.push_back(lane);
         }
     };
@@ -553,7 +801,7 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     uint32_t seen = l.pos;
     for (;;) {
         if (l.phase == Lane::Phase::kMark) {
-            take_turn(lk);
+            if (!take_turn(lk)) { end_lane(l, "abort", false); continue; }   // (P4 B33: stopping)
             if (l.phase == Lane::Phase::kMark) {
                 const uint32_t at = l.pos;
                 std::string me;
@@ -561,14 +809,15 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
                 log_mark(me.empty() ? wm : me);
                 ++marks_;
                 l.mark_at = 0;
-                if (l.want_stop) end_lane(l, "abort", false);
+                if (l.phase != Lane::Phase::kMark) {}                     // (P4 B33: abort_all ended it meanwhile)
+                else if (l.want_stop) end_lane(l, "abort", false);
                 else { l.phase = Lane::Phase::kPrefill; l.parked = true; }   // (still the FIFO's head)
             }
             release_turn(lk);
             continue;
         }
         if (l.phase == Lane::Phase::kPrefill && l.reprep) {
-            take_turn(lk);
+            if (!take_turn(lk)) { end_lane(l, "abort", false); continue; }   // (P4 B33: stopping)
             if (l.phase == Lane::Phase::kPrefill && l.reprep) {
                 l.reprep = false; ++l.repreps; ++repreps_;
                 uint32_t oth = 0;
@@ -583,8 +832,15 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
             continue;
         }
         if (l.phase != Lane::Phase::kPrefill) break;
-        cv_.wait_for(lk, std::chrono::seconds(1));
+        int64_t wait_ms = 1000;   // (P4 B36 (C): a lane held for the decode quota wakes at its guard's deadline)
+        if (l.qheld && !l.qfree) wait_ms = std::clamp<int64_t>(int64_t(double(o_.quota_max_ms) - ms_since(l.t_qhold)) + 1, 1, 1000);
+        cv_.wait_for(lk, std::chrono::milliseconds(wait_ms));
         if (l.phase != Lane::Phase::kPrefill || l.reprep) continue;
+        // P4 B34 (3): a lane held for the short prompts takes its next piece once they are done or the guard's wait passed
+        // (P4 B36 (C): and one held for the decode quota once the decoders made their steps or its guard's wait passed)
+        if ((l.held || l.qheld) && l.parked && !l.want_stop && piping_ && !pause_ && !stopping_ && !hold_long(l, lane)) {
+            submit(l, lane); cv_.notify_all();
+        }
         // (P4 B15) a prompt held in the FIFO behind another has no step in flight: probe its client each second, and a client
         // that left ends it here
         if (l.parked && fifo_waiting(lane) && on_token && !l.want_stop) {
@@ -600,8 +856,9 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     }
     // 4. the prompt's end (the turn held): the arch's checkpoints and the rows past Tp, then the first id
     if (l.phase == Lane::Phase::kPromptReady) {
-        take_turn(lk);
-        if (l.phase == Lane::Phase::kPromptReady) {
+        const bool turn = take_turn(lk);
+        if (!turn) end_lane(l, "abort", false);                           // (P4 B33: stopping)
+        if (turn && l.phase == Lane::Phase::kPromptReady) {
             std::string e2;
             const bool kept = l.kept;
             const std::string we2 = serial(lk, [&] {
@@ -610,7 +867,8 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
                 if (e2.empty()) first = sample_into(l, lane, true, se);
             });
             if (!we2.empty() && e2.empty()) e2 = we2;
-            if (!e2.empty()) end_lane(l, "error: " + e2, true);
+            if (l.phase == Lane::Phase::kDone) {}                          // (P4 B33: abort_all ended it meanwhile)
+            else if (!e2.empty()) end_lane(l, "error: " + e2, true);
             else if (!se.empty()) end_lane(l, "error: sample: " + se, true);
             else if (l.want_stop) end_lane(l, "abort", false);
             else {
@@ -620,7 +878,7 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
                 else { l.next = first; l.phase = Lane::Phase::kDecode; l.parked = true; }
             }
         }
-        release_turn(lk);
+        if (turn) release_turn(lk);
     }
     // 5. the outcome: ids as they land in the outbox, the reply's text re-decoded whole (the engine's serial loop) and streamed
     // up to its last complete UTF-8 character; the server's callback declining cancels the lane at its next completion
@@ -652,6 +910,11 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     }
     // 6. the finish
     r.completion_tokens = uint32_t(all.size());
+    // P4 B27: where the answer starts = after the first generated </think> (a special token detok drops; the prefix's
+    // decode is a byte prefix of the whole reply's)
+    if (rq.think_close >= 0)
+        for (size_t k = 0; k < all.size(); ++k)
+            if (all[k] == rq.think_close) { r.answer_start = m_.detok(std::span<const int32_t>(all).first(k + 1)).size(); break; }
     const std::string& f = l.finish;
     r.finish_reason = aborted ? "abort" : f == "stop" || f == "abort" || f.rfind("error:", 0) == 0 ? f : "length";
     if (t_dec.time_since_epoch().count()) r.decode_ms = ms_since(t_dec);
@@ -661,8 +924,8 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
                  r.prefill_ms, serial_chunks, l.chunks - serial_chunks, l.n_new, l.max_new, l.steps, r.finish_reason.c_str(), busy(), l.cb_ms,
                  (unsigned long long)turns_, (unsigned long long)handovers_, paused_ms_);
     // P4 B10: the arch's reply snapshot, in a turn (the lane is still this request's)
-    if (rq.reply_cache && !l.lost && !l.out.empty() && (r.finish_reason == "stop" || r.finish_reason == "length") && !stopping_) {
-        take_turn(lk);
+    if (rq.reply_cache && !l.lost && !l.out.empty() && (r.finish_reason == "stop" || r.finish_reason == "length") && !stopping_ &&
+        take_turn(lk)) {
         std::string e4;
         const std::string fin = r.finish_reason;
         const uint32_t pos = l.pos;
@@ -671,8 +934,7 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
         if (!e4.empty()) std::fprintf(stderr, "[%s] lane %u finish: %s\n", m_.tag(), lane, e4.c_str());
         release_turn(lk);
     }
-    if (l.lost) {
-        take_turn(lk);
+    if (l.lost && take_turn(lk)) {   // (P4 B33: stopping skips the reset: the process ends and the lane with it)
         (void)serial(lk, [&] { if (auto e3 = m_.reset_lane(lane); !e3.empty()) std::fprintf(stderr, "[%s] reset lane %u: %s\n", m_.tag(), lane, e3.c_str()); });
         l.lost = false;
         release_turn(lk);
@@ -687,14 +949,19 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
 
 std::string LanesServe::status_json() const {
     std::lock_guard<std::mutex> lk(mu_);
-    char buf[512];
+    char buf[1024];
     std::snprintf(buf, sizeof buf,
                   "{\"lanes\":%zu,\"lanes_active\":%u,\"decoding\":%u,\"tokens\":%llu,\"step_ms\":%.2f,\"turns\":%llu,"
                   "\"paused_ms\":%.0f,\"handovers\":%llu,\"prefill_queue\":%zu,\"marks\":%llu,\"repreps\":%llu,"
-                  "\"budget_releases\":%llu}",
+                  "\"budget_releases\":%llu,\"drains\":%llu,\"drain_ms\":%.0f,\"drain_max_ms\":%.0f,\"snapshots\":%llu,"
+                  "\"lookaheads\":%llu,\"short_bypass\":%llu,\"short_guard\":%llu,\"short_guard_wait\":%llu,\"recuts\":%llu,"
+                  "\"quota_holds\":%llu,\"quota_guard\":%llu}",
                   lanes_.size(), busy(), decoding(), (unsigned long long)tokens_, step_ms_, (unsigned long long)turns_, paused_ms_,
                   (unsigned long long)handovers_, fifo_.size(), (unsigned long long)marks_.load(), (unsigned long long)repreps_,
-                  (unsigned long long)budget_releases_);
+                  (unsigned long long)budget_releases_, (unsigned long long)drains_, drain_ms_, drain_max_ms_,
+                  (unsigned long long)m_.snapshots(), (unsigned long long)lookaheads_, (unsigned long long)short_bypass_,
+                  (unsigned long long)short_guard_, (unsigned long long)short_guard_wait_, (unsigned long long)recuts_,
+                  (unsigned long long)quota_holds_, (unsigned long long)quota_guard_);
     return buf;
 }
 

@@ -73,7 +73,9 @@ bool g_pipeline = true;   // IE_QWEN35_NO_PIPELINE unset
 
 // --parallel 1 on the 27B split (Engine::generate), written from its prefill_to loop, not from q27_lanes.hpp: a range longer
 // than one chunk runs pipelined (every chunk the prefill kernels, a 1-row last one too); a shorter range runs forward() chunk by
-// chunk (a 1-row chunk the decode kernels); decode steps are 1-row decode-kernel steps.
+// chunk (a 1-row chunk the decode kernels); decode steps are 1-row decode-kernel steps. P4 B25: the shared prefix is cut at
+// share_at rounded down to the chunk grid, and the two ranges it makes of [restored, snap_at) run pipelined when the uncut
+// range is longer than a chunk (measured from 0 when the restore is the shared prefix itself).
 std::vector<int32_t> serial_ref(Cache& c, const std::vector<int32_t>& ids, uint32_t snap_at, uint32_t n, uint64_t rng,
                                 uint32_t* restored_out = nullptr, bool reply_cache = false, uint32_t share_at = 0,
                                 bool cache_on = true) {
@@ -82,18 +84,21 @@ std::vector<int32_t> serial_ref(Cache& c, const std::vector<int32_t>& ids, uint3
     uint32_t pos = cache_on ? c.restore(ids, h) : 0;
     if (restored_out) *restored_out = pos;
     const uint32_t restored = pos;
-    auto prefill_to = [&](uint32_t end) {
-        if (g_pipeline && end > pos && end - pos > kChunk) {
+    const uint32_t cut = share_at / kChunk * kChunk;
+    const uint32_t base = (cut && restored == cut) ? 0 : restored;
+    const bool whole_pk = g_pipeline && cut && snap_at > restored && snap_at - base > kChunk;
+    auto prefill_to = [&](uint32_t end, bool pk = false) {
+        if (pk || (g_pipeline && end > pos && end - pos > kChunk)) {
             while (pos < end) { const uint32_t k = std::min(kChunk, end - pos); h = step_hash(h, ids.data() + pos, k, pos, true); pos += k; }
             return;
         }
         while (pos < end) { const uint32_t k = std::min(kChunk, end - pos); h = step_hash(h, ids.data() + pos, k, pos, false); pos += k; }
     };
-    if (share_at > restored) {
-        prefill_to(share_at);
-        c.insert(std::vector<int32_t>(ids.begin(), ids.begin() + share_at), h);
+    if (cut > restored) {
+        prefill_to(cut, whole_pk);
+        c.insert(std::vector<int32_t>(ids.begin(), ids.begin() + cut), h);
     }
-    prefill_to(snap_at);
+    prefill_to(snap_at, whole_pk);
     if (cache_on && snap_at > restored) c.insert(std::vector<int32_t>(ids.begin(), ids.begin() + snap_at), h);
     prefill_to(T);
     std::vector<int32_t> out;
@@ -302,12 +307,17 @@ void run_all(std::vector<Req*> rs, ie::LanesServe& s) {
     for (auto& t : th) t.join();
 }
 
-// --parallel 1's op sequence, written from Engine::generate independently of q27_prefill_ops: (piece | insert) in order.
+// --parallel 1's op sequence, written from Engine::generate independently of q27_prefill_ops: (piece | insert) in order. P4 B25:
+// the shared cut is share rounded down to the pf grid, and [reused, snap)'s ranges take the uncut range's kind (from 0 when the
+// restore is the shared prefix itself).
 std::vector<ie::Q27Op> ref_ops(uint32_t T, uint32_t reused, uint32_t snap, uint32_t share, bool cache_on, uint32_t pf, bool pipe) {
     std::vector<ie::Q27Op> r;
     uint32_t pos = reused;
-    auto prefill_to = [&](uint32_t end) {
-        const bool piped = pipe && end > pos && (end - pos) > pf;
+    const uint32_t cut = share / pf * pf;
+    const uint32_t base = (cut && reused == cut) ? 0 : reused;
+    const bool whole = pipe && cut && snap > reused && snap - base > pf;
+    auto prefill_to = [&](uint32_t end, bool pk) {
+        const bool piped = pk || (pipe && end > pos && (end - pos) > pf);
         while (pos < end) {
             const uint32_t n = std::min(pf, end - pos);
             ie::Q27Op o; o.piece = ie::Q27Piece{pos, n, piped};
@@ -315,10 +325,10 @@ std::vector<ie::Q27Op> ref_ops(uint32_t T, uint32_t reused, uint32_t snap, uint3
             pos += n;
         }
     };
-    if (share > reused) { prefill_to(share); ie::Q27Op o; o.kind = ie::Q27Op::kShared; o.at = share; r.push_back(o); }
-    prefill_to(snap);
+    if (cut > reused) { prefill_to(cut, whole); ie::Q27Op o; o.kind = ie::Q27Op::kShared; o.at = cut; r.push_back(o); }
+    prefill_to(snap, whole);
     if (cache_on && snap > reused) { ie::Q27Op o; o.kind = ie::Q27Op::kSnap; o.at = snap; r.push_back(o); }
-    prefill_to(T);
+    prefill_to(T, false);
     return r;
 }
 bool same_op(const ie::Q27Op& a, const ie::Q27Op& b) {
@@ -387,8 +397,9 @@ void test_rules() {
                                 bool has_pk1 = false;
                                 for (const auto& o : ref) has_pk1 = has_pk1 || (o.kind == ie::Q27Op::kPiece && o.piece.rows == 1 && o.piece.pk);
                                 with_pk1 += has_pk1;
-                                const bool due = share > reused && share < p.Tp;
-                                if (due != (p.mark == share && share > 0)) mark_ok = false;
+                                const uint32_t cut = share / pf * pf;   // P4 B25: the mark sits on the grid cut
+                                const bool due = cut > reused && cut < p.Tp;
+                                if (due != (p.mark == cut && cut > 0)) mark_ok = false;
                                 if (p.Tp < reused || p.Tp > T) cut_ok = false;
                                 if (cache_on && snap > reused && p.Tp > snap) cut_ok = false;   // the pipe's part ends by the snapshot
                             }
@@ -397,8 +408,54 @@ void test_rules() {
                       std::to_string(shapes) + " shapes (T <= 30, pipeline on/off, cache on/off)");
     check(split_ok, "the pipe's pieces + the module's mark + prompt_end's rest == --parallel 1's ops in order");
     check(no_pk1 && with_pk1 > 0, "no 1-row pipelined piece ever goes through the pipe (" + std::to_string(with_pk1) + " shapes have one)");
-    check(mark_ok, "q27_plan: mark == share exactly when reused < share < Tp");
+    check(mark_ok, "q27_plan: mark == the grid cut of share exactly when reused < cut < Tp");
     check(cut_ok, "q27_plan: pieces <= pf_chunk rows, reused <= Tp <= T, Tp <= the snapshot boundary when one is due");
+
+    // P4 B25: the pieces with the shared prefix on == the cache-off path's (a cold prefill from 0 of the same prompt), position,
+    // rows AND the kind of every 1-row piece: the first request (cold, the cut inserted) and a later one restoring the cut.
+    {
+        bool first_ok = true, restore_ok = true;
+        uint64_t shapes = 0, cuts = 0;
+        auto pieces = [](const std::vector<ie::Q27Op>& ops, uint32_t from) {
+            std::vector<ie::Q27Op> r;
+            for (const auto& o : ops) if (o.kind == ie::Q27Op::kPiece && o.piece.pos0 >= from) r.push_back(o);
+            return r;
+        };
+        auto same_pieces = [&](const std::vector<ie::Q27Op>& a, const std::vector<ie::Q27Op>& b) {
+            if (a.size() != b.size()) return false;
+            for (size_t i = 0; i < a.size(); ++i) if (!same_op(a[i], b[i])) return false;
+            return true;
+        };
+        for (bool pipe : {true, false})
+            for (uint32_t T = 2; T <= 40; ++T)
+                for (uint32_t snap = 1; snap <= T; ++snap)
+                    for (uint32_t share = 1; share < snap; ++share)
+                        for (uint32_t pf : {1u, 2u, 3u, 5u, 8u}) {
+                            ++shapes;
+                            const auto off = pieces(ie::q27_prefill_ops(T, 0, snap, 0, true, pf, pipe), 0);
+                            const auto on1 = ie::q27_prefill_ops(T, 0, snap, share, true, pf, pipe);
+                            if (!same_pieces(pieces(on1, 0), off)) {
+                                if (first_ok) std::printf("  cold pieces differ: T %u snap %u share %u pf %u pipe %d\n", T, snap, share, pf, pipe);
+                                first_ok = false;
+                            }
+                            const uint32_t cut = share / pf * pf;
+                            if (!cut) continue;
+                            ++cuts;
+                            bool has_cut = false;
+                            for (const auto& o : on1) has_cut = has_cut || (o.kind == ie::Q27Op::kShared && o.at == cut);
+                            const auto on2 = ie::q27_prefill_ops(T, cut, snap, share, true, pf, pipe);
+                            bool no_shared = true;
+                            for (const auto& o : on2) no_shared = no_shared && o.kind != ie::Q27Op::kShared;
+                            if (!has_cut || !no_shared || !same_pieces(pieces(on2, 0), pieces(off, cut))) {
+                                if (restore_ok) std::printf("  restored pieces differ: T %u snap %u share %u pf %u pipe %d\n", T, snap, share, pf, pipe);
+                                restore_ok = false;
+                            }
+                        }
+        check(first_ok, "shared prefix on, first request: its pieces (position, rows, 1-row kinds) == the cache-off cold prefill's, " +
+                            std::to_string(shapes) + " shapes (T <= 40, every share < snap, pf 1/2/3/5/8, pipeline on/off)");
+        check(restore_ok && cuts > 0, "a request restoring the grid cut: the cut inserted at share rounded down to pf, no shared insert of its own, "
+                                          "and its pieces == the cache-off cold prefill's from the cut on (" + std::to_string(cuts) + " shapes)");
+    }
     {
         // T 13 with pf 5 cold, no cache: one pipelined range 5+5+3 (no 1-row piece) -> the pipe runs all of it
         const auto p = ie::q27_plan(ie::q27_prefill_ops(13, 0, 13, 0, false, 5, true), 0, 13);
@@ -558,11 +615,12 @@ void test_reply_snapshot(bool rows) {
     s.shutdown();
 }
 
-// The shared prefix (IE_QWEN35_SHARED_PREFIX=1 turns it on for --parallel 1 AND the lanes): one system prefix, a new user turn
-// per request; the first request marks it, later concurrent ones restore it into their own lane; every reply == --parallel 1's.
+// The shared prefix (on unless IE_QWEN35_SHARED_PREFIX=0, for --parallel 1 AND the lanes): one system prefix, a new user turn
+// per request; the first request marks it (at the chunk-grid cut, P4 B25), later concurrent ones restore it into their own lane;
+// every reply == --parallel 1's with the shared prefix on AND == the cache-off path's (a cold prefill of the same prompt).
 void test_agent_traffic(bool rows) {
-    constexpr uint32_t kSys = 21;   // 4 x 5 + 1: the shared range ends on a 1-row pipelined piece (prompt_end inserts it)
-    for (uint32_t sys_len : {kSys, 25u}) {
+    for (uint32_t sys_len : {21u, 25u, 29u}) {   // cuts 20 (a 1-row rest before the turn), 25 (on the grid), 25
+        const uint32_t cut = sys_len / kChunk * kChunk;
         const std::vector<int32_t> sys = conv(sys_len, 400);
         auto agent_req = [&](int k, uint32_t n) {
             std::vector<int32_t> ids = sys;
@@ -573,24 +631,30 @@ void test_agent_traffic(bool rows) {
         };
         FakeQ27 m({300, 120, 120, 120}, rows);
         ie::LanesServe s(m, {});
-        Cache ref;
+        Cache ref, off;   // off: the cache-off path's prompt cache (conversation snapshots only, never the shared prefix)
         std::vector<std::unique_ptr<Req>> rs;
         rs.push_back(agent_req(0, 12));
         rs[0]->run(s);
         uint32_t r0 = 0;
         const bool ok0 = text_of(serial_ref(ref, rs[0]->ids, rs[0]->rq.snap_at, 12, rs[0]->rq.rng, &r0, false, sys_len)) == rs[0]->res.text;
+        uint32_t off0 = 0;
+        const bool off_ok0 = text_of(serial_ref(off, rs[0]->ids, rs[0]->rq.snap_at, 12, rs[0]->rq.rng, &off0, false, 0)) == rs[0]->res.text;
         for (int k = 1; k <= 3; ++k) rs.push_back(agent_req(k, 12));
         run_all({rs[1].get(), rs[2].get(), rs[3].get()}, s);
-        bool all_share = true, all_ref = true;
+        bool all_share = true, all_ref = true, all_off = true;
         for (int k = 1; k <= 3; ++k) {
             Req& r = *rs[size_t(k)];
-            all_share = all_share && r.res.cached_tokens == sys_len;
+            all_share = all_share && r.res.cached_tokens == cut;
             Cache mine = ref;
             all_ref = all_ref && text_of(serial_ref(mine, r.ids, r.rq.snap_at, 12, r.rq.rng, nullptr, false, sys_len)) == r.res.text;
+            uint32_t offk = 0;
+            all_off = all_off && text_of(serial_ref(off, r.ids, r.rq.snap_at, 12, r.rq.rng, &offk, false, 0)) == r.res.text && offk == 0;
         }
         check(ok0 && all_share && all_ref && m.bad == 0,
-              "shared prefix of " + std::to_string(sys_len) + " rows (" + (sys_len == kSys ? "inserted in prompt_end" : "the module's mark") +
-                  "): request 1 cold, 2-4 at once restore it (cached == " + std::to_string(sys_len) + ") and == --parallel 1's");
+              "shared prefix of " + std::to_string(sys_len) + " rows, cut at " + std::to_string(cut) +
+                  " (the module's mark): request 1 cold, 2-4 at once restore it (cached == " + std::to_string(cut) + ") and == --parallel 1's");
+        check(off_ok0 && off0 == 0 && all_off, "shared prefix of " + std::to_string(sys_len) +
+                                                   " rows: every reply == the cache-off path's cold prefill of the same prompt");
         s.shutdown();
     }
 }

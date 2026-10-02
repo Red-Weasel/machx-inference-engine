@@ -263,6 +263,45 @@ sycl::event embedding_lookup_q4k(sycl::queue& q,
     });
 }
 
+// Q5_K: 64 lanes per token, lane l writes elements l, l+64, l+128, l+192 of each super-block. ggml dequantize_row_q5_K:
+// element e of a block is in 64-group j = e/64, nibble (e%64)/32 of qs[32j + e%32], fifth bit qh[e%32] bit 2j + that
+// nibble, sub-block e/32 (get_scale_min_k4); value (d*sc)*q - dmin*m.
+sycl::event embedding_lookup_q5k(sycl::queue& q,
+                                 const int32_t* token_ids,
+                                 const void* token_embd_q5k,
+                                 sycl::half* y,
+                                 uint32_t n_tokens, uint32_t hidden,
+                                 const std::vector<sycl::event>& deps) {
+    constexpr uint32_t WG = 64;
+    const auto* W = static_cast<const block_q5_K*>(token_embd_q5k);
+    const uint32_t blocks_per_token = hidden / 256;
+    return ie::ps(q, "embed_q5k", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<2>({n_tokens, WG}, {1, WG}), [=](sycl::nd_item<2> it) {
+            const uint32_t t   = uint32_t(it.get_global_id(0));
+            const uint32_t lid = uint32_t(it.get_local_id(1));
+            const int32_t  tok = token_ids[t];
+            if (tok < 0) return;
+            const block_q5_K* row = &W[uint64_t(tok) * blocks_per_token];
+            for (uint32_t b = 0; b < blocks_per_token; ++b) {
+                const block_q5_K& blk = row[b];
+                const float d = dev_fp16_to_fp32(blk.d), dmin = dev_fp16_to_fp32(blk.dmin);
+                for (uint32_t r = 0; r < 4; ++r) {
+                    const uint32_t e = lid + 64 * r, j = e >> 6, hn = (e >> 5) & 1, l = e & 31, sub = e >> 5;
+                    const uint8_t* sc = blk.scales;
+                    uint8_t s, m;
+                    if (sub < 4) { s = sc[sub] & 63; m = sc[sub + 4] & 63; }
+                    else { s = (sc[sub + 4] & 0xF) | ((sc[sub - 4] >> 6) << 4); m = (sc[sub + 4] >> 4) | ((sc[sub] >> 6) << 4); }
+                    const uint8_t v = blk.qs[32 * j + l];
+                    const int qv = int(hn ? (v >> 4) : (v & 0xF)) + (((blk.qh[l] >> (2 * j + hn)) & 1) ? 16 : 0);
+                    const float d1 = d * float(s), m1 = dmin * float(m);
+                    y[uint64_t(t) * hidden + uint64_t(b) * 256 + e] = sycl::half(d1 * float(qv) - m1);
+                }
+            }
+        });
+    });
+}
+
 // Native F16 embedding lookup: row-copy embd[tok, :] → y[t, :]. For EXL3 models
 // whose token_embd ships as plain F16 (kept faithful — not re-quantized).
 sycl::event embedding_lookup_f16(sycl::queue& q,

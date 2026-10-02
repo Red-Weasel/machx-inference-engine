@@ -65,6 +65,9 @@ optional `"version": 1`). Each server is an object of:
 | `restart` | `ie supervise` only: `"none"` (default) or `"on-failure"` (see Supervisor); `ie serve` ignores it |
 | every launch flag | spelled with `_`: `ctx`, `gpus`, `host`, `port`, `parallel`, `max_queue`, `slot_ctx`, `prefill_chunk`, `threads`, `vram_reserve_gib`, `int8_kv`, `spec`, `spec_k`, `spec_head`, `spec_draft`, `temp`, `top_k`, `top_p`, `min_p`, `repeat_penalty`, `repeat_last_n`, `presence_penalty`, `frequency_penalty`, `seed`, `max_tokens`, `stop` (array), `thinking` (true/false or "on"/"off"), `reasoning_effort`, and `prompt_cache` (true/false; false = `--no-prompt-cache`) |
 
+`parallel` takes a number, 1 to 16. Since v0.2.6, a server without the key picks its own number of request lanes at
+load, as `ie serve` does without `--parallel`; the string `"auto"` is not accepted in a layout.
+
 Top-level keys besides `servers` and `version`, all for `ie supervise` (`ie serve` ignores them): `default` (the
 server a request without `"model"` goes to; must name a server), `host` and `port` (the supervisor's front endpoint).
 

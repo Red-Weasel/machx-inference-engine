@@ -55,12 +55,9 @@ struct Q27Op {
     uint32_t at = 0;  // kShared / kSnap
 };
 
-// prefill_to(end) from p: pipelined (pk) when the range is longer than one chunk and the pipeline is on, else forward() chunk
-// by chunk; the same pf_chunk-row cuts either way.
-inline void q27_range(uint32_t p, uint32_t end, uint32_t pf_chunk, bool pipeline, std::vector<Q27Op>& out) {
-    if (end <= p) return;
+// [p, end) in pf_chunk-row pieces of one kind.
+inline void q27_pieces(uint32_t p, uint32_t end, uint32_t pf_chunk, bool pk, std::vector<Q27Op>& out) {
     const uint32_t piece = pf_chunk ? pf_chunk : 1u;
-    const bool pk = pipeline && end - p > piece;
     for (uint32_t q = p; q < end; q += piece) {
         Q27Op o;
         o.piece = Q27Piece{q, end - q < piece ? end - q : piece, pk};
@@ -68,21 +65,45 @@ inline void q27_range(uint32_t p, uint32_t end, uint32_t pf_chunk, bool pipeline
     }
 }
 
-// The whole prefill of a T-token prompt with [0, reused) restored: --parallel 1's prefill_to(share_at) + the shared insert (when
-// share_at > reused), prefill_to(snap_at) + the snapshot insert (when the cache is on and snap_at > reused), prefill_to(T).
-// share_at: 0 = none (it is < snap_at when set: shared_prefix_boundary).
+// prefill_to(end) from p: pipelined (pk) when the range is longer than one chunk and the pipeline is on, else forward() chunk
+// by chunk; the same pf_chunk-row cuts either way.
+inline void q27_range(uint32_t p, uint32_t end, uint32_t pf_chunk, bool pipeline, std::vector<Q27Op>& out) {
+    if (end <= p) return;
+    const uint32_t piece = pf_chunk ? pf_chunk : 1u;
+    q27_pieces(p, end, pf_chunk, pipeline && end - p > piece, out);
+}
+
+// P4 B25: the shared-prefix cut on the piece grid. With the shared-prefix cache off (and before P4) --parallel 1 prefills
+// [restored, snap_at) as ONE range, so its pieces sit at restored + k * pf_chunk; a cut at share_at moves every piece after it
+// unless share_at is on that grid, and the 27B's prefill is not cut-invariant (release gate F1). So the cut is share_at rounded
+// DOWN to a multiple of pf_chunk (0 = none): a cold prompt's grid. The rows between the cut and the shared prefix's end
+// (< pf_chunk) are prefilled again by every request that restores it.
+inline uint32_t q27_share_cut(uint32_t share_at, uint32_t pf_chunk) { return pf_chunk ? share_at / pf_chunk * pf_chunk : share_at; }
+
+// P4 B25: where the range that decides the kind of [reused, snap_at)'s pieces starts. With the cut in play the two ranges
+// [reused, cut) and [cut, snap_at) take the UNCUT range's kind, and a restore of the shared prefix itself (reused == cut) stands
+// for the cache-off path's cold prefill from 0 (nothing else in that path's cache matches a new conversation), so its range is
+// [0, snap_at). Matters only for a 1-row last piece (the prefill kernels of a pipelined range vs the decode kernels).
+inline uint32_t q27_pk_base(uint32_t reused, uint32_t cut) { return (cut && reused == cut) ? 0u : reused; }
+
+// The whole prefill of a T-token prompt with [0, reused) restored: --parallel 1's prefill_to(cut) + the shared insert (when
+// cut > reused), prefill_to(snap_at) + the snapshot insert (when the cache is on and snap_at > reused), prefill_to(T).
+// share_at: 0 = none (it is < snap_at when set: shared_prefix_boundary); the cut is q27_share_cut(share_at), and the pieces of
+// [reused, snap_at) take the kind of the range from q27_pk_base (P4 B25).
 inline std::vector<Q27Op> q27_prefill_ops(uint32_t T, uint32_t reused, uint32_t snap_at, uint32_t share_at, bool cache_on,
                                           uint32_t pf_chunk, bool pipeline) {
     std::vector<Q27Op> ops;
+    const uint32_t piece = pf_chunk ? pf_chunk : 1u;
+    const uint32_t cut = q27_share_cut(share_at, pf_chunk);
     uint32_t pos = reused;
-    if (share_at > reused) {
-        q27_range(pos, share_at, pf_chunk, pipeline, ops);
-        pos = share_at;
-        Q27Op o; o.kind = Q27Op::kShared; o.at = share_at;
+    const bool pk = pipeline && snap_at > pos && snap_at - q27_pk_base(reused, cut) > piece;
+    if (cut > reused) {
+        q27_pieces(pos, cut, pf_chunk, pk, ops);
+        pos = cut;
+        Q27Op o; o.kind = Q27Op::kShared; o.at = cut;
         ops.push_back(o);
     }
-    q27_range(pos, snap_at, pf_chunk, pipeline, ops);
-    if (snap_at > pos) pos = snap_at;
+    if (snap_at > pos) { q27_pieces(pos, snap_at, pf_chunk, pk, ops); pos = snap_at; }
     if (cache_on && snap_at > reused) { Q27Op o; o.kind = Q27Op::kSnap; o.at = snap_at; ops.push_back(o); }
     q27_range(pos, T, pf_chunk, pipeline, ops);
     return ops;
