@@ -135,6 +135,10 @@ inline LaunchOptions parse_launch_options(const std::vector<std::string>& args) 
         else if (flag == "--spec-k") e.spec_k = uint32_t(integer(1, 64));
         else if (flag == "--spec-head") e.spec_head = value();
         else if (flag == "--spec-draft") e.spec_draft = value();
+        else if (flag == "--mmproj") {   // P4 B45: the vision projector GGUF
+            e.mmproj = value();
+            if (e.mmproj.empty()) throw std::runtime_error("--mmproj cannot be empty");
+        }
         else if (flag == "--cards") out.cards = parse_card_list(value());
         else throw std::runtime_error("unknown option: " + flag);
     }

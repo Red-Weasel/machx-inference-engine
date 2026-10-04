@@ -16,6 +16,7 @@
 
 #include "ie/kernel_profiler.hpp"
 #include "ie/ops.hpp"
+#include "ie/prefill_gemm.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -2379,7 +2380,7 @@ sycl::event fa2_rows_xmx_(sycl::queue& q, const sycl::half* q_all, const sycl::h
                           sycl::half* y, float* partials, uint64_t row_floats, const FaDecodeRowsDesc* D,
                           uint32_t n_rows, uint32_t n_wgs, uint32_t li,
                           uint32_t n_q_heads, uint32_t n_kv_heads, uint32_t head_dim, uint32_t csplit,
-                          const std::vector<sycl::event>& deps, AttnProfileData* prof) {
+                          const std::vector<sycl::event>& deps, AttnProfileData* prof, uint32_t keep_below = 0) {
     namespace mat = sycl::ext::oneapi::experimental::matrix;
     using fp16 = sycl::half;
     constexpr uint32_t TM = 8, TN = 16, TK = 16;
@@ -2412,7 +2413,7 @@ sycl::event fa2_rows_xmx_(sycl::queue& q, const sycl::half* q_all, const sycl::h
                 const uint64_t in_off = uint64_t(rw.idx) * N_kv + uint64_t(kv) * head_dim + d;
                 rw.k[out_off] = k_all[in_off];
                 rw.v[out_off] = v_all[in_off];
-            } else {
+            } else if (rw.start_pos + r >= keep_below) {   // P4 B48: keep_below = the end of a group on ONE cache (0 = lanes)
                 rw.k[out_off] = fp16(0);
                 rw.v[out_off] = fp16(0);
             }
@@ -2817,6 +2818,21 @@ bool fa2_decode_rows_plan(sycl::queue& q, const FaDecodeRow* rows, uint32_t n_ro
     return true;
 }
 
+// keep_below (P4 B48): 0 for rows on their own caches (the request lanes). For a group of consecutive positions on ONE
+// cache (full_attention_fa2_decode_rows_shared) it is the group's end: the XMX append then leaves the group's own rows
+// alone instead of zeroing the 15 rows after each token -- the partial pass masks keys past a row's context itself.
+static sycl::event fa2_decode_rows_impl_(sycl::queue& q,
+                                         const FaDecodeRowsPlan& plan,
+                                         const sycl::half* q_in,
+                                         const sycl::half* k_in,
+                                         const sycl::half* v_in,
+                                         sycl::half* y,
+                                         float* partials,
+                                         uint32_t layer_slot,
+                                         const std::vector<sycl::event>& deps,
+                                         AttnProfileData* prof,
+                                         uint32_t keep_below);
+
 sycl::event full_attention_fa2_decode_rows(sycl::queue& q,
                                            const FaDecodeRowsPlan& plan,
                                            const sycl::half* q_in,
@@ -2827,6 +2843,32 @@ sycl::event full_attention_fa2_decode_rows(sycl::queue& q,
                                            uint32_t layer_slot,
                                            const std::vector<sycl::event>& deps,
                                            AttnProfileData* prof) {
+    return fa2_decode_rows_impl_(q, plan, q_in, k_in, v_in, y, partials, layer_slot, deps, prof, 0);
+}
+
+sycl::event full_attention_fa2_decode_rows_shared(sycl::queue& q,
+                                                  const FaDecodeRowsPlan& plan,
+                                                  const sycl::half* q_in,
+                                                  const sycl::half* k_in,
+                                                  const sycl::half* v_in,
+                                                  sycl::half* y,
+                                                  float* partials,
+                                                  uint32_t layer_slot,
+                                                  uint32_t group_end) {
+    return fa2_decode_rows_impl_(q, plan, q_in, k_in, v_in, y, partials, layer_slot, {}, nullptr, group_end);
+}
+
+static sycl::event fa2_decode_rows_impl_(sycl::queue& q,
+                                         const FaDecodeRowsPlan& plan,
+                                         const sycl::half* q_in,
+                                         const sycl::half* k_in,
+                                         const sycl::half* v_in,
+                                         sycl::half* y,
+                                         float* partials,
+                                         uint32_t layer_slot,
+                                         const std::vector<sycl::event>& deps,
+                                         AttnProfileData* prof,
+                                         uint32_t keep_below) {
     const uint32_t n_q_heads = plan.n_q_heads, n_kv_heads = plan.n_kv_heads, head_dim = plan.head_dim;
     const uint32_t N_q = n_q_heads * head_dim, N_kv = n_kv_heads * head_dim;
     const uint64_t row_floats = plan.partials_row_floats;
@@ -2858,7 +2900,7 @@ sycl::event full_attention_fa2_decode_rows(sycl::queue& q,
         const std::vector<sycl::event> d1{e};
         if (kind == 1)
             e = fa2_rows_xmx_(q, q_in, k_in, v_in, y, partials, row_floats, dd, d.n, plan.n_wgs[kind], layer_slot,
-                              n_q_heads, n_kv_heads, head_dim, plan.csplit, d1, prof);
+                              n_q_heads, n_kv_heads, head_dim, plan.csplit, d1, prof, keep_below);
         else if (kind == 2)
             e = fa2_rows_vec_(q, q_in, k_in, v_in, y, partials, row_floats, dd, d.n, plan.n_wgs[kind], layer_slot,
                               n_q_heads, n_kv_heads, head_dim, plan.csplit, d1, prof);

@@ -1,10 +1,11 @@
 // src/core/allocator.cpp
 
-#include <cstdlib>
 #include "ie/allocator.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -276,9 +277,118 @@ void dev_alloc_audit(const char* what) {
                  (unsigned long long)noverlap);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// P4 B50: the VRAM 2 MiB page-alias self-test, at allocation time, for every model.
+//
+// The fault (card 1, 0000:09:00.0; glm5next.cpp 2026-09-03, qwen4exp.cpp 2026-10-04): two virtual 2 MiB pages of ONE
+// malloc_device allocation are backed by one physical page -- both times +0 and +1069547520 of an expert cache a
+// little over 1 GiB. A write to one silently rewrites what the other reads: experts took each other's weights,
+// outputs went NaN, replies ended with no token. Those two models test their expert caches themselves; the KV caches,
+// weights and workspaces of every model had no test.
+//
+// Here every device allocation of IE_ALLOC_ALIAS_MIN_MIB (default 64) or more is tested before it is handed out,
+// while it holds nothing: every 8-byte word tagged (page number, word index) by a KERNEL (a small probe would stay in
+// the caches and read back from them), word 0 of each page rewritten by the COPY ENGINE (the pair the uploads and
+// the kernels use: a mapping that differs between the engines shows too), all of it verified by the EUs, then zeroed
+// (fresh driver memory is zero, and nothing may come to depend on a tag pattern instead). An allocation that fails
+// is KEPT -- so its address range is not handed out again -- and another is made, up to kAliasRetries times; if none
+// passes, malloc fails (returns null) rather than hand out memory known to corrupt. What this cannot see: an alias
+// between two different allocations (the partner does not exist yet, or already holds data).
+// IE_NO_ALLOC_ALIAS_TEST=1 skips the test.
+// ---------------------------------------------------------------------------------------------------------------
+namespace {
+constexpr uint32_t kAliasRetries = 3;
+
+bool alloc_alias_test_on() {
+    static const bool on = std::getenv("IE_NO_ALLOC_ALIAS_TEST") == nullptr;
+    return on;
+}
+size_t alloc_alias_min_bytes() {
+    static const size_t v = [] {
+        const char* e = std::getenv("IE_ALLOC_ALIAS_MIN_MIB");
+        const long n = e ? std::atol(e) : 64;
+        return size_t(n > 4 ? n : 4) << 20;
+    }();
+    return v;
+}
+std::mutex g_alias_mu;
+struct AliasStat { uint64_t tested = 0, bytes = 0, kept = 0, kept_bytes = 0; double ms = 0; };
+AliasStat g_alias_stat;
+// Printed once at exit when anything was tested (IE_ALLOC_ALIAS_STATS=1) or kept aside (always).
+struct AliasStatPrinter {
+    ~AliasStatPrinter() {
+        if (g_alias_stat.kept || (g_alias_stat.tested && std::getenv("IE_ALLOC_ALIAS_STATS")))
+            std::fprintf(stderr, "[alloc] vram alias test: %llu allocations, %.2f GiB, %.2f s; %llu kept aside (%.2f GiB)\n",
+                         (unsigned long long)g_alias_stat.tested, double(g_alias_stat.bytes) / 1073741824.0,
+                         g_alias_stat.ms / 1000.0, (unsigned long long)g_alias_stat.kept,
+                         double(g_alias_stat.kept_bytes) / 1073741824.0);
+    }
+} g_alias_stat_printer;
+
+// The number of words that did not read back their tag (0 = the allocation is sound). Leaves the allocation zeroed.
+uint32_t alloc_alias_bad_words(sycl::queue& q, void* p, size_t nbytes) {
+    constexpr uint64_t PG = 2ull << 20;
+    constexpr uint64_t WPP = PG / 8;             // words per 2 MiB page
+    constexpr uint64_t kCeMark = 0xFFFFFF;       // word 0's copy-engine tag
+    const uint64_t words = nbytes / 8;
+    if (words == 0) return 0;
+    const uint64_t npages = (words + WPP - 1) / WPP;
+    uint32_t* rep = sycl::malloc_device<uint32_t>(1, q);
+    if (!rep) return 0;
+    uint64_t* w = static_cast<uint64_t*>(p);
+    q.memset(rep, 0, sizeof(uint32_t));
+    q.parallel_for<class DevAllocAliasTagK>(sycl::range<1>(words), [=](sycl::id<1> id) {
+        const uint64_t i = id[0];
+        w[i] = ((1 + i / WPP) << 24) | (i % WPP);
+    });
+    q.wait();
+    std::vector<uint64_t> ce(npages);
+    for (uint64_t k = 0; k < npages; ++k) {
+        ce[k] = ((1 + k) << 24) | kCeMark;
+        q.memcpy(static_cast<uint8_t*>(p) + k * PG, &ce[k], 8);
+    }
+    q.wait();
+    q.parallel_for<class DevAllocAliasChkK>(sycl::range<1>(words), [=](sycl::id<1> id) {
+        const uint64_t i = id[0];
+        const uint64_t wi = i % WPP;
+        const uint64_t want = ((1 + i / WPP) << 24) | (wi ? wi : kCeMark);
+        if (w[i] == want) return;
+        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device> c(*rep);
+        c.fetch_add(1u);
+    });
+    q.wait();
+    uint32_t bad = 0;
+    q.memcpy(&bad, rep, sizeof(uint32_t)).wait();
+    sycl::free(rep, q);
+    q.memset(p, 0, nbytes).wait();
+    return bad;
+}
+}   // namespace
+
 void* DeviceAllocator::malloc(size_t nbytes) {
     if (!queue_) return nullptr;
     void* p = sycl::malloc_device(nbytes, *queue_);
+    if (p && alloc_alias_test_on() && nbytes >= alloc_alias_min_bytes()) {
+        for (uint32_t attempt = 0;; ++attempt) {
+            const auto t0 = std::chrono::steady_clock::now();
+            const uint32_t bad = alloc_alias_bad_words(*queue_, p, nbytes);
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            {
+                std::lock_guard<std::mutex> lk(g_alias_mu);
+                ++g_alias_stat.tested; g_alias_stat.bytes += nbytes; g_alias_stat.ms += ms;
+                if (bad) { ++g_alias_stat.kept; g_alias_stat.kept_bytes += nbytes; }
+            }
+            if (!bad) break;
+            // `p` is kept (never freed): its address range must not come back.
+            std::fprintf(stderr, "[alloc] VRAM PAGE ALIAS: %s: a %.1f MiB allocation at %p has %u words that read another "
+                         "page's data -- kept aside, %s (IE_NO_ALLOC_ALIAS_TEST=1 skips this test)\n",
+                         queue_->get_device().get_info<sycl::info::device::name>().c_str(), double(nbytes) / 1048576.0, p,
+                         bad, attempt < kAliasRetries ? "allocating again" : "no sound allocation found: the allocation fails");
+            if (attempt >= kAliasRetries) return nullptr;
+            p = sycl::malloc_device(nbytes, *queue_);
+            if (!p) return nullptr;
+        }
+    }
     if (p && dev_alloc_auditing()) dev_alloc_record(this, p, nbytes);
     return p;
 }

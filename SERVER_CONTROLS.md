@@ -267,6 +267,15 @@ per-request image staging is engine-global and not slot-safe. (DeepSeek-V4.1-Fla
 takes images on its lanes.) Since v0.2.6 a load of MiMo-V2.6-Flash or Qwen3.8-Flash
 without `--parallel` has 4 lanes, so pass `--parallel 1` to serve images on them.
 
+The Qwen3.8-27B and the 35B-A3B two-card splits (`--gpus 2`) take images at `--parallel 1`
+with their vision projector: `--mmproj <mmproj-...-F16.gguf>` (the base model's F16 or the
+abliterated 27B's BF16 projector; the tower loads onto the second card at load, before the
+lanes are sized, and the 27B's `[budget]` line counts it), else `IE_MMPROJ` or an
+`mmproj*.gguf` beside the model (an F16 first), loaded at the first image. `/props`
+`vision.ready` says whether a load takes them. An image request runs without the prompt
+cache and without `--spec`; its text turns are unchanged. The lanes (`--parallel` > 1, the
+default load of both splits) refuse images with that reason.
+
 ## Request lanes on the 35B-A3B class: scheduling switches (v0.2.6, v0.2.8)
 
 These are read once per process and apply to the `qwen35moe` two-card split with more
@@ -300,6 +309,25 @@ reset, and the snapshot of a reply that ended at its length limit, still pause t
 A prompt longer than one piece that arrives beside running lanes, or that is re-cut, is
 read in other pieces than the same prompt alone and can give other bits. Prompts that
 start and run alone, prompts of up to one piece, and `--parallel 1` are unchanged.
+
+## Prefill, speculation and allocation switches (v0.2.13)
+
+Each is on by default and read once per process; `=0` restores the previous path (the two `NO_` switches are set to
+`1` to skip a test). Figures and conditions: the README's "New in v0.2.13".
+
+| switch | what it controls |
+|---|---|
+| `IE_QWEN35_ATTN_GEMM`, `IE_Q35MOE_ATTN_GEMM`, `IE_Q4E_ATTN_GEMM` | a prefill chunk's attention as two matmuls and a softmax (27B split, 35B-A3B split, Flash-Next; Flash-Next up to `IE_Q4E_ATTN_GEMM_MAXCTX` = 65536 keys) |
+| `IE_QWEN35_S8_PREFILL`, `IE_Q35MOE_S8_PREFILL`, `IE_Q4E_S8_PREFILL` | Q8_0 projections read in place by the prefill matmul |
+| `IE_QWEN35_DN_SCAN`, `IE_Q35MOE_DN_SCAN`, `IE_Q4E_DN_SCAN` | the register-resident DeltaNet scan for prefill chunks |
+| `IE_QWEN35_SPEC_STEP` | with `--spec` on the 27B split: speculation as a step of the normal decode loop (any sampler, the prompt cache, any prompt length); `=0` = the greedy-only path with its 4,096-token limit |
+| `IE_QWEN35_SPEC_ROWS` | the speculative verify rows' attention in one pass |
+| `IE_Q4E_PLE_PREFETCH` | Flash-Next reads its per-layer token table into RAM in the background at load; `=wait` makes the load wait for it |
+| `IE_NO_ALLOC_ALIAS_TEST`, `IE_ALLOC_ALIAS_MIN_MIB` (64), `IE_ALLOC_ALIAS_STATS` | the page-alias self-test of every large device allocation; its size threshold; print its totals at exit |
+| `IE_Q4E_NO_ALIAS_TEST` | Flash-Next's own test of its expert caches |
+
+Diagnostics: `IE_QWEN35_PFPROF=1` / `IE_Q4E_PFPROF=1` print where a prefill's time goes; `IE_DEBUG_PICKS=1` prints
+every sampled token.
 
 ## Kernel switches (v0.2.6)
 

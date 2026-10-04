@@ -27,6 +27,43 @@ namespace ie {
 namespace {
 
 DecodeProf g_dp27("27B qwen35split");   // P4 B22 (off unless IE_DECODE_PROF=1)
+
+// IE_QWEN35_PFPROF=1 (P4 B48): where a pipelined prefill's time goes on each card. Every mark waits on the card's
+// queue, so the two cards no longer overlap: read it as shares, not as a speed.
+struct PfProf27 {
+    enum Kind { kExpand, kGemm, kAttn, kDnScan, kDnMisc, kElem, kCount };
+    using clk = std::chrono::steady_clock;
+    const bool on = std::getenv("IE_QWEN35_PFPROF") != nullptr;
+    bool armed[2] = {false, false};
+    double ms[2][kCount] = {};
+    clk::time_point last[2];
+    void start(uint32_t dev, sycl::queue& q) {
+        if (!on || dev > 1) return;
+        q.wait(); last[dev] = clk::now(); armed[dev] = true;
+    }
+    void mark(uint32_t dev, sycl::queue& q, Kind k) {
+        if (!on || dev > 1 || !armed[dev]) return;
+        q.wait();
+        const auto n = clk::now();
+        ms[dev][k] += std::chrono::duration<double, std::milli>(n - last[dev]).count();
+        last[dev] = n;
+    }
+    void stop(uint32_t dev) { if (dev <= 1) armed[dev] = false; }
+    void report(uint32_t tokens) {
+        if (!on) return;
+        static const char* names[kCount] = {"expand to fp16", "matmul", "attention", "DeltaNet scan", "DeltaNet other",
+                                            "norms + elementwise"};
+        for (uint32_t dev = 0; dev < 2; ++dev) {
+            double tot = 0;
+            for (double v : ms[dev]) tot += v;
+            std::fprintf(stderr, "[qwen35split PFPROF] card %u: %u tokens, %.1f ms (wait-bracketed)\n", dev, tokens, tot);
+            for (int k = 0; k < kCount; ++k)
+                std::fprintf(stderr, "  %-20s %9.1f ms  %5.1f%%\n", names[k], ms[dev][k], tot > 0 ? 100.0 * ms[dev][k] / tot : 0.0);
+            for (double& v : ms[dev]) v = 0;
+        }
+    }
+};
+PfProf27 g_pf27;
 #define DPE(DEV, C, ...) do { sycl::event dpe_ = (__VA_ARGS__); if (g_dp27.active()) g_dp27.tag((DEV), dpe_, DecodeProf::C); } while (0)
 
 // Host-side canonical Q6_K row dequant — mirrors ggml's dequantize_row_q6_K
@@ -217,6 +254,8 @@ void Qwen35SplitModel::free_all() {
     if (!fleet_) return;
     free_slot_banks();
     lane_kv_.clear(); lane_dn_.clear();   // (P4 B18 lanes; their logits buffers are in owned_)
+    ss_ = SpecStep{};                     // (P4 B48: its checkpoints free through the fleet; its buffers are in owned_)
+    vrows_partials_.clear(); vrows_table_.clear();
     lane_logits_ = rows_logits_ = nullptr;
     for (uint32_t d = 0; d < ws_.size(); ++d) free_ws(d);
     ws_.clear();
@@ -225,7 +264,10 @@ void Qwen35SplitModel::free_all() {
     owned_.clear();
     for (uint32_t d = 0; d < prefill_bt_.size(); ++d)   // not in owned_ (re-alloc on grow)
         if (prefill_bt_[d]) fleet_->dev(d).free(prefill_bt_[d]);
+    for (uint32_t d = 0; d < prefill_dt_.size(); ++d)
+        if (prefill_dt_[d]) fleet_->dev(d).free(prefill_dt_[d]);
     prefill_bt_.clear(); prefill_bt_cap_.clear(); act_q8_.clear();
+    prefill_dt_.clear(); prefill_dt_cap_.clear();
     for (auto& s : dn_) s.free_storage();
     for (auto& c : kv_) c.free_storage();
 }
@@ -473,6 +515,8 @@ std::string Qwen35SplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
     act_q8_.assign(n_dev_, nullptr);
     prefill_bt_.assign(n_dev_, nullptr);
     prefill_bt_cap_.assign(n_dev_, 0);
+    prefill_dt_.assign(n_dev_, nullptr);
+    prefill_dt_cap_.assign(n_dev_, 0);
     for (uint32_t dev = 0; dev < n_dev_; ++dev) {
         // ×16 rows: row 0 = T=1 decode; rows 0..T-1 = spec-verify batched GEMV (T≤16).
         void* p = fleet.dev(dev).malloc((uint64_t(Kmax) / 32) * sizeof(block_q8_1x) * 16u);
@@ -492,11 +536,14 @@ void Qwen35SplitModel::free_ws(uint32_t dev) {
     auto& alloc = fleet_->dev(dev);
     for (void* p : {static_cast<void*>(w.x), static_cast<void*>(w.x_normed),
                     static_cast<void*>(w.attn_block), static_cast<void*>(w.positions),
+                    static_cast<void*>(w.positions3),
                     static_cast<void*>(w.ids), static_cast<void*>(w.logits),
                     static_cast<void*>(w.qg), static_cast<void*>(w.q),
                     static_cast<void*>(w.gate), static_cast<void*>(w.k),
                     static_cast<void*>(w.v), static_cast<void*>(w.attn_out),
                     static_cast<void*>(w.attn_partials),
+                    static_cast<void*>(w.ag.qh), static_cast<void*>(w.ag.s), static_cast<void*>(w.ag.p),
+                    static_cast<void*>(w.ag.o), static_cast<void*>(w.ag.l),
                     static_cast<void*>(w.dn_qkv), static_cast<void*>(w.dn_conv),
                     static_cast<void*>(w.dn_z), static_cast<void*>(w.dn_qpre),
                     static_cast<void*>(w.dn_kpre), static_cast<void*>(w.dn_vpre),
@@ -513,6 +560,7 @@ void Qwen35SplitModel::free_ws(uint32_t dev) {
 
 std::string Qwen35SplitModel::ensure_ws(uint32_t dev, uint32_t max_T) {
     Workspace& w = ws_[dev];
+    max_T = (max_T + kAttnGemmRowStep - 1) / kAttnGemmRowStep * kAttnGemmRowStep;   // P4 B48: whole row steps
     if (max_T <= w.T) return {};
     if (w.T != 0) free_ws(dev);
     auto& alloc = fleet_->dev(dev);
@@ -536,6 +584,7 @@ std::string Qwen35SplitModel::ensure_ws(uint32_t dev, uint32_t max_T) {
     w.x_normed   = ah(T * H);
     w.attn_block = ah(T * H);
     w.positions  = static_cast<int32_t*>(alloc.malloc(T * sizeof(int32_t)));
+    w.positions3 = static_cast<int32_t*>(alloc.malloc(3 * T * sizeof(int32_t)));   // P4 B45 (12 bytes a row)
     // persistent per-forward buffers (were malloc/free'd EVERY token in forward):
     if (dev == plan_.embed_dev)
         w.ids    = static_cast<int32_t*>(alloc.malloc(T * sizeof(int32_t)));
@@ -566,7 +615,7 @@ std::string Qwen35SplitModel::ensure_ws(uint32_t dev, uint32_t max_T) {
     w.ffn_up     = ah(T * F);
     w.ffn_h      = ah(T * F);
 
-    if (!w.x || !w.x_normed || !w.attn_block || !w.positions || !w.qg || !w.q ||
+    if (!w.x || !w.x_normed || !w.attn_block || !w.positions || !w.positions3 || !w.qg || !w.q ||
         !w.gate || !w.k || !w.v || !w.attn_out || !w.dn_qkv || !w.dn_conv ||
         !w.dn_z || !w.dn_qpre || !w.dn_kpre || !w.dn_vpre || !w.dn_g || !w.dn_beta ||
         !w.dn_out || !w.dn_qrep || !w.dn_krep || !w.dn_alpha_h || !w.dn_beta_h ||
@@ -583,9 +632,65 @@ std::string Qwen35SplitModel::ensure_ws(uint32_t dev, uint32_t max_T) {
         if (!w.attn_partials)
             return "qwen35split attn_partials alloc failed on dev " + std::to_string(dev);
         w.partials_ctx = max_ctx;
+        // P4 B48: full_attention_prefill_gemm's scratch. Scores + weights: 32M elements (128 + 64 MB), or 16 rows at
+        // this card's largest context when that is more.
+        if (attn_gemm_on()) {
+            const uint32_t gqa = d.n_q_heads / d.n_kv_heads;
+            w.ag.sp_elems = std::max<uint64_t>(uint64_t(32) << 20, uint64_t(16) * max_ctx);
+            w.ag.qh = ah(T * N_q);
+            w.ag.s  = af(w.ag.sp_elems);
+            w.ag.p  = ah(w.ag.sp_elems);
+            w.ag.o  = af(T * gqa * d.head_dim);
+            w.ag.l  = af(T * gqa);
+            if (!w.ag.qh || !w.ag.s || !w.ag.p || !w.ag.o || !w.ag.l)
+                return "qwen35split attention scratch alloc failed on dev " + std::to_string(dev);
+        }
     }
     w.T = max_T;
     return {};
+}
+
+// P4 B48: a prefill chunk's full attention through full_attention_prefill_gemm (two oneDNN matmuls and a softmax)
+// from kAttnGemmMinT rows. On by default (gated 2026-10-04: ~/ds41_work/p60/b48/BUILD.md); IE_QWEN35_ATTN_GEMM=0 = the
+// streaming kernels.
+// P4 B48: Q8_0 weights read in place by the prefill matmul (gemm_nt_s8_f16_onednn). On by default (gated 2026-10-04);
+// IE_QWEN35_S8_PREFILL=0 = the expand-to-fp16 route.
+bool Qwen35SplitModel::s8_prefill_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("IE_QWEN35_S8_PREFILL");
+        return !(e && *e && std::atoi(e) == 0) && onednn_available();
+    }();
+    return on;
+}
+
+// P4 B48: a prefill chunk's DeltaNet recurrence through deltanet_scan_prefill (no per-step barriers), from
+// kAttnGemmMinT rows at the 128 / 128 head dims. On by default (gated 2026-10-04); IE_QWEN35_DN_SCAN=0 =
+// deltanet_recurrence.
+bool Qwen35SplitModel::dn_scan_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("IE_QWEN35_DN_SCAN");
+        return !(e && *e && std::atoi(e) == 0);
+    }();
+    return on;
+}
+
+// P4 B48: the spec verify's rows through full_attention_fa2_decode_rows -- one launch per pass for the V rows instead of
+// V serial single-row calls per layer (the rows kernels run the single-row kernels' code per row: the same bytes).
+// On by default (gated 2026-10-04: text equal to plain decode); IE_QWEN35_SPEC_ROWS=0 = the per-row loop.
+bool Qwen35SplitModel::spec_rows_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("IE_QWEN35_SPEC_ROWS");
+        return !(e && *e && std::atoi(e) == 0);
+    }();
+    return on;
+}
+
+bool Qwen35SplitModel::attn_gemm_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("IE_QWEN35_ATTN_GEMM");
+        return !(e && *e && std::atoi(e) == 0) && onednn_available();
+    }();
+    return on;
 }
 
 // Q8_0-SoA aware GEMV. Decode (T==1): quantize activation → int-dot W8A8 over the
@@ -633,6 +738,34 @@ sycl::event Qwen35SplitModel::sgemv(uint32_t dev, const sycl::half* A, const Spl
         quantize_q8_1(q, A, act_q8_[dev], uint32_t(uint64_t(T) * K));
         return gemv_q8_0_soa_q8_batched_sel(q, act_q8_[dev], w.q8_qs, w.q8_d, out, K, N, T);
     }
+    // P4 B48: a Q8_0 weight goes to the matmul in place (oneDNN weights decompression): no expand pass. The scale plane
+    // is transposed per call (1/16 of the weight's bytes) into a scratch grown to the largest plane.
+    if (w.q8_qs && s8_prefill_on()) {
+        const uint64_t nd = uint64_t(N) * (K / 32u);
+        if (nd > prefill_dt_cap_[dev]) {
+            q.wait();   // a queued matmul may still read the old plane
+            if (prefill_dt_[dev]) alloc.free(prefill_dt_[dev]);
+            prefill_dt_[dev] = static_cast<sycl::half*>(alloc.malloc(nd * sizeof(sycl::half)));
+            prefill_dt_cap_[dev] = prefill_dt_[dev] ? nd : 0;
+        }
+        if (prefill_dt_[dev]) {
+            q8_scales_kb_major(q, w.q8_d, prefill_dt_[dev], N, K / 32u);
+            g_pf27.mark(dev, q, PfProf27::kExpand);
+            sycl::event e;
+            const uint32_t M = sgemv_pad_ ? std::min<uint32_t>((T + kAttnGemmRowStep - 1) / kAttnGemmRowStep * kAttnGemmRowStep,
+                                                               ws_[dev].T) : T;
+            if (gemm_nt_s8_f16_onednn(q, A, w.q8_qs, prefill_dt_[dev], out, M, N, K, 32, &e)) {
+                g_pf27.mark(dev, q, PfProf27::kGemm);
+                return e;
+            }
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::fprintf(stderr, "[qwen35split] IE_QWEN35_S8_PREFILL: no jitted oneDNN kernel (%s); the expand route\n",
+                             onednn_nt_s8_f16_impl(q, T, N, K, 32).c_str());
+            }
+        }
+    }
     // prefill: dequant SoA → fp16 scratch, then the batched gemm via gemv_q_T(F16).
     const uint64_t need = uint64_t(K) * N;
     if (need > prefill_bt_cap_[dev]) {
@@ -649,7 +782,10 @@ sycl::event Qwen35SplitModel::sgemv(uint32_t dev, const sycl::half* A, const Spl
                               static_cast<const uint32_t*>(w.kq_d), prefill_bt_[dev], K, N);
     else
         dequant_q8_0_soa_to_Bt(q, w.q8_qs, w.q8_d, prefill_bt_[dev], K, N);
-    return dense::gemv_q_T(q, A, DenseQuantPtr{prefill_bt_[dev], DType::kF16}, out, K, N, T);
+    g_pf27.mark(dev, q, PfProf27::kExpand);
+    sycl::event e = dense::gemv_q_T(q, A, DenseQuantPtr{prefill_bt_[dev], DType::kF16}, out, K, N, T);
+    g_pf27.mark(dev, q, PfProf27::kGemm);
+    return e;
 }
 
 std::string Qwen35SplitModel::forward(const int32_t* input_ids, uint32_t T,
@@ -699,13 +835,10 @@ std::string Qwen35SplitModel::forward(const int32_t* input_ids, uint32_t T,
         if (auto m = ensure_ws(dev, T); !m.empty()) return m;
     g_dp27.begin(T, start_pos);
 
-    // positions on every card; reset per-card hybrid state on a fresh sequence.
-    std::vector<int32_t> pos(T);
-    for (uint32_t t = 0; t < T; ++t) pos[t] = int32_t(start_pos + t);
+    // positions on every card (+ the [3, T] M-RoPE streams while vision is staged, P4 B45); reset per-card hybrid
+    // state on a fresh sequence.
     for (uint32_t dev = 0; dev < n_dev_; ++dev) {
-        if (ws_[dev].positions)
-            fleet_->dev(dev).queue().memcpy(ws_[dev].positions, pos.data(),
-                                            T * sizeof(int32_t)).wait();
+        if (ws_[dev].positions) upload_positions(dev, start_pos, T);
         if (reset_kv) {
             if (dn_[dev].ready()) dn_[dev].reset(fleet_->dev(dev).queue());
             if (kv_[dev].ready()) kv_[dev].reset();
@@ -726,11 +859,13 @@ std::string Qwen35SplitModel::forward(const int32_t* input_ids, uint32_t T,
             embedding_lookup_q5k(q, d_ids, token_embd_, ws_[plan_.embed_dev].x, T, H);
         else
             embedding_lookup_q6k(q, d_ids, token_embd_, ws_[plan_.embed_dev].x, T, H);
+        splice_vision(q, ws_[plan_.embed_dev].x, start_pos, T);   // P4 B45: the image rows (in-order: after the gather)
         q.wait();
         g_dp27.phase(DecodeProf::kSetup);
     }
 
     // device-by-device: copy residual in from prior card, run this card's layers.
+    sgemv_pad_ = true;   // P4 B48: the layer loops' operands are workspace buffers (cleared before the head)
     for (uint32_t dev = 0; dev < n_dev_; ++dev) {
         Workspace& w = ws_[dev];
         auto& q = fleet_->dev(dev).queue();
@@ -741,6 +876,44 @@ std::string Qwen35SplitModel::forward(const int32_t* input_ids, uint32_t T,
         }
         const uint64_t per_layer_kv =
             uint64_t(n_kv) * (kv_[dev].ready() ? kv_[dev].config().max_ctx : 0u) * HD;
+        // P4 B48: the verify rows' attention plan (all rows on this card's cache, row i at start_pos + i with the kernel
+        // the per-row loop would give it), built once per forward and run per layer with its KV slot.
+        FaDecodeRowsPlan vplan;
+        bool vrows = false;
+        if (spec_verify_gemv_ && spec_rows_on() && T >= 2 && T <= kFaDecodeRowsMax && kv_[dev].ready() && w.attn_partials) {
+            if (vrows_partials_.size() != n_dev_) { vrows_partials_.assign(n_dev_, nullptr); vrows_table_.assign(n_dev_, nullptr); }
+            const uint32_t max_ctx = kv_[dev].config().max_ctx;
+            if (!vrows_partials_[dev]) {
+                vrows_partials_floats_ = fa2_decode_rows_partials_floats(dc.n_q_heads, dc.n_kv_heads, HD, max_ctx);
+                void* pp = fleet_->dev(dev).malloc(uint64_t(kFaDecodeRowsMax) * vrows_partials_floats_ * sizeof(float));
+                void* tt = fleet_->dev(dev).malloc(kFaDecodeRowsTableBytes);
+                if (pp && tt) {
+                    owned_[dev].push_back(pp); owned_[dev].push_back(tt);
+                    vrows_partials_[dev] = static_cast<float*>(pp); vrows_table_[dev] = tt;
+                } else {
+                    if (pp) fleet_->dev(dev).free(pp);
+                    if (tt) fleet_->dev(dev).free(tt);
+                }
+            }
+            if (vrows_partials_[dev]) {
+                static const bool dec_vec_p = []{
+                    const char* e = std::getenv("IE_Q35_FA2_VEC");
+                    return !e || std::atoi(e) != 0;
+                }();
+                FaDecodeRow rows[kFaDecodeRowsMax];
+                for (uint32_t i = 0; i < T; ++i) {
+                    rows[i].k_base = kv_[dev].k_ptr();
+                    rows[i].v_base = kv_[dev].v_ptr();
+                    rows[i].layer_stride = per_layer_kv;
+                    rows[i].start_pos = start_pos + i;
+                    rows[i].max_ctx = max_ctx;
+                    rows[i].kind = q35::xmx_decode(start_pos + i, max_ctx) ? FaDecodeKind::kXmx
+                                 : dec_vec_p ? FaDecodeKind::kVec : FaDecodeKind::kAuto;
+                }
+                vrows = fa2_decode_rows_plan(q, rows, T, dc.n_q_heads, dc.n_kv_heads, HD, vrows_partials_floats_,
+                                             vrows_table_[dev], vplan);
+            }
+        }
         if (prof) { q.wait(); pf_last = pclk::now(); }
 
         for (uint32_t L = 0; L < n_layers; ++L) {
@@ -852,6 +1025,9 @@ std::string Qwen35SplitModel::forward(const int32_t* input_ids, uint32_t T,
                         /*ckpt_step=*/uint64_t(ck.n_lin) * se,
                         T, SVH, SHD, SHD);
                 } else {
+                if (dn_scan_on() && T >= kAttnGemmMinT && SHD == 128)   // P4 B48
+                    deltanet_scan_prefill(q, w.dn_qrep, w.dn_krep, w.dn_vpre, w.dn_g, w.dn_beta, state_layer, w.dn_out, T, SVH);
+                else
                 DPE(dev, kDnRec, deltanet_recurrence(q, w.dn_qrep, w.dn_krep, w.dn_vpre, w.dn_g, w.dn_beta,
                                     state_layer, w.dn_out, /*B=*/1, T, SVH, SHD, SHD));
                 }
@@ -894,8 +1070,13 @@ std::string Qwen35SplitModel::forward(const int32_t* input_ids, uint32_t T,
                 }
                 DPE(dev, kAttnPre, rms_norm_f32w(q, w.q, w_l.attn_q_norm, w.q, T * dc.n_q_heads,  HD, eps));
                 DPE(dev, kAttnPre, rms_norm_f32w(q, w.k, w_l.attn_k_norm, w.k, T * dc.n_kv_heads, HD, eps));
+                if (mrope_n_) {   // P4 B45 vision: the 3-stream M-RoPE (== rope_partial when the streams are equal)
+                    rope_imrope3(q, w.q, w.positions3, w.q, T, dc.n_q_heads,  HD, rope_n, dc.rope_theta);
+                    rope_imrope3(q, w.k, w.positions3, w.k, T, dc.n_kv_heads, HD, rope_n, dc.rope_theta);
+                } else {
                 DPE(dev, kAttnPre, rope_partial(q, w.q, w.positions, w.q, T, dc.n_q_heads,  HD, rope_n, dc.rope_theta));
                 DPE(dev, kAttnPre, rope_partial(q, w.k, w.positions, w.k, T, dc.n_kv_heads, HD, rope_n, dc.rope_theta));
+                }
                 auto& kvc = kv_[dev];
                 const uint32_t li = kv_local_[L];   // card-local full-attn layer index
                 sycl::half* kc = kvc.k_ptr() + per_layer_kv * li;
@@ -950,6 +1131,27 @@ std::string Qwen35SplitModel::forward(const int32_t* input_ids, uint32_t T,
                         const char* e = std::getenv("IE_Q35_FA2_VEC");
                         return !e || std::atoi(e) != 0;
                     }();
+                    if (vrows) {
+                        // P4 B48: the T rows share this cache, and a row attends the rows before it: append them all first
+                        // (the rows kernels append per kernel kind, and a group that straddles the XMX threshold would run
+                        // its later rows before its earlier ones were appended), then one launch per pass. The XMX kind's
+                        // append must not zero the group's own rows: the _shared entry point.
+                        const sycl::half* k_in = w.k; const sycl::half* v_in = w.v;
+                        const uint32_t nkv = dc.n_kv_heads;
+                        ie::ps(q, "q27_verify_rows_append", [&](sycl::handler& h) {
+                            h.parallel_for(sycl::range<1>(uint64_t(T) * nkv * HD), [=](sycl::id<1> id) {
+                                const uint64_t idx = id[0];
+                                const uint32_t d   = uint32_t(idx % HD);
+                                const uint32_t kvh = uint32_t((idx / HD) % nkv);
+                                const uint32_t t   = uint32_t(idx / (uint64_t(nkv) * HD));
+                                const uint64_t o   = (uint64_t(kvh) * max_ctx + (start_pos + t)) * HD + d;
+                                kc[o] = k_in[idx];
+                                vc[o] = v_in[idx];
+                            });
+                        });
+                        full_attention_fa2_decode_rows_shared(q, vplan, w.q, w.k, w.v, w.attn_out, vrows_partials_[dev], li,
+                                                              start_pos + T);
+                    } else
                     for (uint32_t t = 0; t < T; ++t) {
                         if (q35::xmx_decode(start_pos + t, max_ctx))   // P4 B23: same choice per position as decode
                             full_attention_fa2_decode_xmx(q,
@@ -983,7 +1185,10 @@ std::string Qwen35SplitModel::forward(const int32_t* input_ids, uint32_t T,
                         if (!e) return 6144u;
                         int v = std::atoi(e); return v > 0 ? uint32_t(v) : 6144u;
                     }();
-                    if (!no_tile && HD == 256 && (start_pos + T) >= tile_minctx) {
+                    if (w.ag.s && T >= kAttnGemmMinT) {   // P4 B48
+                        full_attention_prefill_gemm(q, w.q, w.k, w.v, kc, vc, w.attn_out, T, start_pos,
+                                                    dc.n_q_heads, dc.n_kv_heads, HD, max_ctx, w.ag);
+                    } else if (!no_tile && HD == 256 && (start_pos + T) >= tile_minctx) {
                         full_attention_fa2_prefill_tile_gemma(
                             q, w.q, w.k, w.v, kc, vc, w.attn_out, T, start_pos,
                             dc.n_q_heads, dc.n_kv_heads, HD, max_ctx,
@@ -1030,6 +1235,7 @@ std::string Qwen35SplitModel::forward(const int32_t* input_ids, uint32_t T,
         g_dp27.sync(dev);
     }
 
+    sgemv_pad_ = false;
     // final norm + lm_head on head_dev → last token's logits → host.
     {
         const uint32_t hd = plan_.head_dev;
@@ -1698,10 +1904,62 @@ std::string Qwen35SplitModel::embed_rows(const int32_t* ids, uint32_t n) {
     return {};
 }
 
+// ---- P4 B45: image input (the header's note). ------------------------------------------------------------------------
+std::string Qwen35SplitModel::set_vision(const float* rows_f32, uint32_t t0, uint32_t n_rows) {
+    if (!rows_f32 || !n_rows) return "qwen35split set_vision: empty rows";
+    if (uint64_t(t0) + n_rows > max_ctx_) return "qwen35split set_vision: span past max_ctx";
+    const uint32_t H = cfg_.dense.hidden;
+    const size_t row0 = vis_rows_.size() / H;
+    vis_rows_.resize(vis_rows_.size() + size_t(n_rows) * H);
+    for (size_t i = 0; i < size_t(n_rows) * H; ++i) vis_rows_[row0 * H + i] = sycl::half(rows_f32[i]);
+    vis_spans_.push_back({t0, n_rows, uint32_t(row0)});
+    return {};
+}
+
+void Qwen35SplitModel::set_mrope(const int32_t* pos3, uint32_t n_total, int32_t delta) {
+    mrope3_.assign(pos3, pos3 + size_t(3) * n_total);
+    mrope_n_ = n_total;
+    mrope_delta_ = delta;
+}
+
+void Qwen35SplitModel::clear_vision() {
+    vis_spans_.clear();
+    vis_rows_.clear();
+    mrope3_.clear();
+    mrope_n_ = 0;
+    mrope_delta_ = 0;
+}
+
+// The piece [start, start + T)'s positions onto card dev: the linear token positions (every path's KV index and, without
+// vision, the rope) and, while vision is staged, the [3, T] M-RoPE slice the rope reads instead. One blocking copy each,
+// as forward() did before B45.
+void Qwen35SplitModel::upload_positions(uint32_t dev, uint32_t start, uint32_t T) {
+    Workspace& w = ws_[dev];
+    auto& q = fleet_->dev(dev).queue();
+    std::vector<int32_t> pos(T);
+    for (uint32_t t = 0; t < T; ++t) pos[t] = int32_t(start + t);
+    q.memcpy(w.positions, pos.data(), T * sizeof(int32_t)).wait();
+    if (mrope_n_) {
+        std::vector<int32_t> p3(size_t(3) * T);
+        qwen4_mrope3_slice(mrope3_.data(), mrope_n_, mrope_delta_, start, T, p3.data());
+        q.memcpy(w.positions3, p3.data(), p3.size() * sizeof(int32_t)).wait();
+    }
+}
+
+// The staged projector rows over the piece's gathered embedding rows (f16 row memcpys on the embed card's in-order
+// queue: after the gather, before layer 0). vis_rows_ outlives the copies (cleared at the next request's clear_vision).
+void Qwen35SplitModel::splice_vision(sycl::queue& q, sycl::half* x, uint32_t start, uint32_t T) {
+    if (vis_spans_.empty()) return;
+    const uint32_t H = cfg_.dense.hidden;
+    for (const Qwen4VisSplice& r : qwen4_vis_splice_ranges(vis_spans_, start, T))
+        q.memcpy(x + uint64_t(r.dst) * H, vis_rows_.data() + uint64_t(r.src) * H, uint64_t(r.n) * H * sizeof(sycl::half));
+}
+
 std::string Qwen35SplitModel::forward_stage(uint32_t dev, uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0,
                                             sycl::half* x_host, bool pk) {
     if (T == 0) return "T == 0";
     if (lane >= n_lanes() || n_dev_ != 2 || dev >= 2 || !lane_logits_) return "forward_stage: no such lane/card (lanes not initialised?)";
+    if (vision_active()) return "forward_stage: vision is staged but the lanes have no per-lane image state (P4 B45 step 3)";
     if (uint64_t(pos0) + T > lane_ctx(lane))
         return "forward_stage: rows [" + std::to_string(pos0) + ", " + std::to_string(pos0 + T) + ") past lane " +
                std::to_string(lane) + "'s " + std::to_string(lane_ctx(lane)) + " positions";
@@ -1814,10 +2072,13 @@ void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t sta
     const uint64_t per_layer_kv =
         uint64_t(n_kv) * (kv_at(dev).ready() ? kv_at(dev).config().max_ctx : 0u) * HD;
 
+    g_pf27.start(dev, q);
+    sgemv_pad_ = true;
     for (uint32_t L = 0; L < n_layers; ++L) {
         if (plan_.dev_of_layer[L] != dev) continue;
         const LayerW& w_l = layers_[L];
         rms_norm_f32w(q, w.x, w_l.attn_norm, w.x_normed, T, H, eps);
+        g_pf27.mark(dev, q, PfProf27::kElem);
         if (w_l.is_linear) {
             const uint32_t SKH = cfg_.ssm_n_k_heads;
             const uint32_t SVH = cfg_.ssm_n_v_heads;
@@ -1844,13 +2105,19 @@ void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t sta
             extract_cols(q, w.dn_beta64,  w.dn_beta_h,  T, SVH, SVHp);
             compute_g_beta_h16(q, w.dn_alpha_h, w.dn_beta_h, w_l.ssm_a, w_l.ssm_dt_bias,
                                w.dn_g, w.dn_beta, T, SVH);
+            g_pf27.mark(dev, q, PfProf27::kDnMisc);
             float* state_layer = dn_at(dev).state_ptr() +
                 uint64_t(dn_local_[L]) * dn_at(dev).state_elems_per_layer();
+            if (dn_scan_on() && T >= kAttnGemmMinT && SHD == 128)   // P4 B48
+                deltanet_scan_prefill(q, w.dn_qrep, w.dn_krep, w.dn_vpre, w.dn_g, w.dn_beta, state_layer, w.dn_out, T, SVH);
+            else
             deltanet_recurrence(q, w.dn_qrep, w.dn_krep, w.dn_vpre, w.dn_g, w.dn_beta,
                                 state_layer, w.dn_out, /*B=*/1, T, SVH, SHD, SHD);
+            g_pf27.mark(dev, q, PfProf27::kDnScan);
             sgemv(dev, w.x_normed, w_l.attn_gate, w.dn_z, H, SI, T);
             gated_rms_norm(q, w.dn_out, w.dn_z, w_l.ssm_norm_fp16, w.dn_qkv,
                            T * SVH, SHD, eps);
+            g_pf27.mark(dev, q, PfProf27::kDnMisc);
             sgemv(dev, w.dn_qkv, w_l.ssm_out, w.attn_block, SI, H, T);
         } else {
             sgemv(dev, w.x_normed, w_l.attn_q, w.qg, H, N_qg, T);
@@ -1859,8 +2126,14 @@ void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t sta
             sgemv(dev, w.x_normed, w_l.attn_v, w.v, H, N_kv, T);
             rms_norm_f32w(q, w.q, w_l.attn_q_norm, w.q, T * dc.n_q_heads,  HD, eps);
             rms_norm_f32w(q, w.k, w_l.attn_k_norm, w.k, T * dc.n_kv_heads, HD, eps);
+            if (mrope_n_) {   // P4 B45 vision: the 3-stream M-RoPE (== rope_partial when the streams are equal)
+                rope_imrope3(q, w.q, w.positions3, w.q, T, dc.n_q_heads,  HD, rope_n, dc.rope_theta);
+                rope_imrope3(q, w.k, w.positions3, w.k, T, dc.n_kv_heads, HD, rope_n, dc.rope_theta);
+            } else {
             rope_partial(q, w.q, w.positions, w.q, T, dc.n_q_heads,  HD, rope_n, dc.rope_theta);
             rope_partial(q, w.k, w.positions, w.k, T, dc.n_kv_heads, HD, rope_n, dc.rope_theta);
+            }
+            g_pf27.mark(dev, q, PfProf27::kElem);
             auto& kvc = kv_at(dev);
             const uint32_t li = kv_local_[L];
             sycl::half* kc = kvc.k_ptr() + per_layer_kv * li;
@@ -1873,7 +2146,10 @@ void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t sta
                 if (!e) return 6144u;
                 int v = std::atoi(e); return v > 0 ? uint32_t(v) : 6144u;
             }();
-            if (!no_tile && HD == 256 && (start_pos + T) >= tile_minctx) {
+            if (w.ag.s && T >= kAttnGemmMinT) {   // P4 B48
+                full_attention_prefill_gemm(q, w.q, w.k, w.v, kc, vc, w.attn_out, T, start_pos,
+                                            dc.n_q_heads, dc.n_kv_heads, HD, max_ctx, w.ag);
+            } else if (!no_tile && HD == 256 && (start_pos + T) >= tile_minctx) {
                 full_attention_fa2_prefill_tile_gemma(
                     q, w.q, w.k, w.v, kc, vc, w.attn_out, T, start_pos,
                     dc.n_q_heads, dc.n_kv_heads, HD, max_ctx, 0);
@@ -1883,17 +2159,24 @@ void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t sta
             }
             if (kvc.is_int8()) kvc.quantize_to_int8(q, li, start_pos, T);
             kvc.set_length(li, start_pos + T);
+            g_pf27.mark(dev, q, PfProf27::kAttn);
             sigmoid_gate(q, w.attn_out, w.gate, w.attn_out, uint64_t(T) * N_q);
+            g_pf27.mark(dev, q, PfProf27::kElem);
             sgemv(dev, w.attn_out, w_l.attn_output, w.attn_block, N_q, H, T);
         }
         residual_add_rms_norm_fused(q, w.x, w.attn_block, w_l.post_attn_norm,
                                     w.x_normed, T, H, eps);
+        g_pf27.mark(dev, q, PfProf27::kElem);
         sgemv(dev, w.x_normed, w_l.ffn_gate, w.ffn_gate, H, F, T);
         sgemv(dev, w.x_normed, w_l.ffn_up,   w.ffn_up,   H, F, T);
         swiglu(q, w.ffn_gate, w.ffn_up, w.ffn_h, uint64_t(T) * F);
+        g_pf27.mark(dev, q, PfProf27::kElem);
         sgemv(dev, w.ffn_h, w_l.ffn_down, w.attn_block, F, H, T);
         residual_add(q, w.x, w.attn_block, w.x, uint64_t(T) * H);
+        g_pf27.mark(dev, q, PfProf27::kElem);
     }
+    sgemv_pad_ = false;
+    g_pf27.stop(dev);
 }
 
 std::string Qwen35SplitModel::forward_pipelined(const int32_t* ids, uint32_t T_total,
@@ -1919,6 +2202,9 @@ std::string Qwen35SplitModel::forward_pipelined(const int32_t* ids, uint32_t T_t
     }
     std::vector<int32_t> pos_all(T_total);
     for (uint32_t t = 0; t < T_total; ++t) pos_all[t] = int32_t(start_pos + t);
+    // P4 B45 vision: each chunk's [3, n] M-RoPE slice, host-side, alive until q1.wait() below (the copies are enqueued
+    // without a wait like the positions above: the host must not wait on card 1's compute).
+    std::vector<std::vector<int32_t>> p3_chunks;
 
     auto& q0 = fleet_->dev(0).queue();
     auto& q1 = fleet_->dev(1).queue();
@@ -1939,6 +2225,13 @@ std::string Qwen35SplitModel::forward_pipelined(const int32_t* ids, uint32_t T_t
         // card 0: ids + positions + embed + its layers (enqueue, in-order).
         q0.memcpy(ws_[0].ids, ids + pos, n * sizeof(int32_t));
         q0.memcpy(ws_[0].positions, pos_all.data() + pos, n * sizeof(int32_t));
+        const int32_t* p3 = nullptr;
+        if (mrope_n_) {
+            p3_chunks.emplace_back(size_t(3) * n);
+            qwen4_mrope3_slice(mrope3_.data(), mrope_n_, mrope_delta_, sp, n, p3_chunks.back().data());
+            p3 = p3_chunks.back().data();
+            q0.memcpy(ws_[0].positions3, p3, size_t(3) * n * sizeof(int32_t));
+        }
         if (token_embd_dtype_ == DType::kQ4_K)
             embedding_lookup_q4k(q0, ws_[0].ids, token_embd_, ws_[0].x, n, H);
         else if (token_embd_dtype_ == DType::kQ8_0)
@@ -1947,6 +2240,7 @@ std::string Qwen35SplitModel::forward_pipelined(const int32_t* ids, uint32_t T_t
             embedding_lookup_q5k(q0, ws_[0].ids, token_embd_, ws_[0].x, n, H);
         else
             embedding_lookup_q6k(q0, ws_[0].ids, token_embd_, ws_[0].x, n, H);
+        splice_vision(q0, ws_[0].x, sp, n);   // P4 B45: the image rows (in-order: after the gather)
         stage_card_prefill(0, n, sp);
         // residual → host stage (waits card 0 only; in-order queue orders the copy
         // after the layer ops). Reusing stage s requires card 1's feed of chunk
@@ -1959,6 +2253,7 @@ std::string Qwen35SplitModel::forward_pipelined(const int32_t* ids, uint32_t T_t
         ev_feed[s] = q1.memcpy(ws_[1].x, hstage[s].data(), uint64_t(n) * H * sizeof(sycl::half));
         ev_valid[s] = true;
         q1.memcpy(ws_[1].positions, pos_all.data() + pos, n * sizeof(int32_t));
+        if (p3) q1.memcpy(ws_[1].positions3, p3, size_t(3) * n * sizeof(int32_t));
         stage_card_prefill(1, n, sp);
         pos += n; ++c;
     }
@@ -1976,6 +2271,7 @@ std::string Qwen35SplitModel::forward_pipelined(const int32_t* ids, uint32_t T_t
         sgemv(1, w.x_normed, output_, d_logits, H, V, 1).wait();
         q1.memcpy(out_logits_host, d_logits, uint64_t(V) * sizeof(sycl::half)).wait();
     }
+    g_pf27.report(T_total);
     return {};
 }
 
@@ -1990,6 +2286,139 @@ std::string Qwen35SplitModel::load_mtp_head(const GgufReader& g, uint32_t max_ct
     // Borrow the model's Q8_0-SoA lm_head (head_dev = the MTP head's device):
     // halves the draft's dominant per-step head-GEMV bytes.
     if (output_.q8_qs) mtp_.use_soa_lm_head(output_.q8_qs, output_.q8_d);
+    return {};
+}
+
+// ===========================================================================
+// P4 B48: speculation as a step of a normal decode loop (the header's note).
+// ===========================================================================
+std::string Qwen35SplitModel::spec_step_init(uint32_t K) {
+    if (!mtp_.loaded) return "spec_step: MTP head not loaded";
+    const uint32_t V = std::min<uint32_t>(16u, std::max<uint32_t>(2u, K));
+    SpecStep& s = ss_;
+    if (s.V == V) return {};
+    if (s.V != 0) return "spec_step: already initialised for another K";
+    const uint32_t H = cfg_.dense.hidden, vocab = cfg_.dense.vocab, hd = plan_.head_dev;
+    auto& ha = fleet_->dev(hd);
+    s.ckpts.clear();
+    s.ckpts.resize(n_dev_);
+    for (uint32_t dev = 0; dev < n_dev_; ++dev)
+        if (dn_[dev].ready())
+            if (auto e = s.ckpts[dev].init(fleet_->dev(dev), dn_[dev], V); !e.empty())
+                return "spec_step ckpt dev " + std::to_string(dev) + ": " + e;
+    s.kvsnap.assign(n_dev_, {});
+    for (uint32_t dev = 0; dev < n_dev_; ++dev)
+        if (kv_[dev].ready()) s.kvsnap[dev].resize(kv_[dev].config().n_layers_full);
+    s.d_hid  = static_cast<sycl::half*>(ha.malloc(uint64_t(V) * H * sizeof(sycl::half)));
+    s.d_all  = static_cast<sycl::half*>(ha.malloc(uint64_t(V) * vocab * sizeof(sycl::half)));
+    s.h_last = static_cast<sycl::half*>(ha.malloc(uint64_t(H) * sizeof(sycl::half)));
+    for (void* p : {static_cast<void*>(s.d_hid), static_cast<void*>(s.d_all), static_cast<void*>(s.h_last)})
+        if (p) owned_[hd].push_back(p);
+    if (!s.d_hid || !s.d_all || !s.h_last) return "spec_step scratch alloc failed";
+    s.vin.assign(V, 0);
+    s.V = V;
+    return {};
+}
+
+void Qwen35SplitModel::spec_step_reset() {
+    static const bool prof = std::getenv("IE_QWEN35_PROFILE") != nullptr;
+    if (prof && (ss_.rounds || ss_.plain))
+        std::fprintf(stderr, "[qwen35split SPEC-STEP] rounds=%llu rows answered without a forward=%llu plain steps=%llu "
+                     "(%.3f tokens a forward) cooldowns=%llu\n", (unsigned long long)ss_.rounds, (unsigned long long)ss_.hits,
+                     (unsigned long long)ss_.plain,
+                     double(ss_.rounds + ss_.hits + ss_.plain) / double(ss_.rounds + ss_.plain),
+                     (unsigned long long)ss_.cooldowns);
+    ss_.have_h = false;
+    ss_.n_rows = ss_.next = 0;
+    ss_.rounds = ss_.hits = ss_.plain = ss_.cooldowns = 0;
+    ss_.win_fwd = ss_.win_tok = ss_.cooldown = 0;
+}
+
+std::string Qwen35SplitModel::spec_step_flush() {
+    SpecStep& s = ss_;
+    if (s.next < s.n_rows) {   // rows [next, n_rows) were not followed: the state goes back to base + next
+        const uint32_t accepted = s.next;
+        for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+            if (dn_[dev].ready())
+                if (auto e = s.ckpts[dev].commit_to_n(fleet_->dev(dev).queue(), dn_[dev], accepted); !e.empty())
+                    return "spec_step commit dev " + std::to_string(dev) + ": " + e;
+            for (uint32_t l = 0; l < uint32_t(s.kvsnap[dev].size()); ++l)
+                kv_[dev].set_length(l, s.kvsnap[dev][l] + accepted);
+        }
+        const uint32_t H = cfg_.dense.hidden;
+        fleet_->dev(plan_.head_dev).queue().memcpy(s.h_last, s.d_hid + uint64_t(accepted - 1) * H,
+                                                   uint64_t(H) * sizeof(sycl::half)).wait();
+        s.have_h = true;
+        s.h_pos = s.base + accepted - 1;
+    }
+    s.n_rows = s.next = 0;
+    return {};
+}
+
+std::string Qwen35SplitModel::spec_step(int32_t token, uint32_t pos, sycl::half* logits_host,
+                                        const SpecDraftSampling* ds) {
+    SpecStep& s = ss_;
+    if (s.V == 0) return "spec_step: not initialised";
+    const uint32_t H = cfg_.dense.hidden, vocab = cfg_.dense.vocab;
+    auto& qh = fleet_->dev(plan_.head_dev).queue();
+    const uint64_t row_bytes = uint64_t(vocab) * sizeof(sycl::half);
+
+    // A verified row for exactly this position and input token: its logits are already there.
+    if (s.next < s.n_rows && pos == s.base + s.next && token == s.vin[s.next]) {
+        qh.memcpy(logits_host, s.d_all + uint64_t(s.next) * vocab, row_bytes).wait();
+        ++s.next; ++s.hits; ++s.win_tok;
+        if (s.next == s.n_rows) {   // the round is used up: the state is at pos + 1, as after a plain step
+            qh.memcpy(s.h_last, s.d_hid + uint64_t(s.n_rows - 1) * H, uint64_t(H) * sizeof(sycl::half)).wait();
+            s.have_h = true; s.h_pos = pos;
+            s.n_rows = s.next = 0;
+        }
+        return {};
+    }
+    if (auto e = spec_step_flush(); !e.empty()) return e;
+
+    // A round costs a draft and V rows where a plain step costs one row (73 against 59 ms at V = 3): below about 1.25
+    // tokens a forward speculation loses. Every kSpecWindow forwards the window's rate is checked, and a rate under
+    // kSpecMinRate runs kSpecCooldown plain steps (each exports its hidden, so the next round starts at once).
+    // (24 / 1.3 / 64 fired on ordinary swings and cost 5-11 % on two of four server requests, 2026-10-04.)
+    constexpr uint32_t kSpecWindow = 64, kSpecCooldown = 32;
+    constexpr double   kSpecMinRate = 1.2;
+    if (s.win_fwd >= kSpecWindow) {
+        if (double(s.win_tok) / double(s.win_fwd) < kSpecMinRate) { s.cooldown = kSpecCooldown; ++s.cooldowns; }
+        s.win_fwd = s.win_tok = 0;
+    }
+    const uint32_t max_pos = kv_[plan_.head_dev].ready() ? kv_[plan_.head_dev].config().max_ctx : 0u;
+    if (!s.have_h || s.h_pos + 1 != pos || pos + s.V > max_pos || s.cooldown > 0) {
+        if (s.cooldown > 0) --s.cooldown;
+        // No hidden for position pos - 1 (the first step after a prefill or a restore), or no room for a round: one
+        // plain step, which exports its hidden.
+        if (auto e = forward(&token, 1, pos, /*reset_kv=*/pos == 0, logits_host, nullptr, s.d_hid, nullptr); !e.empty())
+            return e;
+        qh.memcpy(s.h_last, s.d_hid, uint64_t(H) * sizeof(sycl::half)).wait();
+        s.have_h = true; s.h_pos = pos;
+        ++s.plain;
+        return {};
+    }
+
+    // Draft V - 1 tokens from (h_last, token); verify [token, drafts] in one forward (checkpoint mode).
+    s.drafted.clear();
+    if (ds && ds->temperature > 0.f)
+        mtp_.draft_device_sampled(qh, s.h_last, token, /*p_base=*/0, s.V, s.drafted,
+                                  ds->temperature, ds->top_k, ds->top_p, ds->min_p, ds->seed);
+    else
+        mtp_.draft_device_argmax(qh, s.h_last, token, /*p_base=*/0, s.V, s.drafted);
+    if (s.drafted.size() + 1 < s.V) return "spec_step: draft too short";
+    for (uint32_t dev = 0; dev < n_dev_; ++dev)
+        for (uint32_t l = 0; l < uint32_t(s.kvsnap[dev].size()); ++l)
+            s.kvsnap[dev][l] = kv_[dev].length(l);
+    s.vin[0] = token;
+    for (uint32_t j = 1; j < s.V; ++j) s.vin[j] = s.drafted[j - 1];
+    spec_verify_gemv_ = true;    // sgemv T in [2, 16] -> the batched int-dot (the weights read once)
+    const std::string e = forward(s.vin.data(), s.V, pos, /*reset_kv=*/false, logits_host, s.d_all, s.d_hid, &s.ckpts);
+    spec_verify_gemv_ = false;
+    if (!e.empty()) return e;
+    qh.memcpy(logits_host, s.d_all, row_bytes).wait();   // row 0 = this position
+    s.base = pos; s.n_rows = s.V; s.next = 1;
+    ++s.rounds; ++s.win_fwd; ++s.win_tok;
     return {};
 }
 

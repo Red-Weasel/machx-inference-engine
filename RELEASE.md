@@ -1,13 +1,23 @@
 # IE Engine — v1 RELEASE
 
-> **Current release: v0.2.8 (October 2026).** This file is the record of the first release, of June 9, 2026, kept as
+> **Current release: v0.2.13 (October 2026).** This file is the record of the first release, of June 9, 2026, kept as
 > written; its figures are for one Arc Pro B70 and a Q4_K_M model and are not comparable with the two-card figures
-> below. Later releases are described in the README ("New in v0.2.8", "New in v0.2.6", "In v0.2.0") and in the GitHub
+> below. Later releases are described in the README ("New in v0.2.13", "New in v0.2.8", "New in v0.2.6", "In v0.2.0") and in the GitHub
 > release notes:
+> [v0.2.13](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.13),
 > [v0.2.8](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.8),
 > [v0.2.6](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.6),
 > [v0.2.0](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.0),
 > [v0.1.0](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.1.0).
+>
+> **v0.2.13 in short** (two Arc Pro B70 cards, measured October 4, 2026):
+> - Prefill on the Qwen models: Qwen3.8-27B Q8_0 1,037 / 820 -> 2,962 / 3,001 tok/s (2.4K / 10.7K-token prompts), the
+>   35B-A3B class 1,816 / 1,256 -> 2,896 / 2,808, Flash-Next 241 -> 470 tok/s on text never seen before; the 15-agent
+>   replay 116.1 -> 77.1-77.2 s.
+> - `--spec` on the Qwen3.8-27B split works with sampling, the prompt cache and any prompt length; tokens equal plain
+>   decoding's (17.1 -> 24.3 tok/s at temperature 0.7 on a short prompt).
+> - Every device allocation of 64 MiB or more is tested at load for two pages sharing one physical page; that fault
+>   ended Flash-Next replies after a few tokens on one test card.
 >
 > **v0.2.8 in short** (two Arc Pro B70 cards, measured October 2, 2026; the Qwen3.6-35B-A3B class, Q8_0):
 > - The 15-agent replay takes 116.3–116.5 s where v0.2.6 took 131.3–132.4 s in the same day's runs (−12 %); an

@@ -6,10 +6,14 @@
 
 #include "ie/qwen4exp.hpp"
 #include <chrono>
+#include <sys/mman.h>
+#include <unordered_map>
+#include <mutex>
 
 #include "ie/dequant_ref.hpp"
 #include "ie/dtype.hpp"
 #include "ie/ops.hpp"
+#include "ie/prefill_gemm.hpp"
 #include "ie/quant_blocks.hpp"
 #include "ie/qwen4_hc.hpp"
 #include "ie/deepseek4_attn.hpp"
@@ -76,9 +80,14 @@ std::string dequant_tensor_fp32(const GgufTensorInfo* t, std::vector<float>& out
 Qwen4ExpModel::~Qwen4ExpModel() { free_all(); }
 
 void Qwen4ExpModel::free_all() {
+    if (ple_prefetch_.joinable()) {   // P4 B49: before anything it reads can go away
+        ple_prefetch_stop_.store(true);
+        ple_prefetch_.join();
+    }
     if (!alloc_) return;
     for (void* p : owned_) if (p) alloc_->free(p);
     owned_.clear();
+    ag_ = AttnGemmScratch{};   // (P4 B49: its buffers were in owned_)
     layers_.clear();
     alloc_ = nullptr;
 }
@@ -199,6 +208,36 @@ std::string Qwen4ExpModel::load(DeviceAllocator& alloc, const GgufReader& g,
         host_bytes_ += ple_table->nbytes;
         placement_.push_back({std::string(ple_table->name), "host",
                               type_name(ple_table->dtype).data(), ple_table->nbytes});
+        // P4 B49: read the table into the page cache (the header's note). MADV_POPULATE_READ prefaults a range and
+        // reads it with the kernel's readahead; 256 MiB steps so that a stop is seen quickly.
+        const char* pe = std::getenv("IE_Q4E_PLE_PREFETCH");
+        const bool pf_off  = pe && pe[0] == '0';
+        const bool pf_wait = pe && std::string(pe) == "wait";
+        if (!pf_off && ple_table->data && ple_table->nbytes) {
+            const uintptr_t page = 4096;
+            const uintptr_t lo = reinterpret_cast<uintptr_t>(ple_table->data) & ~(page - 1);
+            const uintptr_t hi = (reinterpret_cast<uintptr_t>(ple_table->data) + ple_table->nbytes + page - 1) & ~(page - 1);
+            ple_prefetch_stop_.store(false);
+            ple_prefetch_ = std::thread([this, lo, hi] {
+                const auto t0 = std::chrono::steady_clock::now();
+                constexpr uintptr_t kStep = uintptr_t(256) << 20;
+                for (uintptr_t a = lo; a < hi && !ple_prefetch_stop_.load(); a += kStep) {
+                    const size_t n = size_t(std::min<uintptr_t>(kStep, hi - a));
+#ifdef MADV_POPULATE_READ
+                    if (::madvise(reinterpret_cast<void*>(a), n, MADV_POPULATE_READ) == 0) continue;
+#endif
+                    // no MADV_POPULATE_READ on this kernel: touch a byte a page
+                    volatile uint8_t sink = 0;
+                    for (uintptr_t b = a; b < a + n; b += 4096) sink = sink + *reinterpret_cast<const volatile uint8_t*>(b);
+                    (void)sink;
+                }
+                if (!ple_prefetch_stop_.load())
+                    std::fprintf(stderr, "[qwen4exp] PLE table: %.1f GiB read into RAM in %.1f s (IE_Q4E_PLE_PREFETCH=0 turns "
+                                 "this off)\n", double(hi - lo) / double(1ull << 30),
+                                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+            });
+            if (pf_wait) ple_prefetch_.join();
+        }
     }
 
     for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
@@ -414,6 +453,9 @@ std::string Qwen4ExpModel::load(DeviceAllocator& alloc, const GgufReader& g,
 namespace ie {
 
 namespace {
+// P4 B49 (defined before run_block).
+bool q4e_attn_gemm_on();
+uint32_t q4e_attn_gemm_maxctx();
 
 // Dense-W8 leaf family: A8 int-dot (default) vs A16 (IE_Q4E_A16=1 — F16
 // activation, quality-neutral W8: streaming PPL 6.689 == the F16 baseline;
@@ -1156,6 +1198,26 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
     ak_ = ah(uint64_t(MT) * cfg_.n_kv_heads * cfg_.head_dim);
     av_ = ah(uint64_t(MT) * cfg_.n_kv_heads * cfg_.head_dim);
     attn_out_ = ah(uint64_t(MT) * Nq);
+    // P4 B49: the matmul attention's scratch (ie/prefill_gemm.hpp). Scores + weights: 32M elements (128 + 64 MB); the
+    // masked form is used up to IE_Q4E_ATTN_GEMM_MAXCTX keys (default 65536: its cost grows with the context, the
+    // gathering kernel's does not). IE_Q4E_ATTN_GEMM=0 turns both forms off. Counted by the expert cache's budget (the
+    // device's free memory is read after this).
+    if (nf > 0 && q4e_attn_gemm_on() && onednn_available()) {
+        const uint32_t gqa = cfg_.n_q_heads / cfg_.n_kv_heads;
+        const uint64_t Tc = (uint64_t(MT) + kAttnGemmRowStep - 1) / kAttnGemmRowStep * kAttnGemmRowStep;
+        ag_maxctx_ = std::min<uint32_t>(q4e_attn_gemm_maxctx(), max_ctx);
+        const uint32_t keys_max = std::min<uint32_t>((ag_maxctx_ + kAttnGemmKeyStep - 1) / kAttnGemmKeyStep * kAttnGemmKeyStep, max_ctx);
+        ag_.sp_elems = std::max<uint64_t>(uint64_t(32) << 20, uint64_t(16) * keys_max);
+        ag_.qh = ah(Tc * Nq);
+        ag_.s  = af(ag_.sp_elems);
+        ag_.p  = ah(ag_.sp_elems);
+        ag_.o  = af(Tc * gqa * cfg_.head_dim);
+        ag_.l  = af(Tc * gqa);
+        ag_.mask_words = (keys_max + 31u) / 32u;
+        ag_.mask = static_cast<uint32_t*>(alloc_->malloc(Tc * ag_.mask_words * sizeof(uint32_t)));
+        if (ag_.mask) owned_.push_back(ag_.mask);
+        if (!ag_.qh || !ag_.s || !ag_.p || !ag_.o || !ag_.l || !ag_.mask) return "qwen4exp runtime: attention scratch alloc failed";
+    }
     router_out_ = ah(cfg_.n_experts);
     act_q8_ = alloc_->malloc((SI / 32) * sizeof(block_q8_1x)); owned_.push_back(act_q8_);
     moe_g_ = ah(cfg_.expert_ffn); moe_u_ = ah(cfg_.expert_ffn); moe_h_ = ah(cfg_.expert_ffn);
@@ -1232,9 +1294,33 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
         // and L0 spin-stalls when a tool's real workspaces exceed the 1 GiB
         // estimate (2026-08-27, run2 reference section at ~30/32 GiB).
         const uint64_t reserve = 4096ull << 20;
-        const uint64_t used = dev_bytes_ + (1536ull << 20); // weights + ws estimate
+        const uint64_t ws_est  = 1536ull << 20;
+        const uint64_t used = dev_bytes_ + ws_est;            // weights + ws estimate
         uint64_t budget = gmem > used + reserve ? gmem - used - reserve
                                                 : 4ull << 30;
+        // P4 B46 (2026-10-02): dev_bytes_ counts the WEIGHTS only. The KV cache, the DeltaNet /
+        // conv states and the max_chunk-sized workspaces that init_runtime allocated above were
+        // never subtracted, so at --ctx 250000 the budget oversubscribed the card (the owner's
+        // Flash-Next load: 32.6 of 32 GiB per card, the driver paging device memory, decode at
+        // 0.2 tok/s; capping the cache by hand gave 23.3 tok/s). Ask the device what is really
+        // free now -- that figure already excludes everything allocated so far, the lanes' buffers
+        // included -- and keep the formula as the ceiling (it still bounds a device that reports
+        // more free memory than this process may safely take).
+        const sycl::device& dv = alloc_->device();
+        if (dv.has(sycl::aspect::ext_intel_free_memory)) {
+            const uint64_t free_now = dv.get_info<sycl::ext::intel::info::device::free_memory>();
+            const uint64_t from_free = free_now > reserve + ws_est ? free_now - reserve - ws_est : 0;
+            // the lanes' share is added back here because q4e_lanes_cache_fit below takes it out
+            // again (its refusal message needs the pre-lanes budget)
+            const uint64_t capped = std::min(budget, from_free + lanes_total);
+            std::fprintf(stderr,
+                "[qwen4exp] expert-cache budget: %.2f GiB from the weights formula, %.2f GiB from the "
+                "device's free memory after the context's KV, states and workspaces (%.2f GiB free, "
+                "%.1f GiB reserve) -> %.2f GiB\n",
+                budget / 1073741824.0, (from_free + lanes_total) / 1073741824.0,
+                free_now / 1073741824.0, reserve / 1073741824.0, capped / 1073741824.0);
+            budget = capped;
+        }
         if (lanes_total) {
             // P4 B8: the extra lanes come out of the cache. Refuse, with the numbers, when what is left cannot hold
             // kQ4eLaneMinSlots experts per layer (q4e_lanes_cache_fit, ie/q4e_lanes.hpp).
@@ -1291,6 +1377,123 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
         copyq_ = std::make_unique<sycl::queue>(
             alloc_->queue().get_context(), alloc_->queue().get_device(),
             sycl::property_list{sycl::property::queue::in_order{}});
+        ecache_usable_ = ecache_slots_;
+        // ---- P4 B49: VRAM 2 MiB page-alias self-test (glm5next.cpp's, 2026-09-03; IE_Q4E_NO_ALIAS_TEST=1 skips) ----
+        // On card 1 two virtual 2 MiB pages of one malloc_device allocation can be backed by ONE physical page: a fill
+        // into one expert slot silently rewrites what another slot reads. Found here 2026-10-04 on Flash-Next (ie serve
+        // --ctx 65536 --parallel 1, stage B): rows routed through the hit slots came out NaN from the last layers' MoE,
+        // their keys / values poisoned the last attention layer's cache, and a later decode step that attended one
+        // returned no token (pick -1, finish "stop" after 15 / 61 / 69 tokens). It moves with the allocation layout, so
+        // it must be tested, not assumed away. Two passes over ALL of the stage's caches (a page written and read
+        // straight back cannot show an alias: its partner is not written yet); every word tagged by a KERNEL (a small
+        // probe stays in the caches); word 0 of each page rewritten by the COPY ENGINE and verified by the EUs -- the
+        // pair the fills (copyq_) and the kernels use. A page that fails, and the page whose tag it shows, lose their
+        // slots: last_use = UINT64_MAX, which no victim scan takes.
+        if (!std::getenv("IE_Q4E_NO_ALIAS_TEST")) {
+            sycl::queue& qq = alloc_->queue();
+            constexpr uint64_t PG = 2ull << 20;
+            constexpr uint64_t WPP = PG / 8;            // words per 2 MiB page
+            constexpr uint64_t kCeMark = 0xFFFFFF;      // word 0's copy-engine tag
+            constexpr uint32_t kMaxRep = 64;
+            struct Alloc { uint32_t L; uint64_t words, tag0, npages; };
+            std::vector<Alloc> als;
+            uint64_t tag_base = 1, total_words = 0;
+            for (uint32_t L2 = layer_lo_; L2 < layer_hi_; ++L2) {
+                const uint64_t nw = uint64_t(ecache_slots_) * ecache_[L2].slot_bytes / 8;
+                const uint64_t np = (nw + WPP - 1) / WPP;
+                als.push_back({L2, nw, tag_base, np});
+                tag_base += np;
+                total_words += nw;
+            }
+            uint32_t* rep  = static_cast<uint32_t*>(alloc_->malloc(4));
+            uint64_t* repv = static_cast<uint64_t*>(alloc_->malloc(uint64_t(kMaxRep) * 2 * 8));
+            if (rep && repv) {
+                const auto at0 = std::chrono::steady_clock::now();
+                qq.memset(rep, 0, 4).wait();
+                for (const Alloc& a : als) {          // pass 1: tag every word
+                    uint64_t* p = reinterpret_cast<uint64_t*>(ecache_[a.L].base);
+                    const uint64_t t0 = a.tag0;
+                    qq.parallel_for<class Q4eAliasTagK>(sycl::range<1>(a.words), [=](sycl::id<1> id) {
+                        const uint64_t i = id[0];
+                        p[i] = ((t0 + i / WPP) << 24) | (i % WPP);
+                    });
+                }
+                qq.wait();
+                std::vector<uint64_t> ce(tag_base);   // pass 1b: the copy engine rewrites word 0 of every page
+                for (const Alloc& a : als) {
+                    uint8_t* b = static_cast<uint8_t*>(ecache_[a.L].base);
+                    for (uint64_t k = 0; k < a.npages; ++k) {
+                        ce[a.tag0 + k - 1] = ((a.tag0 + k) << 24) | kCeMark;
+                        copyq_->memcpy(b + k * PG, &ce[a.tag0 + k - 1], 8);
+                    }
+                }
+                copyq_->wait();
+                for (const Alloc& a : als) {          // pass 2: verify with the EUs
+                    const uint64_t* p = reinterpret_cast<const uint64_t*>(ecache_[a.L].base);
+                    const uint64_t t0 = a.tag0;
+                    uint32_t* rp = rep; uint64_t* rv = repv;
+                    qq.parallel_for<class Q4eAliasChkK>(sycl::range<1>(a.words), [=](sycl::id<1> id) {
+                        const uint64_t i = id[0];
+                        const uint64_t w = i % WPP;
+                        const uint64_t want = ((t0 + i / WPP) << 24) | (w ? w : kCeMark);
+                        const uint64_t got = p[i];
+                        if (got == want) return;
+                        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device> c(*rp);
+                        const uint32_t k = c.fetch_add(1u);
+                        if (k < kMaxRep) { rv[2 * k] = t0 + i / WPP; rv[2 * k + 1] = got; }
+                    });
+                }
+                qq.wait();
+                uint32_t nrep = 0;
+                std::vector<uint64_t> hv2(uint64_t(kMaxRep) * 2, 0);
+                qq.memcpy(&nrep, rep, 4).wait();
+                qq.memcpy(hv2.data(), repv, uint64_t(kMaxRep) * 2 * 8).wait();
+                std::vector<std::vector<uint8_t>> bad(cfg_.n_layers);
+                for (const Alloc& a : als) bad[a.L].assign(ecache_slots_, 0);
+                // a page's slots: the one it starts in and, when it straddles a boundary, the next
+                auto mark = [&](uint64_t t, uint32_t& L3, uint64_t& off) {
+                    for (const Alloc& a : als)
+                        if (t >= a.tag0 && t < a.tag0 + a.npages) {
+                            L3 = a.L; off = (t - a.tag0) * PG;
+                            const uint64_t sb = ecache_[a.L].slot_bytes;
+                            const uint64_t s0 = off / sb, s1 = (off + PG - 1) / sb;
+                            for (uint64_t sl = s0; sl <= s1 && sl < ecache_slots_; ++sl) bad[a.L][sl] = 1;
+                            return true;
+                        }
+                    return false;
+                };
+                std::vector<uint64_t> seen;
+                for (uint32_t k = 0; k < std::min<uint32_t>(nrep, kMaxRep); ++k) {
+                    const uint64_t t = hv2[2 * k], got = hv2[2 * k + 1];
+                    if (std::find(seen.begin(), seen.end(), t) != seen.end()) continue;
+                    seen.push_back(t);
+                    uint32_t L3 = 0, L4 = 0; uint64_t off = 0, off4 = 0;
+                    if (!mark(t, L3, off)) continue;
+                    if (mark(got >> 24, L4, off4))
+                        std::fprintf(stderr, "[qwen4exp] VRAM PAGE ALIAS: layer %u cache +%llu reads what was written to layer %u "
+                                     "cache +%llu -- their slots are quarantined\n", L3, (unsigned long long)off, L4,
+                                     (unsigned long long)off4);
+                    else
+                        std::fprintf(stderr, "[qwen4exp] VRAM PAGE FAULTY: layer %u cache +%llu read back 0x%llx -- its slots are "
+                                     "quarantined\n", L3, (unsigned long long)off, (unsigned long long)got);
+                }
+                uint32_t quarantined = 0, worst = 0;
+                for (const Alloc& a : als) {
+                    uint32_t nb = 0;
+                    for (uint32_t sl = 0; sl < ecache_slots_; ++sl)
+                        if (bad[a.L][sl]) { ecache_[a.L].last_use[sl] = UINT64_MAX; ++nb; }
+                    quarantined += nb;
+                    worst = std::max(worst, nb);
+                }
+                ecache_usable_ = ecache_slots_ > worst ? ecache_slots_ - worst : 1u;
+                std::fprintf(stderr, "[qwen4exp] vram alias test: %.2f GiB in %.2f s, %u bad words, %zu bad pages, %u slots "
+                             "quarantined (%u usable a layer)\n", double(total_words) * 8.0 / 1073741824.0,
+                             std::chrono::duration<double>(std::chrono::steady_clock::now() - at0).count(),
+                             nrep, seen.size(), quarantined, ecache_usable_);
+            }
+            if (rep) alloc_->free(rep);
+            if (repv) alloc_->free(repv);
+        }
     }
     if (cfg_.has_ple() && own_ple) {
         e16_ = ah(uint64_t(MT) * H);
@@ -2142,9 +2345,89 @@ void Qwen4ExpModel::reset_state() {
     }
 }
 
+// P4 B49: a prefill chunk's DeltaNet recurrence through deltanet_scan_prefill (ie/prefill_gemm.hpp; fp32 rounding
+// order only). On by default; IE_Q4E_DN_SCAN=0 = deltanet_recurrence.
+namespace {
+bool q4e_dn_scan_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("IE_Q4E_DN_SCAN");
+        return !(e && *e && std::atoi(e) == 0);
+    }();
+    return on;
+}
+}  // namespace
+
+// P4 B49: a prefill chunk's attention through full_attention_prefill_gemm (two oneDNN matmuls and a softmax): the
+// dense form while every key is visible, the masked form (_sel) over the indexer's selected keys up to
+// IE_Q4E_ATTN_GEMM_MAXCTX keys of context. On by default; IE_Q4E_ATTN_GEMM=0 = the tile / gathering kernels.
+namespace {
+bool q4e_attn_gemm_on() {
+    static const bool on = [] {
+        const char* e = std::getenv("IE_Q4E_ATTN_GEMM");
+        return !(e && *e && std::atoi(e) == 0);
+    }();
+    return on;
+}
+uint32_t q4e_attn_gemm_maxctx() {
+    static const uint32_t v = [] {
+        const char* e = std::getenv("IE_Q4E_ATTN_GEMM_MAXCTX");
+        const int n = e ? std::atoi(e) : 65536;
+        return n > 0 ? uint32_t(n) : 65536u;
+    }();
+    return v;
+}
+}  // namespace
+
+// IE_Q4E_PFPROF=1 (P4 B49): where a prefill's time goes inside run_block, summed over both stages and printed at
+// exit. Every mark waits on the stage's queue (the stages keep their own clocks: stage B runs on its own host
+// thread), so read it as shares, not as a speed. Only chunks of more than 16 rows are counted.
+namespace {
+struct Q4ePfProf {
+    enum Kind { kPle, kHc, kProj, kDnScan, kDnOther, kAttnPrep, kAttn, kMoe, kCount };
+    using clk = std::chrono::steady_clock;
+    const bool on = std::getenv("IE_Q4E_PFPROF") != nullptr;
+    std::mutex mu;
+    double ms[kCount] = {};
+    uint64_t rows = 0;
+    std::unordered_map<const void*, clk::time_point> last;
+    void start(const void* who, sycl::queue& q, uint32_t T) {
+        if (!on) return;
+        q.wait();
+        std::lock_guard<std::mutex> g(mu);
+        last[who] = clk::now();
+        rows += T;
+    }
+    void mark(const void* who, sycl::queue& q, Kind k) {
+        if (!on) return;
+        q.wait();
+        const auto n = clk::now();
+        std::lock_guard<std::mutex> g(mu);
+        auto it = last.find(who);
+        if (it == last.end()) return;
+        ms[k] += std::chrono::duration<double, std::milli>(n - it->second).count();
+        it->second = n;
+    }
+    ~Q4ePfProf() {
+        if (!on) return;
+        static const char* names[kCount] = {"PLE", "HC mix / combine", "projections (matmul)", "DeltaNet scan",
+                                            "DeltaNet other", "attention prep + index", "attention", "MoE + shared expert"};
+        double tot = 0;
+        for (double v : ms) tot += v;
+        std::fprintf(stderr, "[qwen4exp PFPROF] %llu layer-rows, %.1f ms (wait-bracketed, both stages)\n",
+                     (unsigned long long)rows, tot);
+        for (int k = 0; k < kCount; ++k)
+            std::fprintf(stderr, "  %-24s %9.1f ms  %5.1f%%\n", names[k], ms[k], tot > 0 ? 100.0 * ms[k] / tot : 0.0);
+    }
+};
+Q4ePfProf g_q4e_pf;
+}  // namespace
+
 void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                               const int32_t* tokens_host, ParityCapture* cap) {
     sycl::queue& q = alloc_->queue();
+    const bool pf_on = g_q4e_pf.on && T > 16;
+    auto pf = [&](Q4ePfProf::Kind k) { if (pf_on) g_q4e_pf.mark(this, q, k); };
+    if (pf_on) g_q4e_pf.start(this, q, T);
     const uint32_t H = cfg_.hidden, D = cfg_.hc_count * H;
     const uint32_t SI = cfg_.ssm_inner, SKH = cfg_.ssm_k_heads, SVH = cfg_.ssm_v_heads;
     const uint32_t SHD = cfg_.ssm_state, CC = SI + 2u * SKH * SHD, KW = SKH * SHD;
@@ -2211,6 +2494,18 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             // prefill, so it is OPT-IN (IE_Q4E_DNN_PREFILL=1) until a
             // deterministic s8 GEMM replaces it; default = dequant-once
             // scratch + gemm_fp16 (deterministic).
+            // P4 B49: the same in-place read with an fp16 result (gemm_nt_s8_f16_onednn, deterministic attribute on,
+            // no fp32 scratch + cast), on by default: the matmul is ~4x the in-house gemm_fp16's rate and the
+            // dequant pass goes away. IE_Q4E_S8_PREFILL=0 = the dequant-once route below.
+            static const bool s8_pre = [] {
+                const char* e = std::getenv("IE_Q4E_S8_PREFILL");
+                return !(e && *e && std::atoi(e) == 0);
+            }();
+            if (s8_pre && Wq.dt && onednn_available()) {
+                sycl::event ev8;
+                if (gemm_nt_s8_f16_onednn(q, X, Wq.qs, reinterpret_cast<const sycl::half*>(Wq.dt), Y, T, N, K, 32, &ev8))
+                    return;
+            }
             static const bool dnn_pre =
                 std::getenv("IE_Q4E_DNN_PREFILL") != nullptr;
             sycl::event ev;
@@ -2444,6 +2739,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             }
         }
 
+        pf(Q4ePfProf::kPle);
         // ---- attn site: HC mix -> token mixer -> HC combine ----------------
         // T > 16 routes the low-rank projections through gemm_fp16 (see
         // qwen4_hc_mix_prefill) — v2 re-streamed both weight mats per token
@@ -2458,6 +2754,26 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                      w.hc_attn_inject, xn_ws_, lo_ws_, mixed_, inj_,
                      T, H, cfg_.hc_count, cfg_.hc_low_rank, eps);
         if (cap) grab(cap->mixed_attn, mixed_);
+        pf(Q4ePfProf::kHc);
+        {   // IE_Q4E_SEL_CHECK=1 (P4 B49 diagnostic): the first chunk's attn-site input per layer -- NaN count and the
+            // largest finite magnitude, to see where values blow up
+            static const bool mix_check = std::getenv("IE_Q4E_SEL_CHECK") != nullptr;
+            if (mix_check && T > 16 && start_pos == 0) {
+                q.wait();
+                std::vector<sycl::half> hb(uint64_t(T) * H);
+                q.memcpy(hb.data(), mixed_, hb.size() * sizeof(sycl::half)).wait();
+                uint64_t nan = 0; float mx = 0.f; uint64_t first = UINT64_MAX, at = 0;
+                for (uint64_t i = 0; i < hb.size(); ++i) {
+                    const float v = float(hb[i]);
+                    if (!(v == v) || v > 65504.f || v < -65504.f) { ++nan; if (first == UINT64_MAX) first = i; }
+                    else if (std::fabs(v) > mx) { mx = std::fabs(v); at = i; }
+                }
+                std::fprintf(stderr, "[q4e mix-check] layer %u (%s): %llu non-finite, largest finite %.2f at row %llu%s\n", L,
+                             lin_idx_[L] >= 0 ? "DeltaNet" : "attention", (unsigned long long)nan, double(mx),
+                             (unsigned long long)(at / H),
+                             first == UINT64_MAX ? "" : (", first non-finite at row " + std::to_string(first / H)).c_str());
+            }
+        }
 
         if (lin_idx_[L] >= 0) {
             // Gated DeltaNet — the qwen35 chain, sigmoid output gate.
@@ -2518,6 +2834,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                     });
                 });
             }
+            pf(Q4ePfProf::kProj);
             depthwise_conv1d_causal(q, dn_qkv_, w.ssm_conv, cst, dn_conv_,
                                     T, CC, cfg_.ssm_conv_kernel);
             cast_qkv_split_fp16_to_fp32(q, dn_conv_, dn_qpre_, dn_kpre_, dn_vpre_,
@@ -2534,6 +2851,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                                dn_g_, dn_beta_, T, SVH);
             float* st = dn_.state_ptr() +
                 uint64_t(lin_idx_[L]) * dn_.state_elems_per_layer();
+            pf(Q4ePfProf::kDnOther);
             if (sv && vck_dn_state_ && vck_cap_ >= T) {
                 const uint64_t se = dn_.state_elems_per_layer();
                 const uint64_t se_step =
@@ -2543,10 +2861,13 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                     vck_dn_state_ + vck_base_ * se_step +
                         uint64_t(lin_idx_[L]) * se,
                     se_step, T, SVH, SHD, SHD);
+            } else if (T >= 32 && SHD == 128 && q4e_dn_scan_on()) {   // P4 B49: the state in registers, no barriers
+                deltanet_scan_prefill(q, dn_qrep_, dn_krep_, dn_vpre_, dn_g_, dn_beta_, st, dn_out_, T, SVH);
             } else {
                 deltanet_recurrence(q, dn_qrep_, dn_krep_, dn_vpre_, dn_g_, dn_beta_,
                                     st, dn_out_, 1, T, SVH, SHD, SHD);
             }
+            pf(Q4ePfProf::kDnScan);
             if (use_q8 && w.gate_q8.qs) {   // reuses the activation quantized for qkv
                 if (dense_a16() && T <= 16)
                     gemv_q8_0_soa_f16_rows(q, mixed_, w.gate_q8.qs, w.gate_q8.d,
@@ -2567,8 +2888,10 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             } else {
                 proj(mixed_, w.attn_gate, dn_z_, H, SI);
             }
+            pf(Q4ePfProf::kProj);
             gated_rms_norm(q, dn_out_, dn_z_, w.ssm_norm, dn_gn_,
                            T * SVH, SHD, eps, /*sigmoid_gate=*/true);
+            pf(Q4ePfProf::kDnOther);
             if (use_q8 && w.out_q8.qs) {
                 if (dense_a16() && T <= 16) {
                     gemv_q8_0_soa_f16_rows(q, dn_gn_, w.out_q8.qs, w.out_q8.d,
@@ -2592,12 +2915,14 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             } else {
                 proj(dn_gn_, w.ssm_out, blockout_, SI, H);
             }
+            pf(Q4ePfProf::kProj);
         } else {
             // Full attention, gate fused in attn_q; dense == QSA in this regime.
             if (w.q_q8.qs) q8_proj(mixed_, w.q_q8, qg_, H, NQ * 2);
             else           proj(mixed_, w.attn_q, qg_, H, NQ * 2);
             proj(mixed_, w.attn_k, ak_, H, NKV);
             proj(mixed_, w.attn_v, av_, H, NKV);
+            pf(Q4ePfProf::kProj);
             split_q_gate_per_head(q, qg_, aq_, agate_, T, cfg_.n_q_heads, HD);
             rms_norm_f32w(q, aq_, w.attn_q_norm, aq_, T * cfg_.n_q_heads, HD, eps);
             rms_norm_f32w(q, ak_, w.attn_k_norm, ak_, T * cfg_.n_kv_heads, HD, eps);
@@ -2650,6 +2975,11 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                     blk_done_[li] = nb_tot;
                 }
             }
+            pf(Q4ePfProf::kAttnPrep);
+            // P4 B49: the matmul attention for a prefill chunk (not the verify rows), while the chunk's rounded row
+            // count fits the workspaces and its context the masked form's bound.
+            const bool ag_ok = ag_.s && !sv && T >= 32 && start_pos + T <= ag_maxctx_ &&
+                               (T + kAttnGemmRowStep - 1) / kAttnGemmRowStep * kAttnGemmRowStep <= max_chunk_;
             if (start_pos + T <= dense_ok) {
                 if (sv)
                     // Spec-verify: LOOP the decode kernel over the T rows —
@@ -2663,6 +2993,9 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                                        attn_out_ + uint64_t(t) * NQ, 1,
                                        start_pos + t, cfg_.n_q_heads,
                                        cfg_.n_kv_heads, HD, max_ctx_);
+                else if (ag_ok)   // P4 B49: two matmuls and a softmax
+                    full_attention_prefill_gemm(q, aq_, ak_, av_, kc, vc, attn_out_, T, start_pos,
+                                                cfg_.n_q_heads, cfg_.n_kv_heads, HD, max_ctx_, ag_);
                 else if (T > 1)
                     // hd256 wide-tile FA2 (qwen35-certified argmax-identical);
                     // naive re-reads the whole KV per query row — measured
@@ -2704,6 +3037,38 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                     qsa_expand_sel_batched(q, qsa_blk_selT_, kblk, kblk, kblk,
                                            d_pos_, qsa_selT_, qsa_sel_cap_,
                                            qsa_nselT_, T);
+                    {   // IE_Q4E_SEL_CHECK=1 (P4 B49 diagnostic): the selection lists read back and checked on the host --
+                        // a listed key must be a position at or before its token.
+                        static const bool sel_check = std::getenv("IE_Q4E_SEL_CHECK") != nullptr;
+                        if (sel_check) {
+                            q.wait();
+                            std::vector<int32_t> hs(uint64_t(T) * qsa_sel_cap_), hn(T);
+                            q.memcpy(hs.data(), qsa_selT_, hs.size() * sizeof(int32_t));
+                            q.memcpy(hn.data(), qsa_nselT_, hn.size() * sizeof(int32_t)).wait();
+                            uint64_t future = 0, neg = 0, over = 0, toks = 0; int32_t worst = 0; uint32_t first_t = 0;
+                            for (uint32_t t = 0; t < T; ++t) {
+                                const int32_t p = int32_t(start_pos + t);
+                                if (hn[t] < 0 || uint32_t(hn[t]) > qsa_sel_cap_) { ++over; continue; }
+                                bool bad = false;
+                                for (int32_t j = 0; j < hn[t]; ++j) {
+                                    const int32_t c = hs[uint64_t(t) * qsa_sel_cap_ + j];
+                                    if (c < 0) { ++neg; bad = true; }
+                                    else if (c > p) { ++future; bad = true; if (c - p > worst) worst = c - p; }
+                                }
+                                if (bad && !toks++) first_t = t;
+                            }
+                            if (future || neg || over)
+                                std::fprintf(stderr, "[q4e sel-check] layer %u chunk at %u (T %u): %llu future keys, %llu negative, "
+                                             "%llu bad counts, in %llu tokens (first row %u, furthest +%d)\n", L, start_pos, T,
+                                             (unsigned long long)future, (unsigned long long)neg, (unsigned long long)over,
+                                             (unsigned long long)toks, first_t, worst);
+                        }
+                    }
+                    if (ag_ok)   // P4 B49: the same selected keys, as a mask over the dense scores
+                        full_attention_prefill_gemm_sel(q, aq_, kc, vc, attn_out_, T, start_pos,
+                                                        cfg_.n_q_heads, cfg_.n_kv_heads, HD, max_ctx_,
+                                                        qsa_selT_, qsa_sel_cap_, qsa_nselT_, ag_);
+                    else
                     for (uint32_t g0 = 0; g0 < T; g0 += 64) {
                         const uint32_t gT = std::min(64u, T - g0);
                         qsa_attend_fused_grp(q, aq_ + uint64_t(g0) * NQ, kc, vc,
@@ -2737,9 +3102,37 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 }
             }
             kv_.set_length(li, start_pos + T);
+            {   // IE_Q4E_SEL_CHECK=1 (P4 B49 diagnostic): NaN / Inf / the largest finite magnitude in the chunk's q, v and
+                // attention output
+                static const bool out_check = std::getenv("IE_Q4E_SEL_CHECK") != nullptr;
+                if (out_check && T > 16) {
+                    q.wait();
+                    auto scan = [&](const char* what, const sycl::half* dev, uint64_t n, uint32_t row_w) {
+                        std::vector<sycl::half> hb(n);
+                        q.memcpy(hb.data(), dev, n * sizeof(sycl::half)).wait();
+                        uint64_t nan = 0, inf = 0; float mx = 0.f; uint64_t first = UINT64_MAX;
+                        for (uint64_t i = 0; i < n; ++i) {
+                            const float v = float(hb[i]);
+                            if (!(v == v)) { ++nan; if (first == UINT64_MAX) first = i; }
+                            else if (v > 65504.f || v < -65504.f) { ++inf; if (first == UINT64_MAX) first = i; }
+                            else if (std::fabs(v) > mx) mx = std::fabs(v);
+                        }
+                        if (nan || inf || mx > 30000.f)
+                            std::fprintf(stderr, "[q4e attn-check] layer %u chunk at %u (T %u) %s: %llu NaN, %llu Inf, largest finite %.1f"
+                                         "%s\n", L, start_pos, T, what, (unsigned long long)nan, (unsigned long long)inf, double(mx),
+                                         first == UINT64_MAX ? "" : (" (first at row " + std::to_string(first / row_w) + ")").c_str());
+                    };
+                    scan("q", aq_, uint64_t(T) * NQ, NQ);
+                    scan("k", ak_, uint64_t(T) * NKV, NKV);
+                    scan("v", av_, uint64_t(T) * NKV, NKV);
+                    scan("attention out", attn_out_, uint64_t(T) * NQ, NQ);
+                }
+            }
+            pf(Q4ePfProf::kAttn);
             sigmoid_gate(q, attn_out_, agate_, attn_out_, uint64_t(T) * NQ);
             if (w.attnout_q8.qs) q8_proj(attn_out_, w.attnout_q8, blockout_, NQ, H);
             else                 proj(attn_out_, w.attn_output, blockout_, NQ, H);
+            pf(Q4ePfProf::kProj);
         }
         if (cap) grab(cap->mixer_out, blockout_);
         {   // Diagnostic: IE_Q4E_DUMP_BLK=<file> appends blockout_ [T,H] f16 per stage
@@ -2754,6 +3147,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             }
         }
         qwen4_hc_combine(q, wide_, blockout_, inj_, T, H, cfg_.hc_count);
+        pf(Q4ePfProf::kHc);
 
         // ---- ffn site: HC mix -> MoE (+ shared expert) -> HC combine -------
         if (T > 16 && hc_prefill_gemm() && w.hc_ffn_down_t)
@@ -2766,6 +3160,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                      w.hc_ffn_inject, xn_ws_, lo_ws_, mixed_, inj_,
                      T, H, cfg_.hc_count, cfg_.hc_low_rank, eps);
         if (cap) grab(cap->mixed_ffn, mixed_);
+        pf(Q4ePfProf::kHc);
         // T=1 decode rides the spec-verify grouped MoE body (ONE launch each
         // for gate+up / swiglu / down / reduce instead of ~5 per pick). The
         // verify body is certified row-exact to the per-pick chain (501/501
@@ -2941,10 +3336,10 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                                 seen[e] = 1; ++uni;
                             }
                         }
-                    if (uni > ecache_slots_) {
+                    if (uni > ecache_usable_) {
                         block_err_ = "qwen4exp verify: expert union " +
                             std::to_string(uni) + " > ecache slots " +
-                            std::to_string(ecache_slots_) +
+                            std::to_string(ecache_usable_) +
                             " (layer " + std::to_string(L) +
                             ") — raise IE_Q4E_ECACHE_GB or lower K";
                         return;
@@ -3245,7 +3640,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                     std::getenv("IE_Q4E_NO_COPYQ") != nullptr;
                 const bool prefetch = !no_copyq && copyq_ != nullptr;
                 const uint32_t wave_max = prefetch
-                    ? std::max(1u, ecache_slots_ / 2) : ecache_slots_;
+                    ? std::max(1u, ecache_usable_ / 2) : ecache_usable_;
                 sycl::queue& cq = prefetch ? *copyq_ : q;
                 sycl::event qfence, kdone[2];
                 if (prefetch) qfence = q.ext_oneapi_submit_barrier();
@@ -3470,6 +3865,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             cast_f32_to_f16(q, moe_accT_, blockout_, uint64_t(T) * H);
         }
         if (cap) grab(cap->moe_out, blockout_);
+        pf(Q4ePfProf::kMoe);
         {   // Diagnostic: IE_Q4E_DUMP_BLK=<file> appends blockout_ [T,H] f16 per stage
             static const char* dump_blk = std::getenv("IE_Q4E_DUMP_BLK");
             if (dump_blk) {
@@ -3482,6 +3878,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             }
         }
         qwen4_hc_combine(q, wide_, blockout_, inj_, T, H, cfg_.hc_count);
+        pf(Q4ePfProf::kHc);
 }
 
 std::string Qwen4ExpModel::run_block_parity(uint32_t L, const float* wide_in_host,
@@ -3718,7 +4115,7 @@ Qwen4ExpModel::LaneRef Qwen4ExpModel::lane_ref(uint32_t lane) noexcept {
 }
 
 uint32_t Qwen4ExpModel::rows_max() const noexcept {
-    return q4e_rows_max_group(ecache_slots_, cfg_.n_experts_used);
+    return q4e_rows_max_group(ecache_usable_, cfg_.n_experts_used);
 }
 
 std::string Qwen4ExpModel::rows_off_reason() const {
@@ -4035,9 +4432,9 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
             for (uint32_t vt = 0; vt < G; ++vt)
                 for (const auto& pr : tk[vt])
                     if (!seen[pr.first]) { seen[pr.first] = 1; ++uni; }
-            if (uni > ecache_slots_) {
+            if (uni > ecache_usable_) {
                 block_err_ = "qwen4exp rows: expert union " + std::to_string(uni) + " > ecache slots " +
-                             std::to_string(ecache_slots_) + " (layer " + std::to_string(L) + ")";
+                             std::to_string(ecache_usable_) + " (layer " + std::to_string(L) + ")";
                 return;
             }
         }

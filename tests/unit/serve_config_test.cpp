@@ -105,9 +105,10 @@ int main(int argc, char** argv) {
     // "~/" expands to $HOME; absolute paths stay
     {
         setenv("HOME", "/home/u", 1);
-        const auto cfg = ie::parse_serve_config(R"({"servers": [{"model": "~/models/x", "spec_draft": "d.gguf"}]})", "/cfg");
+        const auto cfg = ie::parse_serve_config(R"({"servers": [{"model": "~/models/x", "spec_draft": "d.gguf", "mmproj": "mmproj-F16.gguf"}]})", "/cfg");
         assert(ie::single_server(cfg).model == "/home/u/models/x");
         assert(ie::single_server(cfg).launch.engine.spec_draft == "/cfg/d.gguf");
+        assert(ie::single_server(cfg).launch.engine.mmproj == "/cfg/mmproj-F16.gguf");   // P4 B45: a path key, resolved like the others
     }
 
     // ---- validation: each names what is wrong

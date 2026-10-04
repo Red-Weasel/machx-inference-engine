@@ -337,7 +337,10 @@ void Qwen35MoeSplitModel::free_all() {
     owned_.clear();
     for (uint32_t d = 0; d < prefill_bt_.size(); ++d)
         if (prefill_bt_[d]) fleet_->dev(d).free(prefill_bt_[d]);
+    for (uint32_t d = 0; d < prefill_dt_.size(); ++d)
+        if (prefill_dt_[d]) fleet_->dev(d).free(prefill_dt_[d]);
     prefill_bt_.clear(); prefill_bt_cap_.clear(); act_q8_.clear();
+    prefill_dt_.clear(); prefill_dt_cap_.clear();
     for (auto& s : dn_) s.free_storage();
     for (auto& c : kv_) c.free_storage();
     for (auto& l : lane_dn_) for (auto& s : l) s.free_storage();
@@ -676,6 +679,8 @@ std::string Qwen35MoeSplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
     act_q8_.assign(n_dev_, nullptr);
     prefill_bt_.assign(n_dev_, nullptr);
     prefill_bt_cap_.assign(n_dev_, 0);
+    prefill_dt_.assign(n_dev_, nullptr);
+    prefill_dt_cap_.assign(n_dev_, 0);
     for (uint32_t dev = 0; dev < n_dev_; ++dev) {
         void* p = fleet.dev(dev).malloc((uint64_t(Kmax) / 32) * sizeof(block_q8_1x));
         if (!p) return "act_q8 alloc dev " + std::to_string(dev);
@@ -701,10 +706,13 @@ void Qwen35MoeSplitModel::free_ws(uint32_t dev) {
     auto& alloc = fleet_->dev(dev);
     for (void* p : {static_cast<void*>(w.x), static_cast<void*>(w.x_normed),
                     static_cast<void*>(w.attn_block), static_cast<void*>(w.positions),
+                    static_cast<void*>(w.positions3),
                     static_cast<void*>(w.ids), static_cast<void*>(w.logits),
                     static_cast<void*>(w.qg), static_cast<void*>(w.q), static_cast<void*>(w.gate),
                     static_cast<void*>(w.k), static_cast<void*>(w.v), static_cast<void*>(w.attn_out),
                     static_cast<void*>(w.attn_partials),
+                    static_cast<void*>(w.ag.qh), static_cast<void*>(w.ag.s), static_cast<void*>(w.ag.p),
+                    static_cast<void*>(w.ag.o), static_cast<void*>(w.ag.l),
                     static_cast<void*>(w.dn_qkv), static_cast<void*>(w.dn_conv), static_cast<void*>(w.dn_z),
                     static_cast<void*>(w.dn_qpre), static_cast<void*>(w.dn_kpre), static_cast<void*>(w.dn_vpre),
                     static_cast<void*>(w.dn_g), static_cast<void*>(w.dn_beta), static_cast<void*>(w.dn_out),
@@ -725,6 +733,7 @@ void Qwen35MoeSplitModel::free_ws(uint32_t dev) {
 
 std::string Qwen35MoeSplitModel::ensure_ws(uint32_t dev, uint32_t max_T) {
     Workspace& w = ws_[dev];
+    max_T = (max_T + kAttnGemmRowStep - 1) / kAttnGemmRowStep * kAttnGemmRowStep;   // P4 B49: whole row steps
     if (max_T <= w.T) return {};
     if (w.T != 0) free_ws(dev);
     auto& alloc = fleet_->dev(dev);
@@ -747,6 +756,7 @@ std::string Qwen35MoeSplitModel::ensure_ws(uint32_t dev, uint32_t max_T) {
 
     w.x = ah(T*H); w.x_normed = ah(T*H); w.attn_block = ah(T*H);
     w.positions = static_cast<int32_t*>(alloc.malloc(T * sizeof(int32_t)));
+    w.positions3 = static_cast<int32_t*>(alloc.malloc(3 * T * sizeof(int32_t)));   // P4 B45 (12 bytes a row)
     if (dev == plan_.embed_dev) {   // P4 B22: persistent, like the 27B split's
         w.ids = static_cast<int32_t*>(alloc.malloc(T * sizeof(int32_t)));
         if (!w.ids) return "qwen35moe_split ids alloc failed on dev " + std::to_string(dev);
@@ -780,7 +790,7 @@ std::string Qwen35MoeSplitModel::ensure_ws(uint32_t dev, uint32_t max_T) {
     w.moe_sw = ah(TK);
     w.moe_tk2pk = static_cast<uint32_t*>(alloc.malloc(TK * sizeof(uint32_t)));
 
-    if (!w.x || !w.x_normed || !w.attn_block || !w.positions || !w.qg || !w.q ||
+    if (!w.x || !w.x_normed || !w.attn_block || !w.positions || !w.positions3 || !w.qg || !w.q ||
         !w.gate || !w.k || !w.v || !w.attn_out || !w.dn_qkv || !w.dn_conv || !w.dn_z ||
         !w.dn_qpre || !w.dn_kpre || !w.dn_vpre || !w.dn_g || !w.dn_beta || !w.dn_out ||
         !w.dn_qrep || !w.dn_krep || !w.dn_alpha_h || !w.dn_beta_h || !w.dn_alpha64 ||
@@ -797,9 +807,46 @@ std::string Qwen35MoeSplitModel::ensure_ws(uint32_t dev, uint32_t max_T) {
         w.attn_partials = static_cast<float*>(alloc.malloc(n_floats * sizeof(float)));
         if (!w.attn_partials) return "qwen35moe_split attn_partials alloc failed on dev " + std::to_string(dev);
         w.partials_ctx = max_ctx;
+        // P4 B49: full_attention_prefill_gemm's scratch. Scores + weights: 32M elements (128 + 64 MB), or 16 rows at
+        // this card's largest context when that is more.
+        if (attn_gemm_on()) {
+            const uint32_t gqa = cfg_.n_q_heads / cfg_.n_kv_heads;
+            w.ag.sp_elems = std::max<uint64_t>(uint64_t(32) << 20, uint64_t(16) * max_ctx);
+            w.ag.qh = ah(T * N_q);
+            w.ag.s  = af(w.ag.sp_elems);
+            w.ag.p  = ah(w.ag.sp_elems);
+            w.ag.o  = af(T * gqa * cfg_.head_dim);
+            w.ag.l  = af(T * gqa);
+            if (!w.ag.qh || !w.ag.s || !w.ag.p || !w.ag.o || !w.ag.l)
+                return "qwen35moe_split attention scratch alloc failed on dev " + std::to_string(dev);
+        }
     }
     w.T = max_T;
     return {};
+}
+
+// P4 B49: the 27B split's reading levers (P4 B48, ~/ds41_work/p60/b48/BUILD.md) on the crown split. Each is on by
+// default; =0 restores the old path.
+//   IE_Q35MOE_ATTN_GEMM   a prefill piece's full attention = full_attention_prefill_gemm (two oneDNN matmuls + a softmax)
+//   IE_Q35MOE_S8_PREFILL  a Q8_0 projection read in place by the matmul (gemm_nt_s8_f16_onednn), no expand-to-fp16 pass
+//   IE_Q35MOE_DN_SCAN     the DeltaNet recurrence of a piece = deltanet_scan_prefill (state in registers, no barriers)
+namespace {
+bool q35m_b49_switch(const char* name) {
+    const char* e = std::getenv(name);
+    return !(e && *e && std::atoi(e) == 0);
+}
+}  // namespace
+bool Qwen35MoeSplitModel::attn_gemm_on() {
+    static const bool on = q35m_b49_switch("IE_Q35MOE_ATTN_GEMM") && onednn_available();
+    return on;
+}
+bool Qwen35MoeSplitModel::s8_prefill_on() {
+    static const bool on = q35m_b49_switch("IE_Q35MOE_S8_PREFILL") && onednn_available();
+    return on;
+}
+bool Qwen35MoeSplitModel::dn_scan_on() {
+    static const bool on = q35m_b49_switch("IE_Q35MOE_DN_SCAN");
+    return on;
 }
 
 sycl::event Qwen35MoeSplitModel::sgemv(uint32_t dev, const sycl::half* A, const SplitW& w,
@@ -813,6 +860,30 @@ sycl::event Qwen35MoeSplitModel::sgemv(uint32_t dev, const sycl::half* A, const 
         sycl::event e = gemv_q8_0_soa_q8_sel(q, act_q8_[dev], w.q8_qs, w.q8_d, out, K, N);
         if (g_dp35.active()) g_dp35.tag(dev, e, DecodeProf::kGemv);
         return e;
+    }
+    // P4 B49: a Q8_0 weight goes to the matmul in place (oneDNN weights decompression): no expand pass. The scale plane
+    // is transposed per call (1/16 of the weight's bytes) into a scratch grown to the largest plane.
+    if (w.q8_qs && s8_prefill_on()) {
+        const uint64_t nd = uint64_t(N) * (K / 32u);
+        if (nd > prefill_dt_cap_[dev]) {
+            q.wait();   // a queued matmul may still read the old plane
+            if (prefill_dt_[dev]) alloc.free(prefill_dt_[dev]);
+            prefill_dt_[dev] = static_cast<sycl::half*>(alloc.malloc(nd * sizeof(sycl::half)));
+            prefill_dt_cap_[dev] = prefill_dt_[dev] ? nd : 0;
+        }
+        if (prefill_dt_[dev]) {
+            q8_scales_kb_major(q, w.q8_d, prefill_dt_[dev], N, K / 32u);
+            sycl::event e;
+            const uint32_t M = sgemv_pad_ ? std::min<uint32_t>((T + kAttnGemmRowStep - 1) / kAttnGemmRowStep * kAttnGemmRowStep,
+                                                               ws_[dev].T) : T;
+            if (gemm_nt_s8_f16_onednn(q, A, w.q8_qs, prefill_dt_[dev], out, M, N, K, 32, &e)) return e;
+            static bool said = false;
+            if (!said) {
+                said = true;
+                std::fprintf(stderr, "[qwen35moe_split] IE_Q35MOE_S8_PREFILL: no jitted oneDNN kernel (%s); the expand route\n",
+                             onednn_nt_s8_f16_impl(q, T, N, K, 32).c_str());
+            }
+        }
     }
     const uint64_t need = uint64_t(K) * N;
     if (need > prefill_bt_cap_[dev]) {
@@ -869,19 +940,17 @@ std::string Qwen35MoeSplitModel::forward(const int32_t* input_ids, uint32_t T,
         if (auto m = ensure_ws(dev, T); !m.empty()) return m;
     g_dp35.begin(T, start_pos);
 
-    std::vector<int32_t> pos(T);
-    for (uint32_t t = 0; t < T; ++t) pos[t] = int32_t(start_pos + t);
+    // positions on every card (+ the [3, T] M-RoPE streams while vision is staged, P4 B45); the reset on a fresh sequence
     for (uint32_t dev = 0; dev < n_dev_; ++dev) {
-        if (ws_[dev].positions)
-            fleet_->dev(dev).queue().memcpy(ws_[dev].positions, pos.data(), T * sizeof(int32_t)).wait();
+        if (ws_[dev].positions) upload_positions(dev, start_pos, T);
         if (reset_kv) {
             if (dn_at(dev).ready()) dn_at(dev).reset(fleet_->dev(dev).queue());
             if (kv_at(dev).ready()) kv_at(dev).reset();
         }
     }
 
-    // embedding → ws_[embed_dev].x
-    if (auto m = embed(input_ids, T); !m.empty()) return m;
+    // embedding → ws_[embed_dev].x (+ the image rows spliced over it, P4 B45)
+    if (auto m = embed(input_ids, T, start_pos); !m.empty()) return m;
     g_dp35.phase(DecodeProf::kSetup);
 
     // IE_Q35MOE_TIMING: per-section wall-clock (adds q.wait barriers → relative
@@ -923,7 +992,7 @@ std::string Qwen35MoeSplitModel::forward(const int32_t* input_ids, uint32_t T,
     return {};
 }
 
-std::string Qwen35MoeSplitModel::embed(const int32_t* input_ids, uint32_t T) {
+std::string Qwen35MoeSplitModel::embed(const int32_t* input_ids, uint32_t T, uint32_t start_pos) {
     const uint32_t H = cfg_.hidden;
     auto& alloc = fleet_->dev(plan_.embed_dev);
     auto& q = alloc.queue();
@@ -942,8 +1011,61 @@ std::string Qwen35MoeSplitModel::embed(const int32_t* input_ids, uint32_t T) {
                              ws_[plan_.embed_dev].x, T, H);
     else
         embedding_lookup_q6k(q, d_ids, token_embd_, ws_[plan_.embed_dev].x, T, H);
+    // P4 B45 vision: the staged projector rows over the gathered rows (in-order: after the gather, before layer 0; a no-op
+    // without spans -- the lanes' forward_stage refuses while vision is staged, so only forward() reaches this with any)
+    splice_vision(q, ws_[plan_.embed_dev].x, start_pos, T);
     q.wait();
     return {};
+}
+
+// ---- P4 B45 step 2: image input (the header's note; the 27B split's set, qwen35_split.cpp). ---------------------------
+std::string Qwen35MoeSplitModel::set_vision(const float* rows_f32, uint32_t t0, uint32_t n_rows) {
+    if (!rows_f32 || !n_rows) return "qwen35moe_split set_vision: empty rows";
+    if (uint64_t(t0) + n_rows > max_ctx_) return "qwen35moe_split set_vision: span past max_ctx";
+    const uint32_t H = cfg_.hidden;
+    const size_t row0 = vis_rows_.size() / H;
+    vis_rows_.resize(vis_rows_.size() + size_t(n_rows) * H);
+    for (size_t i = 0; i < size_t(n_rows) * H; ++i) vis_rows_[row0 * H + i] = sycl::half(rows_f32[i]);
+    vis_spans_.push_back({t0, n_rows, uint32_t(row0)});
+    return {};
+}
+
+void Qwen35MoeSplitModel::set_mrope(const int32_t* pos3, uint32_t n_total, int32_t delta) {
+    mrope3_.assign(pos3, pos3 + size_t(3) * n_total);
+    mrope_n_ = n_total;
+    mrope_delta_ = delta;
+}
+
+void Qwen35MoeSplitModel::clear_vision() {
+    vis_spans_.clear();
+    vis_rows_.clear();
+    mrope3_.clear();
+    mrope_n_ = 0;
+    mrope_delta_ = 0;
+}
+
+// The piece [start, start + T)'s positions onto card dev: the linear token positions (every path's KV index and, without
+// vision, the rope) and, while vision is staged, the [3, T] M-RoPE slice the rope reads instead (one blocking copy each,
+// as forward() did before B45).
+void Qwen35MoeSplitModel::upload_positions(uint32_t dev, uint32_t start, uint32_t T) {
+    Workspace& w = ws_[dev];
+    auto& q = fleet_->dev(dev).queue();
+    std::vector<int32_t> pos(T);
+    for (uint32_t t = 0; t < T; ++t) pos[t] = int32_t(start + t);
+    q.memcpy(w.positions, pos.data(), T * sizeof(int32_t)).wait();
+    if (mrope_n_) {
+        std::vector<int32_t> p3(size_t(3) * T);
+        qwen4_mrope3_slice(mrope3_.data(), mrope_n_, mrope_delta_, start, T, p3.data());
+        q.memcpy(w.positions3, p3.data(), p3.size() * sizeof(int32_t)).wait();
+    }
+}
+
+// The staged projector rows over the piece's gathered embedding rows (f16 row memcpys on the embed card's in-order queue).
+void Qwen35MoeSplitModel::splice_vision(sycl::queue& q, sycl::half* x, uint32_t start, uint32_t T) {
+    if (vis_spans_.empty()) return;
+    const uint32_t H = cfg_.hidden;
+    for (const Qwen4VisSplice& r : qwen4_vis_splice_ranges(vis_spans_, start, T))
+        q.memcpy(x + uint64_t(r.dst) * H, vis_rows_.data() + uint64_t(r.src) * H, uint64_t(r.n) * H * sizeof(sycl::half));
 }
 
 // One card's layers of a T-row step at start_pos (the selected lane's state on that card): x → x in ws_[dev].
@@ -965,6 +1087,11 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
     auto& q = fleet_->dev(dev).queue();
     const uint64_t per_layer_kv =
         uint64_t(n_kv) * (kv_at(dev).ready() ? kv_at(dev).config().max_ctx : 0u) * HD;
+    struct PadGuard {   // P4 B49: sgemv's operands are workspace buffers for the length of this call
+        bool& f;
+        explicit PadGuard(bool& x) : f(x) { f = true; }
+        ~PadGuard() { f = false; }
+    } pad_guard(sgemv_pad_);
 
     for (uint32_t L = 0; L < n_layers; ++L) {
         if (plan_.dev_of_layer[L] != dev) continue;
@@ -1009,6 +1136,9 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
                                w.dn_g, w.dn_beta, T, SVH));
             float* state_layer = dn_at(dev).state_ptr() +
                 uint64_t(dn_local_[L]) * dn_at(dev).state_elems_per_layer();
+            if (dn_scan_on() && T >= kAttnGemmMinT && SHD == 128)   // P4 B49
+                deltanet_scan_prefill(q, w.dn_qrep, w.dn_krep, w.dn_vpre, w.dn_g, w.dn_beta, state_layer, w.dn_out, T, SVH);
+            else
             DPE(dev, kDnRec, deltanet_recurrence(q, w.dn_qrep, w.dn_krep, w.dn_vpre, w.dn_g, w.dn_beta,
                                 state_layer, w.dn_out, /*B=*/1, T, SVH, SHD, SHD));
             sgemv(dev, w.x_normed, w_l.attn_gate, w.dn_z, H, SI, T);
@@ -1021,8 +1151,13 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
             sgemv(dev, w.x_normed, w_l.attn_v, w.v, H, N_kv, T);
             DPE(dev, kAttnPre, rms_norm_f32w(q, w.q, w_l.attn_q_norm, w.q, T * cfg_.n_q_heads,  HD, eps));
             DPE(dev, kAttnPre, rms_norm_f32w(q, w.k, w_l.attn_k_norm, w.k, T * cfg_.n_kv_heads, HD, eps));
+            if (mrope_n_) {   // P4 B45 vision: the 3-stream M-RoPE (== rope_partial when the streams are equal)
+                rope_imrope3(q, w.q, w.positions3, w.q, T, cfg_.n_q_heads,  HD, rope_n, cfg_.rope_theta);
+                rope_imrope3(q, w.k, w.positions3, w.k, T, cfg_.n_kv_heads, HD, rope_n, cfg_.rope_theta);
+            } else {
             DPE(dev, kAttnPre, rope_partial(q, w.q, w.positions, w.q, T, cfg_.n_q_heads,  HD, rope_n, cfg_.rope_theta));
             DPE(dev, kAttnPre, rope_partial(q, w.k, w.positions, w.k, T, cfg_.n_kv_heads, HD, rope_n, cfg_.rope_theta));
+            }
             auto& kvc = kv_at(dev);
             const uint32_t li = kv_local_[L];   // local full-attn layer index on this card
             sycl::half* kc = kvc.k_ptr() + per_layer_kv * li;
@@ -1068,7 +1203,10 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
                 // depending on whether it was re-cut. IE_Q35MOE_FA2_TILE_MINCTX=6144 restores v0.2.6's bytes.
                 static const bool no_tile = std::getenv("IE_Q35MOE_NO_FA2_TILE") != nullptr;
                 static const uint32_t tile_minctx = q35m_fa2_tile_minctx();
-                if (!no_tile && HD == 256 && (start_pos + T) >= tile_minctx) {
+                if (w.ag.s && T >= kAttnGemmMinT) {   // P4 B49
+                    full_attention_prefill_gemm(q, w.q, w.k, w.v, kc, vc, w.attn_out, T, start_pos,
+                                                cfg_.n_q_heads, cfg_.n_kv_heads, HD, max_ctx, w.ag);
+                } else if (!no_tile && HD == 256 && (start_pos + T) >= tile_minctx) {
                     full_attention_fa2_prefill_tile_gemma(q, w.q, w.k, w.v, kc, vc, w.attn_out, T, start_pos,
                                                           cfg_.n_q_heads, cfg_.n_kv_heads, HD, max_ctx, 0 /*window: full causal*/);
                 } else {
@@ -1401,6 +1539,7 @@ std::string Qwen35MoeSplitModel::forward_stage(uint32_t dev, uint32_t lane, cons
     if (T == 0) return "T == 0";
     if (aborting(T)) return kStopped;
     if (lane >= n_lanes() || n_dev_ != 2 || dev >= 2 || !lane_logits_) return "forward_stage: no such lane/card (lanes not initialised?)";
+    if (vision_active()) return "forward_stage: vision is staged but the lanes have no per-lane image state (P4 B45 step 3)";
     if (auto m = ensure_ws(dev, T); !m.empty()) return m;
     cur_[dev] = lane;
     auto& q = fleet_->dev(dev).queue();
@@ -1415,7 +1554,7 @@ std::string Qwen35MoeSplitModel::forward_stage(uint32_t dev, uint32_t lane, cons
         if (kv_at(dev).ready()) kv_at(dev).reset();
     }
     const uint64_t xb = uint64_t(T) * cfg_.hidden * sizeof(sycl::half);
-    if (dev == plan_.embed_dev) { if (auto m = embed(ids, T); !m.empty()) return m; }
+    if (dev == plan_.embed_dev) { if (auto m = embed(ids, T, pos0); !m.empty()) return m; }
     else q.memcpy(w.x, x_host, xb).wait();
     double t_attn = 0.0, t_moe = 0.0;
     run_layers(dev, T, pos0, false, t_attn, t_moe);
@@ -1653,6 +1792,7 @@ std::string Qwen35MoeSplitModel::forward_stage_rows(uint32_t dev, std::span<cons
         if (pos0[i] == 0) return "forward_stage_rows: lane " + std::to_string(lanes[i]) + " at position 0 (a group row never starts a sequence)";
     }
     if (dev == plan_.embed_dev && !ids) return "forward_stage_rows: no ids";
+    if (vision_active()) return "forward_stage_rows: vision is staged but the lanes have no per-lane image state (P4 B45 step 3)";
     if (auto m = ensure_ws(dev, G); !m.empty()) return m;
     auto& q = fleet_->dev(dev).queue();
     Workspace& w = ws_[dev];
@@ -1661,7 +1801,8 @@ std::string Qwen35MoeSplitModel::forward_stage_rows(uint32_t dev, std::span<cons
     for (uint32_t i = 0; i < G; ++i) pos[i] = int32_t(pos0[i]);
     q.memcpy(w.positions, pos, G * sizeof(int32_t)).wait();
     const uint64_t xb = uint64_t(G) * cfg_.hidden * sizeof(sycl::half);
-    if (dev == plan_.embed_dev) { if (auto m = embed(ids, G); !m.empty()) return m; }
+    // (the G rows are one decode row each of different lanes: no piece position; the splice is a no-op -- guarded above)
+    if (dev == plan_.embed_dev) { if (auto m = embed(ids, G, /*start_pos=*/0); !m.empty()) return m; }
     else q.memcpy(w.x, x_host, xb).wait();
     run_layers_rows(dev, lanes, pos0);
     if (dev != plan_.head_dev) { q.memcpy(x_host, w.x, xb).wait(); return {}; }

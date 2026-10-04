@@ -23,11 +23,13 @@
 #include "ie/dense_split.hpp"        // LayerPlan (reused as-is)
 #include "ie/dense_transformer.hpp"  // DenseQuantPtr, dense::upload*
 #include "ie/deltanet_state.hpp"     // DeltaNetState
+#include "ie/prefill_gemm.hpp"
 #include "ie/gguf.hpp"
 #include "ie/kv_cache.hpp"
 #include "ie/lanes_auto.hpp"         // LanesAutoFit (P4 B30)
 #include "ie/model_config.hpp"       // Qwen35Config
 #include "ie/qwen35_dense.hpp"       // MtpHead + Qwen35SpecCheckpoint (spec-decode)
+#include "ie/qwen4_vision.hpp"       // Qwen4VisSpan + the mrope slice / splice ranges (P4 B45 vision)
 
 #include <functional>
 #include <span>
@@ -167,6 +169,25 @@ public:
     using SpecEmit = std::function<bool(int32_t)>;
     std::string load_mtp_head(const GgufReader& g, uint32_t max_ctx);
     bool mtp_loaded() const noexcept { return mtp_.loaded; }
+
+    // ---- P4 B48: speculation as a STEP of a normal decode loop -----------------------------------------------------
+    // The caller keeps its own loop and samples every token itself (any sampler, penalties, stops, its prompt cache);
+    // spec_step(token, pos) returns the logits of position `pos` for the input `token`, as forward(T = 1) would. Behind
+    // it: the MTP head drafts V - 1 tokens and ONE forward verifies [token, drafts] (the weights read once for V rows);
+    // while the caller's next sampled token equals the next draft, the next call is answered from the verified rows
+    // without a forward. A sampled token that differs rolls the unused rows back (the DeltaNet checkpoints, the KV
+    // lengths) and starts a new round. Every returned row is the model's own logits for that prefix, so the caller's
+    // tokens are those of plain decode with the same sampler and seed.
+    //   spec_step_init(K)   V = K rows a round (2..16); allocates once.
+    //   spec_step_reset()   a new generation, or the model's state was restored / replaced: no pending rows, no hidden.
+    //   spec_step_flush()   leave the model's state at the caller's position (before a stash, a snapshot, the end).
+    std::string spec_step_init(uint32_t K);
+    void        spec_step_reset();
+    // The caller's sampler for the token AFTER `token` (seed = the seed it will use for that sample; the drafts take
+    // seed, seed + 1, ..): the drafts are then sampled the way their targets will be. Null = argmax drafts.
+    struct SpecDraftSampling { float temperature = 0.f; uint32_t top_k = 0; float top_p = 1.f, min_p = 0.f; uint64_t seed = 0; };
+    std::string spec_step(int32_t token, uint32_t pos, sycl::half* logits_host, const SpecDraftSampling* ds = nullptr);
+    std::string spec_step_flush();
     // Self-contained: resets per-card state, chunk-prefills ids[0..P0) (exporting
     // the conditioning hidden), then runs the draft/verify loop. Emits committed
     // tokens in order via `emit` (return false to stop). Greedy/argmax only.
@@ -184,7 +205,33 @@ public:
                                   sycl::half* out_logits_host,
                                   sycl::half* hidden_last_dev = nullptr);
 
+    // ---- P4 B45: IMAGE INPUT on the --parallel 1 paths (forward / forward_pipelined; ~/ds41_work/p60/vision-splits/
+    // STUDY.md step 1). The engine encodes each image on a card (Qwen4Vision::encode_gpu, the same tower as Flash-Next's
+    // with this model's mm.2 width 5120) and stages here, before the request's prefill: set_vision APPENDS a span of n
+    // projector rows (f32 -> f16, the embedding's dtype) that overwrite the gathered embedding rows at prompt positions
+    // [t0, t0 + n) on the embed card (qwen4_vis_splice_ranges per piece, after the gather and before layer 0); set_mrope
+    // stages the prompt's [3, n] stream-major M-RoPE table (qwen4_build_mrope3) + the decode delta: every piece ropes
+    // through rope_imrope3 over its [3, T] slice (qwen4_mrope3_slice: a prompt row from the table, a decode row at
+    // position + delta on all streams) while the KV index, the attention bound and the cache length stay the token
+    // position. clear_vision() returns to the text path (rope_partial over w.positions, no splice) -- the engine calls it
+    // at every generate(), so a text request never ropes through the vision kernel: its bytes are the pre-B45 bytes.
+    // Lanes (forward_stage / forward_stage_rows) have no per-lane vision state yet and refuse while staging is set.
+    std::string set_vision(const float* rows_f32, uint32_t t0, uint32_t n_rows);
+    void        set_mrope(const int32_t* pos3, uint32_t n_total, int32_t delta);
+    void        clear_vision();
+    bool        vision_active() const noexcept { return mrope_n_ != 0 || !vis_spans_.empty(); }
+
 private:
+    std::vector<Qwen4VisSpan> vis_spans_;
+    std::vector<sycl::half>   vis_rows_;      // concat [sum n, hidden] f16
+    std::vector<int32_t>      mrope3_;        // [3, mrope_n_] host
+    uint32_t mrope_n_ = 0;
+    int32_t  mrope_delta_ = 0;
+    // The piece [start, start + T)'s rope positions onto card dev: w.positions (linear, every path) and, with vision
+    // staged, w.positions3 ([3, T]); the one place every forward path uploads them.
+    void upload_positions(uint32_t dev, uint32_t start, uint32_t T);
+    // The staged rows over the piece's gathered embedding rows in x (card embed_dev's queue; no-op without vision).
+    void splice_vision(sycl::queue& q, sycl::half* x, uint32_t start, uint32_t T);
     // Slot banks (batched decode). bank_kv_[slot][dev] / bank_dn_[slot][dev];
     // d_slot_logits_ is an [n_banks, vocab] fp16 staging buffer on head_dev.
     std::vector<std::vector<KvCache>>       bank_kv_;
@@ -244,6 +291,7 @@ private:
         uint32_t T = 0;
         sycl::half *x = nullptr, *x_normed = nullptr, *attn_block = nullptr;
         int32_t* positions = nullptr;
+        int32_t* positions3 = nullptr;   // [3, T] M-RoPE streams (P4 B45 vision; read only while vision is staged)
         int32_t* ids = nullptr;          // [T] input ids (embed_dev only) — persistent,
                                          // was a per-forward malloc/free
         sycl::half* logits = nullptr;    // [vocab] lm_head out (head_dev only) — ditto
@@ -256,6 +304,7 @@ private:
         sycl::half *attn_out = nullptr;  // [T, N_q]
         float      *attn_partials = nullptr;  // FA-2 decode partials (T==1)
         uint32_t    partials_ctx = 0;
+        AttnGemmScratch ag;              // full_attention_prefill_gemm's scratch (P4 B48; cards with a KV cache)
         // DeltaNet (27B dims: n_v=48, conv_ch=10240, ssm_inner=6144, Vd=6144)
         sycl::half *dn_qkv = nullptr;    // [T, conv_ch 10240]
         sycl::half *dn_conv = nullptr;   // [T, conv_ch]
@@ -304,6 +353,12 @@ private:
     bool    spec_verify_gemv_ = false;         // route sgemv T∈[2,16] → batched int-dot
     std::vector<sycl::half*> prefill_bt_;       // [dev] fp16 [K*N]max dequant scratch
     std::vector<uint64_t>    prefill_bt_cap_;   // [dev] element capacity
+    std::vector<sycl::half*> prefill_dt_;       // [dev] kb-major scale plane of the weight in flight (P4 B48, s8_prefill_on)
+    std::vector<uint64_t>    prefill_dt_cap_;   // [dev] element capacity
+    // P4 B48: set while a layer loop runs (forward(), stage_card_prefill): sgemv's operands are then workspace buffers
+    // of ws_[dev].T rows, so its in-place Q8_0 matmul may round the row count up to kAttnGemmRowStep (a primitive per
+    // rounded shape instead of one per prompt length).
+    bool sgemv_pad_ = false;
 
     // Q8_0-SoA aware GEMV: out[T,N] = A[T,K] @ W. Decode (T==1) int-dot; prefill
     // dequant-to-fp16 + gemm; non-Q8_0 → dense::gemv_q_T. Runs on dev's queue.
@@ -323,6 +378,11 @@ private:
 
     std::string ensure_ws(uint32_t dev, uint32_t max_T);
     void free_ws(uint32_t dev);
+    static bool attn_gemm_on();                       // P4 B48: on; IE_QWEN35_ATTN_GEMM=0 off
+    static bool s8_prefill_on();                      // P4 B48: on; IE_QWEN35_S8_PREFILL=0 off
+    static bool dn_scan_on();                         // P4 B48: on; IE_QWEN35_DN_SCAN=0 off
+    static bool spec_rows_on();                       // P4 B48: on; IE_QWEN35_SPEC_ROWS=0 off
+    static constexpr uint32_t kAttnGemmMinT = 32;     // chunks below this keep the streaming kernels
     void free_all();
 
     // P4 B18 request lanes: lanes 1..n-1 ([lane - 1][dev]; lane 0 = kv_/dn_), the lane each card's prefill stage and the
@@ -340,6 +400,28 @@ private:
     std::vector<float*> rows_partials_;
     std::vector<void*>  rows_table_;
     uint64_t            rows_partials_floats_ = 0;
+    // P4 B48: spec_step's state.
+    struct SpecStep {
+        uint32_t V = 0;                                   // rows a round (0 = not initialised)
+        std::vector<Qwen35SpecCheckpoint> ckpts;          // [dev]
+        std::vector<std::vector<uint32_t>> kvsnap;        // [dev][layer] KV lengths before the round
+        sycl::half* d_hid = nullptr;                      // [V, H]     hidden rows of the last forward (head card)
+        sycl::half* d_all = nullptr;                      // [V, vocab] logits rows of the last verify (head card)
+        sycl::half* h_last = nullptr;                     // [H]        the hidden of position h_pos
+        bool     have_h = false;
+        uint32_t h_pos = 0;
+        uint32_t base = 0, n_rows = 0, next = 0;          // the pending round: rows at base.., `next` = the row to hand out
+        std::vector<int32_t> vin, drafted;
+        uint32_t win_fwd = 0, win_tok = 0, cooldown = 0;  // the rate window and the plain steps left of a cooldown
+        uint64_t rounds = 0, hits = 0, plain = 0, cooldowns = 0;   // IE_QWEN35_PROFILE
+    };
+    SpecStep ss_;
+
+    // P4 B48: the spec verify's own partials / table (forward()'s verify rows on ONE cache; allocated at the first verify,
+    // in owned_), so that --spec without request lanes has them too.
+    std::vector<float*> vrows_partials_;
+    std::vector<void*>  vrows_table_;
+    uint64_t            vrows_partials_floats_ = 0;
     KvCache&       kv_at(uint32_t dev) { return cur_[dev] ? lane_kv_[cur_[dev] - 1][dev] : kv_[dev]; }
     DeltaNetState& dn_at(uint32_t dev) { return cur_[dev] ? lane_dn_[cur_[dev] - 1][dev] : dn_[dev]; }
     KvCache&       lane_kv(uint32_t lane, uint32_t dev) { return lane ? lane_kv_[lane - 1][dev] : kv_[dev]; }

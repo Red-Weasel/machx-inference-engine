@@ -10,6 +10,7 @@
 // build without it is functionally identical — only the qwen35-27B prefill
 // loses its ~1.65× oneDNN speedup and falls back to gemm_fp16.
 #include "ie/ops.hpp"
+#include "ie/prefill_gemm.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -63,6 +64,26 @@ sycl::event gemm_nt_f32_onednn(sycl::queue&, const float*, const float*, float*,
                                const std::vector<sycl::event>&) {
     no_onednn("gemm_nt_f32_onednn");
 }
+
+// P4 B48 (ie/prefill_gemm.hpp).
+sycl::event gemm_attn_qk_onednn(sycl::queue&, const sycl::half*, const sycl::half*, float*,
+                                uint32_t, uint32_t, uint32_t,
+                                const std::vector<sycl::event>&) {
+    no_onednn("gemm_attn_qk_onednn");
+}
+
+sycl::event gemm_attn_pv_onednn(sycl::queue&, const sycl::half*, const sycl::half*, float*,
+                                uint32_t, uint32_t, uint32_t,
+                                const std::vector<sycl::event>&) {
+    no_onednn("gemm_attn_pv_onednn");
+}
+
+bool gemm_nt_s8_f16_onednn(sycl::queue&, const sycl::half*, const int8_t*, const sycl::half*, sycl::half*,
+                           uint32_t, uint32_t, uint32_t, uint32_t, sycl::event*) {
+    return false;
+}
+
+std::string onednn_nt_s8_f16_impl(sycl::queue&, uint32_t, uint32_t, uint32_t, uint32_t) { return "oneDNN off"; }
 
 sycl::event gemm_bmm_nt_f16_onednn(sycl::queue&, const sycl::half*, const sycl::half*, float*,
                                    uint32_t, uint32_t, uint32_t, uint32_t,

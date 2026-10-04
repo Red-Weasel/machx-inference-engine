@@ -25,7 +25,9 @@
 #include "ie/kv_cache.hpp"
 #include "ie/lanes_auto.hpp"         // LanesAutoFit (P4 B30)
 #include "ie/ops.hpp"                // C32Bank (P4 B21)
+#include "ie/prefill_gemm.hpp"       // AttnGemmScratch + the matmul-based prefill pieces (P4 B48 / B49)
 #include "ie/qwen36.hpp"             // QwenConfig
+#include "ie/qwen4_vision.hpp"       // Qwen4VisSpan + the mrope slice / splice ranges (P4 B45 step 2 vision)
 
 #include <sycl/sycl.hpp>
 #include <atomic>
@@ -67,6 +69,19 @@ public:
     // Device-by-device forward. Host ids in, last token's logits → host fp16 [vocab].
     std::string forward(const int32_t* input_ids, uint32_t T, uint32_t start_pos,
                         bool reset_kv, sycl::half* out_logits_host);
+
+    // ---- P4 B45 step 2: IMAGE INPUT on the --parallel 1 path (forward(); the 27B split's contract, qwen35_split.hpp).
+    // The engine encodes each image (Qwen4Vision, this model's mm.2 width 2048) and stages here before the request's
+    // prefill: set_vision APPENDS a span of projector rows (f32 -> f16) that overwrite the gathered embedding rows at prompt
+    // positions [t0, t0 + n) inside embed(); set_mrope stages the prompt's [3, n] M-RoPE table + the decode delta, and
+    // run_layers ropes through rope_imrope3 over each piece's [3, T] slice (prompt rows from the table, decode rows at
+    // position + delta on all streams) while the KV index / attention bound / cache length keep the token position.
+    // clear_vision() = the text path (rope_partial over w.positions, no splice); the engine calls it at every generate().
+    // The lanes (forward_stage / forward_stage_rows) have no per-lane image state yet and refuse while staging is set.
+    std::string set_vision(const float* rows_f32, uint32_t t0, uint32_t n_rows);
+    void        set_mrope(const int32_t* pos3, uint32_t n_total, int32_t delta);
+    void        clear_vision();
+    bool        vision_active() const noexcept { return mrope_n_ != 0 || !vis_spans_.empty(); }
 
     // P4 B10 (docs/lanes/LANES_SERVE.md): request lanes for `ie serve --parallel N` on the two-card split. A lane is
     // one sequence's KV + DeltaNet state on every card; lane 0 is the state load() allocated (nothing else changes with one
@@ -190,12 +205,14 @@ private:
         uint32_t T = 0;
         sycl::half *x = nullptr, *x_normed = nullptr, *attn_block = nullptr;
         int32_t* positions = nullptr;
+        int32_t* positions3 = nullptr;  // [3, T] M-RoPE streams (P4 B45 vision; read only while vision is staged)
         int32_t*    ids = nullptr;      // P4 B22: [T] on embed_dev (was a malloc + free per forward)
         sycl::half* logits = nullptr;   // P4 B22: [vocab] on head_dev (was a malloc + free per forward)
         // full-attn
         sycl::half *qg = nullptr, *q = nullptr, *gate = nullptr;
         sycl::half *k = nullptr, *v = nullptr, *attn_out = nullptr;
         float      *attn_partials = nullptr; uint32_t partials_ctx = 0;
+        AttnGemmScratch ag;              // full_attention_prefill_gemm's scratch (P4 B49; cards with a KV cache)
         // DeltaNet (crown dims: n_v=32, conv_ch=8192, ssm_inner=4096, Vd=4096)
         sycl::half *dn_qkv = nullptr, *dn_conv = nullptr, *dn_z = nullptr;
         float      *dn_qpre = nullptr, *dn_kpre = nullptr, *dn_vpre = nullptr;
@@ -247,6 +264,16 @@ private:
     std::vector<void*>       act_q8_;       // [dev] block_q8_1x [Kmax/32]
     std::vector<sycl::half*> prefill_bt_;    // [dev] fp16 [K*N]max dequant scratch
     std::vector<uint64_t>    prefill_bt_cap_;
+    // P4 B49 (the 27B split's B48 levers): the kb-major scale plane of the Q8_0 weight in flight; sgemv_pad_ is set
+    // while run_layers runs (sgemv's operands are then workspace buffers of ws_[dev].T rows, so its in-place matmul may
+    // round the row count up to kAttnGemmRowStep).
+    std::vector<sycl::half*> prefill_dt_;
+    std::vector<uint64_t>    prefill_dt_cap_;
+    bool sgemv_pad_ = false;
+    static bool attn_gemm_on();                       // on; IE_Q35MOE_ATTN_GEMM=0 = the tile / naive kernels
+    static bool s8_prefill_on();                      // on; IE_Q35MOE_S8_PREFILL=0 = the expand-to-fp16 route
+    static bool dn_scan_on();                         // on; IE_Q35MOE_DN_SCAN=0 = deltanet_recurrence
+    static constexpr uint32_t kAttnGemmMinT = 32;     // pieces below this keep the streaming kernels
 
     // P4 B10 request lanes: lanes 1..n-1 ([lane - 1][dev]; lane 0 = kv_/dn_), the lane each card acts on, the logits a
     // card-1 stage leaves.
@@ -256,6 +283,15 @@ private:
     std::vector<uint64_t>                   lane_bytes_;   // [dev] one extra lane
     uint32_t    max_ctx_ = 0, lane_ctx_ = 0;
     sycl::half* lane_logits_ = nullptr;                    // [vocab] on head_dev
+    // P4 B45 step 2: the vision staging (set_vision / set_mrope / clear_vision above) and its two helpers: the piece's
+    // positions onto a card (w.positions always; w.positions3 while staged) and the splice over the gathered rows.
+    std::vector<Qwen4VisSpan> vis_spans_;
+    std::vector<sycl::half>   vis_rows_;      // concat [sum n, hidden] f16
+    std::vector<int32_t>      mrope3_;        // [3, mrope_n_] host
+    uint32_t mrope_n_ = 0;
+    int32_t  mrope_delta_ = 0;
+    void upload_positions(uint32_t dev, uint32_t start, uint32_t T);
+    void splice_vision(sycl::queue& q, sycl::half* x, uint32_t start, uint32_t T);
     KvCache&       kv_at(uint32_t dev) { return cur_[dev] ? lane_kv_[cur_[dev] - 1][dev] : kv_[dev]; }
     DeltaNetState& dn_at(uint32_t dev) { return cur_[dev] ? lane_dn_[cur_[dev] - 1][dev] : dn_[dev]; }
     // P4 B14 rows: a lane's state by index (the rows path never touches cur_), the G-row int-dot activation per card
@@ -278,7 +314,7 @@ private:
                         uint32_t T);
 
     // forward()'s pieces (kept in its order): the embedding into card embed_dev's x, one card's layers, the head.
-    std::string embed(const int32_t* input_ids, uint32_t T);
+    std::string embed(const int32_t* input_ids, uint32_t T, uint32_t start_pos);   // (start_pos: the splice's piece position, P4 B45)
     void        run_layers(uint32_t dev, uint32_t T, uint32_t start_pos, bool dbg_timing, double& t_attn, double& t_moe);
     void        head(uint32_t T, sycl::half* d_logits);
 

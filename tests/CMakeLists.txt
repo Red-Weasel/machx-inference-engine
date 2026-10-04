@@ -718,6 +718,17 @@ add_executable(qwen4_vision_cpu_test unit/qwen4_vision_cpu_test.cpp)
 target_link_libraries(qwen4_vision_cpu_test PRIVATE ie_core)
 add_test(NAME qwen4_vision_cpu_test COMMAND qwen4_vision_cpu_test)
 
+# P4 B45 (host-only, no GPU): the vision position builder (text-only identity, the HF get_rope_index contract, the
+# per-piece slice) and the splice ranges the 27B split shares with Flash-Next (include/ie/qwen4_vision.hpp).
+add_executable(qwen_vision_pos_test unit/qwen_vision_pos_test.cpp)
+target_link_libraries(qwen_vision_pos_test PRIVATE ie_core)
+add_test(NAME qwen_vision_pos_test COMMAND qwen_vision_pos_test)
+
+# P4 B45 (3) (host-only, no SYCL): /props "prompt_cache_slots" per arch (include/ie/prompt_cache_slots.hpp).
+add_executable(prompt_cache_slots_test unit/prompt_cache_slots_test.cpp)
+target_include_directories(prompt_cache_slots_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME prompt_cache_slots_test COMMAND prompt_cache_slots_test)
+
 # 3-stream interleaved M-RoPE kernel (vision): text bit-identity + host-ref parity.
 add_executable(rope_imrope3_test unit/rope_imrope3_test.cpp)
 target_link_libraries(rope_imrope3_test PRIVATE ie_core ie_sycl_flags)

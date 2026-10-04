@@ -15,7 +15,8 @@
 namespace ie {
 namespace {
 
-// Materialize any F16/F32 gguf tensor as f32.
+// Materialize any F32/F16/BF16 gguf tensor as f32 (P4 B45: BF16 -- the Huihui
+// abliterated mmprojs; bf16 -> f32 is the 16-bit pattern in the high half, exact).
 std::string to_f32(const GgufReader& r, const char* name, std::vector<float>& out,
                    size_t expect) {
     const GgufTensorInfo* ti = r.find_tensor(name);
@@ -31,8 +32,15 @@ std::string to_f32(const GgufReader& r, const char* name, std::vector<float>& ou
     } else if (ti->dtype == DType::kF16) {
         const uint16_t* h = reinterpret_cast<const uint16_t*>(ti->data);
         for (size_t i = 0; i < n; ++i) out[i] = fp16_to_fp32(h[i]);
+    } else if (ti->dtype == DType::kBF16) {
+        const uint16_t* h = reinterpret_cast<const uint16_t*>(ti->data);
+        for (size_t i = 0; i < n; ++i) {
+            const uint32_t bits = uint32_t(h[i]) << 16;
+            float f; std::memcpy(&f, &bits, 4);
+            out[i] = f;
+        }
     } else {
-        return std::string("qwen4 vision: ") + name + " unexpected dtype";
+        return std::string("qwen4 vision: ") + name + " unexpected dtype (want F32, F16 or BF16)";
     }
     return {};
 }
@@ -107,8 +115,19 @@ std::string Qwen4Vision::load(const std::string& mmproj_path) {
     const uint32_t md = kVisHid * kVisMerge * kVisMerge;   // 4608
     if (auto e = to_f32(r, "mm.0.weight", mm0_w_, size_t(md) * md); !e.empty()) return e;
     if (auto e = to_f32(r, "mm.0.bias", mm0_b_, md); !e.empty()) return e;
-    if (auto e = to_f32(r, "mm.2.weight", mm2_w_, size_t(kVisOutD) * md); !e.empty()) return e;
-    if (auto e = to_f32(r, "mm.2.bias", mm2_b_, kVisOutD); !e.empty()) return e;
+    // P4 B45: the projector's output width is the mmproj's, not a constant -- mm.2.weight
+    // is stored [md, OUT] (gguf ne order: ne[0] = the input width 4608, ne[1] = OUT).
+    {
+        const GgufTensorInfo* ti = r.find_tensor("mm.2.weight");
+        if (!ti) return "qwen4 vision: missing tensor mm.2.weight";
+        if (ti->n_dims != 2 || ti->shape[0] != md || ti->shape[1] == 0)
+            return "qwen4 vision: mm.2.weight is not [" + std::to_string(md) + ", OUT] (dims " +
+                   std::to_string(ti->n_dims) + ": " + std::to_string(ti->shape[0]) + " x " +
+                   std::to_string(ti->shape[1]) + ")";
+        out_d_ = uint32_t(ti->shape[1]);
+    }
+    if (auto e = to_f32(r, "mm.2.weight", mm2_w_, size_t(out_d_) * md); !e.empty()) return e;
+    if (auto e = to_f32(r, "mm.2.bias", mm2_b_, out_d_); !e.empty()) return e;
 
     blocks_.resize(kVisDepth);
     for (uint32_t L = 0; L < kVisDepth; ++L) {
@@ -272,9 +291,34 @@ std::string Qwen4Vision::encode(const float* img, uint32_t H, uint32_t W,
     std::vector<float> merged(size_t(Nm) * md);
     gemm_bias(h.data(), mm0_w_.data(), mm0_b_.data(), merged.data(), Nm, md, md);
     for (auto& v2 : merged) v2 = gelu_erf(v2);
-    out.resize(size_t(Nm) * kVisOutD);
-    gemm_bias(merged.data(), mm2_w_.data(), mm2_b_.data(), out.data(), Nm, md, kVisOutD);
+    out.resize(size_t(Nm) * out_d_);
+    gemm_bias(merged.data(), mm2_w_.data(), mm2_b_.data(), out.data(), Nm, md, out_d_);
     return {};
+}
+
+uint64_t Qwen4Vision::gpu_weight_bytes() const noexcept {
+    if (!loaded()) return 0;
+    // src/ops/qwen4_vision_gpu.cpp's upload: every weight matrix f16 (upload_bt), every
+    // bias / norm vector f32 (upload_f32); the patch weight is the fused [1152, 1536].
+    const uint64_t pd = 3ull * 2 * kVisPatch * kVisPatch;              // 1536
+    const uint64_t md = uint64_t(kVisHid) * kVisMerge * kVisMerge;     // 4608
+    uint64_t halfs = uint64_t(kVisHid) * pd + md * md + uint64_t(out_d_) * md;
+    uint64_t floats = kVisHid + md + out_d_ + 2ull * kVisHid;          // patch_b, mm0_b, mm2_b, post_ln w+b
+    for (uint32_t L = 0; L < kVisDepth; ++L) {
+        halfs += 3ull * kVisHid * kVisHid + uint64_t(kVisHid) * kVisHid + 2ull * kVisFfn * kVisHid;
+        floats += 4ull * kVisHid + 3ull * kVisHid + kVisHid + kVisFfn + kVisHid;   // ln1/ln2 w+b, qkv_b, out_b, up_b, down_b
+    }
+    return halfs * 2 + floats * 4;
+}
+
+uint64_t Qwen4Vision::gpu_scratch_bytes(uint32_t N) const noexcept {
+    // encode_gpu's per-patch scratch (px f16 [N, 1536], posadd/res f32 [N, 1152], cs/sn f32
+    // [N, 36], C f32 [N, 4608], xh f16 [N, 4608], qkv f16 [N, 3456], ffn f16 [N, 4304],
+    // att f16 [N, 1152]); the merger reuses C / xh (N * 4608 >= Nm * out_d for every OUT <= 18432).
+    const uint64_t pd = 3ull * 2 * kVisPatch * kVisPatch, md = uint64_t(kVisHid) * 4;
+    const uint64_t per_patch = pd * 2 + kVisHid * 4 + 2ull * kVisRot * 4 + kVisHid * 4 + md * 4 + md * 2 +
+                               3ull * kVisHid * 2 + kVisFfn * 2 + kVisHid * 2;
+    return per_patch * N;
 }
 
 }  // namespace ie

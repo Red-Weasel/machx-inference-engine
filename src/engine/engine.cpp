@@ -7,6 +7,7 @@
 #include "ie/mimo26_engine.hpp"
 #include "ie/mimo26_host_rules.hpp"  // mimo26_vision_refusal (vision_status_json)
 #include "ie/ds41_vision.hpp"        // kDs41VisMaxTok (vision_status_json)
+#include "ie/prompt_cache_slots.hpp" // prompt_cache_slots_rule (/props "prompt_cache_slots", P4 B45 (3))
 #include "../../third_party/nlohmann/json.hpp"
 #include "ie/reasoning.hpp"
 #include <future>
@@ -859,6 +860,15 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             // release gate F1 failed a2046bf's unaligned cut). IE_QWEN35_SHARED_PREFIX=0: --parallel 1's prefill as before B18,
             // and the lanes match it.
             e->q27_share_ = [] { const char* v = std::getenv("IE_QWEN35_SHARED_PREFIX"); return !(v && *v == '0'); }();
+            // P4 B45: --mmproj loads the vision tower NOW (CPU weights; its mm.2 width must be 5120) so the budget below
+            // counts it on the head card (card 1 of the two-card plan; card 0 of a one-card IE_QWEN35_Q8 plan), where it
+            // is uploaded once the check passes. Without the flag the first image loads it (IE_MMPROJ or mmproj-F16.gguf
+            // beside the model), as Flash-Next does.
+            uint64_t vis_bytes = 0;
+            if (!opts.mmproj.empty()) {
+                if (auto m = e->qvis_load_tower(); !m.empty()) { err = m; return nullptr; }
+                vis_bytes = e->qvis_tower_->gpu_weight_bytes() + e->qvis_tower_->gpu_scratch_bytes(kVisMaxPatches);
+            }
             // --- Load-time VRAM budget check (added after the 2026-08-26
             // desktop crash). This stack has NO free-VRAM query and driver
             // OOM at run time is NOT graceful — it killed the xe driver and
@@ -874,12 +884,13 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                 const std::vector<uint64_t> wbytes = model.device_bytes();
                 const uint64_t reserve = uint64_t(2) << 30;   // workspaces/partials/logits
                 // card d's worst case but the banks; a bank = kv_slot + dnb (P4 B30: the auto pick and the check share it)
-                struct Budget { uint64_t gmem = 0, weights = 0, kv_live = 0, kv_slot = 0, dnb = 0, cache = 0; };
+                struct Budget { uint64_t gmem = 0, weights = 0, kv_live = 0, kv_slot = 0, dnb = 0, cache = 0, vision = 0; };
                 auto budget_of = [&](uint32_t d) {
                     Budget b;
                     b.gmem = e->fleet_.dev(d).device()
                         .get_info<sycl::info::device::global_mem_size>();
                     b.weights = d < wbytes.size() ? wbytes[d] : 0;
+                    b.vision = d == model.head_dev() ? vis_bytes : 0;   // P4 B45: the tower's card (weights + the scratch cap)
                     if (model.dev_has_kv(d)) {
                         const auto& kc = model.kv_cache(d).config();
                         const uint64_t per_tok = uint64_t(kc.n_layers_full) *
@@ -906,12 +917,36 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                     }
                     return b;
                 };
+                // P4 B45 (4): a resident vision tower on the head card can push that card over the line (ctx 32768 + the
+                // BF16 tower: 33.0 of 34.2 GB, 2026-10-02): the prompt cache's prefix bound then shrinks to the largest
+                // multiple of 512 that fits (q27_cache_fit, lanes_auto.hpp) instead of the load refusing. IE_PROMPT_CACHE_MAX_PREFIX
+                // stays the explicit bound: set, nothing shrinks and the refusal below stands.
+                if (vis_bytes && e->prompt_cache_on_ && !std::getenv("IE_PROMPT_CACHE_MAX_PREFIX")) {
+                    const uint32_t d = model.head_dev();
+                    const Budget b = budget_of(d);
+                    const uint64_t banks = opts.parallel > 1 ? (q27_lanes ? opts.parallel - 1 : opts.parallel) * (b.kv_slot + b.dnb) : 0;
+                    uint64_t per_tok = 0;
+                    if (model.dev_has_kv(d)) {
+                        const auto& kc = model.kv_cache(d).config();
+                        per_tok = uint64_t(kc.n_layers_full) * kc.n_kv_heads * kc.head_dim * 2 * 2;
+                    }
+                    const uint32_t pre0 = std::min<uint32_t>(e->split_cache_cfg_.max_prefix_len, opts.max_ctx);
+                    const Q27CacheFit fit = q27_cache_fit(b.gmem, b.weights + b.kv_live + b.dnb + banks + b.vision + reserve,
+                                                          e->split_cache_cfg_.max_entries, per_tok, b.dnb, pre0);
+                    if (fit.shrunk) {
+                        std::fprintf(stderr, "[budget] card %u: prompt cache max %.1f -> %.1f GB (prefix %u -> %u tokens) to fit the vision "
+                                             "tower (IE_PROMPT_CACHE_MAX_PREFIX sets the bound explicitly)\n",
+                                     d, b.cache / 1e9, fit.cache_bytes / 1e9, pre0, fit.max_prefix);
+                        e->split_cache_cfg_.max_prefix_len = fit.max_prefix;
+                        e->fleet_cache_.set_max_prefix_len(fit.max_prefix);
+                    }
+                }
                 uint32_t n_par = std::max<uint32_t>(opts.parallel, 1u);
                 if (q27_auto) {   // P4 B30: the most lanes, up to 16, whose banks keep every card within the 92 % below
                     std::vector<LanesCardRoom> room;
                     for (uint32_t d = 0; d < e->fleet_.size(); ++d) {
                         const Budget b = budget_of(d);
-                        room.push_back(q27_budget_room(b.gmem, b.weights + b.kv_live + b.dnb + b.cache + reserve, b.kv_slot + b.dnb));
+                        room.push_back(q27_budget_room(b.gmem, b.weights + b.kv_live + b.dnb + b.cache + b.vision + reserve, b.kv_slot + b.dnb));
                     }
                     n_par = q27_budget_n = lanes_auto_fit(room, kLanesAutoMax);
                 }
@@ -921,8 +956,15 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                     const Budget b = budget_of(d);
                     // (the lanes: n_par - 1 extra, lane 0 is the live state; the joint step: n_par banks)
                     const uint64_t banks = (n_par > 1) ? (q27_lanes ? n_par - 1 : n_par) * (b.kv_slot + b.dnb) : 0;
-                    const uint64_t total = b.weights + b.kv_live + b.dnb + banks + b.cache + reserve;
-                    char line[256];
+                    const uint64_t total = b.weights + b.kv_live + b.dnb + banks + b.cache + b.vision + reserve;
+                    char line[320];
+                    if (b.vision)   // P4 B45: the vision tower's card
+                        std::snprintf(line, sizeof line,
+                            "[budget] card %u: weights %.1f + kv %.1f + banks %.1f + "
+                            "cache-max %.1f + vision %.1f + reserve 2.0 = %.1f GB of %.1f GB\n",
+                            d, b.weights / 1e9, b.kv_live / 1e9,
+                            banks / 1e9, b.cache / 1e9, b.vision / 1e9, total / 1e9, b.gmem / 1e9);
+                    else
                     std::snprintf(line, sizeof line,
                         "[budget] card %u: weights %.1f + kv %.1f + banks %.1f + "
                         "cache-max %.1f + reserve 2.0 = %.1f GB of %.1f GB\n",
@@ -941,6 +983,9 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                     return nullptr;
                 }
             }
+            // P4 B45: the tower onto the head card now that the budget passed -- before the lanes, so the auto-fit's free-VRAM
+            // measure (init_lanes) sees it.
+            if (vis_bytes) { if (auto m = e->qvis_upload_tower(); !m.empty()) { err = m; return nullptr; } }
             // --parallel>1: allocate the per-slot decode banks and spawn the
             // joint-step scheduler (Phase 2b). Bank alloc failure is a clean
             // load-time refusal — shrink --slot-ctx or --parallel to fit.
@@ -1285,6 +1330,13 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                 err = "crown-split prompt-cache: " + m; return nullptr;
             }
             e->prompt_cache_on_ = true;
+        }
+        // P4 B45 step 2: --mmproj places the vision tower (CPU load + the upload onto the head card, card 1) NOW, before the
+        // lanes: init_lanes' free-VRAM measure and the lanes' prompt-cache budget then see it (the study's risk 1: a tower
+        // landing after the budget was fixed). Without the flag the first image loads it (IE_MMPROJ / an mmproj*.gguf
+        // beside the model) -- on a 16-lane load that is a late ~1.6 GB allocation on card 1; prefer the flag.
+        if (!opts.mmproj.empty()) {
+            if (auto m = e->qvis_upload_tower(); !m.empty()) { err = m; return nullptr; }
         }
         // P4 B10: --parallel N > 1 = N request lanes on the two cards (lanes 1..N-1 at --slot-ctx, 0 = 32,768), served together
         // by the lanes module (Engine::q35m_lanes_init, after the tokenizer). IE_Q35MOE_LANES=0 keeps the one-at-a-time path.
@@ -1911,6 +1963,20 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
     // P4 B18: the 27B split's request lanes likewise
     if (e->qwen35_split_ && e->qwen35_split_model_.n_lanes() > 1)
         if (auto m = e->q27_lanes_init(); !m.empty()) { err = m; return nullptr; }
+    // P4 B45: the Qwen3.8 vision projector's path, known at load so /props "vision" and Engine::chat's refusal can read it
+    // (the tower itself loads at the first image unless --mmproj asked for it at load: Flash-Next here, the 27B in its branch).
+    if (e->q4e_ || e->qwen35_split_ || e->qwen35moe_split_) {
+        e->qvis_resolve_mmproj();
+        if (e->q4e_ && !opts.mmproj.empty())
+            if (auto m = e->qvis_upload_tower(); !m.empty()) { err = m; return nullptr; }
+        if (e->qwen35_split_ || e->qwen35moe_split_) {
+            const std::string state = e->qvis_mmproj_.empty()
+                ? std::string("no mmproj (images refused: --mmproj <mmproj-F16.gguf> or IE_MMPROJ enables them)")
+                : (e->qvis_tower_ ? "images at --parallel 1, tower resident (" : "images at --parallel 1, tower loads at the first image (") +
+                  e->qvis_mmproj_ + ")";
+            std::fprintf(stderr, "[vision] %s split: %s\n", e->qwen35_split_ ? "27B" : "35B-A3B", state.c_str());
+        }
+    }
     // P4 B30: the archs (and loads) without request lanes serve one request at a time under auto; the lanes archs picked above
     if (e->opts_.parallel == kLanesAuto) {
         e->opts_.parallel = 1;
@@ -1952,76 +2018,155 @@ sycl::event Engine::ds4_forward(sycl::queue& q, const int32_t* ids, uint32_t T,
     return q.memcpy(d_logits_, tp_logits_host_.data(), uint64_t(V) * sizeof(sycl::half));
 }
 
-std::string Engine::q4e_stage_vision(const std::vector<int32_t>& ids) {
-    // Lazy mmproj: env IE_MMPROJ, else mmproj*.gguf beside the model file.
-    if (!q4e_vis_) {
-        if (q4e_mmproj_.empty()) {
-            if (const char* mp = std::getenv("IE_MMPROJ")) q4e_mmproj_ = mp;
-            else {
-                namespace fs = std::filesystem;
-                const fs::path dir = fs::path(model_path_).parent_path();
-                for (const auto* cand : {"mmproj-F16.gguf", "mmproj-BF16.gguf"}) {
-                    if (fs::exists(dir / cand)) { q4e_mmproj_ = (dir / cand).string(); break; }
-                    if (fs::exists(dir.parent_path() / cand)) {
-                        q4e_mmproj_ = (dir.parent_path() / cand).string(); break;
-                    }
-                }
-            }
-            if (q4e_mmproj_.empty())
-                return "vision: no mmproj*.gguf next to the model (or set IE_MMPROJ)";
-        }
-        auto v = std::make_unique<Qwen4Vision>();
-        if (auto e = v->load(q4e_mmproj_); !e.empty()) return "vision: " + e;
-        q4e_vis_ = std::move(v);
-        std::fprintf(stderr, "[vision] loaded %s\n", q4e_mmproj_.c_str());
+// ---- Qwen3.8 vision (Flash-Next + the 27B split; the header's note) ----------------
+std::string Engine::qvis_resolve_mmproj() {
+    if (!qvis_mmproj_.empty()) return qvis_mmproj_;
+    if (!opts_.mmproj.empty()) return qvis_mmproj_ = opts_.mmproj;            // P4 B45: --mmproj
+    if (const char* mp = std::getenv("IE_MMPROJ")) return qvis_mmproj_ = mp;
+    namespace fs = std::filesystem;
+    const fs::path dir = fs::path(model_path_).parent_path();
+    for (const auto* cand : {"mmproj-F16.gguf", "mmproj-BF16.gguf"}) {
+        if (fs::exists(dir / cand)) return qvis_mmproj_ = (dir / cand).string();
+        if (fs::exists(dir.parent_path() / cand)) return qvis_mmproj_ = (dir.parent_path() / cand).string();
     }
-    const int32_t pad = q4e_->cfg.ple_image_token ? int32_t(q4e_->cfg.ple_image_token)
-                                                  : 248056;
+    // P4 B45 step 2: any mmproj*.gguf beside the model or one dir up (the 35B Distill repo ships
+    // mmproj-Qwen3.8-35B-A3B-F16.gguf), an F16 first, then a BF16, else the first by name.
+    for (const fs::path& d : {dir, dir.parent_path()}) {
+        std::error_code ec;
+        std::vector<std::string> cands;
+        for (const auto& ent : fs::directory_iterator(d, ec)) {
+            const std::string n = ent.path().filename().string();
+            if (n.rfind("mmproj", 0) == 0 && n.size() > 5 && n.compare(n.size() - 5, 5, ".gguf") == 0) cands.push_back(n);
+        }
+        if (cands.empty()) continue;
+        std::sort(cands.begin(), cands.end());
+        auto has = [](const std::string& n, const char* tag) { return n.find(tag) != std::string::npos; };
+        for (const char* tag : {"F16", "f16", "BF16", "bf16"})
+            for (const std::string& n : cands) if (has(n, tag)) return qvis_mmproj_ = (d / n).string();
+        return qvis_mmproj_ = (d / cands.front()).string();
+    }
+    return {};
+}
+
+DeviceAllocator* Engine::qvis_alloc() {
+    if (q4e_) return q4e_->split ? &q4e_->a1 : &alloc_;   // Flash-Next: the tail stage's card
+    if (qwen35_split_) return &fleet_.dev(qwen35_split_model_.head_dev());   // the 27B split: the head card (card 1)
+    if (qwen35moe_split_) return &fleet_.dev(qwen35moe_split_model_.head_dev());   // the crown split: likewise (step 2)
+    return nullptr;
+}
+
+std::string Engine::qvis_load_tower() {
+    if (qvis_tower_) return {};
+    if (qvis_resolve_mmproj().empty())
+        return "vision: no mmproj (pass --mmproj <mmproj-F16.gguf>, set IE_MMPROJ, or put mmproj-F16.gguf / mmproj-BF16.gguf beside the model)";
+    auto v = std::make_unique<Qwen4Vision>();
+    if (auto e = v->load(qvis_mmproj_); !e.empty()) return "vision: " + e;
+    // The projector must emit this model's width: the tower is one class for the family, mm.2 is the model's.
+    const uint32_t hidden = q4e_ ? q4e_->cfg.hidden
+                          : qwen35_split_ ? qwen35_split_model_.config().dense.hidden
+                          : qwen35moe_split_ ? qwen35moe_split_model_.config().hidden : 0u;
+    if (hidden == 0) return "vision: this load has no model to splice into";
+    if (v->out_d() != hidden)
+        return "vision: " + qvis_mmproj_ + " projects to " + std::to_string(v->out_d()) + " but this model's hidden size is " +
+               std::to_string(hidden) + " (2560 = Flash-Next, 5120 = the 27B, 2048 = the 35B-A3B)";
+    qvis_tower_ = std::move(v);
+    std::fprintf(stderr, "[vision] loaded %s (projector out %u, %.2f GiB of f16 weights on the card)\n", qvis_mmproj_.c_str(),
+                 qvis_tower_->out_d(), qvis_tower_->gpu_weight_bytes() / 1073741824.0);
+    return {};
+}
+
+std::string Engine::qvis_upload_tower() {
+    if (auto e = qvis_load_tower(); !e.empty()) return e;
+    DeviceAllocator* va = qvis_alloc();
+    if (!va) return "vision: this load has no vision card";
+    if (qvis_tower_->gpu_resident()) return {};
+    if (auto e = qvis_tower_->upload_gpu(*va); !e.empty()) return "vision: " + e;
+    const std::string where = qwen35_split_ ? "card " + std::to_string(qwen35_split_model_.head_dev())
+                            : qwen35moe_split_ ? "card " + std::to_string(qwen35moe_split_model_.head_dev())
+                            : std::string(q4e_ && q4e_->split ? "the tail stage's card" : "the model's card");
+    std::fprintf(stderr, "[vision] tower on %s: %.2f GiB weights + up to %.2f GiB encode scratch (%u-patch cap)\n", where.c_str(),
+                 qvis_tower_->gpu_weight_bytes() / 1073741824.0,
+                 qvis_tower_->gpu_scratch_bytes(kVisMaxPatches) / 1073741824.0, kVisMaxPatches);
+    return {};
+}
+
+std::string Engine::qvis_stage(const std::vector<int32_t>& ids) {
+    if (auto e = qvis_upload_tower(); !e.empty()) return e;   // lazy (no --mmproj): the first image loads + uploads
+    DeviceAllocator& va = *qvis_alloc();
+    // The image-pad id: Flash-Next's PLE key when the GGUF has one, else the vocabulary's <|image_pad|> -- the token chat()'s
+    // pad-run rewrite renders (248056 in every Qwen3.8 vocabulary).
+    int32_t pad = q4e_ && q4e_->cfg.ple_image_token ? int32_t(q4e_->cfg.ple_image_token) : -1;
+    if (pad < 0) {
+        const auto pid = tok_.encode("<|image_pad|>", /*allow_special=*/true);
+        if (pid.size() != 1) return "vision: the vocabulary has no <|image_pad|> token";
+        pad = pid[0];
+    }
     // Pad runs in prompt order must match the pending images one-to-one.
-    q4e_vis_rows_.clear();
-    q4e_vis_spans_.clear();
+    qvis_rows_.clear();
+    qvis_spans_.clear();
     std::vector<Qwen4VisGrid> grids;
     size_t img = 0;
     for (uint32_t t = 0; t < ids.size(); ) {
         if (ids[t] != pad) { ++t; continue; }
         uint32_t n = 0;
         while (t + n < ids.size() && ids[t + n] == pad) ++n;
-        if (img >= q4e_pending_imgs_.size())
+        if (img >= qvis_pending_.size())
             return "vision: more image_pad runs than attached images";
-        auto& im = q4e_pending_imgs_[img];
+        auto& im = qvis_pending_[img];
         const uint32_t gh2 = im.H / 32, gw2 = im.W / 32;
         if (n != gh2 * gw2)
             return "vision: image_pad run length mismatch (client-injected pads?)";
-        DeviceAllocator& va = q4e_->split ? q4e_->a1 : alloc_;
         std::vector<float> emb;
-        if (auto e = q4e_vis_->encode_gpu(va, im.px.data(), im.H, im.W, emb);
+        if (auto e = qvis_tower_->encode_gpu(va, im.px.data(), im.H, im.W, emb);
             !e.empty()) return "vision encode: " + e;
-        q4e_vis_spans_.push_back({t, n});
+        qvis_spans_.push_back({t, n});
         grids.push_back({t, gh2, gw2});
-        q4e_vis_rows_.insert(q4e_vis_rows_.end(), emb.begin(), emb.end());
+        qvis_rows_.insert(qvis_rows_.end(), emb.begin(), emb.end());
         ++img;
         t += n;
     }
-    if (img != q4e_pending_imgs_.size())
+    if (img != qvis_pending_.size())
         return "vision: fewer image_pad runs than attached images";
-    qwen4_build_mrope3(uint32_t(ids.size()), grids, q4e_pos3_, q4e_delta_);
-    q4e_pending_imgs_.clear();
-    q4e_vis_active_ = true;
+    qwen4_build_mrope3(uint32_t(ids.size()), grids, qvis_pos3_, qvis_delta_);
+    qvis_pending_.clear();
+    qvis_active_ = true;
     return {};
 }
 
-void Engine::q4e_apply_vision() {
-    if (!q4e_ || !q4e_vis_active_) return;
-    const uint32_t H = q4e_->cfg.hidden;
-    size_t row = 0;
-    for (const auto& [t0, n] : q4e_vis_spans_) {
-        if (auto e = q4e_->A.set_vision(q4e_vis_rows_.data() + row * H, t0, n);
-            !e.empty() && q4e_err_.empty()) q4e_err_ = e;
-        row += n;
+std::string Engine::qvis_apply() {
+    if (!qvis_active_) return {};
+    const uint32_t np = uint32_t(qvis_pos3_.size() / 3);
+    std::string first;
+    if (q4e_) {
+        const uint32_t H = q4e_->cfg.hidden;
+        size_t row = 0;
+        for (const auto& [t0, n] : qvis_spans_) {
+            if (auto e = q4e_->A.set_vision(qvis_rows_.data() + row * H, t0, n); !e.empty()) {
+                if (q4e_err_.empty()) q4e_err_ = e;   // (the Flash-Next latch generate() checks after the prefill)
+                if (first.empty()) first = e;
+            }
+            row += n;
+        }
+        q4e_->A.set_mrope(qvis_pos3_.data(), np, qvis_delta_);
+        if (q4e_->split) q4e_->B.set_mrope(qvis_pos3_.data(), np, qvis_delta_);
+    } else if (qwen35_split_) {   // P4 B45: one model object holds both cards' staging
+        const uint32_t H = qwen35_split_model_.config().dense.hidden;
+        size_t row = 0;
+        for (const auto& [t0, n] : qvis_spans_) {
+            if (auto e = qwen35_split_model_.set_vision(qvis_rows_.data() + row * H, t0, n); !e.empty() && first.empty()) first = e;
+            row += n;
+        }
+        qwen35_split_model_.set_mrope(qvis_pos3_.data(), np, qvis_delta_);
+    } else if (qwen35moe_split_) {   // step 2: the crown, the same contract
+        const uint32_t H = qwen35moe_split_model_.config().hidden;
+        size_t row = 0;
+        for (const auto& [t0, n] : qvis_spans_) {
+            if (auto e = qwen35moe_split_model_.set_vision(qvis_rows_.data() + row * H, t0, n); !e.empty() && first.empty()) first = e;
+            row += n;
+        }
+        qwen35moe_split_model_.set_mrope(qvis_pos3_.data(), np, qvis_delta_);
     }
-    const uint32_t np = uint32_t(q4e_pos3_.size() / 3);
-    q4e_->A.set_mrope(q4e_pos3_.data(), np, q4e_delta_);
-    if (q4e_->split) q4e_->B.set_mrope(q4e_pos3_.data(), np, q4e_delta_);
+    return first;
 }
 
 // ---- DeepSeek-V4-Flash-Vision-Exp ---------------------------------------
@@ -2115,7 +2260,7 @@ sycl::event Engine::q4e_forward(sycl::queue& q, const int32_t* ids, uint32_t T,
     if (pos == 0) {
         q4e_->A.reset_state();
         if (q4e_->split) q4e_->B.reset_state();
-        q4e_apply_vision();   // reset just wiped staging; re-arm for this request
+        qvis_apply();   // reset just wiped staging; re-arm for this request
     }
     const uint32_t V = q4e_vocab_;
     if (tp_logits_host_.size() < V) tp_logits_host_.resize(V);
@@ -3497,7 +3642,7 @@ GenerateResult Engine::generate(const std::string& prompt,
     if (q27_ && q27_->serve) return q35m_generate_lanes(prompt, sp, on_token, cache_prefix_len, reply_cache, shared_prefix_len);   // P4 B18
     GenerateResult res;
     auto& q = alloc_.queue();
-    q4e_vis_active_ = false;   // re-armed below iff this request carries images
+    qvis_active_ = false;   // re-armed below iff this request carries images
     ds4_vis_active_ = false;
     auto ids = tok_.encode(prompt, /*allow_special=*/true);
     if (ds4_ && !ds4_pending_imgs_.empty()) {
@@ -3541,13 +3686,24 @@ GenerateResult Engine::generate(const std::string& prompt,
     ds4_err_.clear();   // deepseek4 latch (inert on every other arch)
     q4e_err_.clear();   // qwen4exp latch, same contract
 
-    // Vision staging (qwen4exp): encode the images chat() left pending against
-    // this prompt's pad runs. GPU work — runs under the gate like the rest.
-    if (q4e_ && !q4e_pending_imgs_.empty()) {
-        if (auto e = q4e_stage_vision(ids); !e.empty()) {
-            q4e_pending_imgs_.clear();
+    // Vision staging (qwen4exp; P4 B45: the 27B split too): encode the images chat()
+    // left pending against this prompt's pad runs. GPU work — runs under the gate
+    // like the rest. The 27B split's model keeps the staging across its resets, so
+    // every request clears it first (a text request after an image one ropes with
+    // rope_partial again: its bytes are the pre-B45 bytes) and an image request
+    // applies it once, here, before its prefill.
+    if (qwen35_split_) qwen35_split_model_.clear_vision();
+    if (qwen35moe_split_) qwen35moe_split_model_.clear_vision();   // (step 2: the crown keeps its staging the same way)
+    if ((q4e_ || qwen35_split_ || qwen35moe_split_) && !qvis_pending_.empty()) {
+        if (auto e = qvis_stage(ids); !e.empty()) {
+            qvis_pending_.clear();
             res.finish_reason = "error: " + e;
             return res;
+        }
+        if (qwen35_split_ || qwen35moe_split_) {
+            if (auto e = qvis_apply(); !e.empty()) { res.finish_reason = "error: vision: " + e; return res; }
+            std::fprintf(stderr, "[vision] %zu image span(s), %u prompt rows, decode rope delta %d\n", qvis_spans_.size(),
+                         uint32_t(qvis_pos3_.size() / 3), qvis_delta_);
         }
     }
     if (ds4_ && ds4_vis_active_) {
@@ -3691,7 +3847,21 @@ GenerateResult Engine::generate(const std::string& prompt,
     const bool fleet_spec_loaded =
         (qwen35_split_ && qwen35_split_model_.mtp_loaded()) ||
         (qwen35_tp_ && qwen35_tp_model_.mtp_loaded());
-    if (spec_ && fleet_spec_loaded &&
+    // P4 B45: an image request takes the plain decode below -- spec_generate's own prefill has no splice and its
+    // draft / verify rows no M-RoPE shift (the Flash-Next precedent: MTP + vision unsupported). Greedy, still exact.
+    if (spec_ && fleet_spec_loaded && qvis_active_)
+        std::fprintf(stderr, "[vision] --spec: this request carries images, so it takes the plain (non-speculative) decode\n");
+    // P4 B48: with --spec the 27B split speculates inside the normal decode loop below (any sampler, the normal prefill
+    // and its prompt cache, no prompt-length cut-off), and this greedy-only branch steps aside. IE_QWEN35_SPEC_STEP=0
+    // restores the branch.
+    static const bool q27_step_env = [] {
+        const char* e = std::getenv("IE_QWEN35_SPEC_STEP");
+        return !(e && *e && std::atoi(e) == 0);
+    }();
+    const bool q27_step = q27_step_env && spec_ && qwen35_split_ && !qwen35_tp_ && qwen35_split_model_.mtp_loaded() &&
+                          !qvis_active_ && !opts_.int8_kv && qwen35_split_model_.n_lanes() <= 1 &&
+                          qwen35_split_model_.n_slot_banks() == 0;
+    if (spec_ && fleet_spec_loaded && !qvis_active_ && !q27_step &&
         arch_ == ModelArch::kQwen35Dense && sp.temperature == 0.0f &&
         (sp.repeat_window == 0 || (sp.repeat_penalty == 1.f && sp.presence_penalty == 0.f && sp.frequency_penalty == 0.f)) &&
         uint32_t(ids.size()) <= spec_max_prompt) {
@@ -3941,7 +4111,8 @@ GenerateResult Engine::generate(const std::string& prompt,
     } else if (prompt_cache_on_ && qwen35moe_split_) {
         // Crown Q8 2-card split — identical per-card contract as the 80B path. This
         // is the fix for "0 cached every turn" on the daily-driver 2-card crown.
-        restored = fleet_cache_restore(qwen35moe_split_model_, fleet_cache_, ids, "crown-split-cache");
+        // (P4 B45 step 2: an image request neither restores nor snapshots -- the 27B's rule below.)
+        if (!qvis_active_) restored = fleet_cache_restore(qwen35moe_split_model_, fleet_cache_, ids, "crown-split-cache");
     } else if (prompt_cache_on_ && gptoss_tp_) {
         // gpt-oss tensor-parallel — KV-only (no DeltaNet); the DN half of the restore
         // is a no-op (dev_has_dn=false on every card).
@@ -3954,7 +4125,10 @@ GenerateResult Engine::generate(const std::string& prompt,
         restored = fleet_cache_restore(q3moe_tp_model_, fleet_cache_, ids, "q3moe-tp-cache");
     } else if (prompt_cache_on_ && qwen35_split_) {
         // 27B DeltaNet+dense layer-split — snapshots per-card KV + DeltaNet (like crown).
-        restored = fleet_cache_restore(qwen35_split_model_, fleet_cache_, ids, "27b-split-cache");
+        // P4 B45: an image request neither restores nor snapshots (the insert below): its pad ids cannot tell one
+        // image's rows from another's, so no cached state may be keyed by them (step 3 of the study weighs hashed ids /
+        // restoring a text-only prefix into an image request, Flash-Next's rule).
+        if (!qvis_active_) restored = fleet_cache_restore(qwen35_split_model_, fleet_cache_, ids, "27b-split-cache");
     } else if (prompt_cache_on_ && arch_ == ModelArch::kGemma4) {
         // Gemma4 VRAM-guarded single-endpoint snapshot (task #6). LCP-match the
         // incoming ids against the stored snapshot tokens; restore that depth (leave
@@ -4137,7 +4311,7 @@ GenerateResult Engine::generate(const std::string& prompt,
         // request must be dropped by hand; this request's (if any) re-arms.
         q4e_->A.clear_vision();
         if (q4e_->split) q4e_->B.clear_vision();
-        q4e_apply_vision();
+        qvis_apply();
     }
     res.cached_tokens = restored;
     // Snapshot boundary: the STABLE conversation depth (cache_prefix_len, no gen-prompt/
@@ -4159,7 +4333,7 @@ GenerateResult Engine::generate(const std::string& prompt,
     // Other archs ignore it. A vision request: none (image rows cannot be told apart by their ids). P4 B25: the 27B cuts on its
     // piece grid (q27_share_cut: the pieces of the uncut, cache-off prefill; its lanes round the same way).
     const uint32_t share_at = [&] {
-        const uint32_t s = ((qwen35moe_split_ || q4e_ || (qwen35_split_ && q27_share_)) && !q4e_vis_active_ && !ds4_vis_active_)
+        const uint32_t s = ((qwen35moe_split_ || q4e_ || (qwen35_split_ && q27_share_)) && !qvis_active_ && !ds4_vis_active_)
             ? shared_prefix_boundary(shared_prefix_len, snap_at, prompt_cache_on_) : 0u;
         return qwen35_split_ ? q27_share_cut(s, pf_chunk) : s;
     }();
@@ -4237,7 +4411,9 @@ GenerateResult Engine::generate(const std::string& prompt,
                          uint64_t(V) * sizeof(sycl::half)).wait();
                 return;
             } else {
-                std::fprintf(stderr, "[q4e-pipeline] serial fallback\n");
+                // The reason was dropped before 2026-10-02 (the owner's 250K-context load fell back and
+                // nothing said why): print it.
+                std::fprintf(stderr, "[q4e-pipeline] serial fallback: %s\n", m.c_str());
             }
         }
         while (pos < end && slot_err.empty() && !pf_abort) {
@@ -4323,17 +4499,17 @@ GenerateResult Engine::generate(const std::string& prompt,
         std::string m;
         const char* tag = nullptr;
         if (next_)                   { m = fleet_cache_.insert(next_model_, pref);            tag = "fleet-cache"; }
-        else if (qwen35moe_split_)   { m = fleet_cache_.insert(qwen35moe_split_model_, pref); tag = "crown-split-cache"; }
+        else if (qwen35moe_split_)   { if (!qvis_active_) { m = fleet_cache_.insert(qwen35moe_split_model_, pref); tag = "crown-split-cache"; } }   // (P4 B45: never an image request)
         else if (gptoss_tp_)         { m = fleet_cache_.insert(gptoss_tp_model_, pref);       tag = "gptoss-tp-cache"; }
         else if (q3moe_split_)       { m = fleet_cache_.insert(q3moe_split_model_, pref);     tag = "q3moe-split-cache"; }
         else if (q3moe_tp_)          { m = fleet_cache_.insert(q3moe_tp_model_, pref);        tag = "q3moe-tp-cache"; }
-        else if (qwen35_split_)      { m = fleet_cache_.insert(qwen35_split_model_, pref);    tag = "27b-split-cache"; }
+        else if (qwen35_split_)      { if (!qvis_active_) { m = fleet_cache_.insert(qwen35_split_model_, pref); tag = "27b-split-cache"; } }   // (P4 B45: never an image request)
         else if (arch_ == ModelArch::kGemma4) { m = gemma_model_.snapshot_kv(q, snap_at, pref); tag = "gemma4-cache"; }
         else if (arch_ == ModelArch::kQwen4Exp) {
             // Never snapshot a vision request: a later prompt with the SAME pad
             // pattern but DIFFERENT image bytes would restore silently wrong KV
             // (token ids cannot distinguish the images).
-            if (!q4e_vis_active_) {
+            if (!qvis_active_) {
                 tag = "q4e-cache";
                 m = q4e_->snap(snap_at);
                 if (m.empty()) q4e_->snap_tokens = pref;
@@ -4551,6 +4727,14 @@ GenerateResult Engine::generate(const std::string& prompt,
         res.decode_ms = dec_ms();
         return res;
     }
+    if (q27_step) {   // P4 B48
+        if (auto m = qwen35_split_model_.spec_step_init(opts_.spec_k); !m.empty())
+            std::fprintf(stderr, "[spec-step] %s -- plain decode\n", m.c_str());
+        else {
+            qwen35_split_model_.spec_step_reset();
+            q27_spec_step_ = true;
+        }
+    }
     for (uint32_t step = 0; step < max_new; ++step) {
         if (sp.repeat_penalty != 1.0f || sp.presence_penalty != 0.f || sp.frequency_penalty != 0.f) {
             // llama.cpp-style penalty_last_n: the window is the last N tokens of
@@ -4606,6 +4790,14 @@ GenerateResult Engine::generate(const std::string& prompt,
                                  rng + step);
         int32_t pick = 0;
         q.memcpy(&pick, d_pick_, sizeof(pick)).wait();
+        {   // IE_DEBUG_PICKS=1 (P4 B49): every picked token id and its text, one line a step (stderr).
+            static const bool dbg_picks = std::getenv("IE_DEBUG_PICKS") != nullptr;
+            if (dbg_picks) {
+                const std::string piece = tok_.decode(std::span<const int32_t>(&pick, 1), /*skip_special=*/false,
+                                                      std::span<const int32_t>{});
+                std::fprintf(stderr, "[pick] step %u pos %u id %d '%s'\n", step, pos, pick, piece.c_str());
+            }
+        }
         if (dbg_topk && step < 4 && !dbg_logits.empty()) {
             const float pl = dbg_logits[pick];
             uint32_t rank = 0;
@@ -4646,7 +4838,8 @@ GenerateResult Engine::generate(const std::string& prompt,
         // re-uploaded from the host `pick` below, not copied from d_pick_.
         const bool yielded = (qwen35_split_ || q4e_) && (test_yield || real_yield);
         if (qwen35_split_ && (test_yield || real_yield)) {
-            std::string se = slot_stash.stash(qwen35_split_model_, pos);
+            std::string se = q27_spec_step_ ? qwen35_split_model_.spec_step_flush() : std::string();   // P4 B48
+            if (se.empty()) se = slot_stash.stash(qwen35_split_model_, pos);
             if (se.empty() && test_yield) {
                 const int32_t wrong = (pick + 1 < int32_t(vocab())) ? pick + 1 : 0;
                 q.memcpy(d_ids_ + pos, &wrong, sizeof(wrong)).wait();
@@ -4668,6 +4861,7 @@ GenerateResult Engine::generate(const std::string& prompt,
                 gate_.acquire();
                 se = slot_stash.unstash(qwen35_split_model_);
             }
+            if (q27_spec_step_) qwen35_split_model_.spec_step_reset();   // P4 B48: the state was replaced
             if (!se.empty()) {
                 res.finish_reason = "error: slot-stash: " + se;
                 break;
@@ -4702,6 +4896,17 @@ GenerateResult Engine::generate(const std::string& prompt,
         // forward_step and latch errors before it returns, unchanged.
         if (yielded) q.memcpy(d_ids_ + pos, &pick, sizeof(pick)).wait();   // gate was released: see above
         else         q.memcpy(d_ids_ + pos, d_pick_, sizeof(int32_t));
+        if (q27_spec_step_) {   // P4 B48: the sampler and the seed of the NEXT token, for the step's drafts
+            // Off by default: measured 2026-10-04 (ie serve, temperature 0.7, seed 7, three requests) the sampled drafts
+            // were accepted slightly LESS often than argmax drafts (tokens a forward 1.62 / 1.34 / 1.31 against 1.68 /
+            // 1.40 / 1.35). IE_QWEN35_SPEC_DRAFT_SAMPLED=1 turns them on.
+            static const bool sampled_drafts = [] {
+                const char* e = std::getenv("IE_QWEN35_SPEC_DRAFT_SAMPLED");
+                return e && std::atoi(e) != 0;
+            }();
+            q27_draft_on_ = sampled_drafts;
+            q27_draft_ = {sp.temperature, sp.top_k, sp.top_p, sp.min_p, uint64_t(rng + step + 1)};
+        }
         forward_step(q, d_ids_ + pos, /*T=*/1, pos);
         pos += 1;
         // deepseek4 keeps its special tokens in the decoded text (Phase L): the
@@ -4722,6 +4927,11 @@ GenerateResult Engine::generate(const std::string& prompt,
         if (!ds4_err_.empty()) { res.finish_reason = "error: deepseek4: " + ds4_err_; break; }
         if (!glm5_err_.empty()) { res.finish_reason="error: glm5next: "+glm5_err_; break; }
         if (!q4e_err_.empty()) { res.finish_reason = "error: qwen4exp: " + q4e_err_; break; }
+    }
+    if (q27_spec_step_) {   // P4 B48: the model's state back at `pos` (rows the sampler did not follow are rolled back)
+        if (auto m = qwen35_split_model_.spec_step_flush(); !m.empty())
+            std::fprintf(stderr, "[spec-step] flush: %s\n", m.c_str());
+        q27_spec_step_ = false;
     }
     res.decode_ms = std::chrono::duration<double, std::milli>(
         std::chrono::steady_clock::now() - t_dec0).count();
@@ -4961,7 +5171,11 @@ GenerateResult Engine::q4e_generate_lanes(const std::string& prompt, const Sampl
 uint32_t Engine::prompt_cache_slots() const {
     if (mimo26_) return mimo26_prompt_cache_slots();
     if (ds41_) return ds41_prompt_cache_slots();
-    return prompt_cache_on_ ? 1u : 0u;   // the other arches: the live conversation's prefix, when the cache is on
+    // P4 B45 (3): the two Qwen splits keep many conversations in their FleetPrefixCache (the crown's lanes cache: the load
+    // line's "up to N entries", q35m_lanes_init's set_limits; the 27B's shared-prefix cache: 12, IE_PROMPT_CACHE_MAX_ENTRIES),
+    // so they report that limit -- Dream skips its end-of-turn verifier at 1 ("this engine keeps one conversation cached ...
+    // would evict this one"). The other arches: the live conversation's prefix (1) when the cache is on, 0 when off.
+    return prompt_cache_slots_rule(prompt_cache_on_, qwen35moe_split_ || qwen35_split_, fleet_cache_.config().max_entries);
 }
 
 std::string Engine::vision_status_json() const {
@@ -4984,6 +5198,14 @@ std::string Engine::vision_status_json() const {
             break;
         case ModelArch::kQwen4Exp:   // not ready at --parallel > 1: Engine::chat refuses images there (the same rule)
             reason = q4e_vision_refusal(opts_.parallel);
+            ready = reason.empty();
+            break;
+        case ModelArch::kQwen35Dense:   // P4 B45: the 27B's two-card split with an mmproj at --parallel 1 (Engine::chat: the same rule)
+            reason = q27_vision_refusal(qwen35_split_, !qvis_mmproj_.empty() /* resolved at load */, opts_.parallel);
+            ready = reason.empty();
+            break;
+        case ModelArch::kQwen35Moe:   // P4 B45 step 2: the crown's two-card split with an mmproj at --parallel 1 (Engine::chat: the same rule)
+            reason = q35m_vision_refusal(qwen35moe_split_, !qvis_mmproj_.empty() /* resolved at load */, opts_.parallel);
             ready = reason.empty();
             break;
         default:
@@ -5018,14 +5240,27 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
     }
     if (arch_ == ModelArch::kDeepSeek41) return ds41_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
     if (arch_ == ModelArch::kMimo26) return mimo26_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
-    // Vision guard: only the qwen4exp path (ChatML branch below) consumes
-    // turn images; every other arch must refuse rather than silently drop.
-    q4e_pending_imgs_.clear();
+    // Vision guard: only the Qwen3.8 ChatML branch below (Flash-Next; P4 B45: the
+    // 27B two-card split) consumes turn images; every other arch must refuse rather
+    // than silently drop. Each refusal helper is the one /props "vision" reports.
+    qvis_pending_.clear();
     ds4_pending_imgs_.clear();
     bool has_images = false;
     for (const auto& t : turns) has_images |= !t.images.empty();
     if (has_images && arch_ == ModelArch::kDeepSeek4) {
         if (const std::string why = ds4_vision_refusal(ds4_vis_ != nullptr, opts_.parallel); !why.empty()) {
+            GenerateResult res;
+            res.finish_reason = "error: " + why;
+            return res;
+        }
+    } else if (has_images && arch_ == ModelArch::kQwen35Dense) {
+        if (const std::string why = q27_vision_refusal(qwen35_split_, !qvis_mmproj_.empty(), opts_.parallel); !why.empty()) {
+            GenerateResult res;
+            res.finish_reason = "error: " + why;
+            return res;
+        }
+    } else if (has_images && arch_ == ModelArch::kQwen35Moe) {   // step 2: the crown split
+        if (const std::string why = q35m_vision_refusal(qwen35moe_split_, !qvis_mmproj_.empty(), opts_.parallel); !why.empty()) {
             GenerateResult res;
             res.finish_reason = "error: " + why;
             return res;
@@ -5275,17 +5510,18 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
         }
     }
     std::span<const ChatTurn> render_turns = turns;
-    // Vision (qwen4exp, docs/qwen4/16_vision_port.md §4): decode each image NOW
-    // (its merged grid sets the pad-run length), stash pixels for generate()'s
-    // encode, and rewrite the turn's content with the sentinel run the
-    // tokenizer maps to ids 248053 / 248056×N / 248054.
+    // Vision (qwen4exp, docs/qwen4/16_vision_port.md §4; P4 B45: the 27B split, the
+    // same vocabulary ids and template run): decode each image NOW (its merged
+    // grid sets the pad-run length), stash pixels for generate()'s encode, and
+    // rewrite the turn's content with the sentinel run the tokenizer maps to ids
+    // 248053 / 248056×N / 248054.
     std::vector<ChatTurn> vis_turns;
     if (has_images) {
         vis_turns.assign(turns.begin(), turns.end());
         for (auto& t : vis_turns) {
             std::string runs;
             for (const auto& bytes : t.images) {
-                Q4ePendingImage im;
+                QvisPendingImage im;
                 if (auto e = qwen4_load_image_mem(bytes.data(), bytes.size(),
                                                   im.px, im.H, im.W); !e.empty()) {
                     GenerateResult res;
@@ -5296,7 +5532,7 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
                 runs += "<|vision_start|>";
                 for (uint32_t i = 0; i < nm; ++i) runs += "<|image_pad|>";
                 runs += "<|vision_end|>";
-                q4e_pending_imgs_.push_back(std::move(im));
+                qvis_pending_.push_back(std::move(im));
             }
             for (size_t p = t.content.find(kChatImageMarker); p != std::string::npos;
                  p = t.content.find(kChatImageMarker)) t.content.erase(p, kChatImageMarker.size());

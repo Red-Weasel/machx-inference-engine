@@ -20,22 +20,25 @@ int main() {
     const char* gp = std::getenv("IE_VIS_GOLDEN");
     if (!gp) { std::fprintf(stderr, "SKIP: IE_VIS_GOLDEN not set\n"); return 0; }
 
+    // P4 B45: the golden's row width is the mmproj's projector width (out_d), so the
+    // tower loads first; the oracle wrote [Nm, out_d] rows and the file must end there.
+    ie::Qwen4Vision vis;
+    if (auto e = vis.load(mmproj); !e.empty()) {
+        std::fprintf(stderr, "FAIL: load: %s\n", e.c_str()); return 1;
+    }
     FILE* f = std::fopen(gp, "rb");
     if (!f) { std::fprintf(stderr, "FAIL: cannot open %s\n", gp); return 1; }
     uint32_t hdr[3];
     if (std::fread(hdr, 4, 3, f) != 3) { std::fprintf(stderr, "FAIL: short golden\n"); return 1; }
     const uint32_t H = hdr[0], W = hdr[1], Nm = hdr[2];
-    std::vector<float> img(size_t(3) * H * W), gold(size_t(Nm) * ie::kVisOutD);
+    std::vector<float> img(size_t(3) * H * W), gold(size_t(Nm) * vis.out_d());
     if (std::fread(img.data(), 4, img.size(), f) != img.size() ||
         std::fread(gold.data(), 4, gold.size(), f) != gold.size()) {
-        std::fprintf(stderr, "FAIL: truncated golden\n"); return 1;
+        std::fprintf(stderr, "FAIL: truncated golden (want [%u, %u] rows)\n", Nm, vis.out_d()); return 1;
     }
+    if (std::fgetc(f) != EOF) { std::fprintf(stderr, "FAIL: golden has more than [%u, %u] rows (OUT mismatch?)\n", Nm, vis.out_d()); return 1; }
     std::fclose(f);
 
-    ie::Qwen4Vision vis;
-    if (auto e = vis.load(mmproj); !e.empty()) {
-        std::fprintf(stderr, "FAIL: load: %s\n", e.c_str()); return 1;
-    }
     std::vector<float> out;
     if (auto e = vis.encode(img.data(), H, W, out); !e.empty()) {
         std::fprintf(stderr, "FAIL: encode: %s\n", e.c_str()); return 1;
@@ -53,8 +56,8 @@ int main() {
         ref_sq += double(gold[i]) * gold[i];
     }
     const double rel = std::sqrt(sum_sq / (ref_sq > 0 ? ref_sq : 1.0));
-    std::printf("vision cpu vs oracle: max|d|=%.3e (at %zu: %f vs %f)  rel_l2=%.3e  [%u x %u -> %u tok]\n",
-                max_abs, argmax, out[argmax], gold[argmax], rel, W, H, Nm);
+    std::printf("vision cpu vs oracle: max|d|=%.3e (at %zu: %f vs %f)  rel_l2=%.3e  [%u x %u -> %u tok x %u]\n",
+                max_abs, argmax, out[argmax], gold[argmax], rel, W, H, Nm, vis.out_d());
     if (max_abs > 1e-3 || rel > 1e-4) { std::printf("GATE FAILED\n"); return 1; }
     std::printf("GATE PASSED\n");
     return 0;

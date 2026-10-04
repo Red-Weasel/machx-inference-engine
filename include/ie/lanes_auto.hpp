@@ -103,6 +103,36 @@ inline LanesCardRoom q27_budget_room(uint64_t gmem, uint64_t fixed, uint64_t ban
     return {cap > fixed ? cap - fixed : 0, bank, 0, 0};
 }
 
+// P4 B45 (4): the 27B split's prompt-cache prefix bound beside a resident vision tower (Engine::load's [budget] check). The
+// cache's worst case on a card is max_entries x (per_tok x max_prefix + dnb) bytes; when the card's total (`fixed` = weights,
+// the live KV and DeltaNet state, the banks, the tower, the reserve + that cache) crosses the 92 % line, the bound shrinks
+// to the largest prefix (a multiple of 512) that fits, never below min_prefix -- the load then prints
+// "[budget] card 1: prompt cache max X -> Y GB ... to fit the vision tower" instead of refusing. fits == false = the refusal
+// stands (the fixed part alone is over the line, or the room is below min_prefix). An explicit IE_PROMPT_CACHE_MAX_PREFIX is
+// the caller's rule: the load does not call this then.
+struct Q27CacheFit { bool fits = false; bool shrunk = false; uint32_t max_prefix = 0; uint64_t cache_bytes = 0; };
+inline uint64_t q27_cache_bytes(uint32_t max_entries, uint64_t per_tok, uint64_t dnb, uint32_t max_prefix) {
+    return uint64_t(max_entries) * (per_tok * max_prefix + dnb);
+}
+inline Q27CacheFit q27_cache_fit(uint64_t gmem, uint64_t fixed, uint32_t max_entries, uint64_t per_tok, uint64_t dnb,
+                                 uint32_t max_prefix, uint32_t min_prefix = 1024) {
+    Q27CacheFit r;
+    r.max_prefix = max_prefix;
+    r.cache_bytes = q27_cache_bytes(max_entries, per_tok, dnb, max_prefix);
+    const uint64_t cap = uint64_t(0.92 * double(gmem));   // (the check compares in double; a total <= this truncated cap passes it)
+    if (fixed + r.cache_bytes <= cap) { r.fits = true; return r; }
+    if (fixed >= cap || max_entries == 0 || per_tok == 0) return r;   // not the cache's overflow, or nothing to shrink
+    const uint64_t per_entry = (cap - fixed) / max_entries;
+    if (per_entry <= dnb) return r;
+    uint64_t pre = ((per_entry - dnb) / per_tok) / 512 * 512;
+    if (pre < min_prefix || pre >= max_prefix) return r;
+    r.max_prefix = uint32_t(pre);
+    r.cache_bytes = q27_cache_bytes(max_entries, per_tok, dnb, r.max_prefix);
+    r.fits = fixed + r.cache_bytes <= cap;
+    r.shrunk = r.fits;
+    return r;
+}
+
 // The load's one line about the pick: the arch, N, the lane context, why, and each measured card's numbers.
 inline std::string lanes_auto_line(const char* arch, uint32_t n, uint32_t lane_ctx, const std::string& why,
                                    std::span<const LanesCardRoom> cards = {}) {

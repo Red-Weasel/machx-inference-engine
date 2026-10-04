@@ -82,6 +82,31 @@ void test_plan() {
           "plan: lane ctx = the arch's default (crown 32768, 27B 65536) or 16384 on the host-expert archs, capped at --ctx");
 }
 
+// P4 B45 (4): the 27B split's prompt-cache bound beside a resident vision tower (q27_cache_fit). The numbers are the
+// 2026-10-02 load that was refused (ctx 32768, --mmproj, the BF16 tower): gmem 34.2 GB, weights 14.3, kv 1.1, dnb 0.076,
+// reserve 2 GiB, tower 1.6; 12 entries x (32,768 B a token x 32,768 + dnb) = 13.8 GB -> 33.0 of 34.2 (> 92 %).
+void test_cache_fit() {
+    const uint64_t gmem = 34200000000ull, per_tok = 32768, dnb = 76000000ull, reserve = 2147483648ull;
+    const uint64_t cap = uint64_t(0.92 * double(gmem));
+    const uint64_t fixed_text = 14300000000ull + 1100000000ull + dnb + reserve;   // no tower: 17.6 GB
+    const uint64_t fixed_vis  = fixed_text + 1600000000ull;                        // the tower on card 1: 19.2 GB
+    const auto a = ie::q27_cache_fit(gmem, fixed_text, 12, per_tok, dnb, 32768);
+    check(a.fits && !a.shrunk && a.max_prefix == 32768 && a.cache_bytes / 100000000 == 137,
+          "cache fit: without the tower the 13.8 GB cache fits (31.4 of 34.2) and is unchanged");
+    const auto b = ie::q27_cache_fit(gmem, fixed_vis, 12, per_tok, dnb, 32768);
+    check(b.fits && b.shrunk && b.max_prefix == 28672, "cache fit: with the tower the prefix shrinks 32768 -> 28672 (a multiple of 512)");
+    check(fixed_vis + b.cache_bytes <= cap, "cache fit: the shrunk total is within the 92 % line");
+    check(fixed_vis + ie::q27_cache_bytes(12, per_tok, dnb, b.max_prefix + 512) > cap, "cache fit: one step more would not fit");
+    check(b.cache_bytes / 100000000 == 121, "cache fit: the cache is 12.19 GB after the shrink (the load line prints 13.8 -> 12.2)");
+    const auto c = ie::q27_cache_fit(gmem, cap + 1, 12, per_tok, dnb, 32768);
+    check(!c.fits && !c.shrunk && c.max_prefix == 32768, "cache fit: the fixed part alone over the line = no shrink, the refusal stands");
+    const auto d = ie::q27_cache_fit(gmem, cap - 12 * (per_tok * 512 + dnb), 12, per_tok, dnb, 32768);
+    check(!d.fits && !d.shrunk, "cache fit: room for fewer than 1,024 tokens a prefix = the refusal stands");
+    const auto e = ie::q27_cache_fit(gmem, fixed_vis, 12, per_tok, dnb, 8192);
+    check(e.fits && !e.shrunk && e.max_prefix == 8192, "cache fit: a bound that already fits (IE_PROMPT_CACHE_MAX_PREFIX=8192's 4.1 GB) is unchanged");
+    check(!ie::q27_cache_fit(gmem, fixed_vis, 12, 0, dnb, 32768).shrunk, "cache fit: a card without KV (per_tok 0) never shrinks");
+}
+
 void test_fit_edges() {
     const uint64_t lane = 350 * MiB, per = 31 * MiB, keep = 3 * GiB;
     std::vector<ie::LanesCardRoom> c{{0, lane, per, keep}};
@@ -241,6 +266,7 @@ void test_line() {
 int main() {
     test_plan();
     test_fit_edges();
+    test_cache_fit();
     test_crown();
     test_q27();
     test_line();

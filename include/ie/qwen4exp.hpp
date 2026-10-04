@@ -17,6 +17,7 @@
 //    spec 12 §6).
 #pragma once
 
+#include "ie/prefill_gemm.hpp"       // AttnGemmScratch (P4 B49)
 #include "ie/allocator.hpp"
 #include "ie/deltanet_state.hpp"
 #include "ie/gguf.hpp"
@@ -26,6 +27,8 @@
 
 #include <sycl/sycl.hpp>
 
+#include <thread>
+#include <atomic>
 #include <cstdint>
 #include <cstdlib>
 #include <functional>
@@ -178,6 +181,12 @@ public:
     sycl::half* out_hc_down_t = nullptr;
     float*      out_hc_norm = nullptr;  // [10240]
     const GgufTensorInfo* ple_table = nullptr;  // [160, 320001536] IQ4_NL, host
+    // P4 B49: the table is read at random, 16 rows a token, straight from the file mapping; cold, a row is a page fault
+    // served from disk (measured 2026-10-04: ~130 us a row, 39 % of a first read of 7,933 tokens, 241 against 487
+    // tok/s for a repeated prompt). The load starts one background pass that reads the whole table into the page
+    // cache; IE_Q4E_PLE_PREFETCH=0 turns it off, =wait makes the load wait for it. Stopped and joined in free_all.
+    std::thread       ple_prefetch_;
+    std::atomic<bool> ple_prefetch_stop_{false};
 
     uint64_t device_bytes() const noexcept { return dev_bytes_; }
     uint64_t host_bank_bytes() const noexcept { return host_bytes_; }
@@ -470,6 +479,10 @@ private:
     DeltaNetState dn_;
     std::vector<int32_t> full_idx_, lin_idx_;   // layer -> cache-local index
     uint32_t max_ctx_ = 0, max_chunk_ = 0;
+    // P4 B49: full_attention_prefill_gemm's scratch (stages with a full-attention layer; allocated with the workspaces,
+    // before the expert cache is sized) and the largest context its masked form is used at.
+    AttnGemmScratch ag_;
+    uint32_t ag_maxctx_ = 0;
     uint32_t layer_lo_ = 0, layer_hi_ = 0;      // owned block range [lo, hi)
     // Snapshot storage (device): DeltaNet recurrent+conv state, PLE conv
     // state; host: PLE history, per-layer QSA block counters, KV lengths.
@@ -568,6 +581,10 @@ private:
     std::vector<ECache> ecache_;
     uint64_t ecache_clock_ = 0;
     uint32_t ecache_slots_ = 0;
+    // P4 B49: slots a layer can really use -- ecache_slots_ minus the most slots any layer of this stage lost to the
+    // VRAM page-alias self-test (init_runtime). A quarantined slot keeps last_use = UINT64_MAX, so no victim scan
+    // takes it; the wave size, the union checks and the rows group bound use this count.
+    uint32_t ecache_usable_ = 0;
     // Prefill expert-upload prefetch queue (in-order, same device/context as
     // compute): with half-cache waves, wave i+1's slot refills overlap wave
     // i's kernels — see the wave loop's eviction-safety argument.

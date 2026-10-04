@@ -150,4 +150,27 @@ inline std::string ds4_vision_refusal(bool sidecar_loaded, uint32_t parallel) {
     return q4e_vision_refusal(parallel);
 }
 
+// P4 B45: why a Qwen3.8-27B (qwen35) load refuses image requests, "" when it takes them: images run on the layer-split
+// model only (Qwen35SplitModel: --gpus 2, or IE_QWEN35_Q8 on one card; the single-card Qwen35DenseModel has no splice),
+// need an mmproj (--mmproj, IE_MMPROJ, or mmproj-F16.gguf / mmproj-BF16.gguf beside the model) and --parallel 1 (the
+// staging is engine-global like Flash-Next's; the 27B's request lanes take text only until step 3 of
+// ~/ds41_work/p60/vision-splits/STUDY.md). Engine::vision_status_json (/props "vision") and Engine::chat's refusal both
+// come from here, so they cannot disagree.
+inline std::string q27_vision_refusal(bool split, bool mmproj_known, uint32_t parallel) {
+    if (!split) return "this 27B load has no vision path (images need the layer-split model: --gpus 2)";
+    if (!mmproj_known) return "this 27B load has no vision projector (pass --mmproj <mmproj-F16.gguf>, or set IE_MMPROJ, or put mmproj-F16.gguf beside the model)";
+    if (parallel > 1) return "image inputs need --parallel 1 (the 27B split's request lanes take text only; per-request image staging is engine-global)";
+    return {};
+}
+
+// P4 B45 step 2: the same rule for the Qwen3.6/3.8-35B-A3B crown (qwen35moe) -- its two-card split (Qwen35MoeSplitModel) with a
+// projector (the 35B Distill repo's mmproj-Qwen3.8-35B-A3B-F16.gguf, mm.2 2048) at --parallel 1; the single-card QwenModel has
+// no splice and the lanes take text only (step 3). /props "vision" and Engine::chat read this one helper.
+inline std::string q35m_vision_refusal(bool split, bool mmproj_known, uint32_t parallel) {
+    if (!split) return "this 35B-A3B load has no vision path (images need the two-card split: --gpus 2)";
+    if (!mmproj_known) return "this 35B-A3B load has no vision projector (pass --mmproj <mmproj-...-F16.gguf>, or set IE_MMPROJ, or put an mmproj*.gguf beside the model)";
+    if (parallel > 1) return "image inputs need --parallel 1 (the 35B-A3B split's request lanes take text only; per-request image staging is engine-global)";
+    return {};
+}
+
 }  // namespace ie

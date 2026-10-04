@@ -186,6 +186,12 @@ struct EngineOptions {
     std::string spec_draft;          // dspark separate-draft GGUF (kQwen35Dense target,
                                      // e.g. *-dspark-Q4_1.gguf). Loads a target-conditioned
                                      // DsparkDrafter; lossless GREEDY spec. CLI: --spec-draft.
+    std::string mmproj;              // P4 B45: the vision projector GGUF (mmproj-*.gguf) for the
+                                     // Qwen3.8 family (qwen4exp Flash-Next, the qwen35 27B split).
+                                     // Given, the tower is loaded and placed on its card AT LOAD
+                                     // (the card budget sees it). Empty: IE_MMPROJ, else
+                                     // mmproj-F16.gguf / mmproj-BF16.gguf beside the model, found
+                                     // and loaded at the first image (as before). CLI: --mmproj.
 };
 
 struct GenerateResult {
@@ -406,6 +412,12 @@ private:
     } stepper_;
     void stepper_spawn_();
     void stepper_loop_();
+    // P4 B48: true while generate()'s decode loop runs the 27B split through Qwen35SplitModel::spec_step.
+    bool q27_spec_step_ = false;
+    // The decode loop's sampler for the NEXT token (set before each forward_step), for drafts sampled with it:
+    // IE_QWEN35_SPEC_DRAFT_SAMPLED=1 (off by default: measured no better than argmax drafts, engine.cpp).
+    Qwen35SplitModel::SpecDraftSampling q27_draft_;
+    bool q27_draft_on_ = false;
     // Arch-tagged backend pair (no virtual interface yet — two backends):
     // model_ is engaged when arch_ == kQwen35Moe (crown path, unchanged);
     // dense_ when arch_ == kQwen3Dense (dn_ stays uninit — reset() no-ops).
@@ -462,6 +474,11 @@ private:
             // bounced into d_logits_ so the existing GPU sampler is unchanged.
             if (tp_ids_host_.size() < T) tp_ids_host_.resize(T);
             q.memcpy(tp_ids_host_.data(), ids, T * sizeof(int32_t)).wait();
+            if (T == 1 && q27_spec_step_) {   // P4 B48: a decode step through the model's speculative step
+                if (auto m = qwen35_split_model_.spec_step(tp_ids_host_[0], pos, tp_logits_host_.data(),
+                                                           q27_draft_on_ ? &q27_draft_ : nullptr); !m.empty())
+                    std::fprintf(stderr, "qwen35split spec step: %s\n", m.c_str());
+            } else
             if (auto m = qwen35_split_model_.forward(tp_ids_host_.data(), T, pos,
                                                      /*reset_kv=*/(pos == 0),
                                                      tp_logits_host_.data()); !m.empty())
@@ -662,27 +679,40 @@ private:
     std::unique_ptr<Q4eBundle> q4e_;
     uint32_t        q4e_vocab_ = 0;
     std::string     q4e_err_;             // forward-failure latch (mirrors ds4_err_)
-    // Vision (qwen4exp only; docs/qwen4/16_vision_port.md §4). chat() decodes
-    // each image and rewrites the turn's content with the pad run; generate()
-    // encodes the pending images and stages the splice + M-RoPE table here;
-    // q4e_forward applies them right AFTER its pos==0 reset (which would
-    // otherwise wipe them). Staging clears at the next generate().
-    std::unique_ptr<Qwen4Vision> q4e_vis_;
+    // Vision for the Qwen3.8 family on one tower class (Qwen4Vision): Flash-Next
+    // (kQwen4Exp, docs/qwen4/16_vision_port.md §4) and, P4 B45, the 27B two-card
+    // split (kQwen35Dense + qwen35_split_; ~/ds41_work/p60/vision-splits/STUDY.md
+    // step 1). chat() decodes each image and rewrites the turn's content with the
+    // pad run; generate() encodes the pending images on the model's vision card
+    // and stages the splice rows + M-RoPE table here; qvis_apply hands them to
+    // the model (q4e_forward: right AFTER its pos==0 reset, which would otherwise
+    // wipe them; the 27B split: once before its prefill, its staging survives
+    // resets and is cleared at every generate()). Staging clears at the next
+    // generate(). Engine-global, so images need --parallel 1 on both archs.
+    std::unique_ptr<Qwen4Vision> qvis_tower_;
     std::string     model_path_;          // gguf path from load() (mmproj discovery)
-    std::string     q4e_mmproj_;          // resolved mmproj path ("" = none found)
-    struct Q4ePendingImage { std::vector<float> px; uint32_t H, W; };
-    std::vector<Q4ePendingImage> q4e_pending_imgs_;
-    std::vector<float>   q4e_vis_rows_;   // concat merged rows, span order
-    std::vector<std::pair<uint32_t, uint32_t>> q4e_vis_spans_;  // (t0, n)
-    std::vector<int32_t> q4e_pos3_;       // [3, n_prompt]
-    int32_t              q4e_delta_ = 0;
-    bool                 q4e_vis_active_ = false;
-    // (engine.cpp) Encode the pending images against the tokenized prompt and
-    // fill the staging above; apply staging to the bundle (A splice + A/B
-    // mrope). Apply runs at q4e_forward's pos==0 (after its reset) or right
-    // after a prompt-cache restore.
-    std::string q4e_stage_vision(const std::vector<int32_t>& ids);
-    void        q4e_apply_vision();
+    std::string     qvis_mmproj_;         // resolved mmproj path ("" = none found yet)
+    struct QvisPendingImage { std::vector<float> px; uint32_t H, W; };
+    std::vector<QvisPendingImage> qvis_pending_;
+    std::vector<float>   qvis_rows_;      // concat merged rows, span order
+    std::vector<std::pair<uint32_t, uint32_t>> qvis_spans_;  // (t0, n)
+    std::vector<int32_t> qvis_pos3_;      // [3, n_prompt]
+    int32_t              qvis_delta_ = 0;
+    bool                 qvis_active_ = false;
+    // (engine.cpp) The mmproj path: opts_.mmproj, else IE_MMPROJ, else mmproj-F16.gguf /
+    // mmproj-BF16.gguf beside the model or one directory up ("" = none); the vision
+    // card's allocator (Flash-Next: the tail stage's; the 27B split: the head card's);
+    // load the tower's weights (CPU f32) and check its mm.2 width against the model's
+    // hidden size; upload them to the vision card. --mmproj runs load + upload at
+    // Engine::load (the 27B's card budget counts them); otherwise the first image does.
+    std::string      qvis_resolve_mmproj();
+    DeviceAllocator* qvis_alloc();
+    std::string      qvis_load_tower();
+    std::string      qvis_upload_tower();
+    // Encode the pending images against the tokenized prompt and fill the staging
+    // above; apply the staging to the loaded model ("" or the first error).
+    std::string qvis_stage(const std::vector<int32_t>& ids);
+    std::string qvis_apply();
     // Deepest prefix the deepseek4 prompt cache will snapshot. Capped at load
     // because the snapshot (22.55 MiB + 6.88 kB/token PER CARD at the default fp16 values) is drawn from
     // the same reserve the expert arena is derived from, and trading expert

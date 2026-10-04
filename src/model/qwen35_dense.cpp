@@ -1684,6 +1684,26 @@ void MtpHead::draft_device_argmax(sycl::queue& q, const sycl::half* h_last,
     q.memcpy(out.data(), d_draft_ids, uint64_t(K) * sizeof(int32_t)).wait();
 }
 
+void MtpHead::draft_device_sampled(sycl::queue& q, const sycl::half* h_last,
+                                   int32_t tn, uint32_t p_base, uint32_t K,
+                                   std::vector<int32_t>& out,
+                                   float temperature, uint32_t top_k, float top_p, float min_p, uint64_t seed0) {
+    out.clear();
+    if (K == 0 || K > 16) return;
+    q.memcpy(d_tok1, &tn, sizeof(int32_t));
+    const sycl::half* h_src = h_last;
+    const uint32_t nv = draft_vocab ? std::min(draft_vocab, vocab) : vocab;
+    for (uint32_t j = 0; j < K; ++j) {
+        const int32_t* e_tok = j == 0 ? d_tok1 : d_draft_ids + (j - 1);
+        build_x_device(q, h_src, e_tok);
+        run_layer(q, int32_t(p_base + j));
+        sample_softmax_topk_topp(q, d_logits1, d_draft_ids + j, nv, temperature, top_k, top_p, min_p, seed0 + j);
+        h_src = d_x;     // build_x_device copies d_x to d_h before overwriting it
+    }
+    out.resize(K);
+    q.memcpy(out.data(), d_draft_ids, uint64_t(K) * sizeof(int32_t)).wait();
+}
+
 std::string Qwen35DenseModel::load_mtp_head(const GgufReader& g, uint32_t max_ctx) {
     if (!alloc_) return "load_mtp_head: model not loaded";
     return mtp_.load(*alloc_, g, cfg_, max_ctx);

@@ -1,6 +1,7 @@
-// tools/qwen4_vision_probe.cpp — standalone qwen4exp vision encode probe.
+// tools/qwen4_vision_probe.cpp — standalone Qwen3.8 vision encode probe (CPU path).
 // Usage: ie-qwen4-vision-probe <mmproj.gguf> <image> [--dump out.bin]
-// Prints grid/token counts and embedding stats; --dump writes [Nm, 2560] f32.
+// Prints grid/token counts and embedding stats; --dump writes [Nm, out_d] f32
+// (out_d = the mmproj's projector width: 2560 Flash-Next, 5120 the 27B, 2048 the 35B).
 
 #include "ie/qwen4_vision.hpp"
 
@@ -36,13 +37,13 @@ int main(int argc, char** argv) {
     }
     auto t3 = std::chrono::steady_clock::now();
 
-    const size_t nm = emb.size() / ie::kVisOutD;
+    const size_t nm = emb.size() / vis.out_d();
     double mu = 0, sq = 0;
     for (float v : emb) mu += v;
     mu /= double(emb.size());
     for (float v : emb) sq += (v - mu) * (v - mu);
     std::printf("[emb] [%zu, %u]  mean=%.6f std=%.6f  first4: %.4f %.4f %.4f %.4f\n",
-                nm, ie::kVisOutD, mu, std::sqrt(sq / double(emb.size())),
+                nm, vis.out_d(), mu, std::sqrt(sq / double(emb.size())),
                 emb[0], emb[1], emb[2], emb[3]);
     std::printf("[time] load %.2fs  encode %.2fs\n",
                 std::chrono::duration<double>(t1 - t0).count(),

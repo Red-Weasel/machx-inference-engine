@@ -94,7 +94,10 @@ std::string server_capabilities_json(const std::string& model_path) {
                       {"thinking_description",reasoning.thinking_description}}},
         {"features",{{"prompt_cache",cache},{"speculative",spec},{"int8_kv",kv8},
                      {"context_shift",false},
-                     {"vision",arch==ModelArch::kDeepSeek4 || arch==ModelArch::kQwen4Exp || arch==ModelArch::kDeepSeek41 || arch==ModelArch::kMimo26}}},
+                     // (P4 B45: the Qwen3.8 splits -- the 27B takes images on its two-card split with an mmproj at --parallel 1,
+                     // the 35B-A3B is the next step; the load's /props "vision" says whether THIS load is ready)
+                     {"vision",arch==ModelArch::kDeepSeek4 || arch==ModelArch::kQwen4Exp || arch==ModelArch::kDeepSeek41 || arch==ModelArch::kMimo26 ||
+                               arch==ModelArch::kQwen35Dense || arch==ModelArch::kQwen35Moe}}},
         {"defaults",{{"temperature",r6(sp.temperature)},{"top_k",sp.top_k},{"top_p",r6(sp.top_p)},{"min_p",r6(sp.min_p)},
                      {"repeat_penalty",r6(sp.repeat_penalty)},{"repeat_last_n",sp.repeat_window},{"presence_penalty",r6(sp.presence_penalty)},
                      {"frequency_penalty",r6(sp.frequency_penalty)},{"seed",sp.seed},

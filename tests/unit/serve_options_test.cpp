@@ -58,6 +58,13 @@ int main() {
         "--max-queue", "16"});
     assert(p.engine.max_ctx == 200000 && p.engine.n_gpus == 2);
     assert(p.max_queue == 16);
+    assert(p.engine.mmproj.empty());   // P4 B45: no --mmproj = the load's discovery (IE_MMPROJ, mmproj-F16.gguf beside the model)
+    assert(ie::parse_launch_options({"--mmproj", "/m/mmproj-F16.gguf"}).engine.mmproj == "/m/mmproj-F16.gguf");
+    {
+        bool rejected = false;
+        try { ie::parse_launch_options({"--mmproj", ""}); } catch (const std::exception&) { rejected = true; }
+        assert(rejected);   // an empty path would silently mean "discovery"
+    }
     assert(p.engine.cpu_threads == 12 && !p.engine.prompt_cache);
     assert(p.engine.prefill_chunk == 32 && p.engine.parallel == 2 && p.engine.slot_ctx == 8000);
     const auto& s = p.defaults.sampling;

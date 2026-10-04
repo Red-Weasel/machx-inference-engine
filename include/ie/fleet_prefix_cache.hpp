@@ -95,6 +95,8 @@ public:
     // P4 B29: change the caps after init (the crown split's request lanes size them once their own VRAM is allocated). Takes
     // effect at the next insert; existing entries are not evicted here.
     void     set_limits(uint32_t max_entries, uint64_t max_dev_bytes) noexcept { pcfg_.max_entries = max_entries; pcfg_.max_dev_bytes = max_dev_bytes; }
+    // P4 B45 (4): the prefix bound insert() applies (the 27B's load shrinks it to fit its budget beside a vision tower)
+    void     set_max_prefix_len(uint32_t n) noexcept { pcfg_.max_prefix_len = n; }
     void     set_supersede(bool on) noexcept { pcfg_.supersede = on; }
     const FleetPrefixCacheConfig& config() const noexcept { return pcfg_; }
     uint64_t total_bytes() const noexcept;

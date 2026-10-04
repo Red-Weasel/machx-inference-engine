@@ -38,7 +38,7 @@ inline const std::vector<ConfigKey>& serve_config_keys() {
         {"vram_reserve_gib", "--vram-reserve-gib", K::Num},
         {"int8_kv", "--int8-kv", K::Flag},            {"spec", "--spec", K::Flag},
         {"spec_k", "--spec-k", K::Int},               {"spec_head", "--spec-head", K::Path},
-        {"spec_draft", "--spec-draft", K::Path},
+        {"spec_draft", "--spec-draft", K::Path},     {"mmproj", "--mmproj", K::Path},
         {"temp", "--temp", K::Num},                   {"top_k", "--top-k", K::Int},
         {"top_p", "--top-p", K::Num},                 {"min_p", "--min-p", K::Num},
         {"repeat_penalty", "--repeat-penalty", K::Num}, {"repeat_last_n", "--repeat-last-n", K::Int},

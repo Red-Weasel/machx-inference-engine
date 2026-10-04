@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Pure-numpy golden oracle for the qwen4exp vision tower (docs/qwen4/16_vision_port.md).
+"""Pure-numpy golden oracle for the Qwen3.8 vision tower (docs/qwen4/16_vision_port.md).
 
-Loads mmproj-F16.gguf directly and reproduces Qwen4ExpVisionModel.forward exactly
+Loads an mmproj GGUF directly and reproduces Qwen4ExpVisionModel.forward exactly
 (reference: modeling_qwen4_exp.py:1660-1960 + vision_utils.py). Emits a golden
 dump the C++ unit test (qwen4_vision_cpu_test) compares against.
 
 Usage:
-  python3 qwen4_vision_oracle.py [--mmproj PATH] [--out PATH] [--h 64] [--w 96]
+  python3 qwen4_vision_oracle.py [--mmproj PATH] [--out PATH] [--h 64] [--w 96] [--out-d N]
 
 The input image is a deterministic synthetic gradient (no file decode), height/
-width in PIXELS (multiples of 32).
+width in PIXELS (multiples of 32). P4 B45: the projector's output width is read
+from mm.2.weight's shape (2560 Flash-Next, 5120 the 27B, 2048 the 35B-A3B);
+--out-d only asserts it. F16, F32 and BF16 tensors are accepted (BF16 arrives as
+raw bytes and is widened exactly: the 16-bit pattern in the high half of an f32).
 """
 import argparse
 import os
@@ -25,7 +28,6 @@ ROT = HD // 2              # 36 (18 h-freqs + 18 w-freqs)
 FFN = 4304
 DEPTH = 27
 GRID_SIDE = 48             # sqrt(2304) learned pos table
-OUT_D = 2560
 LN_EPS = 1e-6
 VIS_THETA = 1e4
 
@@ -34,6 +36,9 @@ def t(reader, name):
     for te in reader.tensors:
         if te.name == name:
             a = np.asarray(te.data)
+            if te.tensor_type.name == "BF16":   # the reader hands BF16 back as raw bytes [rows, 2*cols]
+                bits = a.reshape(-1).view("<u2").astype(np.uint32) << 16
+                return bits.view(np.float32).reshape(-1)
             return a.astype(np.float32)
     raise KeyError(name)
 
@@ -68,12 +73,19 @@ def main():
     ap.add_argument("--out", default="qwen4_vision_golden.npz")
     ap.add_argument("--h", type=int, default=64)
     ap.add_argument("--w", type=int, default=96)
+    ap.add_argument("--out-d", type=int, default=0, help="assert the mmproj's projector width (0 = no check)")
     args = ap.parse_args()
     assert args.h % (P * MERGE) == 0 and args.w % (P * MERGE) == 0
 
     r = GGUFReader(args.mmproj)
     gh, gw = args.h // P, args.w // P            # patch grid
     n_patch = gh * gw
+    # mm.2.weight is [4608, OUT] (gguf ne order); OUT is the text model's width.
+    mm2 = next(te for te in r.tensors if te.name == "mm.2.weight")
+    assert len(mm2.shape) == 2 and int(mm2.shape[0]) == 4 * HID, list(mm2.shape)
+    OUT_D = int(mm2.shape[1])
+    assert args.out_d in (0, OUT_D), f"mm.2 projects to {OUT_D}, --out-d said {args.out_d}"
+    print(f"mmproj {args.mmproj}: projector OUT {OUT_D}, mm.2 dtype {mm2.tensor_type.name}")
 
     # ---- synthetic image, [3, H, W] f32 in [0,1], deterministic -------------
     yy, xx = np.mgrid[0:args.h, 0:args.w].astype(np.float32)
@@ -164,7 +176,7 @@ def main():
 
     print(f"golden: {x.shape} mean={x.mean():.6f} std={x.std():.6f} "
           f"[0,:4]={np.round(x[0, :4], 4)}")
-    # Flat binary for the C++ test: u32 H, u32 W, u32 Nm, f32 img[3*H*W], f32 emb[Nm*2560]
+    # Flat binary for the C++ test: u32 H, u32 W, u32 Nm, f32 img[3*H*W], f32 emb[Nm*OUT_D]
     with open(args.out, "wb") as f:
         np.array([args.h, args.w, x.shape[0]], np.uint32).tofile(f)
         img.astype(np.float32).tofile(f)

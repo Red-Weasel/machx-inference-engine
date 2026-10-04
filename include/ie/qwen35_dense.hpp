@@ -300,6 +300,14 @@ struct MtpHead {
                              uint32_t p_base, uint32_t K,
                              std::vector<int32_t>& out);
 
+    // P4 B48: the same burst with each draft SAMPLED by the caller's sampler and the seed the caller will use for that
+    // position (seed0 + j), so that a draft follows the randomness of the token it tries to predict. temperature <= 0
+    // is an argmax. A draft is only a guess: the caller still samples every token from the model's own verified
+    // logits. Measured on the 27B split (2026-10-04): accepted slightly less often than argmax drafts; opt-in.
+    void draft_device_sampled(sycl::queue& q, const sycl::half* h_last, int32_t tn,
+                              uint32_t p_base, uint32_t K, std::vector<int32_t>& out,
+                              float temperature, uint32_t top_k, float top_p, float min_p, uint64_t seed0);
+
     // Device argmax over one vocab row (bit-faithful to the host scan: strict >,
     // first-index ties, row[0]-NaN corner). For verify-row argmax off-TU.
     static sycl::event argmax_row_device(sycl::queue& q, const sycl::half* row,

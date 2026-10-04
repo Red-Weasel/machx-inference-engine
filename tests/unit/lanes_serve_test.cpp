@@ -363,6 +363,28 @@ void test_q4e_rules() {
     check(ie::ds4_vision_refusal(false, 1).find("no vision sidecar") != std::string::npos &&
           ie::ds4_vision_refusal(false, 2).find("no vision sidecar") != std::string::npos,
           "ds4_vision_refusal: no sidecar: the sidecar reason first, whatever --parallel");
+    // P4 B45: the 27B split's rule (/props "vision" and Engine::chat read the same helper)
+    check(ie::q27_vision_refusal(true, true, 1).empty() && ie::q27_vision_refusal(true, true, 0).empty(),
+          "q27_vision_refusal: the split with an mmproj at --parallel 1 takes images");
+    check(ie::q27_vision_refusal(false, true, 1).find("layer-split") != std::string::npos &&
+          ie::q27_vision_refusal(false, false, 4).find("layer-split") != std::string::npos,
+          "q27_vision_refusal: the single-card 27B (Qwen35DenseModel) has no vision path, whatever else");
+    check(ie::q27_vision_refusal(true, false, 1).find("--mmproj") != std::string::npos &&
+          ie::q27_vision_refusal(true, false, 1).find("IE_MMPROJ") != std::string::npos,
+          "q27_vision_refusal: the split without an mmproj names --mmproj and IE_MMPROJ");
+    check(ie::q27_vision_refusal(true, true, 4).find("--parallel 1") != std::string::npos &&
+          ie::q27_vision_refusal(true, true, 2).find("--parallel 1") != std::string::npos,
+          "q27_vision_refusal: the split's lanes refuse images (step 3)");
+    // P4 B45 step 2: the crown's rule, the same shape
+    check(ie::q35m_vision_refusal(true, true, 1).empty() && ie::q35m_vision_refusal(true, true, 0).empty(),
+          "q35m_vision_refusal: the split with an mmproj at --parallel 1 takes images");
+    check(ie::q35m_vision_refusal(false, true, 1).find("two-card split") != std::string::npos,
+          "q35m_vision_refusal: the single-card crown has no vision path");
+    check(ie::q35m_vision_refusal(true, false, 1).find("--mmproj") != std::string::npos &&
+          ie::q35m_vision_refusal(true, false, 1).find("IE_MMPROJ") != std::string::npos,
+          "q35m_vision_refusal: the split without an mmproj names --mmproj and IE_MMPROJ");
+    check(ie::q35m_vision_refusal(true, true, 16).find("--parallel 1") != std::string::npos,
+          "q35m_vision_refusal: the lanes refuse images (step 3)");
 }
 
 void test_choose() {

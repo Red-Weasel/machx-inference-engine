@@ -45,7 +45,7 @@ int main() {
 
     if (gpu.size() != cpu.size()) { std::fprintf(stderr, "FAIL: size\n"); return 1; }
     double sum_sq = 0, ref_sq = 0, max_d = 0, min_cos = 1.0;
-    const uint32_t D = ie::kVisOutD;
+    const uint32_t D = vis.out_d();   // P4 B45: the mmproj's projector width
     for (size_t r = 0; r < cpu.size() / D; ++r) {
         double dot = 0, na = 0, nb = 0;
         for (uint32_t j = 0; j < D; ++j) {

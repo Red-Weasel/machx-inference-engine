@@ -217,6 +217,40 @@ float* upload_f32(DeviceAllocator& a, const std::vector<float>& w) {
 
 }  // namespace
 
+// P4 B45: the one-time weight upload, callable at load (a card budget then sees the
+// tower) or by encode_gpu's first call. Idempotent for the same allocator.
+std::string Qwen4Vision::upload_gpu(DeviceAllocator& alloc) {
+    if (!loaded()) return "qwen4 vision: not loaded";
+    if (gpu_) return gpu_->alloc == &alloc ? std::string() : "qwen4 vision gpu: allocator changed between calls";
+    const uint32_t pd = 3 * 2 * kVisPatch * kVisPatch;   // 1536
+    const uint32_t md = kVisHid * 4;                     // 4608
+    gpu_ = std::make_unique<GpuState>();
+    GpuState& g = *gpu_;
+    g.alloc = &alloc;
+    g.patch = upload_bt(alloc, patch_w_, kVisHid, pd);
+    g.patch_b = upload_f32(alloc, patch_b_);
+    g.blk.resize(kVisDepth);
+    for (uint32_t L = 0; L < kVisDepth; ++L) {
+        const Block& s = blocks_[L];
+        auto& d = g.blk[L];
+        d.ln1_w = upload_f32(alloc, s.ln1_w); d.ln1_b = upload_f32(alloc, s.ln1_b);
+        d.ln2_w = upload_f32(alloc, s.ln2_w); d.ln2_b = upload_f32(alloc, s.ln2_b);
+        d.qkv = upload_bt(alloc, s.qkv_w, 3 * kVisHid, kVisHid);
+        d.out = upload_bt(alloc, s.out_w, kVisHid, kVisHid);
+        d.up = upload_bt(alloc, s.up_w, kVisFfn, kVisHid);
+        d.down = upload_bt(alloc, s.down_w, kVisHid, kVisFfn);
+        d.qkv_b = upload_f32(alloc, s.qkv_b); d.out_b = upload_f32(alloc, s.out_b);
+        d.up_b = upload_f32(alloc, s.up_b);   d.down_b = upload_f32(alloc, s.down_b);
+    }
+    g.post_w = upload_f32(alloc, post_ln_w_);
+    g.post_b = upload_f32(alloc, post_ln_b_);
+    g.mm0 = upload_bt(alloc, mm0_w_, md, md);
+    g.mm0_b = upload_f32(alloc, mm0_b_);
+    g.mm2 = upload_bt(alloc, mm2_w_, out_d_, md);
+    g.mm2_b = upload_f32(alloc, mm2_b_);
+    return {};
+}
+
 std::string Qwen4Vision::encode_gpu(DeviceAllocator& alloc, const float* img,
                                     uint32_t H, uint32_t W,
                                     std::vector<float>& out) {
@@ -225,40 +259,14 @@ std::string Qwen4Vision::encode_gpu(DeviceAllocator& alloc, const float* img,
     if (H % f || W % f || !H || !W) return "qwen4 vision: H/W must be multiples of 32";
     const uint32_t gh = H / kVisPatch, gw = W / kVisPatch;
     const uint32_t N = gh * gw;
-    if (N > 12288) return "qwen4 vision gpu: patch grid too large (cap via IE_VIS_MAX_PX)";
+    if (N > kVisMaxPatches) return "qwen4 vision gpu: patch grid too large (cap via IE_VIS_MAX_PX)";
     const uint32_t pd = 3 * 2 * kVisPatch * kVisPatch;   // 1536
     const uint32_t md = kVisHid * 4;                     // 4608
     sycl::queue& q = alloc.queue();
 
-    // ---- one-time weight upload ---------------------------------------------
-    if (!gpu_) {
-        gpu_ = std::make_unique<GpuState>();
-        GpuState& g = *gpu_;
-        g.alloc = &alloc;
-        g.patch = upload_bt(alloc, patch_w_, kVisHid, pd);
-        g.patch_b = upload_f32(alloc, patch_b_);
-        g.blk.resize(kVisDepth);
-        for (uint32_t L = 0; L < kVisDepth; ++L) {
-            const Block& s = blocks_[L];
-            auto& d = g.blk[L];
-            d.ln1_w = upload_f32(alloc, s.ln1_w); d.ln1_b = upload_f32(alloc, s.ln1_b);
-            d.ln2_w = upload_f32(alloc, s.ln2_w); d.ln2_b = upload_f32(alloc, s.ln2_b);
-            d.qkv = upload_bt(alloc, s.qkv_w, 3 * kVisHid, kVisHid);
-            d.out = upload_bt(alloc, s.out_w, kVisHid, kVisHid);
-            d.up = upload_bt(alloc, s.up_w, kVisFfn, kVisHid);
-            d.down = upload_bt(alloc, s.down_w, kVisHid, kVisFfn);
-            d.qkv_b = upload_f32(alloc, s.qkv_b); d.out_b = upload_f32(alloc, s.out_b);
-            d.up_b = upload_f32(alloc, s.up_b);   d.down_b = upload_f32(alloc, s.down_b);
-        }
-        g.post_w = upload_f32(alloc, post_ln_w_);
-        g.post_b = upload_f32(alloc, post_ln_b_);
-        g.mm0 = upload_bt(alloc, mm0_w_, md, md);
-        g.mm0_b = upload_f32(alloc, mm0_b_);
-        g.mm2 = upload_bt(alloc, mm2_w_, kVisOutD, md);
-        g.mm2_b = upload_f32(alloc, mm2_b_);
-    }
+    // ---- one-time weight upload (or the load-time one, P4 B45) ---------------
+    if (auto e = upload_gpu(alloc); !e.empty()) return e;
     GpuState& g = *gpu_;
-    if (g.alloc != &alloc) return "qwen4 vision gpu: allocator changed between calls";
     if (g.cap < N) {
         auto am = [&](size_t bytes) { return alloc.malloc(bytes); };
         g.px = static_cast<sycl::half*>(am(size_t(N) * pd * 2));
@@ -367,11 +375,12 @@ std::string Qwen4Vision::encode_gpu(DeviceAllocator& alloc, const float* img,
     layer_norm_f16(q, g.res, g.post_w, g.post_b, g.xh, N, kVisHid);
     gemm_fp16(q, g.xh, g.mm0, g.C, Nm, md, md);
     bias_act_f16(q, g.C, g.mm0_b, g.xh, Nm, md, 2);
-    gemm_fp16(q, g.xh, g.mm2, g.C, Nm, kVisOutD, md);
-    out.resize(size_t(Nm) * kVisOutD);
+    const uint32_t od = out_d_;   // (Nm * od <= N * md: C holds the projector output for every OUT <= 18432)
+    gemm_fp16(q, g.xh, g.mm2, g.C, Nm, od, md);
+    out.resize(size_t(Nm) * od);
     // bias into the f32 download
     q.parallel_for(sycl::range<1>(out.size()),
-                   [C = g.C, b = g.mm2_b, od = kVisOutD](sycl::id<1> i) {
+                   [C = g.C, b = g.mm2_b, od](sycl::id<1> i) {
         C[i] += b[uint32_t(i % od)];
     });
     q.memcpy(out.data(), g.C, out.size() * 4).wait();
