@@ -624,6 +624,19 @@ void DeviceFleet::all_reduce_sum_fp16(const std::vector<sycl::half*>& bufs,
             sycl::half* d0 = bufs[0];
             sycl::half* scr = ar2_scratch_;
             auto& q1 = devs_[1].queue();
+            // P4 B52 re-test: IE_AR_P2P_SYNC=1 = the same three steps with a host wait after each (no cross-queue
+            // event dependency), to tell a bad push from a dependency that is not honoured.
+            static const bool p2p_sync = std::getenv("IE_AR_P2P_SYNC") != nullptr;
+            if (p2p_sync) {
+                q1.wait();
+                q1.memcpy(scr, bufs[1], bytes).wait();
+                q0.wait();
+                q0.parallel_for(sycl::range<1>(n_elem), [=](sycl::id<1> i) {
+                    d0[i] = sycl::half(float(d0[i]) + float(scr[i]));
+                }).wait();
+                q0.memcpy(bufs[1], bufs[0], bytes).wait();
+                return;
+            }
             const sycl::event push = q1.memcpy(scr, bufs[1], bytes);   // dev1 → dev0 (PUSH)
             const sycl::event sum = q0.submit([&](sycl::handler& h) {
                 h.depends_on(push);

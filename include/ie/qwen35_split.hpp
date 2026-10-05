@@ -23,6 +23,7 @@
 #include "ie/dense_split.hpp"        // LayerPlan (reused as-is)
 #include "ie/dense_transformer.hpp"  // DenseQuantPtr, dense::upload*
 #include "ie/deltanet_state.hpp"     // DeltaNetState
+#include "ie/ngram_draft.hpp"         // Ds41NgramIndex (P4 B52 lookup drafts)
 #include "ie/prefill_gemm.hpp"
 #include "ie/gguf.hpp"
 #include "ie/kv_cache.hpp"
@@ -182,6 +183,16 @@ public:
     //   spec_step_reset()   a new generation, or the model's state was restored / replaced: no pending rows, no hidden.
     //   spec_step_flush()   leave the model's state at the caller's position (before a stash, a snapshot, the end).
     std::string spec_step_init(uint32_t K);
+    // P4 B52: prompt-lookup drafts. The step keeps the token history (the prompt handed here, then every token it is
+    // given); when the last tokens repeat an earlier span of at least IE_QWEN35_LOOKUP_MIN tokens (default 8), the
+    // draft is what followed that span -- up to kLookRows - 1 tokens, verified in one forward -- instead of the MTP
+    // head's K - 1. Agent replies copy a lot (file contents, tool output, code being edited): a copied span costs one
+    // forward per kLookRows tokens. Verified like any draft, so the tokens stay plain decoding's.
+    // IE_QWEN35_LOOKUP=0 turns it off.
+    void spec_step_context(const int32_t* ids, uint32_t n);
+    static constexpr uint32_t kLookRows = 8;
+    static constexpr uint32_t kLookBlock = 24;
+    static constexpr uint32_t kLookStrong = 24;
     void        spec_step_reset();
     // The caller's sampler for the token AFTER `token` (seed = the seed it will use for that sample; the drafts take
     // seed, seed + 1, ..): the drafts are then sampled the way their targets will be. Null = argmax drafts.
@@ -414,6 +425,23 @@ private:
         std::vector<int32_t> vin, drafted;
         uint32_t win_fwd = 0, win_tok = 0, cooldown = 0;  // the rate window and the plain steps left of a cooldown
         uint64_t rounds = 0, hits = 0, plain = 0, cooldowns = 0;   // IE_QWEN35_PROFILE
+        Ds41NgramIndex idx;                               // P4 B52: the token history, for lookup drafts
+        bool     idx_on = false, look_round = false;
+        uint32_t cap = 0;                                 // rows the checkpoints / scratch hold (>= V)
+        uint64_t look_rounds = 0, look_rows = 0, look_hits = 0;
+        // P4 B52 (4): a FAST lookup round -- more rows than `cap`, run through the prefill kernels with no per-row
+        // checkpoints; the state before the round is kept (snap_*) and, when a row is not followed, restored and the
+        // followed rows are run again.
+        uint32_t fast_rows = 0;                           // 0 = off
+        bool     fast_round = false;
+        std::vector<float*>      snap_state;              // [dev]
+        std::vector<sycl::half*> snap_conv;               // [dev]
+        std::vector<sycl::half>  scratch_logits;          // host, for the re-run
+        uint64_t fast_rounds = 0, fast_redo = 0;
+        // Probe first: a lookup starts as a checkpointed round of at most `cap` rows; only after a lookup round whose
+        // rows were ALL followed may the next one be fast. A lookup round with fewer than 2 rows followed blocks
+        // lookups for the next kLookBlock tokens.
+        uint32_t look_streak = 0, look_block = 0;
     };
     SpecStep ss_;
 

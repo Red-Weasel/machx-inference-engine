@@ -2,6 +2,7 @@
 // streaming callback.  v1: one implicit session; server treats requests as
 // stateless (reset + full-conversation prefill per request).
 #pragma once
+#include "ie/dn_ladder.hpp"
 #include "ie/qwen4_vision.hpp"
 #include "ie/ds4_vision.hpp"
 #include "ie/allocator.hpp"
@@ -414,6 +415,14 @@ private:
     void stepper_loop_();
     // P4 B48: true while generate()'s decode loop runs the 27B split through Qwen35SplitModel::spec_step.
     bool q27_spec_step_ = false;
+    // P4 B57: in-place restart points of the live sequence on the 27B / 35B splits at one request lane (ie/dn_ladder.hpp).
+    // ladder_epoch_ counts every time the live state was replaced under a running request (a yield's unstash): that
+    // request then stops taking copies.
+    DnLadder ladder_;
+    bool     ladder_tried_ = false;
+    uint64_t ladder_epoch_ = 0;
+    bool q4e_look_step_ = false;    // P4 B56: Flash-Next's decode steps go through Q4eBundle::look_step
+    bool q35m_look_step_ = false;   // P4 B53: the 35B split's decode steps go through look_step (prompt-lookup drafts)
     // The decode loop's sampler for the NEXT token (set before each forward_step), for drafts sampled with it:
     // IE_QWEN35_SPEC_DRAFT_SAMPLED=1 (off by default: measured no better than argmax drafts, engine.cpp).
     Qwen35SplitModel::SpecDraftSampling q27_draft_;
@@ -492,6 +501,10 @@ private:
             // KV/DeltaNet), bounced into d_logits_ so the GPU sampler is unchanged.
             if (tp_ids_host_.size() < T) tp_ids_host_.resize(T);
             q.memcpy(tp_ids_host_.data(), ids, T * sizeof(int32_t)).wait();
+            if (T == 1 && q35m_look_step_) {   // P4 B53: a decode step through the model's lookup step
+                if (auto m = qwen35moe_split_model_.look_step(tp_ids_host_[0], pos, tp_logits_host_.data()); !m.empty())
+                    std::fprintf(stderr, "qwen35moe_split look step: %s\n", m.c_str());
+            } else
             if (auto m = qwen35moe_split_model_.forward(tp_ids_host_.data(), T, pos,
                                                         /*reset_kv=*/(pos == 0),
                                                         tp_logits_host_.data()); !m.empty())

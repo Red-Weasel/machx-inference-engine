@@ -562,6 +562,19 @@ std::string Glm5LanePipe::set_lane_pos(uint32_t lane, uint32_t n_pos) {
     return {};
 }
 
+std::string Glm5LanePipe::rewind_lane(uint32_t lane, uint32_t n_pos) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (lane >= lanes_.size()) return "glm5 lane pipe: lane " + std::to_string(lane) + " of " + std::to_string(lanes_.size());
+    Lane& ln = lanes_[lane];
+    const std::string who = "glm5 lane pipe: lane " + std::to_string(lane) + " rewind";
+    if (ln.nfl && !(ln.in_cb && ln.cb_tid == std::this_thread::get_id() && !ln.resub && ln.nfl == 1))
+        return who + ": it has a step in flight";
+    if (ln.failed) return who + ": its last step failed part-way";
+    if (n_pos > ln.n_pos) return who + ": " + std::to_string(n_pos) + " is past its position " + std::to_string(ln.n_pos);
+    ln.n_pos = n_pos;
+    return {};
+}
+
 std::string Glm5LanePipe::reset_lane(uint32_t lane) {
     std::lock_guard<std::mutex> lk(mu_);
     if (lane >= lanes_.size()) return "glm5 lane pipe: lane " + std::to_string(lane) + " of " + std::to_string(lanes_.size());

@@ -402,6 +402,10 @@ public:
     uint32_t    snapshot_depth() const noexcept { return snap_depth_; }
     std::string restore();     // rewinds to snapshot_depth()
     void        drop_snapshot() noexcept { snap_depth_ = 0; }
+    // P4 B56: a second slot with the same contents, for a prompt-lookup round's rollback (the engine's look step): the
+    // state before the round at `depth`; look_restore() rewinds to it. Independent of the prompt cache's slot above.
+    std::string look_snapshot(uint32_t depth);
+    std::string look_restore();
 
     // -- spec-verify mode ---------------------------------------------------
     // While on, forward() with T in [2,16] computes every row with kernels
@@ -492,6 +496,13 @@ private:
     PleHistory  snap_ple_hist_{};
     std::vector<uint32_t> snap_blk_done_;
     uint32_t    snap_depth_ = 0;
+    float*      look_dn_state_ = nullptr;   // P4 B56: look_snapshot's slot
+    sycl::half* look_dn_conv_  = nullptr;
+    float*      look_ple_conv_ = nullptr;
+    PleHistory  look_ple_hist_{};
+    std::vector<uint32_t> look_blk_done_;
+    uint32_t    look_depth_ = 0;
+    bool        look_have_ = false;
     bool        spec_verify_ = false;
     // run_block() is void; a block-level fault (e.g. verify expert union >
     // cache slots) latches here and forward_range()/run_block_parity()

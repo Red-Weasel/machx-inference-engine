@@ -2258,6 +2258,51 @@ std::string Qwen4ExpModel::restore() {
     return {};
 }
 
+// P4 B56: snapshot() / restore() over a second slot (a lookup round's rollback).
+std::string Qwen4ExpModel::look_snapshot(uint32_t depth) {
+    sycl::queue& q = alloc_->queue();
+    const uint64_t se = dn_.state_elems_per_layer() * dn_.config().n_layers_linear;
+    const uint64_t ce = dn_.conv_elems_per_layer() * dn_.config().n_layers_linear;
+    if (!look_dn_state_) {
+        look_dn_state_ = static_cast<float*>(alloc_->malloc(se * sizeof(float)));
+        look_dn_conv_  = static_cast<sycl::half*>(alloc_->malloc(ce * sizeof(sycl::half)));
+        if (!look_dn_state_ || !look_dn_conv_) return "qwen4exp look_snapshot: alloc failed";
+        owned_.push_back(look_dn_state_);
+        owned_.push_back(look_dn_conv_);
+        if (ple_conv_state_) {
+            look_ple_conv_ = static_cast<float*>(alloc_->malloc(uint64_t(kPleStateRows) * kPleSI * sizeof(float)));
+            if (!look_ple_conv_) return "qwen4exp look_snapshot: ple alloc failed";
+            owned_.push_back(look_ple_conv_);
+        }
+    }
+    q.memcpy(look_dn_state_, dn_.state_ptr(), se * sizeof(float));
+    q.memcpy(look_dn_conv_, dn_.conv_state_ptr(), ce * sizeof(sycl::half));
+    if (ple_conv_state_) q.memcpy(look_ple_conv_, ple_conv_state_, uint64_t(kPleStateRows) * kPleSI * sizeof(float));
+    q.wait();
+    look_ple_hist_ = ple_hist_;
+    look_blk_done_ = blk_done_;
+    look_depth_    = depth;
+    look_have_     = true;
+    return {};
+}
+
+std::string Qwen4ExpModel::look_restore() {
+    if (!look_have_) return "qwen4exp look_restore: no snapshot";
+    sycl::queue& q = alloc_->queue();
+    const uint64_t se = dn_.state_elems_per_layer() * dn_.config().n_layers_linear;
+    const uint64_t ce = dn_.conv_elems_per_layer() * dn_.config().n_layers_linear;
+    q.memcpy(dn_.state_ptr(), look_dn_state_, se * sizeof(float));
+    q.memcpy(dn_.conv_state_ptr(), look_dn_conv_, ce * sizeof(sycl::half));
+    if (ple_conv_state_ && look_ple_conv_)
+        q.memcpy(ple_conv_state_, look_ple_conv_, uint64_t(kPleStateRows) * kPleSI * sizeof(float));
+    q.wait();
+    ple_hist_ = look_ple_hist_;
+    blk_done_ = look_blk_done_;
+    for (uint32_t L = layer_lo_; L < layer_hi_; ++L)
+        if (full_idx_[L] >= 0) kv_.set_length(uint32_t(full_idx_[L]), look_depth_);
+    return {};
+}
+
 std::string Qwen4ExpModel::commit_verify(uint32_t n_commit) {
     if (!vck_T_) return "commit_verify: no verify forward captured";
     if (n_commit == 0 || n_commit > vck_T_) return "commit_verify: bad n_commit";

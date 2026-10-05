@@ -16,10 +16,13 @@
 #include "ie/dequant.hpp"
 #include "ie/dspark_drafter.hpp"
 #include "ie/ops.hpp"
+#include "ie/dequant_ref.hpp"
+#include "ie/quant_blocks.hpp"
 #include "ie/quant_blocks.hpp"
 
 #include "dense_dispatch.hpp"
 
+#include <thread>
 #include <algorithm>
 #include <functional>
 #include <cmath>
@@ -1286,9 +1289,66 @@ namespace {
 // Host-side AoS block_q8_0 → SoA (qs[n*K+k] int8 col-contig + fp16 d per 32-block)
 // upload for an MTP weight. One-shot at load; ~340 MB total across the block.
 // Returns {nullptr,nullptr} (no error) when the source is not Q8_0.
+// P4 B52: a Q6_K / Q5_K / Q4_K draft weight re-rounded to Q8_0-SoA on the host (one scale per 32 weights:
+// max|x| / 127), the first `rows` rows (0 = all). The draft head only GUESSES tokens -- the target's own logits decide
+// every token -- so its rounding is free; what it buys is the int-dot draft path (1 byte a weight where the F16
+// copy reads 2: the draft was 12 ms a round on the K-quant files against 5 on Q8_0).
+MtpHead::SoaW mtp_requant_q8_soa(DeviceAllocator& alloc, const GgufTensorInfo* t, uint32_t rows,
+                                 std::vector<void*>& owned, std::string& err) {
+    MtpHead::SoaW w{};
+    if (!t || t->n_dims != 2) return w;
+    if (t->dtype != DType::kQ6_K && t->dtype != DType::kQ5_K && t->dtype != DType::kQ4_K) return w;
+    const uint32_t K = uint32_t(t->shape[0]);
+    const uint32_t N = rows ? std::min<uint32_t>(rows, uint32_t(t->shape[1])) : uint32_t(t->shape[1]);
+    if (K % 256) return w;                       // whole super-blocks a row
+    const uint32_t bpc = K / 32;
+    const size_t row_bytes = size_t(K / 256) * (t->dtype == DType::kQ6_K ? sizeof(block_q6_K)
+                                               : t->dtype == DType::kQ5_K ? sizeof(block_q5_K) : sizeof(block_q4_K));
+    std::vector<int8_t>   hq((uint64_t)N * K);
+    std::vector<uint16_t> hd((uint64_t)N * bpc);
+    const uint8_t* src = static_cast<const uint8_t*>(t->data);
+    const DType dt = t->dtype;
+    const unsigned nth = std::max(1u, std::min(16u, std::thread::hardware_concurrency()));
+    std::vector<std::thread> pool;
+    for (unsigned th = 0; th < nth; ++th)
+        pool.emplace_back([&, th] {
+            std::vector<float> row(K);
+            for (uint32_t n = th; n < N; n += nth) {
+                const uint8_t* p = src + size_t(n) * row_bytes;
+                if (dt == DType::kQ6_K)      ref::dequant_q6_K_buffer(p, K, row.data());
+                else if (dt == DType::kQ5_K) ref::dequant_q5_K_buffer(p, K, row.data());
+                else                         ref::dequant_q4_K_buffer(p, K, row.data());
+                for (uint32_t b = 0; b < bpc; ++b) {
+                    float mx = 0.f;
+                    for (uint32_t i = 0; i < 32; ++i) mx = std::max(mx, std::fabs(row[b * 32 + i]));
+                    const sycl::half dh(mx / 127.f);
+                    const float d = float(dh), inv = d > 0.f ? 1.f / d : 0.f;
+                    hd[(uint64_t)n * bpc + b] = sycl::bit_cast<uint16_t>(dh);
+                    for (uint32_t i = 0; i < 32; ++i) {
+                        const int v = int(std::lrint(row[b * 32 + i] * inv));
+                        hq[(uint64_t)n * K + b * 32 + i] = int8_t(std::max(-127, std::min(127, v)));
+                    }
+                }
+            }
+        });
+    for (auto& th : pool) th.join();
+    auto* dq = static_cast<int8_t*>(alloc.malloc(hq.size()));
+    auto* dd = static_cast<uint16_t*>(alloc.malloc(hd.size() * sizeof(uint16_t)));
+    if (!dq || !dd) { if (dq) alloc.free(dq); if (dd) alloc.free(dd); err = "mtp requant malloc"; return w; }
+    alloc.queue().memcpy(dq, hq.data(), hq.size()).wait();
+    alloc.queue().memcpy(dd, hd.data(), hd.size() * sizeof(uint16_t)).wait();
+    owned.push_back(dq); owned.push_back(dd);
+    w.qs = dq; w.d = dd;
+    return w;
+}
+
 MtpHead::SoaW mtp_upload_q8_soa(DeviceAllocator& alloc, const GgufTensorInfo* t,
                                 std::vector<void*>& owned, std::string& err) {
     MtpHead::SoaW w{};
+    if (t && t->n_dims == 2 && t->dtype != DType::kQ8_0) {   // P4 B52 (IE_QWEN35_MTP_REQUANT=0: the F16 copy)
+        static const bool requant = [] { const char* e = std::getenv("IE_QWEN35_MTP_REQUANT"); return !(e && *e && std::atoi(e) == 0); }();
+        return requant ? mtp_requant_q8_soa(alloc, t, 0, owned, err) : w;
+    }
     if (!t || t->n_dims != 2 || t->dtype != DType::kQ8_0) return w;
     const uint32_t K = uint32_t(t->shape[0]);
     const uint32_t N = uint32_t(t->shape[1]);
@@ -1499,8 +1559,33 @@ std::string MtpHead::load(DeviceAllocator& a, const GgufReader& g,
     {
         const auto* o = g.find_tensor("output.weight");
         if (!o) return "output.weight: not found (MTP shared head)";
-        w_lm_head = mtp_dequant_any_to_fp16(a, o, owned, err);
+        // P4 B52: a K-quant head -> the draft's own Q8_0-SoA copy of its first draft_vocab rows (335 MB at 65,536);
+        // a split / TP model that packs a Q8_0 head lends its own afterwards (use_soa_lm_head) and this one is unused.
+        if (o->dtype != DType::kQ8_0 && draft_vocab && draft_vocab < vocab && !std::getenv("IE_QWEN35_MTP_F16_HEAD")) {
+            own_lm_ = mtp_requant_q8_soa(a, o, draft_vocab, owned, err);
+            if (!err.empty()) return "output.weight: " + err;
+            if (own_lm_.qs) { lm_q8_qs = own_lm_.qs; lm_q8_d = own_lm_.d; }
+        }
+        if (!own_lm_.qs) w_lm_head = mtp_dequant_any_to_fp16(a, o, owned, err);
         if (!err.empty()) return "output.weight: " + err;
+        // P4 B52: the F16 head is [K, N] with N = the FULL vocabulary (W[k * vocab + n]); the draft's GEMV passes
+        // N = draft_vocab, i.e. it read W[k * draft_vocab + n] -- other rows' weights. Every file whose head is not
+        // borrowed as Q8_0-SoA (Q6_K / Q5_K on the split, any file on one card) drafted noise: 0 drafts accepted,
+        // --spec slower than plain decode (27B Q6_K: 16.1 against 21.8 tok/s, 2026-10-04). The head becomes a compact
+        // [K, draft_vocab] copy (0.67 GB at 65,536 instead of 2.5 GB) and the full one is freed.
+        if (draft_vocab && draft_vocab < vocab && w_lm_head) {
+            const uint32_t K = H, NV = vocab, DV = draft_vocab;
+            auto* c = static_cast<sycl::half*>(a.malloc(uint64_t(K) * DV * sizeof(sycl::half)));
+            if (!c) return "output.weight: malloc (draft vocabulary copy)";
+            const sycl::half* full = w_lm_head;
+            q.parallel_for(sycl::range<2>(K, DV), [=](sycl::id<2> id) {
+                c[id[0] * DV + id[1]] = full[id[0] * NV + id[1]];
+            }).wait();
+            for (auto& p2 : owned) if (p2 == static_cast<void*>(w_lm_head)) p2 = nullptr;
+            a.free(w_lm_head);
+            owned.push_back(c);
+            w_lm_head = c;
+        }
     }
     // token_embd (independent upload for the lookup)
     {
@@ -1546,6 +1631,7 @@ void MtpHead::embed(sycl::queue& q, int32_t tok) {
 void MtpHead::embed_device(sycl::queue& q, const int32_t* tok) {
     if (te_dtype == DType::kQ4_K)      embedding_lookup_q4k(q, tok, te_dev, d_e, 1, H);
     else if (te_dtype == DType::kQ6_K) embedding_lookup_q6k(q, tok, te_dev, d_e, 1, H);
+    else if (te_dtype == DType::kQ5_K) embedding_lookup_q5k(q, tok, te_dev, d_e, 1, H);   // P4 B52: was read as Q8_0
     else                               embedding_lookup_q8_0(q, tok, te_dev, d_e, 1, H);
 }
 

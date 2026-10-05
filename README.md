@@ -1,7 +1,7 @@
 
 # Mach X — LLM Inference Engine for Intel Arc
 
-**A C++/SYCL local LLM inference engine for Intel Arc GPUs, built and tuned on two Arc Pro B70 cards. XMX kernels, quantized models and multi-GPU execution. New in v0.2.13: the Qwen models read prompts 1.4–3.7× faster — Qwen3.8-27B at about 3,000 tok/s, the 35B-A3B class at about 2,800 — the 15-agent replay takes 77 s instead of 116 s, speculative decoding on the 27B works with sampling and the prompt cache, and every large GPU allocation is tested for a memory-page fault at load.**
+**A C++/SYCL local LLM inference engine for Intel Arc GPUs, built and tuned on two Arc Pro B70 cards. XMX kernels, quantized models and multi-GPU execution. New in v0.2.18: replies that copy text already in the conversation — file edits, quoted code — are written several times faster with `--spec` on the Qwen models (a 1,800-token file edit: 108 s → 28 s on Qwen3.8-27B, 24 s → 7 s on the 35B-A3B class, 69 s → 31 s on Flash-Next), a conversation edited in the middle restarts from the nearest saved point instead of being read again, and the 27B loads at long context with the prompt cache on. Since v0.2.13 the Qwen models read prompts 1.4–3.7× faster (Qwen3.8-27B at about 3,000 tok/s).**
 
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue)
 ![Language](https://img.shields.io/badge/C%2B%2B20-SYCL%20%2F%20DPC%2B%2B-orange)
@@ -40,6 +40,129 @@ class ([New in v0.2.6](#new-in-v026)).
 
 ![DeepSeek-V4.1-Flash running locally in the Dream Agent Harness, served by Mach X on two Arc Pro B70 cards](docs/images/dream-deepseek-v41.png)
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
+
+---
+
+<a id="new-in-v0218"></a>
+## 🆕 New in v0.2.18
+
+Everything since [v0.2.13](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.13) (versions 0.2.14
+to 0.2.18). Every figure was measured on October 4–5, 2026, on two Arc Pro B70 cards, on community fine-tunes of the
+models, old path against new path on the same day; "bench" is `ie-prompt-bench` (prompt cache off, greedy), "serve" is
+`ie serve` with an OpenAI client.
+
+### Replies that copy are written several times faster (`--spec`)
+
+An agent's reply often repeats text that is already in the conversation: a file returned with one change, a quoted
+function, a tool result read back. With `--spec` the engine keeps an index of the conversation's tokens (built per
+request, in memory, discarded after). When the last tokens of the reply repeat an earlier span, the tokens that followed
+that span are taken as a draft and checked by the model in ONE forward; the reply follows the draft for as long as the
+model's own sampled token is the drafted one, and the rest is rolled back. The model still decides every token, with
+the request's sampler; nothing is added to the weights or the prompt.
+
+| a reply that returns a file with one identifier renamed (serve, temperature 0.7, 1,800 tokens) | plain | with `--spec` |
+|---|---:|---:|
+| Qwen3.8-27B Q8_0 | 108.5 s | **28.4 s** |
+| 35B-A3B class Q8_0, one request | 24.3 s | **7.1 s** |
+| Flash-Next UD-Q4_K_XL | 68.7 s | **30.7 s** |
+
+| bench, greedy | plain | with `--spec` |
+|---|---:|---:|
+| 27B, a file copied with comments added (400 tokens) | 16.9 tok/s | **146** (58–67 with exact rows only) |
+| 27B, a documentation page repeated with rewording | 17.0 | **37.3** |
+| 35B-A3B class, the same copy prompt | 78.4 | **281** |
+| 35B-A3B class, the reworded page | 84.4 | **118.7** |
+| Flash-Next, the copy prompt (600 tokens) | 26.9 | **40.7** |
+| ordinary prompts (2.4K / 10.7K tokens): 35B-A3B class | 78.2 / 72.5 | 78.1 / 74.8 |
+| ordinary prompts: Flash-Next | 28.7 / 28.2 | 28.7 / 28.2 |
+
+**On the 35B-A3B class it works across the request lanes** (`ie serve --parallel N --spec`): one lookup round runs at a
+time and the other lanes make two steps between rounds.
+
+| 35B-A3B class, `ie serve`, 1,800-token file edits at temperature 0.7 | plain | with `--spec` |
+|---|---:|---:|
+| 8 lanes: 4 edits and 1 ordinary question at once | 36.8 s (202 tok/s together) | **22.6 s** (330) |
+| ... the ordinary question beside them | 7.6 s | 10.4 s |
+| 16 lanes: 12 edits and 1 ordinary question at once | 74.3 s (294 tok/s together) | **53.6 s** (408) |
+| ... the ordinary question beside them | 15.7 s | 19.6 s |
+
+**What it changes in the text.** A long draft is checked through the prefill kernels (the ones that read every prompt),
+not the decode kernels, so a token at a near-tie can come out differently from plain decoding, and the text after it
+then differs. Measured: Flash-Next's greedy 900-token edit was byte-equal to plain decoding and the first 394 of 600
+tokens of its copy bench were equal; on the 35B-A3B class one of three greedy edits was byte-equal and the first
+different token of two copy benches came after 143 and 160 of 400 tokens. On the 27B, `IE_QWEN35_LOOKUP_FAST=0` keeps
+every row exact (text equal to plain decoding; 58 tok/s on the copy bench instead of 146). No task benchmark was run
+with the feature on against off.
+
+On Flash-Next a lookup round costs far more than on the other two (200 ms for 8 rows, about 2.3 s for 512, against
+35–42 ms for a plain token), so it waits for a repeat of 32 tokens and starts at 64 rows; a reply that picks up the
+copy again after a changed word resumes four tokens later, and a draft stops just before a word pair the reply has
+been changing.
+
+### `--spec` on the 27B's Q6_K and Q5_K files
+
+Three faults in the draft head off the Q8_0 path made `--spec` slower than plain decoding on these files (every draft
+was noise). Fixed; greedy text equal to plain decoding on both files.
+
+| Qwen3.8-27B, `--spec --spec-k 3`, bench (2.4K / 10.7K-token prompts) | plain | speculative |
+|---|---:|---:|
+| Q6_K | 21.5 / 19.8 tok/s | **26.9 / 21.6** |
+| Q5_K | 23.3 / 21.4 | **26.3 / 22.9** |
+| Q6_K, five short prompts (median) | | **33.2** |
+
+`--spec-k 3` measured best (Q8_0 / Q6_K, short prompts: K=3 29.7 / 33.2, K=4 29.3 / 32.4, K=5 28.6 / 28.5 tok/s).
+
+### A conversation edited in the middle restarts from a saved point
+
+These models keep a running state over everything they have read (the DeltaNet layers), which cannot be rewound, so a
+change in the middle of a context used to mean reading it again from the last saved prompt. On the Qwen3.8-27B and
+35B-A3B splits at one request lane, with the prompt cache on, the engine now keeps small copies of that state every
+8,192 tokens while a prompt is read (every 16,384 at `--ctx 200000`), one at the conversation boundary and one at the
+reply's end. A next prompt that shares its beginning with the live conversation restarts from the deepest copy before
+the change, in place: no KV rows are copied.
+
+| `ie serve --ctx 65536`, greedy, a 29,300-token prompt | before | now |
+|---|---:|---:|
+| 27B: one line changed two thirds in | 22.9 s | **17.5 s** (12,949 tokens read instead of 29,333) |
+| 35B-A3B class: the same | 15.2 s | **9.0 s** |
+| 27B: next turns of a conversation too large for the prompt cache | 22.9–23.0 s | **11.1–17.5 s** |
+
+Every reply was byte-equal with the copies on and off (six requests on each model). A copy is 73 MiB a card on the 27B
+and 30 MiB on the 35B-A3B class, allocated on first use.
+
+### The 27B loads at long context with the prompt cache on
+
+The load-time memory check on the 27B counted twelve saved prompts each as large as the whole context (99 GB a card
+at `--ctx 250000`) and refused the load, although the context itself fit (24.5 of 34.2 GB). The check no longer
+refuses: the prompt cache gets the memory the cards have left, drops its oldest entries to stay inside it, and skips a
+snapshot that alone does not fit. A card whose weights and context alone pass 92 % prints a warning.
+
+### Switches
+
+On by default where a line says so; `=0` restores the previous path.
+
+| switch | applies to |
+|---|---|
+| `--spec` | turns the lookup drafts on (with the MTP draft head on the 27B); without it nothing here changes decoding |
+| `IE_QWEN35_LOOKUP`, `IE_QWEN35_LOOKUP_FAST` (`=0`: exact rows only), `IE_QWEN35_LOOKUP_MIN` (8) | Qwen3.8-27B split, one request lane |
+| `IE_Q35MOE_LOOKUP`, `IE_Q35MOE_LANES_LOOKUP`, `IE_Q35MOE_LOOKUP_MIN` (16), `IE_Q35MOE_LOOKUP_GAP` (2) | 35B-A3B class: one lane; the lanes; the repeat that starts a lookup; the other lanes' steps between rounds |
+| `IE_Q4E_LOOKUP`, `IE_Q4E_LOOKUP_MIN` (32), `IE_Q4E_LOOKUP_ROWS` (512) | Flash-Next, one request lane |
+| `IE_DN_LADDER`, `IE_DN_LADDER_STEP` (8192) | the in-place restart points (27B and 35B-A3B splits, one lane, prompt cache on) |
+
+### What is still slow, and not checked
+
+- **Lookup needs `--spec`, and one request lane on the 27B and Flash-Next** (the 27B's lanes are off under `--spec`).
+- **Only one lookup round runs at a time across the lanes**: one edit gets 3.4×, twelve at once 1.4×, and a lane that
+  is not copying waits longer beside them.
+- **Ordinary writing is unchanged**: the 27B is still at the memory wall (about 17 tok/s plain, 20–25 with the draft
+  head), and at temperature 1.0 fewer drafts are followed than at 0.7 (not measured here).
+- **Flash-Next often answers an edit with reasoning only**, in plain decoding too; lookup does nothing for those replies.
+- **The restart points are not on the request lanes or Flash-Next**; a prompt identical to the live one still restarts
+  from the conversation boundary, not from its last token.
+- **`ie serve --help` does not describe the lookup drafts.**
+- **Not run for this release:** image requests (they take plain decoding and no restart points), `--int8-kv`, two
+  clients sharing one lane during a lookup round, a client that disconnects during one, the 15-agent replay with
+  `--spec`, a load of the 27B above `--ctx 200000`.
 
 ---
 

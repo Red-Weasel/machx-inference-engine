@@ -329,6 +329,24 @@ Each is on by default and read once per process; `=0` restores the previous path
 Diagnostics: `IE_QWEN35_PFPROF=1` / `IE_Q4E_PFPROF=1` print where a prefill's time goes; `IE_DEBUG_PICKS=1` prints
 every sampled token.
 
+## Lookup drafts and restart points (v0.2.18)
+
+`--spec` turns the lookup drafts on (on the 27B together with its MTP draft head); without it decoding is unchanged.
+The restart points are on by default with the prompt cache. Figures and conditions: the README's "New in v0.2.18".
+
+| switch | what it controls |
+|---|---|
+| `IE_QWEN35_LOOKUP` | 27B split, one request lane: drafts taken from the conversation's own text; `=0` = the MTP head only |
+| `IE_QWEN35_LOOKUP_FAST` (128) | the longest round checked through the prefill kernels; `=0` = exact rows only (text equal to plain decoding) |
+| `IE_QWEN35_LOOKUP_MIN` (8), `IE_QWEN35_LOOKUP_ROWS` (8) | the repeated span that starts a lookup; the rows of an exact round |
+| `IE_Q35MOE_LOOKUP`, `IE_Q35MOE_LOOKUP_ROWS` (128), `IE_Q35MOE_LOOKUP_MIN` (16) | 35B-A3B split at `--parallel 1` |
+| `IE_Q35MOE_LANES_LOOKUP`, `IE_Q35MOE_LOOKUP_GAP` (2) | 35B-A3B split with request lanes: lookup rounds on the lanes; the steps every other decoding lane makes between two rounds |
+| `IE_Q4E_LOOKUP`, `IE_Q4E_LOOKUP_MIN` (32), `IE_Q4E_LOOKUP_ROWS` (512) | Flash-Next at `--parallel 1` |
+| `IE_DN_LADDER`, `IE_DN_LADDER_STEP` (8192) | in-place restart points on the 27B and 35B-A3B splits (one lane, prompt cache on): copies of the DeltaNet state while a prompt is read; the spacing doubles until 16 copies cover `--ctx` |
+
+Diagnostics: `IE_Q35MOE_LOOKUP_STATS=1` / `IE_Q4E_LOOKUP_STATS=1` print a request's lookup counts; `/health` carries a
+`lookup` object on the 35B-A3B lanes; a restart prints a `[dn-ladder]` line.
+
 ## Kernel switches (v0.2.6)
 
 Each new kernel sits beside the one it replaces; `=0` selects the previous kernel.

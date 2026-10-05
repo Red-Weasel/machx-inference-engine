@@ -256,6 +256,7 @@ struct MtpHead {
     // back to the F16 copy (non-Q8_0 source).
     struct SoaW { int8_t* qs = nullptr; uint16_t* d = nullptr; };
     SoaW s_eh, s_q, s_k, s_v, s_ao, s_fg, s_fu, s_fd;
+    SoaW own_lm_;   // P4 B52: the draft's own Q8_0-SoA head prefix (K-quant files)
     // draft GEMV: SoA int-dot when the weight has a SoA copy, else the F16 lane.
     void mg(sycl::queue& q, const sycl::half* in, const sycl::half* f16w,
             const SoaW& soa, sycl::half* out, uint32_t K, uint32_t N);

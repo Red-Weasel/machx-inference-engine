@@ -19,6 +19,7 @@
 #pragma once
 
 #include "ie/glm5_lanes.hpp"
+#include "ie/ngram_draft.hpp"   // Ds41NgramIndex (P4 B55 lookup rounds)
 
 #include <algorithm>
 #include <atomic>
@@ -238,6 +239,26 @@ public:
         return {};
     }
     virtual std::string pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) = 0;
+    // P4 B55: prompt-lookup rounds on a decoding lane (LanesServe::Options::look). look_rows() = the longest round the
+    // arch runs (0 = none: no lookups). A round is ONE step of T rows at the lane's position -- ids[0] the lane's next
+    // input, ids[1..] the drafted continuation -- that keeps every row's logits and a copy of the lane's state from
+    // before it (pipe_submit_look); sample_look gives one id per row, row r from its logits with windows[r] / seeds[r]
+    // (each what sample() gives for that row); pipe_submit_redo puts the lane's state back to before the round and runs
+    // its first T rows again (the rows that were followed). One round (with its redo) is in flight at a time.
+    virtual uint32_t look_rows() const { return 0; }
+    virtual std::string pipe_submit_look(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) {
+        (void)lane; (void)ids; (void)T; (void)pos0;
+        return "lookup rounds not supported";
+    }
+    virtual std::string sample_look(uint32_t lane, uint32_t rows, const LanesSampling& sp, std::span<const std::span<const int32_t>> windows,
+                                    std::span<const uint64_t> seeds, std::span<int32_t> picks) {
+        (void)lane; (void)rows; (void)sp; (void)windows; (void)seeds; (void)picks;
+        return "lookup rounds not supported";
+    }
+    virtual std::string pipe_submit_redo(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) {
+        (void)lane; (void)ids; (void)T; (void)pos0;
+        return "lookup rounds not supported";
+    }
     // P4 B39 (5): the lane's step AHEAD of the other lanes' queued steps (a prompt's tail piece past plan.snap, <= kTailFront rows:
     // v0.2.6 ran it inside the drained prompt-end turn, before everything; through the pipe it landed behind the other prompts'
     // first pieces -- the wave leader's 7 rows waited 1.4 s behind 14 followers). Default: no priority (pipe_submit).
@@ -292,6 +313,7 @@ public:
         return pipe_.submit_ahead(lane, ids, T, pos0, taken);
     }
     std::string reset_lane(uint32_t lane);   // the model reset the lane's state (Glm5LanePipe::reset_lane)
+    std::string rewind_lane(uint32_t lane, uint32_t n_pos) { return pipe_.rewind_lane(lane, n_pos); }   // P4 B55
     std::string pause();
     std::string resume();
     bool        paused() const { return paused_; }
@@ -358,6 +380,19 @@ public:
         // prompt's latest piece landed -- a lookahead too -- until quota_max_ms passed since the wait began (the guard). Only the
         // order of whole pieces across lanes changes, so the bytes are each lane's own pieces'.
         uint32_t decode_quota = 0, quota_max_ms = 2000;
+        // P4 B55 prompt-lookup rounds (off here; the crown sets it from IE_Q35MOE_LANES_LOOKUP): when a decoding lane's
+        // last tokens repeat an earlier span of its history (prompt ++ reply) of at least look_min tokens, the tokens that
+        // followed it are run with the lane's next input as ONE step (LanesModel::pipe_submit_look) and sampled row by row
+        // with the request's sampler; the reply follows the rows while the sampled id is the drafted one. Rows not followed:
+        // the lane's state goes back and the followed rows run again (pipe_submit_redo). Probe first: a round is look_probe
+        // rows (look_strong_rows on a repeated span of look_strong tokens) and doubles, up to the arch's look_rows(), after
+        // each round followed to its end; a round with fewer than 3 rows followed blocks the lane's lookups for look_block
+        // tokens, twice as long after each such round in a row (at most look_block_max). One round at a time over all lanes.
+        // look_gap: after a round landed, the next round (any lane's) waits until every OTHER decoding lane made that many
+        // steps, at most look_gap_ms (a round holds each card for tens of ms: the other lanes' steps wait behind it).
+        uint32_t look_gap = 2, look_gap_ms = 250;
+        bool     look = false;
+        uint32_t look_min = 16, look_probe = 8, look_strong = 24, look_strong_rows = 32, look_block = 24, look_block_max = 384;
     };
     LanesServe(LanesModel& m, Options o);
     ~LanesServe();
@@ -408,6 +443,13 @@ public:
         std::chrono::steady_clock::time_point t_sub{}, t_ahead{}, t_land{};   // (t_land: its last piece landed, or its pipe part began)
         uint32_t steps = 0, chunks = 0;
         double   cb_ms = 0;
+        // P4 B55 lookup rounds
+        Ds41NgramIndex idx; bool idx_on = false;    // the history's n-gram index (prompt ++ committed ids)
+        std::vector<int32_t> look_ids;              // the round's inputs
+        uint32_t look_n = 0, look_base = 0;         // a round of look_n rows at look_base is in the pipe
+        uint32_t redo_n = 0; bool redo_fly = false; // rows to run again (pending, or in the pipe)
+        bool     look_end = false; std::string look_finish;   // the lane ends (with look_finish) once its redo landed
+        uint32_t look_streak = 0, look_blocked = 0, look_block_len = 0, look_grow = 0;
     };
 
 private:
@@ -436,6 +478,10 @@ private:
     bool fifo_waiting(uint32_t li) const;      // a prefill lane held in the FIFO (not its head, or its head re-preparing)
     bool step_landed(Lane& l, uint32_t li);
     void step_sampled(Lane& l, uint32_t li, int32_t id, const std::string& err);
+    // P4 B55 (mu held)
+    bool look_try(Lane& l, uint32_t li);          // a lookup round is due: look_ids / look_n / look_base are set
+    void look_landed(Lane& l, uint32_t li);       // the round's callback: sample its rows, follow them, roll back or go on
+    void decode_next(Lane& l, uint32_t li);       // a decode lane's next step is due (abort / park / submit)
     void pipe_failed(const std::string& e);
     // P4 B33: false = stopping, the turn not taken. P4 B39: drain = pause the pipe for the turn (every step in flight finished);
     // false = the pipe runs on (LanesModel::serial_drains answered false for the turn's kind). kind: a lane at its mark / snapshot
@@ -474,6 +520,10 @@ private:
     uint64_t short_bypass_ = 0, short_guard_ = 0, short_guard_wait_ = 0;
     uint64_t recuts_ = 0;                      // P4 B36 (A): lanes whose remaining plan was re-cut
     uint64_t quota_holds_ = 0, quota_guard_ = 0;   // P4 B36 (C): quota waits begun; of them ended by the guard
+    int      look_owner_ = -1;                 // P4 B55: the lane whose lookup round (or its redo) is in flight or pending
+    std::vector<uint64_t> look_gap_base_;      //   every lane's dsteps when the last round landed
+    Clock::time_point look_gap_t0_{};
+    uint64_t look_rounds_ = 0, look_drafted_ = 0, look_hits_ = 0, look_redos_ = 0;
     uint32_t turn_waiters_ = 0;
     uint64_t tick_ = 0;
     double   step_ms_ = 0;

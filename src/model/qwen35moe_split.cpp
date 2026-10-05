@@ -928,7 +928,7 @@ sycl::event Qwen35MoeSplitModel::egemv(uint32_t dev, const sycl::half* A, const 
 
 std::string Qwen35MoeSplitModel::forward(const int32_t* input_ids, uint32_t T,
                                          uint32_t start_pos, bool reset_kv,
-                                         sycl::half* out_logits_host) {
+                                         sycl::half* out_logits_host, sycl::half* all_logits_dev) {
     static const char* kStopped = "stopped at a layer boundary: the engine is stopping";   // (P4 B33)
     if (T == 0) return "T == 0";
     if (aborting(T)) return kStopped;
@@ -983,7 +983,8 @@ std::string Qwen35MoeSplitModel::forward(const int32_t* input_ids, uint32_t T,
         auto& alloc = fleet_->dev(plan_.head_dev);
         sycl::half* d_logits = ws_[plan_.head_dev].logits;   // P4 B22: persistent [V] (ensure_ws)
         if (!d_logits) return "logits alloc failed";
-        head(T, d_logits);
+        if (all_logits_dev) { head_all(T, all_logits_dev); d_logits = all_logits_dev + uint64_t(T - 1) * V; }   // P4 B53
+        else head(T, d_logits);
         g_dp35.sync(plan_.head_dev);
         alloc.queue().memcpy(out_logits_host, d_logits, uint64_t(V) * sizeof(sycl::half)).wait();
         g_dp35.phase(DecodeProf::kHead);
@@ -1136,7 +1137,7 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
                                w.dn_g, w.dn_beta, T, SVH));
             float* state_layer = dn_at(dev).state_ptr() +
                 uint64_t(dn_local_[L]) * dn_at(dev).state_elems_per_layer();
-            if (dn_scan_on() && T >= kAttnGemmMinT && SHD == 128)   // P4 B49
+            if (dn_scan_on() && (T >= kAttnGemmMinT || (look_rows_[dev] && T > 1)) && SHD == 128)   // P4 B49 (B53: a lookup round)
                 deltanet_scan_prefill(q, w.dn_qrep, w.dn_krep, w.dn_vpre, w.dn_g, w.dn_beta, state_layer, w.dn_out, T, SVH);
             else
             DPE(dev, kDnRec, deltanet_recurrence(q, w.dn_qrep, w.dn_krep, w.dn_vpre, w.dn_g, w.dn_beta,
@@ -1203,7 +1204,7 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
                 // depending on whether it was re-cut. IE_Q35MOE_FA2_TILE_MINCTX=6144 restores v0.2.6's bytes.
                 static const bool no_tile = std::getenv("IE_Q35MOE_NO_FA2_TILE") != nullptr;
                 static const uint32_t tile_minctx = q35m_fa2_tile_minctx();
-                if (w.ag.s && T >= kAttnGemmMinT) {   // P4 B49
+                if (w.ag.s && (T >= kAttnGemmMinT || (look_rows_[dev] && T > 1))) {   // P4 B49 (B53: a lookup round)
                     full_attention_prefill_gemm(q, w.q, w.k, w.v, kc, vc, w.attn_out, T, start_pos,
                                                 cfg_.n_q_heads, cfg_.n_kv_heads, HD, max_ctx, w.ag);
                 } else if (!no_tile && HD == 256 && (start_pos + T) >= tile_minctx) {
@@ -1398,6 +1399,171 @@ void Qwen35MoeSplitModel::head(uint32_t T, sycl::half* d_logits) {
     sgemv(hd, last, output_, d_logits, H, V, 1).wait();
 }
 
+// P4 B53: every row's logits. The rows are rounded up to a multiple of 8 (within the workspace) so the matmul is built
+// for a handful of shapes; the rows past T are whatever x_normed held and are never read.
+void Qwen35MoeSplitModel::head_all(uint32_t T, sycl::half* d_all) {
+    const uint32_t H = cfg_.hidden, V = cfg_.vocab;
+    const uint32_t hd = plan_.head_dev;
+    Workspace& w = ws_[hd];
+    auto& q = fleet_->dev(hd).queue();
+    DPE(hd, kNorm, rms_norm_f32w(q, w.x, output_norm_, w.x_normed, T, H, cfg_.rms_eps));
+    const uint32_t M = std::min<uint32_t>((T + 7u) / 8u * 8u, w.T);
+    sgemv(hd, w.x_normed, output_, d_all, H, V, M).wait();
+}
+
+// ---- P4 B53: prompt-lookup drafts (--parallel 1) ------------------------------------------------------------------
+
+namespace {
+bool q35m_lookup_on() {
+    static const bool v = [] { const char* e = std::getenv("IE_Q35MOE_LOOKUP"); return !(e && *e && std::atoi(e) == 0); }();
+    return v;
+}
+uint32_t q35m_lookup_min() {
+    static const uint32_t v = [] { const char* e = std::getenv("IE_Q35MOE_LOOKUP_MIN"); const int n = e ? std::atoi(e) : 16;
+                                   return uint32_t(n >= 2 ? n : 8); }();
+    return v;
+}
+}  // namespace
+
+std::string Qwen35MoeSplitModel::look_step_init() {
+    LookStep& s = ls_;
+    if (s.rows) return {};
+    if (!q35m_lookup_on()) return "lookup off (IE_Q35MOE_LOOKUP=0)";
+    static const uint32_t rows_env = [] { const char* e = std::getenv("IE_Q35MOE_LOOKUP_ROWS"); const int n = e ? std::atoi(e) : 128;
+                                          return uint32_t(std::min(256, std::max(8, n))) / 8u * 8u; }();
+    const uint32_t V = cfg_.vocab, hd = plan_.head_dev;
+    if (ws_.size() != n_dev_) ws_.assign(n_dev_, {});
+    s.snap_state.assign(n_dev_, nullptr); s.snap_conv.assign(n_dev_, nullptr);
+    s.kvsnap.assign(n_dev_, {});
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+        if (kv_[dev].ready()) s.kvsnap[dev].resize(kv_[dev].config().n_layers_full);
+        if (!dn_[dev].ready()) continue;
+        const uint64_t nl = dn_[dev].config().n_layers_linear;
+        s.snap_state[dev] = static_cast<float*>(fleet_->dev(dev).malloc(nl * dn_[dev].state_elems_per_layer() * sizeof(float)));
+        s.snap_conv[dev]  = static_cast<sycl::half*>(fleet_->dev(dev).malloc(nl * dn_[dev].conv_elems_per_layer() * sizeof(sycl::half)));
+        if (s.snap_state[dev]) owned_[dev].push_back(s.snap_state[dev]);
+        if (s.snap_conv[dev])  owned_[dev].push_back(s.snap_conv[dev]);
+        if (!s.snap_state[dev] || !s.snap_conv[dev]) return "look_step snapshot alloc failed";
+    }
+    s.d_all = static_cast<sycl::half*>(fleet_->dev(hd).malloc(uint64_t(rows_env) * V * sizeof(sycl::half)));
+    if (!s.d_all) return "look_step logits alloc failed";
+    owned_[hd].push_back(s.d_all);
+    s.scratch_logits.resize(V);
+    s.vin.assign(rows_env, 0);
+    s.rows = rows_env;
+    return {};
+}
+
+void Qwen35MoeSplitModel::look_step_context(const int32_t* ids, uint32_t n) {
+    ls_.idx_on = ls_.rows != 0;
+    if (ls_.idx_on) ls_.idx.reset(std::vector<int32_t>(ids, ids + n));
+}
+
+void Qwen35MoeSplitModel::look_step_reset() {
+    LookStep& s = ls_;
+    static const bool prof = std::getenv("IE_Q35MOE_PROFILE") != nullptr || std::getenv("IE_Q35MOE_LOOKUP_STATS") != nullptr;
+    if (prof && (s.rounds || s.plain))
+        std::fprintf(stderr, "[qwen35moe_split LOOKUP] rounds=%llu drafted=%llu accepted=%llu re-run after a miss=%llu "
+                     "plain steps=%llu (%.3f tokens a forward); ms: rounds %.1f, re-runs %.1f, plain %.1f\n",
+                     (unsigned long long)s.rounds, (unsigned long long)s.drafted, (unsigned long long)s.hits,
+                     (unsigned long long)s.redo, (unsigned long long)s.plain,
+                     double(s.rounds + s.hits + s.plain) / double(s.rounds + s.redo + s.plain),
+                     s.ms_round, s.ms_redo, s.ms_plain);
+    s.rounds = s.drafted = s.hits = s.redo = s.plain = 0;
+    s.ms_round = s.ms_redo = s.ms_plain = 0;
+    s.n_rows = s.next = 0;
+    s.look_streak = s.look_block = 0;
+    s.block_len = kLookBlock; s.grow = kLookProbe;
+}
+
+std::string Qwen35MoeSplitModel::look_step_flush() {
+    LookStep& s = ls_;
+    if (s.next < s.n_rows) {
+        // Rows [next, n_rows) were not followed. The round has no per-row checkpoints: back to the state before it,
+        // then the followed rows again.
+        const uint32_t accepted = s.next;
+        s.look_streak = 0;
+        if (accepted < 3) { s.look_block = s.block_len; s.block_len = std::min<uint32_t>(s.block_len * 2u, kLookBlockMax); }
+        for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+            auto& qd = fleet_->dev(dev).queue();
+            if (dn_[dev].ready()) {
+                const uint64_t nl = dn_[dev].config().n_layers_linear;
+                qd.memcpy(dn_[dev].state_ptr(), s.snap_state[dev], nl * dn_[dev].state_elems_per_layer() * sizeof(float));
+                qd.memcpy(dn_[dev].conv_state_ptr(), s.snap_conv[dev], nl * dn_[dev].conv_elems_per_layer() * sizeof(sycl::half));
+                qd.wait();
+            }
+            for (uint32_t l = 0; l < uint32_t(s.kvsnap[dev].size()); ++l) kv_[dev].set_length(l, s.kvsnap[dev][l]);
+        }
+        s.n_rows = s.next = 0;
+        const auto t0 = std::chrono::steady_clock::now();
+        look_rows_[0] = look_rows_[1] = true;
+        auto e = forward(s.vin.data(), accepted, s.base, /*reset_kv=*/false, s.scratch_logits.data());
+        look_rows_[0] = look_rows_[1] = false;
+        if (!e.empty()) return "look_step re-run: " + e;
+        s.ms_redo += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        ++s.redo;
+    }
+    s.n_rows = s.next = 0;
+    return {};
+}
+
+std::string Qwen35MoeSplitModel::look_step(int32_t token, uint32_t pos, sycl::half* logits_host) {
+    LookStep& s = ls_;
+    if (!s.rows) return "look_step: not initialised";
+    if (s.idx_on) s.idx.push(token);   // every token the caller forwards, in order: the history the lookup reads
+    if (s.look_block) --s.look_block;
+    const uint32_t V = cfg_.vocab;
+    auto& qh = fleet_->dev(plan_.head_dev).queue();
+    const uint64_t row_bytes = uint64_t(V) * sizeof(sycl::half);
+
+    // A row of the round for exactly this position and input token: its logits are already there.
+    if (s.next < s.n_rows && pos == s.base + s.next && token == s.vin[s.next]) {
+        qh.memcpy(logits_host, s.d_all + uint64_t(s.next) * V, row_bytes).wait();
+        ++s.next; ++s.hits;
+        if (s.next == s.n_rows) {   // used up: the state is at pos + 1
+            ++s.look_streak; s.block_len = kLookBlock;
+            s.grow = std::min<uint32_t>(std::max<uint32_t>(s.n_rows, kLookProbe) * 2u, s.rows);
+            s.n_rows = s.next = 0;
+        }
+        return {};
+    }
+    if (auto e = look_step_flush(); !e.empty()) return e;
+
+    std::vector<int32_t> look;
+    if (s.idx_on && !s.look_block && pos != 0 && pos + s.rows <= max_ctx_) {
+        if (!s.look_streak) look = s.idx.draft(std::min(s.rows, kLookStrongRows) - 1, kLookStrong);
+        if (look.size() < 2) look = s.idx.draft((s.look_streak ? s.grow : kLookProbe) - 1, q35m_lookup_min());
+        if (look.size() < 2) look.clear();
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    if (look.empty()) {
+        ++s.plain;
+        auto e = forward(&token, 1, pos, /*reset_kv=*/pos == 0, logits_host);
+        s.ms_plain += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        return e;
+    }
+    const uint32_t Vr = 1 + uint32_t(look.size());
+    s.vin[0] = token;
+    for (uint32_t j = 1; j < Vr; ++j) s.vin[j] = look[j - 1];
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+        for (uint32_t l = 0; l < uint32_t(s.kvsnap[dev].size()); ++l) s.kvsnap[dev][l] = kv_[dev].length(l);
+        if (!dn_[dev].ready()) continue;
+        auto& qd = fleet_->dev(dev).queue();
+        const uint64_t nl = dn_[dev].config().n_layers_linear;
+        qd.memcpy(s.snap_state[dev], dn_[dev].state_ptr(), nl * dn_[dev].state_elems_per_layer() * sizeof(float));
+        qd.memcpy(s.snap_conv[dev], dn_[dev].conv_state_ptr(), nl * dn_[dev].conv_elems_per_layer() * sizeof(sycl::half));
+    }
+    look_rows_[0] = look_rows_[1] = true;
+    auto e = forward(s.vin.data(), Vr, pos, /*reset_kv=*/false, s.scratch_logits.data(), s.d_all);
+    look_rows_[0] = look_rows_[1] = false;
+    if (!e.empty()) return e;
+    qh.memcpy(logits_host, s.d_all, row_bytes).wait();   // row 0 = this position
+    s.ms_round += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    s.base = pos; s.n_rows = Vr; s.next = 1;
+    ++s.rounds; s.drafted += look.size();
+    return {};
+}
+
 
 // ---- P4 B10: request lanes (docs/lanes/LANES_SERVE.md) -----------------------------------------------------------
 
@@ -1533,8 +1699,23 @@ void Qwen35MoeSplitModel::reset_lane_state(uint32_t lane) {
     }
 }
 
+void Qwen35MoeSplitModel::lane_look_restore(uint32_t lane) {
+    LookStep& s = ls_;
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+        auto& qd = fleet_->dev(dev).queue();
+        DeltaNetState& dn = lane_dn(lane, dev);
+        if (dn.ready()) {
+            const uint64_t nl = dn.config().n_layers_linear;
+            qd.memcpy(dn.state_ptr(), s.snap_state[dev], nl * dn.state_elems_per_layer() * sizeof(float));
+            qd.memcpy(dn.conv_state_ptr(), s.snap_conv[dev], nl * dn.conv_elems_per_layer() * sizeof(sycl::half));
+        }
+        KvCache& kv = lane_kv(lane, dev);
+        for (uint32_t l = 0; l < uint32_t(s.kvsnap[dev].size()); ++l) kv.set_length(l, s.kvsnap[dev][l]);
+    }
+}
+
 std::string Qwen35MoeSplitModel::forward_stage(uint32_t dev, uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0,
-                                               sycl::half* x_host) {
+                                               sycl::half* x_host, int look) {
     static const char* kStopped = "stopped at a layer boundary: the engine is stopping";   // (P4 B33)
     if (T == 0) return "T == 0";
     if (aborting(T)) return kStopped;
@@ -1556,11 +1737,25 @@ std::string Qwen35MoeSplitModel::forward_stage(uint32_t dev, uint32_t lane, cons
     const uint64_t xb = uint64_t(T) * cfg_.hidden * sizeof(sycl::half);
     if (dev == plan_.embed_dev) { if (auto m = embed(ids, T, pos0); !m.empty()) return m; }
     else q.memcpy(w.x, x_host, xb).wait();
+    if (look && !ls_.rows) return "forward_stage: a lookup round without look_step_init";
+    if (look == 1) {   // P4 B55: the lane's state before the round, aside
+        if (T > ls_.rows) return "forward_stage: a lookup round of " + std::to_string(T) + " rows";
+        DeltaNetState& dn = dn_at(dev);
+        if (dn.ready()) {
+            const uint64_t nl = dn.config().n_layers_linear;
+            q.memcpy(ls_.snap_state[dev], dn.state_ptr(), nl * dn.state_elems_per_layer() * sizeof(float));
+            q.memcpy(ls_.snap_conv[dev], dn.conv_state_ptr(), nl * dn.conv_elems_per_layer() * sizeof(sycl::half));
+        }
+        for (uint32_t l = 0; l < uint32_t(ls_.kvsnap[dev].size()); ++l) ls_.kvsnap[dev][l] = kv_at(dev).length(l);
+    }
     double t_attn = 0.0, t_moe = 0.0;
+    look_rows_[dev] = look != 0;
     run_layers(dev, T, pos0, false, t_attn, t_moe);
+    look_rows_[dev] = false;
     if (aborting(T)) { q.wait(); return kStopped; }   // (P4 B33: nothing of the step still runs on the card)
     if (dev != plan_.head_dev) { q.memcpy(x_host, w.x, xb).wait(); return {}; }
-    head(T, lane_logits_);
+    if (look == 1) head_all(T, ls_.d_all);
+    else head(T, lane_logits_);
     return {};
 }
 

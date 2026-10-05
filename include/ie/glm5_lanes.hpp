@@ -148,6 +148,10 @@ public:
     // The caller reset the lane's state outside the pipe (a new, empty sequence): its position is 0 and the failed mark is
     // cleared. Refused while the lane has a step in flight.
     std::string reset_lane(uint32_t lane);
+    // P4 B55: the owner rolled the lane's state BACK to n_pos (at most its committed position) -- a lookup round whose
+    // rows were not all followed. From the lane's own done callback (before its one resubmit), or while the lane has no
+    // step in flight. Refused otherwise, and while its last step failed part-way.
+    std::string rewind_lane(uint32_t lane, uint32_t n_pos);
     std::string error() const;                // the latched stage error ("" = none); stop() returns and clears it
 
 private:

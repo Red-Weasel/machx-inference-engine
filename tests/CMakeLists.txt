@@ -565,6 +565,11 @@ add_executable(lanes_auto_test unit/lanes_auto_test.cpp)
 target_include_directories(lanes_auto_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME lanes_auto_test COMMAND lanes_auto_test)
 
+# P4 B57: the in-place restart points' host bookkeeping (include/ie/dn_ladder_plan.hpp)
+add_executable(dn_ladder_test unit/dn_ladder_test.cpp)
+target_include_directories(dn_ladder_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME dn_ladder_test COMMAND dn_ladder_test)
+
 add_executable(glm5_server_test unit/glm5_server_test.cpp)
 target_link_libraries(glm5_server_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME glm5_server_test COMMAND glm5_server_test)

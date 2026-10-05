@@ -161,6 +161,8 @@ uint32_t LanesServe::decoding() const {
 void LanesServe::end_lane(Lane& l, const std::string& finish, bool lost) {
     if (l.finish.empty()) l.finish = finish;
     l.lost = l.lost || lost; l.phase = Lane::Phase::kDone; l.parked = false; l.next = -1; l.reprep = false;
+    if (look_owner_ == int(&l - lanes_.data())) look_owner_ = -1;   // (P4 B55)
+    l.look_n = l.redo_n = 0; l.redo_fly = l.look_end = false;
     fifo_drop(uint32_t(&l - lanes_.data()));
     cv_.notify_all();
 }
@@ -346,6 +348,7 @@ bool LanesServe::commit(Lane& l, int32_t id) {
     if (!l.rq->sp.ignore_eos && m_.is_stop(id)) { l.finish = "stop"; return false; }
     ++l.n_new; ++tokens_;
     l.hist.push_back(id);
+    if (l.idx_on) { l.idx.push(id); if (l.look_blocked) --l.look_blocked; }   // (P4 B55)
     l.out.push_back(id);
     l.outbox.push_back(id);
     if (l.n_new >= l.max_new) { l.finish = "length"; return false; }
@@ -367,6 +370,12 @@ void LanesServe::submit(Lane& l, uint32_t li) {
         // steps -- what the drained prompt-end turn did; one small piece per prompt, so no one starves
         const bool tail = l.plan.snap && p0 >= l.plan.snap && t <= kTailFront;
         e = tail ? m_.pipe_submit_front(li, l.rq->ids->data() + p0, t, p0) : m_.pipe_submit(li, l.rq->ids->data() + p0, t, p0);
+    } else if (l.redo_n) {   // P4 B55: a round's followed rows again, from the state before it
+        l.pend = 0; l.redo_fly = true; ++look_redos_;
+        e = m_.pipe_submit_redo(li, l.look_ids.data(), l.redo_n, l.look_base);
+    } else if (look_try(l, li)) {
+        l.pend = 0;
+        e = m_.pipe_submit_look(li, l.look_ids.data(), l.look_n, l.look_base);
     } else {
         l.pend = 0;
         e = m_.pipe_submit(li, &l.next, 1, l.pos);
@@ -517,10 +526,107 @@ bool LanesServe::step_landed(Lane& l, uint32_t li) {
         cv_.notify_all();
         return false;
     }
+    if (l.redo_fly) {   // P4 B55: the followed rows ran again: the lane's state is at l.pos
+        l.redo_fly = false; l.redo_n = 0;
+        if (look_owner_ == int(li)) look_owner_ = -1;
+        if (l.look_end) { l.look_end = false; end_lane(l, l.look_finish, false); return false; }
+        decode_next(l, li);
+        return false;
+    }
+    if (l.look_n) { look_landed(l, li); return false; }   // P4 B55: a lookup round
     ++steps_; ++l.steps; ++l.dsteps;
     step_ms_ = steps_ == 1 ? step : 0.9 * step_ms_ + 0.1 * step;
     l.pos += 1;
     return true;
+}
+
+// ---- P4 B55: prompt-lookup rounds (mu held throughout) -----------------------------------------------------------------------
+
+void LanesServe::decode_next(Lane& l, uint32_t li) {
+    if (l.want_stop) { end_lane(l, "abort", /*lost=*/l.redo_n != 0); return; }   // (rows not rolled back: the lane is forgotten)
+    if (pause_ || stopping_) { l.parked = true; cv_.notify_all(); return; }
+    submit(l, li);
+    cv_.notify_all();
+}
+
+bool LanesServe::look_try(Lane& l, uint32_t li) {
+    if (!o_.look || !l.idx_on || look_owner_ >= 0 || l.look_blocked) return false;
+    if (o_.look_gap && !look_gap_base_.empty() && ms_since(look_gap_t0_) < double(o_.look_gap_ms))
+        for (uint32_t k = 0; k < lanes_.size(); ++k) {
+            const Lane& x = lanes_[k];
+            if (k != li && x.busy && x.phase == Lane::Phase::kDecode && x.dsteps - look_gap_base_[k] < o_.look_gap) return false;
+        }
+    const uint32_t room = std::min(l.max_new - l.n_new, l.cap > l.pos ? l.cap - l.pos : 0u);   // a row may give one id
+    const uint32_t rows_max = std::min(m_.look_rows(), room);
+    if (rows_max < 3) return false;
+    std::vector<int32_t> d;
+    if (!l.look_streak) d = l.idx.draft(std::min(rows_max, o_.look_strong_rows) - 1, o_.look_strong);
+    if (d.size() < 2) d = l.idx.draft(std::min(rows_max, l.look_streak ? l.look_grow : o_.look_probe) - 1, o_.look_min);
+    if (d.size() < 2) return false;
+    l.look_ids.assign(1, l.next);
+    l.look_ids.insert(l.look_ids.end(), d.begin(), d.end());
+    l.look_n = uint32_t(l.look_ids.size()); l.look_base = l.pos;
+    look_owner_ = int(li);
+    ++look_rounds_; look_drafted_ += d.size();
+    return true;
+}
+
+void LanesServe::look_landed(Lane& l, uint32_t li) {
+    const uint32_t R = l.look_n;
+    l.look_n = 0;
+    ++steps_; ++l.steps;
+    if (o_.look_gap) {   // the other lanes' steps count from here
+        look_gap_base_.resize(lanes_.size());
+        for (uint32_t k = 0; k < lanes_.size(); ++k) look_gap_base_[k] = lanes_[k].dsteps;
+        look_gap_t0_ = Clock::now();
+    }
+    const LanesSampling& sp = l.rq->sp;
+    // row r's sampler as if rows 0..r-1 were followed: the window over hist ++ drafts, the seed of the (n_new + r)-th id
+    std::vector<int32_t> ext;
+    std::vector<std::span<const int32_t>> wins(R);
+    std::vector<uint64_t> seeds(R);
+    if (sp.penalties()) {
+        ext = l.hist;
+        ext.insert(ext.end(), l.look_ids.begin() + 1, l.look_ids.end());
+        for (uint32_t r = 0; r < R; ++r) {
+            const size_t end = l.hist.size() + r;
+            const size_t nw = std::min<size_t>({size_t(sp.repeat_window), end, size_t(512)});
+            wins[r] = std::span<const int32_t>(ext.data() + (end - nw), nw);
+        }
+    }
+    for (uint32_t r = 0; r < R; ++r) seeds[r] = l.rq->rng + l.n_new + r;
+    std::vector<int32_t> picks(R, 0);
+    std::string err;
+    try { err = m_.sample_look(li, R, sp, wins, seeds, picks); }
+    catch (const std::exception& x) { err = std::string("threw: ") + x.what(); }
+    if (!err.empty()) { end_lane(l, std::string("error: ") + m_.tag() + " lane " + std::to_string(li) + " lookup sample: " + err, true); return; }
+    uint32_t acc = 0;      // rows followed: the lane's state must end at look_base + acc
+    bool ended = false;
+    for (uint32_t r = 0; r < R; ++r) {
+        acc = r + 1; l.pos = l.look_base + acc; ++l.dsteps;
+        if (!commit(l, picks[r])) { ended = true; break; }
+        l.next = picks[r];
+        if (r + 1 < R && picks[r] != l.look_ids[r + 1]) break;
+    }
+    look_hits_ += acc - 1;
+    if (acc == R) {
+        ++l.look_streak; l.look_block_len = o_.look_block;
+        l.look_grow = std::min(std::max(R, o_.look_probe) * 2u, m_.look_rows());
+    } else {
+        l.look_streak = 0;
+        if (acc < 3) { l.look_blocked = l.look_block_len; l.look_block_len = std::min(l.look_block_len * 2u, o_.look_block_max); }
+    }
+    if (o_.trace) std::fprintf(stderr, "[%s step] lane %u lookup %u row(s) at %u: %u followed\n", m_.tag(), li, R, l.look_base, acc);
+    if (acc == R) {
+        look_owner_ = -1;
+        if (ended) { end_lane(l, l.finish, false); return; }
+        decode_next(l, li);
+        return;
+    }
+    l.redo_n = acc; l.look_end = ended; l.look_finish = ended ? l.finish : std::string();
+    if (ended) l.finish.clear();   // (end_lane sets it when the redo landed)
+    if (stopping_) { end_lane(l, "abort", true); return; }
+    decode_next(l, li);
 }
 
 // A decode step's callback, its second half (mu held): the sampled id (or the sampler's error) commits, ends the lane, or
@@ -732,6 +838,10 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     if (T >= cap_max) { r.finish_reason = "context_length_exceeded"; return r; }
     const auto t_req = Clock::now();
     Clock::time_point t_dec{};
+    // P4 B55: the prompt's n-gram index, built before the serve mutex is taken
+    const bool look_on = o_.look && m_.look_rows() >= 3;
+    Ds41NgramIndex look_idx;
+    if (look_on) look_idx.reset(ids);
     auto alive = [&] { return !on_token || on_token(std::string_view{}); };   // the server's liveness probe (an empty piece)
     auto fits = [&] { for (const auto& l : lanes_) if (!l.busy && l.cap > T) return true; return false; };
 
@@ -760,6 +870,9 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     // (P4 B39: the callbacks of the other lanes may read these while the prepare runs: a new prompt with no plan yet)
     l.plan = LanesPlan{}; l.pos = l.reused = l.chunk_at = l.mark_at = l.snap_at = l.piece_max = 0; l.preparing = true;
     l.hist.assign(ids.begin(), ids.end());
+    l.idx_on = look_on; if (look_on) l.idx = std::move(look_idx);   // (P4 B55)
+    l.look_n = l.redo_n = l.look_streak = l.look_blocked = 0; l.redo_fly = l.look_end = false;
+    l.look_block_len = o_.look_block; l.look_grow = o_.look_probe;
     l.max_new = lanes_reply_budget(T, rq.sp.max_tokens, l.cap); l.n_new = 0;   // (T < l.cap)
     uint32_t others = 0;                                               // lanes of other requests still running
     for (uint32_t k = 0; k < lanes_.size(); ++k) others += k != lane && lanes_[k].busy && lanes_[k].phase != Lane::Phase::kDone;
@@ -1082,6 +1195,11 @@ std::string LanesServe::status_json() const {
                   (unsigned long long)boundary_first_);
     std::string js(buf);
     if (!pipe.empty()) { js.pop_back(); js += ",\"pipe\":" + pipe + "}"; }
+    if (o_.look) {   // (P4 B55)
+        js.pop_back();
+        js += ",\"lookup\":{\"rounds\":" + std::to_string(look_rounds_) + ",\"drafted\":" + std::to_string(look_drafted_) +
+              ",\"followed\":" + std::to_string(look_hits_) + ",\"redos\":" + std::to_string(look_redos_) + "}}";
+    }
     return js;
 }
 

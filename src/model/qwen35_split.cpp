@@ -2292,6 +2292,18 @@ std::string Qwen35SplitModel::load_mtp_head(const GgufReader& g, uint32_t max_ct
 // ===========================================================================
 // P4 B48: speculation as a step of a normal decode loop (the header's note).
 // ===========================================================================
+namespace {
+bool q27_lookup_on() {
+    static const bool on = [] { const char* e = std::getenv("IE_QWEN35_LOOKUP"); return !(e && *e && std::atoi(e) == 0); }();
+    return on;
+}
+uint32_t q27_lookup_min() {
+    static const uint32_t v = [] { const char* e = std::getenv("IE_QWEN35_LOOKUP_MIN"); const int n = e ? std::atoi(e) : 8;
+                                   return uint32_t(n >= 2 ? n : 8); }();
+    return v;
+}
+}  // namespace
+
 std::string Qwen35SplitModel::spec_step_init(uint32_t K) {
     if (!mtp_.loaded) return "spec_step: MTP head not loaded";
     const uint32_t V = std::min<uint32_t>(16u, std::max<uint32_t>(2u, K));
@@ -2299,43 +2311,107 @@ std::string Qwen35SplitModel::spec_step_init(uint32_t K) {
     if (s.V == V) return {};
     if (s.V != 0) return "spec_step: already initialised for another K";
     const uint32_t H = cfg_.dense.hidden, vocab = cfg_.dense.vocab, hd = plan_.head_dev;
+    // P4 B52: room for a lookup round (IE_QWEN35_LOOKUP_ROWS, 3..16; the batched verify kernels take up to 16 rows)
+    static const uint32_t look_rows = [] { const char* e = std::getenv("IE_QWEN35_LOOKUP_ROWS"); const int n = e ? std::atoi(e) : int(kLookRows);
+                                           return uint32_t(std::min(16, std::max(3, n))); }();
+    const uint32_t cap = q27_lookup_on() ? std::max<uint32_t>(V, look_rows) : V;
     auto& ha = fleet_->dev(hd);
     s.ckpts.clear();
     s.ckpts.resize(n_dev_);
     for (uint32_t dev = 0; dev < n_dev_; ++dev)
         if (dn_[dev].ready())
-            if (auto e = s.ckpts[dev].init(fleet_->dev(dev), dn_[dev], V); !e.empty())
+            if (auto e = s.ckpts[dev].init(fleet_->dev(dev), dn_[dev], cap); !e.empty())
                 return "spec_step ckpt dev " + std::to_string(dev) + ": " + e;
     s.kvsnap.assign(n_dev_, {});
     for (uint32_t dev = 0; dev < n_dev_; ++dev)
         if (kv_[dev].ready()) s.kvsnap[dev].resize(kv_[dev].config().n_layers_full);
-    s.d_hid  = static_cast<sycl::half*>(ha.malloc(uint64_t(V) * H * sizeof(sycl::half)));
-    s.d_all  = static_cast<sycl::half*>(ha.malloc(uint64_t(V) * vocab * sizeof(sycl::half)));
+    // P4 B52 (4): fast lookup rounds of up to IE_QWEN35_LOOKUP_FAST rows (default 128, 0 = off, at most 256) through
+    // the PREFILL kernels: one read of the weights for the whole round where the exact batched kernels cost ~7.5 ms a
+    // row. Their rows are the prefill path's numerics (as a prompt's rows are), not the decode kernels'.
+    static const uint32_t fast_env = [] { const char* e = std::getenv("IE_QWEN35_LOOKUP_FAST"); const int n = e ? std::atoi(e) : 128;
+                                          return uint32_t(std::min(256, std::max(0, n))); }();
+    s.fast_rows = (q27_lookup_on() && fast_env > cap) ? fast_env : 0;
+    const uint32_t rows_max = std::max(cap, s.fast_rows);
+    if (s.fast_rows) {
+        s.snap_state.assign(n_dev_, nullptr); s.snap_conv.assign(n_dev_, nullptr);
+        for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+            if (!dn_[dev].ready()) continue;
+            const uint64_t nl = dn_[dev].config().n_layers_linear;
+            s.snap_state[dev] = static_cast<float*>(fleet_->dev(dev).malloc(nl * dn_[dev].state_elems_per_layer() * sizeof(float)));
+            s.snap_conv[dev]  = static_cast<sycl::half*>(fleet_->dev(dev).malloc(nl * dn_[dev].conv_elems_per_layer() * sizeof(sycl::half)));
+            if (!s.snap_state[dev] || !s.snap_conv[dev]) return "spec_step snapshot alloc failed";
+            owned_[dev].push_back(s.snap_state[dev]); owned_[dev].push_back(s.snap_conv[dev]);
+        }
+        s.scratch_logits.resize(vocab);
+    }
+    s.d_hid  = static_cast<sycl::half*>(ha.malloc(uint64_t(rows_max) * H * sizeof(sycl::half)));
+    s.d_all  = static_cast<sycl::half*>(ha.malloc(uint64_t(rows_max) * vocab * sizeof(sycl::half)));
     s.h_last = static_cast<sycl::half*>(ha.malloc(uint64_t(H) * sizeof(sycl::half)));
     for (void* p : {static_cast<void*>(s.d_hid), static_cast<void*>(s.d_all), static_cast<void*>(s.h_last)})
         if (p) owned_[hd].push_back(p);
     if (!s.d_hid || !s.d_all || !s.h_last) return "spec_step scratch alloc failed";
-    s.vin.assign(V, 0);
+    s.vin.assign(rows_max, 0);
+    s.cap = cap;
     s.V = V;
     return {};
+}
+
+void Qwen35SplitModel::spec_step_context(const int32_t* ids, uint32_t n) {
+    SpecStep& s = ss_;
+    s.idx_on = q27_lookup_on() && s.cap >= 3;
+    if (!s.idx_on) return;
+    s.idx.reset(std::vector<int32_t>(ids, ids + n));
 }
 
 void Qwen35SplitModel::spec_step_reset() {
     static const bool prof = std::getenv("IE_QWEN35_PROFILE") != nullptr;
     if (prof && (ss_.rounds || ss_.plain))
         std::fprintf(stderr, "[qwen35split SPEC-STEP] rounds=%llu rows answered without a forward=%llu plain steps=%llu "
-                     "(%.3f tokens a forward) cooldowns=%llu\n", (unsigned long long)ss_.rounds, (unsigned long long)ss_.hits,
+                     "(%.3f tokens a forward) cooldowns=%llu; lookup rounds=%llu drafted=%llu accepted=%llu\n",
+                     (unsigned long long)ss_.rounds, (unsigned long long)ss_.hits,
                      (unsigned long long)ss_.plain,
                      double(ss_.rounds + ss_.hits + ss_.plain) / double(ss_.rounds + ss_.plain),
-                     (unsigned long long)ss_.cooldowns);
+                     (unsigned long long)ss_.cooldowns, (unsigned long long)ss_.look_rounds,
+                     (unsigned long long)ss_.look_rows, (unsigned long long)ss_.look_hits);
+    if (prof && ss_.fast_rounds)
+        std::fprintf(stderr, "[qwen35split SPEC-STEP] fast lookup rounds=%llu, re-run after a miss=%llu\n",
+                     (unsigned long long)ss_.fast_rounds, (unsigned long long)ss_.fast_redo);
+    ss_.look_rounds = ss_.look_rows = ss_.look_hits = ss_.fast_rounds = ss_.fast_redo = 0;
     ss_.have_h = false;
     ss_.n_rows = ss_.next = 0;
     ss_.rounds = ss_.hits = ss_.plain = ss_.cooldowns = 0;
     ss_.win_fwd = ss_.win_tok = ss_.cooldown = 0;
+    ss_.look_streak = ss_.look_block = 0;
 }
 
 std::string Qwen35SplitModel::spec_step_flush() {
     SpecStep& s = ss_;
+    if (s.next < s.n_rows && s.look_round) {   // a lookup round that was not followed to its end
+        s.look_streak = 0;
+        if (s.next < 3) s.look_block = kLookBlock;
+    }
+    if (s.next < s.n_rows && s.fast_round) {
+        // A fast round has no per-row checkpoints: back to the state before it, then the followed rows again.
+        const uint32_t accepted = s.next;
+        for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+            auto& qd = fleet_->dev(dev).queue();
+            if (dn_[dev].ready()) {
+                const uint64_t nl = dn_[dev].config().n_layers_linear;
+                qd.memcpy(dn_[dev].state_ptr(), s.snap_state[dev], nl * dn_[dev].state_elems_per_layer() * sizeof(float));
+                qd.memcpy(dn_[dev].conv_state_ptr(), s.snap_conv[dev], nl * dn_[dev].conv_elems_per_layer() * sizeof(sycl::half));
+                qd.wait();
+            }
+            for (uint32_t l = 0; l < uint32_t(s.kvsnap[dev].size()); ++l) kv_[dev].set_length(l, s.kvsnap[dev][l]);
+        }
+        const uint32_t H = cfg_.dense.hidden;
+        // the hidden of the last followed row is the first run's (the same inputs): keep it before d_hid is reused
+        fleet_->dev(plan_.head_dev).queue().memcpy(s.h_last, s.d_hid + uint64_t(accepted - 1) * H,
+                                                   uint64_t(H) * sizeof(sycl::half)).wait();
+        if (auto e = forward(s.vin.data(), accepted, s.base, /*reset_kv=*/false, s.scratch_logits.data(), nullptr, nullptr, nullptr);
+            !e.empty()) return "spec_step fast re-run: " + e;
+        s.have_h = true; s.h_pos = s.base + accepted - 1;
+        ++s.fast_redo;
+    } else
     if (s.next < s.n_rows) {   // rows [next, n_rows) were not followed: the state goes back to base + next
         const uint32_t accepted = s.next;
         for (uint32_t dev = 0; dev < n_dev_; ++dev) {
@@ -2359,6 +2435,8 @@ std::string Qwen35SplitModel::spec_step(int32_t token, uint32_t pos, sycl::half*
                                         const SpecDraftSampling* ds) {
     SpecStep& s = ss_;
     if (s.V == 0) return "spec_step: not initialised";
+    if (s.idx_on) s.idx.push(token);   // every token the caller forwards, in order: the history the lookup reads
+    if (s.look_block) --s.look_block;
     const uint32_t H = cfg_.dense.hidden, vocab = cfg_.dense.vocab;
     auto& qh = fleet_->dev(plan_.head_dev).queue();
     const uint64_t row_bytes = uint64_t(vocab) * sizeof(sycl::half);
@@ -2367,7 +2445,9 @@ std::string Qwen35SplitModel::spec_step(int32_t token, uint32_t pos, sycl::half*
     if (s.next < s.n_rows && pos == s.base + s.next && token == s.vin[s.next]) {
         qh.memcpy(logits_host, s.d_all + uint64_t(s.next) * vocab, row_bytes).wait();
         ++s.next; ++s.hits; ++s.win_tok;
+        if (s.look_round) ++s.look_hits;
         if (s.next == s.n_rows) {   // the round is used up: the state is at pos + 1, as after a plain step
+            if (s.look_round) ++s.look_streak;
             qh.memcpy(s.h_last, s.d_hid + uint64_t(s.n_rows - 1) * H, uint64_t(H) * sizeof(sycl::half)).wait();
             s.have_h = true; s.h_pos = pos;
             s.n_rows = s.next = 0;
@@ -2387,7 +2467,17 @@ std::string Qwen35SplitModel::spec_step(int32_t token, uint32_t pos, sycl::half*
         s.win_fwd = s.win_tok = 0;
     }
     const uint32_t max_pos = kv_[plan_.head_dev].ready() ? kv_[plan_.head_dev].config().max_ctx : 0u;
-    if (!s.have_h || s.h_pos + 1 != pos || pos + s.V > max_pos || s.cooldown > 0) {
+    // P4 B52: a lookup draft -- the tokens that followed the last earlier occurrence of the current suffix.
+    std::vector<int32_t> look;
+    // Probe first (the header's note) -- unless the repeated span is already long (kLookStrong tokens): that is a
+    // copy in progress, and the round goes fast at once.
+    const uint32_t look_big = std::max(s.cap, s.fast_rows);
+    if (s.idx_on && !s.look_block && pos + look_big <= max_pos) {
+        if (s.fast_rows && !s.look_streak) look = s.idx.draft(look_big - 1, kLookStrong);
+        if (look.size() < 2) look = s.idx.draft((s.look_streak ? look_big : s.cap) - 1, q27_lookup_min());
+        if (look.size() < 2) look.clear();
+    }
+    if (look.empty() && (!s.have_h || s.h_pos + 1 != pos || pos + s.V > max_pos || s.cooldown > 0)) {
         if (s.cooldown > 0) --s.cooldown;
         // No hidden for position pos - 1 (the first step after a prefill or a restore), or no room for a round: one
         // plain step, which exports its hidden.
@@ -2400,24 +2490,47 @@ std::string Qwen35SplitModel::spec_step(int32_t token, uint32_t pos, sycl::half*
     }
 
     // Draft V - 1 tokens from (h_last, token); verify [token, drafts] in one forward (checkpoint mode).
-    s.drafted.clear();
-    if (ds && ds->temperature > 0.f)
-        mtp_.draft_device_sampled(qh, s.h_last, token, /*p_base=*/0, s.V, s.drafted,
-                                  ds->temperature, ds->top_k, ds->top_p, ds->min_p, ds->seed);
-    else
-        mtp_.draft_device_argmax(qh, s.h_last, token, /*p_base=*/0, s.V, s.drafted);
-    if (s.drafted.size() + 1 < s.V) return "spec_step: draft too short";
+    uint32_t Vr = s.V;   // rows of this round
+    if (!look.empty()) {
+        Vr = 1 + uint32_t(look.size());
+        s.drafted = look;
+        ++s.look_rounds; s.look_rows += look.size();
+    } else {
+        s.drafted.clear();
+        if (ds && ds->temperature > 0.f)
+            mtp_.draft_device_sampled(qh, s.h_last, token, /*p_base=*/0, s.V, s.drafted,
+                                      ds->temperature, ds->top_k, ds->top_p, ds->min_p, ds->seed);
+        else
+            mtp_.draft_device_argmax(qh, s.h_last, token, /*p_base=*/0, s.V, s.drafted);
+        if (s.drafted.size() + 1 < s.V) return "spec_step: draft too short";
+    }
     for (uint32_t dev = 0; dev < n_dev_; ++dev)
         for (uint32_t l = 0; l < uint32_t(s.kvsnap[dev].size()); ++l)
             s.kvsnap[dev][l] = kv_[dev].length(l);
     s.vin[0] = token;
-    for (uint32_t j = 1; j < s.V; ++j) s.vin[j] = s.drafted[j - 1];
-    spec_verify_gemv_ = true;    // sgemv T in [2, 16] -> the batched int-dot (the weights read once)
-    const std::string e = forward(s.vin.data(), s.V, pos, /*reset_kv=*/false, logits_host, s.d_all, s.d_hid, &s.ckpts);
-    spec_verify_gemv_ = false;
+    for (uint32_t j = 1; j < Vr; ++j) s.vin[j] = s.drafted[j - 1];
+    const bool fast = Vr > s.cap;   // P4 B52 (4): more rows than the checkpoints hold -> the prefill kernels
+    std::string e;
+    if (fast) {
+        for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+            if (!dn_[dev].ready()) continue;
+            auto& qd = fleet_->dev(dev).queue();
+            const uint64_t nl = dn_[dev].config().n_layers_linear;
+            qd.memcpy(s.snap_state[dev], dn_[dev].state_ptr(), nl * dn_[dev].state_elems_per_layer() * sizeof(float));
+            qd.memcpy(s.snap_conv[dev], dn_[dev].conv_state_ptr(), nl * dn_[dev].conv_elems_per_layer() * sizeof(sycl::half));
+        }
+        e = forward(s.vin.data(), Vr, pos, /*reset_kv=*/false, logits_host, s.d_all, s.d_hid, nullptr);
+        ++s.fast_rounds;
+    } else {
+        spec_verify_gemv_ = true;    // sgemv T in [2, 16] -> the batched int-dot (the weights read once)
+        e = forward(s.vin.data(), Vr, pos, /*reset_kv=*/false, logits_host, s.d_all, s.d_hid, &s.ckpts);
+        spec_verify_gemv_ = false;
+    }
     if (!e.empty()) return e;
     qh.memcpy(logits_host, s.d_all, row_bytes).wait();   // row 0 = this position
-    s.base = pos; s.n_rows = s.V; s.next = 1;
+    s.base = pos; s.n_rows = Vr; s.next = 1;
+    s.fast_round = fast;
+    s.look_round = !look.empty();
     ++s.rounds; ++s.win_fwd; ++s.win_tok;
     return {};
 }

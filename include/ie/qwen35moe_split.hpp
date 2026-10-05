@@ -24,6 +24,7 @@
 #include "ie/gguf.hpp"
 #include "ie/kv_cache.hpp"
 #include "ie/lanes_auto.hpp"         // LanesAutoFit (P4 B30)
+#include "ie/ngram_draft.hpp"        // Ds41NgramIndex (P4 B53 lookup drafts)
 #include "ie/ops.hpp"                // C32Bank (P4 B21)
 #include "ie/prefill_gemm.hpp"       // AttnGemmScratch + the matmul-based prefill pieces (P4 B48 / B49)
 #include "ie/qwen36.hpp"             // QwenConfig
@@ -68,7 +69,25 @@ public:
 
     // Device-by-device forward. Host ids in, last token's logits → host fp16 [vocab].
     std::string forward(const int32_t* input_ids, uint32_t T, uint32_t start_pos,
-                        bool reset_kv, sycl::half* out_logits_host);
+                        bool reset_kv, sycl::half* out_logits_host, sycl::half* all_logits_dev = nullptr);
+
+    // ---- P4 B53: prompt-lookup drafts on the --parallel 1 path (the 27B split's B52 lookup, qwen35_split.hpp, without an
+    // MTP head). look_step(token, pos) returns the logits of position `pos` for the input `token`, as forward(T = 1)
+    // would. When the last tokens repeat an earlier span of the history (the prompt, then every token given), the tokens
+    // that followed it are run with `token` in ONE forward through the prefill kernels (all rows' logits kept on the head
+    // card), and the next calls are answered from those rows while the caller's token is the drafted one. A row that is
+    // not followed: the state goes back to the copy taken before the round and the followed rows are run again. Probe
+    // first: a round is kLookProbe rows (kLookStrongRows on a repeated span of kLookStrong tokens) and doubles, up to
+    // the longest, after each round followed to its end; a round with fewer than 3 rows followed blocks lookups for
+    // kLookBlock tokens, twice as long after each such round in a row (at most kLookBlockMax). The rows of a
+    // round carry the prefill path's numerics (as a prompt's rows do). IE_Q35MOE_LOOKUP=0 off; IE_Q35MOE_LOOKUP_MIN (16)
+    // the repeated span that starts a draft; IE_Q35MOE_LOOKUP_ROWS (128, 8..256) the longest round.
+    static constexpr uint32_t kLookProbe = 8, kLookBlock = 24, kLookBlockMax = 384, kLookStrong = 24, kLookStrongRows = 32;
+    std::string look_step_init();
+    void        look_step_context(const int32_t* ids, uint32_t n);
+    void        look_step_reset();
+    std::string look_step(int32_t token, uint32_t pos, sycl::half* logits_host);
+    std::string look_step_flush();
 
     // ---- P4 B45 step 2: IMAGE INPUT on the --parallel 1 path (forward(); the 27B split's contract, qwen35_split.hpp).
     // The engine encodes each image (Qwen4Vision, this model's mm.2 width 2048) and stages here before the request's
@@ -110,8 +129,16 @@ public:
     // logits() (device, card 1). pos0 0 resets the lane on the card first. Touches only that card's objects, so the two cards'
     // stages may run at once on two threads (for different lanes, or card 1 of chunk k beside card 0 of chunk k + 1).
     // Returns when the card's work is done. The kernels are forward()'s, card by card.
+    // P4 B55 (a lane's lookup round, LanesServe): look 1 = the round -- the card copies the lane's DeltaNet state and KV
+    // lengths aside before its layers, and card 1 leaves EVERY row's logits in look_logits() (not logits()); look 2 = the
+    // redo of a round's followed rows. Both take the matmul attention and the register scan from 2 rows (look_step's
+    // rule). lane_look_restore puts the lane back to the copy (queued on each card behind the steps in flight; no wait).
+    // Needs look_step_init() (the copies and the rows' logits: one round in flight at a time).
     std::string forward_stage(uint32_t dev, uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0,
-                              sycl::half* x_host);
+                              sycl::half* x_host, int look = 0);
+    void        lane_look_restore(uint32_t lane);
+    sycl::half* look_logits() const noexcept { return ls_.d_all; }
+    uint32_t    look_rows_max() const noexcept { return ls_.rows; }
     sycl::half* logits() const noexcept { return lane_logits_; }
     // P4 B14 phase 1b (rows): one card's part of ONE decode step of G = 2..kMaxRows lanes at once (a rows-mode group of the
     // card pipe), one row per lane, lane i at pos0[i] (never 0: a decode row never starts a sequence). Card 0: embeds the G
@@ -317,6 +344,29 @@ private:
     std::string embed(const int32_t* input_ids, uint32_t T, uint32_t start_pos);   // (start_pos: the splice's piece position, P4 B45)
     void        run_layers(uint32_t dev, uint32_t T, uint32_t start_pos, bool dbg_timing, double& t_attn, double& t_moe);
     void        head(uint32_t T, sycl::half* d_logits);
+    void        head_all(uint32_t T, sycl::half* d_all);   // P4 B53: every row's logits [T, vocab] (rows rounded up to 8)
+
+    // P4 B53: look_step's state.
+    struct LookStep {
+        uint32_t rows = 0;                       // the longest round (0 = not initialised)
+        Ds41NgramIndex idx;
+        bool     idx_on = false;
+        std::vector<int32_t> vin;                // the round's inputs [n_rows]
+        uint32_t base = 0, n_rows = 0, next = 0; // rows [next, n_rows) are still unanswered
+        sycl::half* d_all = nullptr;             // [rows, vocab] on head_dev
+        std::vector<float*>      snap_state;     // [dev] the DeltaNet state before the round
+        std::vector<sycl::half*> snap_conv;      // [dev]
+        std::vector<std::vector<uint32_t>> kvsnap;   // [dev][full-attention layer] the KV lengths before the round
+        std::vector<sycl::half>  scratch_logits;
+        uint32_t look_streak = 0, look_block = 0;
+        uint32_t block_len = kLookBlock, grow = kLookProbe;   // the next block's length; the next round's rows
+        uint64_t rounds = 0, drafted = 0, hits = 0, redo = 0, plain = 0;
+        double   ms_round = 0, ms_redo = 0, ms_plain = 0;   // IE_Q35MOE_LOOKUP_STATS
+    };
+    LookStep ls_;
+    // set for a lookup round's forward: its rows (2 and up) take the matmul attention and the register scan, which
+    // ordinary pieces take only from kAttnGemmMinT rows (their bytes stay as they are)
+    bool look_rows_[2] = {false, false};   // per card: the lanes' stages run on two threads
 
     // Q8_0-SoA aware GEMV (decode int-dot / prefill dequant+gemm / non-Q8 fallback).
     sycl::event sgemv(uint32_t dev, const sycl::half* A, const SplitW& w,

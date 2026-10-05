@@ -1,14 +1,25 @@
 # IE Engine — v1 RELEASE
 
-> **Current release: v0.2.13 (October 2026).** This file is the record of the first release, of June 9, 2026, kept as
+> **Current release: v0.2.18 (October 2026).** This file is the record of the first release, of June 9, 2026, kept as
 > written; its figures are for one Arc Pro B70 and a Q4_K_M model and are not comparable with the two-card figures
-> below. Later releases are described in the README ("New in v0.2.13", "New in v0.2.8", "New in v0.2.6", "In v0.2.0") and in the GitHub
+> below. Later releases are described in the README ("New in v0.2.18", "New in v0.2.13", "New in v0.2.8", "New in v0.2.6", "In v0.2.0") and in the GitHub
 > release notes:
+> [v0.2.18](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.18),
 > [v0.2.13](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.13),
 > [v0.2.8](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.8),
 > [v0.2.6](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.6),
 > [v0.2.0](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.0),
 > [v0.1.0](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.1.0).
+>
+> **v0.2.18 in short** (two Arc Pro B70 cards, measured October 4-5, 2026; versions 0.2.14 to 0.2.18):
+> - With `--spec`, a reply that copies text already in the conversation is drafted from that text and checked in one
+>   forward: a 1,800-token file edit 108.5 -> 28.4 s on Qwen3.8-27B, 24.3 -> 7.1 s on the 35B-A3B class (and across its
+>   request lanes: 12 edits at once 74.3 -> 53.6 s), 68.7 -> 30.7 s on Flash-Next. A long draft is checked through the
+>   prefill kernels, so a token at a near-tie can differ from plain decoding.
+> - `--spec` on the 27B's Q6_K / Q5_K files: three draft-head faults fixed (Q6_K 21.5 -> 26.9 tok/s).
+> - In-place restart points on the 27B and 35B-A3B splits: after one line changed two thirds into a 29.3K-token prompt
+>   the next request took 17.5 s instead of 22.9 (27B) and 9.0 instead of 15.2 (35B-A3B class); replies byte-equal.
+> - The 27B's load no longer refuses at long context with the prompt cache on.
 >
 > **v0.2.13 in short** (two Arc Pro B70 cards, measured October 4, 2026):
 > - Prefill on the Qwen models: Qwen3.8-27B Q8_0 1,037 / 820 -> 2,962 / 3,001 tok/s (2.4K / 10.7K-token prompts), the
