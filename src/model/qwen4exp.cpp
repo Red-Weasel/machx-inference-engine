@@ -1014,6 +1014,16 @@ static bool ram_can_pin(uint64_t nbytes) {
     return avail_kb * 1024ull > nbytes + headroom;
 }
 
+// P4 B61 (2026-10-05): the check above no longer refuses a load. It says once what it saw; the pin is made as asked.
+static void ram_pin_warn(uint64_t nbytes) {
+    static bool said = false;
+    if (said) return;
+    said = true;
+    std::fprintf(stderr, "[qwen4exp] WARNING: pinning %.1f GiB of expert weights with less than that + 32 GiB reported available in "
+                         "system RAM; the load goes on (pinned memory cannot be swapped: if RAM runs out the machine can stall; "
+                         "IE_Q4E_NO_PIN_BANKS=1 reads the weights from disk instead)\n", double(nbytes) / 1073741824.0);
+}
+
 std::string Qwen4ExpModel::prepare_bank_views() {
     // Bank donor (replicated multi-GPU topologies): reuse another instance's
     // prepared views — pinned host USM is context-scoped, and the fleet's
@@ -1052,9 +1062,8 @@ std::string Qwen4ExpModel::prepare_bank_views() {
             std::getenv("IE_Q4E_NO_PIN_BANKS") == nullptr;
         if (fast) {
             if (pin_banks) {
-                if (!ram_can_pin(t->nbytes))
-                    return "qwen4exp: refusing bank pin, MemAvailable too low "
-                           "(set IE_Q4E_NO_PIN_BANKS=1 to stream from mmap)";
+                if (!ram_can_pin(t->nbytes))   // P4 B61: a warning, the pin goes on as asked
+                    ram_pin_warn(t->nbytes);
                 void* pin = sycl::malloc_host(t->nbytes, alloc_->queue());
                 if (!pin) return "qwen4exp: bank pin alloc failed";
                 std::memcpy(pin, t->data, t->nbytes);
@@ -1073,9 +1082,7 @@ std::string Qwen4ExpModel::prepare_bank_views() {
         sycl::half* dst;
         if (pin_banks) {
             const uint64_t need = uint64_t(E) * K * N * sizeof(sycl::half);
-            if (!ram_can_pin(need))
-                return "qwen4exp: refusing f16 bank pin, MemAvailable too low "
-                       "(set IE_Q4E_NO_PIN_BANKS=1 to stream from mmap)";
+            if (!ram_can_pin(need)) ram_pin_warn(need);   // P4 B61
             dst = static_cast<sycl::half*>(
                 sycl::malloc_host(need, alloc_->queue()));
             if (!dst) return "qwen4exp: f16 bank pin alloc failed";

@@ -1761,8 +1761,8 @@ std::string Qwen35SplitModel::init_lanes(uint32_t n_lanes, uint32_t lane_ctx, ui
                                          LanesAutoFit* fit) {
     if (fit) fit->cards.clear();
     else if (n_lanes < 2) return {};
-    if (!fleet_ || n_dev_ != 2 || plan_.embed_dev != 0 || plan_.head_dev != 1)
-        return "request lanes need the two-card plan (embedding on card 0, head on card 1)";
+    if (!fleet_ || n_dev_ < 1 || n_dev_ > 2 || plan_.embed_dev != 0 || plan_.head_dev != n_dev_ - 1)   // (P4 B58: one card = one stage)
+        return "request lanes need the one- or two-card plan (embedding on card 0, head on the last card)";
     if (!lane_kv_.empty()) return "request lanes are already allocated";
     if (n_lanes > kMaxRows) return "request lanes: " + std::to_string(n_lanes) + " lanes, at most " + std::to_string(kMaxRows);
     if (lane_ctx < 9 || lane_ctx > max_ctx_)
@@ -1821,7 +1821,8 @@ std::string Qwen35SplitModel::init_lanes(uint32_t n_lanes, uint32_t lane_ctx, ui
             fit->cards.push_back({free_now, lane_bytes_[dev], 0, reserve_bytes + logits_b + rows_partials_b + fit->keep});
             continue;
         }
-        if (auto m = q35m_lanes_fit(free_now, lane_bytes_[dev], n_lanes, lane_ctx, reserve_bytes + logits_b + rows_partials_b, dev); !m.empty()) return m;
+        if (auto m = q35m_lanes_fit(free_now, lane_bytes_[dev], n_lanes, lane_ctx, reserve_bytes + logits_b + rows_partials_b, dev); !m.empty())
+            std::fprintf(stderr, "[lanes] WARNING: %s -- the load goes on as asked (P4 B60: nothing is refused on this measure)\n", m.c_str());
     }
     if (fit) {
         n_lanes = fit->n = lanes_auto_fit(fit->cards, fit->n_max);
@@ -1958,7 +1959,7 @@ void Qwen35SplitModel::splice_vision(sycl::queue& q, sycl::half* x, uint32_t sta
 std::string Qwen35SplitModel::forward_stage(uint32_t dev, uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0,
                                             sycl::half* x_host, bool pk) {
     if (T == 0) return "T == 0";
-    if (lane >= n_lanes() || n_dev_ != 2 || dev >= 2 || !lane_logits_) return "forward_stage: no such lane/card (lanes not initialised?)";
+    if (lane >= n_lanes() || n_dev_ > 2 || dev >= n_dev_ || !lane_logits_) return "forward_stage: no such lane/card (lanes not initialised?)";
     if (vision_active()) return "forward_stage: vision is staged but the lanes have no per-lane image state (P4 B45 step 3)";
     if (uint64_t(pos0) + T > lane_ctx(lane))
         return "forward_stage: rows [" + std::to_string(pos0) + ", " + std::to_string(pos0 + T) + ") past lane " +
@@ -1997,7 +1998,7 @@ std::string Qwen35SplitModel::forward_stage_rows(uint32_t dev, std::span<const u
                                                  const uint32_t* pos0, sycl::half* x_host) {
     const uint32_t G = uint32_t(lanes.size());
     if (G < 2 || G > kMaxRows) return "forward_stage_rows: " + std::to_string(G) + " rows (2.." + std::to_string(kMaxRows) + ")";
-    if (n_dev_ != 2 || dev >= 2 || !rows_logits_) return "forward_stage_rows: no such card (lanes not initialised?)";
+    if (n_dev_ > 2 || dev >= n_dev_ || !rows_logits_) return "forward_stage_rows: no such card (lanes not initialised?)";
     for (uint32_t i = 0; i < G; ++i) {
         if (lanes[i] >= n_lanes()) return "forward_stage_rows: no lane " + std::to_string(lanes[i]);
         if (pos0[i] == 0 || pos0[i] >= lane_ctx(lanes[i]))

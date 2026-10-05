@@ -31,12 +31,6 @@ ie::Q35mLaneShape crown_card() {
     return sh;
 }
 // One card of the 27B split (32 layers: 8 full attention + 24 DeltaNet; the q27_lanes_test shape)
-ie::Q35mLaneShape q27_card() {
-    ie::Q35mLaneShape sh;
-    sh.n_full = 8; sh.n_kv_heads = 4; sh.head_dim = 256;
-    sh.n_lin = 24; sh.v_heads = 48; sh.k_head_dim = 128; sh.v_head_dim = 128; sh.conv_channels = 10240; sh.conv_kernel = 4;
-    return sh;
-}
 // A lane's DeltaNet part (the crown's sticky checkpoint, Q35mLanesModel::init_sticky's per-lane need)
 uint64_t dn_bytes(ie::Q35mLaneShape sh) { sh.n_full = 0; return ie::q35m_lane_bytes(sh, 0); }
 
@@ -80,31 +74,6 @@ void test_plan() {
               ie::q4e_lane_ctx(ie::lanes_auto_plan(A::kFlashNext, 2, true, 0).slot_ctx, 262144) == 16384 &&
               ie::q4e_lane_ctx(ie::lanes_auto_plan(A::kFlashNext, 2, true, 0).slot_ctx, 8192) == 8192,
           "plan: lane ctx = the arch's default (crown 32768, 27B 65536) or 16384 on the host-expert archs, capped at --ctx");
-}
-
-// P4 B45 (4): the 27B split's prompt-cache bound beside a resident vision tower (q27_cache_fit). The numbers are the
-// 2026-10-02 load that was refused (ctx 32768, --mmproj, the BF16 tower): gmem 34.2 GB, weights 14.3, kv 1.1, dnb 0.076,
-// reserve 2 GiB, tower 1.6; 12 entries x (32,768 B a token x 32,768 + dnb) = 13.8 GB -> 33.0 of 34.2 (> 92 %).
-void test_cache_fit() {
-    const uint64_t gmem = 34200000000ull, per_tok = 32768, dnb = 76000000ull, reserve = 2147483648ull;
-    const uint64_t cap = uint64_t(0.92 * double(gmem));
-    const uint64_t fixed_text = 14300000000ull + 1100000000ull + dnb + reserve;   // no tower: 17.6 GB
-    const uint64_t fixed_vis  = fixed_text + 1600000000ull;                        // the tower on card 1: 19.2 GB
-    const auto a = ie::q27_cache_fit(gmem, fixed_text, 12, per_tok, dnb, 32768);
-    check(a.fits && !a.shrunk && a.max_prefix == 32768 && a.cache_bytes / 100000000 == 137,
-          "cache fit: without the tower the 13.8 GB cache fits (31.4 of 34.2) and is unchanged");
-    const auto b = ie::q27_cache_fit(gmem, fixed_vis, 12, per_tok, dnb, 32768);
-    check(b.fits && b.shrunk && b.max_prefix == 28672, "cache fit: with the tower the prefix shrinks 32768 -> 28672 (a multiple of 512)");
-    check(fixed_vis + b.cache_bytes <= cap, "cache fit: the shrunk total is within the 92 % line");
-    check(fixed_vis + ie::q27_cache_bytes(12, per_tok, dnb, b.max_prefix + 512) > cap, "cache fit: one step more would not fit");
-    check(b.cache_bytes / 100000000 == 121, "cache fit: the cache is 12.19 GB after the shrink (the load line prints 13.8 -> 12.2)");
-    const auto c = ie::q27_cache_fit(gmem, cap + 1, 12, per_tok, dnb, 32768);
-    check(!c.fits && !c.shrunk && c.max_prefix == 32768, "cache fit: the fixed part alone over the line = no shrink, the refusal stands");
-    const auto d = ie::q27_cache_fit(gmem, cap - 12 * (per_tok * 512 + dnb), 12, per_tok, dnb, 32768);
-    check(!d.fits && !d.shrunk, "cache fit: room for fewer than 1,024 tokens a prefix = the refusal stands");
-    const auto e = ie::q27_cache_fit(gmem, fixed_vis, 12, per_tok, dnb, 8192);
-    check(e.fits && !e.shrunk && e.max_prefix == 8192, "cache fit: a bound that already fits (IE_PROMPT_CACHE_MAX_PREFIX=8192's 4.1 GB) is unchanged");
-    check(!ie::q27_cache_fit(gmem, fixed_vis, 12, 0, dnb, 32768).shrunk, "cache fit: a card without KV (per_tok 0) never shrinks");
 }
 
 void test_fit_edges() {
@@ -202,44 +171,6 @@ void test_crown() {
     check(ie::lanes_auto_fit(c16, 16) == 16, "crown: 7 GiB free at --slot-ctx 16384 -> 16");
 }
 
-void test_q27() {
-    // Engine::load's [budget] rule for the 27B split, per card: weights + live KV + DeltaNet + banks + prompt cache at its
-    // caps + 2 GiB > 92 % of the card = refused. Fake card: 34.2 GB (what the gate logs print), weights 14.3 GB.
-    const ie::Q35mLaneShape sh = q27_card();
-    const uint64_t gmem = 34200000000ull, weights = 14300000000ull, reserve = 2ull << 30;
-    const uint64_t per_tok = 2ull * sh.n_full * sh.n_kv_heads * sh.head_dim * 2, dnb = dn_bytes(sh);
-    auto over = [&](uint64_t total) { return double(total) > 0.92 * double(gmem); };   // the engine's compare
-    struct Case { uint32_t ctx; bool cache; uint32_t want; };
-    for (const Case cs : {Case{8192, true, 16}, Case{16384, true, 12}, Case{32768, true, 1}, Case{16384, false, 16},
-                          Case{65536, false, 6}}) {
-        const uint32_t lane_ctx = ie::q27_lane_ctx(0, cs.ctx);
-        const uint64_t kv_live = per_tok * cs.ctx, bank = per_tok * lane_ctx + dnb;
-        const uint64_t cache = cs.cache ? 12 * (per_tok * cs.ctx + dnb) : 0;   // 12 entries x a full-depth endpoint
-        const uint64_t fixed = weights + kv_live + dnb + cache + reserve;
-        const std::vector<ie::LanesCardRoom> room{ie::q27_budget_room(gmem, fixed, bank), ie::q27_budget_room(gmem, fixed, bank)};
-        const uint32_t n = ie::lanes_auto_fit(room, 16);
-        const bool within = !over(fixed + uint64_t(n - 1) * bank);
-        const bool next_over = n == 16 || over(fixed + uint64_t(n) * bank);
-        check(n == cs.want && within && next_over,
-              "27B budget: --ctx " + std::to_string(cs.ctx) + (cs.cache ? "" : " --no-prompt-cache") + " -> " + std::to_string(n) +
-                  " lanes at ctx " + std::to_string(lane_ctx) + " (within the 92 % rule, one more would be refused)");
-    }
-    // the truncated cap never lets a pick through that the double compare refuses, at any card size
-    bool ok = true;
-    for (uint64_t g = 30000000000ull; g < 36000000000ull; g += 123456789ull)
-        for (uint64_t fixed = 20000000000ull; fixed < 32000000000ull; fixed += 777777777ull) {
-            const std::vector<ie::LanesCardRoom> room{ie::q27_budget_room(g, fixed, 616000000ull)};
-            const uint32_t n = ie::lanes_auto_fit(room, 16);
-            if (n > 1) ok = ok && !(double(fixed + uint64_t(n - 1) * 616000000ull) > 0.92 * double(g));
-        }
-    check(ok, "27B budget: no pick above 1 is refused by the [budget] check's own compare");
-    // init_lanes then picks within the budget's bound by the free VRAM (1.5 GiB reserve + the logits and partials)
-    const uint64_t lane16 = ie::q35m_lane_bytes(sh, 16384), res = 1536 * MiB, bufs = 300 * MiB;
-    std::vector<ie::LanesCardRoom> fr{{17 * GiB, lane16, 0, res + bufs}, {17 * GiB, lane16, 0, res + bufs}};
-    check(ie::lanes_auto_fit(fr, 12) == 12, "27B: 17 GiB free holds the budget's 12 lanes at 16K");
-    fr[1].avail = 6 * GiB;
-    check(ie::lanes_auto_fit(fr, 12) == 8, "27B: a card with only 6 GiB free cuts the budget's 12 to 8");
-}
 
 void test_line() {
     const std::vector<ie::LanesCardRoom> c{{9500 * MiB, 350 * MiB, 31 * MiB, 3686 * MiB}, {9932 * MiB, 350 * MiB, 31 * MiB, 3686 * MiB}};
@@ -266,9 +197,7 @@ void test_line() {
 int main() {
     test_plan();
     test_fit_edges();
-    test_cache_fit();
     test_crown();
-    test_q27();
     test_line();
     std::printf("%s (%d failure(s))\n", g_fail ? "FAIL" : "ALL PASS", g_fail);
     return g_fail ? 1 : 0;

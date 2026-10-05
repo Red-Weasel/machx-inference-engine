@@ -329,6 +329,18 @@ Each is on by default and read once per process; `=0` restores the previous path
 Diagnostics: `IE_QWEN35_PFPROF=1` / `IE_Q4E_PFPROF=1` print where a prefill's time goes; `IE_DEBUG_PICKS=1` prints
 every sampled token.
 
+## One card, the prompt cache's room, warnings (v0.2.20)
+
+| switch | what it controls |
+|---|---|
+| `IE_QWEN35_ONE_CARD_SPLIT`, `IE_Q35MOE_ONE_CARD_SPLIT` | `=0`: `--gpus 1` keeps the previous one-card path for the 27B / the 35B-A3B class (default: the two-card model's code on one stage for Q8_0 / Q6_K / Q5_K files) |
+| `IE_PROMPT_CACHE_VRAM_MIB` | the prompt cache's room per card on the 27B and 35B-A3B splits (default: the VRAM the card reports free after the load, less 2 GiB of working buffers) |
+| `IE_Q35MOE_LANE_LADDER` | `=0`: no in-place restart points on the 35B-A3B class's lead request lane |
+| `IE_Q4E_NO_PIN_BANKS=1` | Flash-Next reads its expert weights from disk instead of pinning them in system RAM |
+
+The 27B takes one request lane unless `--parallel N` is given. Memory estimates print a `WARNING` and the load goes on;
+see the README's "A load is tried as asked".
+
 ## Lookup drafts and restart points (v0.2.18)
 
 `--spec` turns the lookup drafts on (on the 27B together with its MTP draft head); without it decoding is unchanged.

@@ -204,7 +204,13 @@ std::string Mimo26Forward::upload_card(Card& c) {
         const uint64_t tier_min = first < c.L1 ? uint64_t(c.L1 - first) * lay.bytes * (opt_.n_static ? opt_.n_static + opt_.stream_slots : opt_.stream_slots + 1) +
                                                  ds4_expert_batch_ws_bytes(T, cfg.n_activated_experts, H, cfg.moe_inter_dim) : 0;
         const uint64_t reserve = uint64_t(reserve_gib * 1073741824.0) + tier_min + (ci == 0 ? opt_.reserve_card0 : 0);
-        if (auto e = mimo26_lanes_fit(free_now, per, uint32_t(lanes_.size() - 1), reserve, uint32_t(ci), lctx); !e.empty()) return e;
+        if (auto e = mimo26_lanes_fit(free_now, per, uint32_t(lanes_.size() - 1), reserve, uint32_t(ci), lctx); !e.empty()) {
+            // P4 B61: the free-memory reserve is advice (a warning, the load goes on); what stays a limit is the experts'
+            // minimum tier, without which a step cannot run
+            const uint64_t hard = tier_min + (ci == 0 ? opt_.reserve_card0 : 0);
+            if (auto e2 = mimo26_lanes_fit(free_now, per, uint32_t(lanes_.size() - 1), hard, uint32_t(ci), lctx); !e2.empty()) return e2;
+            std::fprintf(stderr, "[mimo26] WARNING: %s -- the load goes on as asked\n", e.c_str());
+        }
         const uint64_t b0 = c.bytes;
         for (size_t l = 1; l < lanes_.size(); ++l)
             for (uint32_t L = c.L0; L < c.L1; ++L) {

@@ -135,7 +135,11 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
         const uint64_t avail = ds41_mem_available_bytes();
         const uint64_t cap_free = avail > kFreeAfterPin ? avail - kFreeAfterPin : 0;
         if (cap_free < pin_cap) { pin_cap = cap_free; why += "; then min with MemAvailable - 30 GiB kept free after the pin"; }
-        if (!pin_cap) return "init_resident: less than 30 GiB would stay available after any pin (" + why + ")";
+        if (!pin_cap) {   // P4 B61: a warning, the load goes on: half of what is available is pinned, the rest streams from disk
+            pin_cap = std::max<uint64_t>(avail / 2, 1ull << 30);
+            std::fprintf(stderr, "[ds41 forward] WARNING: less than 30 GiB of system RAM would stay available after any pin (%s); the load "
+                                 "goes on with a %.1f GiB pin\n", why.c_str(), double(pin_cap) / 1073741824.0);
+        }
         std::fprintf(stderr, "[ds41 forward] pinned host cap %.1f GiB from the live rule: %s\n", double(pin_cap) / 1073741824.0, why.c_str());
     }
 

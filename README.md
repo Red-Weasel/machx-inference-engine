@@ -1,7 +1,7 @@
 
 # Mach X — LLM Inference Engine for Intel Arc
 
-**A C++/SYCL local LLM inference engine for Intel Arc GPUs, built and tuned on two Arc Pro B70 cards. XMX kernels, quantized models and multi-GPU execution. New in v0.2.18: replies that copy text already in the conversation — file edits, quoted code — are written several times faster with `--spec` on the Qwen models (a 1,800-token file edit: 108 s → 28 s on Qwen3.8-27B, 24 s → 7 s on the 35B-A3B class, 69 s → 31 s on Flash-Next), a conversation edited in the middle restarts from the nearest saved point instead of being read again, and the 27B loads at long context with the prompt cache on. Since v0.2.13 the Qwen models read prompts 1.4–3.7× faster (Qwen3.8-27B at about 3,000 tok/s).**
+**A C++/SYCL local LLM inference engine for Intel Arc GPUs, built and tuned on two Arc Pro B70 cards. XMX kernels, quantized models and multi-GPU execution. New in v0.2.20: one Arc Pro B70 now runs the Qwen models on the same fast code as two — Qwen3.8-27B (Q6_K) reads at about 820 tok/s and writes at 22 (33 with `--spec`), the 35B-A3B class (Q5_K_M) reads at about 1,300 and writes at 87 — and a load is tried as asked: memory estimates warn, they do not refuse. Since v0.2.18, replies that copy text already in the conversation are written several times faster with `--spec` (a 1,800-token file edit: 108 s → 28 s on the 27B, 24 s → 7 s on the 35B-A3B class, 69 s → 31 s on Flash-Next) and a conversation edited in the middle restarts from a saved point.**
 
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue)
 ![Language](https://img.shields.io/badge/C%2B%2B20-SYCL%20%2F%20DPC%2B%2B-orange)
@@ -40,6 +40,70 @@ class ([New in v0.2.6](#new-in-v026)).
 
 ![DeepSeek-V4.1-Flash running locally in the Dream Agent Harness, served by Mach X on two Arc Pro B70 cards](docs/images/dream-deepseek-v41.png)
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
+
+---
+
+<a id="new-in-v0220"></a>
+## 🆕 New in v0.2.20
+
+Everything since [v0.2.18](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.18). Every figure was
+measured on October 5, 2026, on Arc Pro B70 cards, on community fine-tunes of the models; "bench" is `ie-prompt-bench`
+(prompt cache off, greedy, prompts of 2,404 and 10,693 tokens), "serve" is `ie serve` with an OpenAI client.
+
+### One card
+
+Most people have one card. Until now `--gpus 1` put the Qwen models on older code: the 27B on an fp16 path, and the
+35B-A3B class on a loader that did not accept a Q5_K_M or Q6_K file at all (`token_embd: unsupported dtype`). A Q8_0,
+Q6_K or Q5_K file on one card now runs the two-card model's code on a single stage, so one card gets the same prefill and
+decode kernels, the prompt cache, `--spec` with its lookup drafts, the in-place restart points and the request lanes.
+
+| one Arc Pro B70 | prefill, tok/s (2.4K / 10.7K) | decode, tok/s | with `--spec` |
+|---|---:|---:|---|
+| Qwen3.8-27B Q6_K, before | 190 / 173 | 13.1 / 12.5 | |
+| Qwen3.8-27B Q6_K, now | **823 / 830** | **22.0 / 20.4** | 32.6 / 19.8 tok/s |
+| 35B-A3B class Q5_K_M, before | did not load | | |
+| 35B-A3B class Q5_K_M, now | **1,337 / 1,304** | **87.2 / 82.9** | a 1,800-token file edit 22.2 s → 9.4 s |
+
+- **Replies are the two-card ones**: three greedy file edits gave byte-equal replies on one card and on two, on both models.
+- **Several requests at once on one card.** The 35B-A3B class picks its request lanes by what the card has free: 3 with
+  the Q5_K_M file (four 1,800-token edits and a question at once: 64.9 s, 45.1 s with `--spec`). The 27B takes one lane
+  unless `--parallel N` says more.
+- **What fits one 32 GB card**: the model file plus the context. The 27B at Q6_K (22.4 GB) or Q5_K (19.5 GB) and the
+  35B-A3B class at Q5_K_M (25.3 GB) were run; the 27B at Q8_0 (29.0 GB) is tight and was not run; the 35B at Q8_0 (37.8 GB)
+  does not fit. Other files (Q4_K_M) keep the previous one-card path.
+- `IE_QWEN35_ONE_CARD_SPLIT=0` / `IE_Q35MOE_ONE_CARD_SPLIT=0` restore the previous one-card paths.
+
+### A load is tried as asked
+
+The engine no longer refuses a load from a memory estimate.
+
+- **Qwen3.8-27B**: its load-time memory check is gone. It loads at `--ctx 250000` with the prompt cache and `--spec` on.
+- **The prompt cache gets what is free.** On the 27B and the 35B-A3B class the cache's room is the VRAM each card reports
+  free after the model, the context and the lanes are allocated (less 2 GiB for the first request's working buffers):
+  6.1 GB a card on the 27B at `--ctx 200000`, 12.4 GB on the 35B-A3B class at one lane. `IE_PROMPT_CACHE_VRAM_MIB` sets it.
+- **Estimates warn.** A lane count the free-memory measure says is too large (27B, 35B-A3B class), Flash-Next's and GLM's
+  system-RAM checks, DeepSeek-V4.1's pinned-RAM floor and MiMo's free-memory reserve print a `WARNING` and the load goes
+  on. Pinned system RAM cannot be swapped: a model that pins more than the machine has can stall it, and an over-filled
+  card can take the display driver down. That choice is now the user's.
+- **What still stops a load**: an allocation that really fails, and the two minimums without which a step cannot run
+  (MiMo's smallest expert tier, DeepSeek-V4.1's stream partition).
+
+### Restart points on the lead lane
+
+With request lanes on the 35B-A3B class, the lane that holds the long conversation (lane 0, the one at `--ctx`) now keeps
+the in-place restart points of v0.2.18: after one line changed two thirds into a 29,300-token conversation the next
+request took 7.8 s instead of 10.8 s, and the edited prompt with another question 5.9 s instead of 9.0 s; all six
+replies byte-equal with them on and off. Sixteen busy lanes cost nothing measurable (56–58 s with, 55–58 s without).
+`IE_Q35MOE_LANE_LADDER=0` turns them off. A conversation short enough for a small lane (`--slot-ctx`) is served there,
+without them.
+
+### What is still slow, and not checked
+
+- **Not run on one card**: Flash-Next, the DeepSeek, GLM and MiMo models (they lean on two cards and a lot of RAM), the
+  27B at Q8_0, images.
+- **Not run**: a load that truly does not fit, and the warning paths themselves (they need a machine short of memory).
+- **An explicit `--parallel N` on one card** is tried even when it will not fit; the automatic count is the safe one.
+- Everything listed under [New in v0.2.18](#new-in-v0218) still holds.
 
 ---
 
@@ -132,10 +196,9 @@ and 30 MiB on the 35B-A3B class, allocated on first use.
 
 ### The 27B loads at long context with the prompt cache on
 
-The load-time memory check on the 27B counted twelve saved prompts each as large as the whole context (99 GB a card
-at `--ctx 250000`) and refused the load, although the context itself fit (24.5 of 34.2 GB). The check no longer
-refuses: the prompt cache gets the memory the cards have left, drops its oldest entries to stay inside it, and skips a
-snapshot that alone does not fit. A card whose weights and context alone pass 92 % prints a warning.
+The 27B's load used to estimate memory and could refuse a long context although it fit. It no longer does (see
+[New in v0.2.20](#new-in-v0220)): the prompt cache gets the memory the cards have free, drops its oldest entries to stay
+inside it, and skips a snapshot that alone does not fit.
 
 ### Switches
 

@@ -1,15 +1,24 @@
 # IE Engine — v1 RELEASE
 
-> **Current release: v0.2.18 (October 2026).** This file is the record of the first release, of June 9, 2026, kept as
+> **Current release: v0.2.20 (October 2026).** This file is the record of the first release, of June 9, 2026, kept as
 > written; its figures are for one Arc Pro B70 and a Q4_K_M model and are not comparable with the two-card figures
-> below. Later releases are described in the README ("New in v0.2.18", "New in v0.2.13", "New in v0.2.8", "New in v0.2.6", "In v0.2.0") and in the GitHub
+> below. Later releases are described in the README ("New in v0.2.20", "New in v0.2.18", "New in v0.2.13", "New in v0.2.8", "New in v0.2.6", "In v0.2.0") and in the GitHub
 > release notes:
+> [v0.2.20](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.20),
 > [v0.2.18](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.18),
 > [v0.2.13](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.13),
 > [v0.2.8](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.8),
 > [v0.2.6](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.6),
 > [v0.2.0](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.0),
 > [v0.1.0](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.1.0).
+>
+> **v0.2.20 in short** (Arc Pro B70 cards, measured October 5, 2026):
+> - One card runs the Qwen models on the two-card code: Qwen3.8-27B Q6_K prefill 190 / 173 -> 823 / 830 tok/s and decode
+>   13.1 / 12.5 -> 22.0 / 20.4; the 35B-A3B class Q5_K_M, which did not load on one card, 1,337 / 1,304 and 87.2 / 82.9
+>   tok/s; request lanes, `--spec`, the prompt cache and the restart points on one card; replies byte-equal to two cards.
+> - A load is tried as asked: the 27B's load-time memory check is gone, the prompt cache gets the VRAM the cards report
+>   free, and the remaining memory estimates (lanes, system-RAM pins) warn instead of refusing.
+> - Restart points on the 35B-A3B class's lead request lane.
 >
 > **v0.2.18 in short** (two Arc Pro B70 cards, measured October 4-5, 2026; versions 0.2.14 to 0.2.18):
 > - With `--spec`, a reply that copies text already in the conversation is drafted from that text and checked in one

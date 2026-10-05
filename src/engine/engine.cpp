@@ -981,7 +981,19 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         // TENSOR-PARALLEL path: IE_QWEN35_TP=1 + --gpus>1 → both cards on the same
         // token (Megatron). Mutually exclusive with the layer-split Q8 path below.
         const bool use_tp = opts.n_gpus > 1 && std::getenv("IE_QWEN35_TP");
-        const bool use_split = !use_tp && (opts.n_gpus > 1 || std::getenv("IE_QWEN35_Q8"));
+        // P4 B58: ONE card takes the split model too (one stage) when the file is one it packs natively (Q8_0 / Q6_K /
+        // Q5_K): its prefill and decode kernels, prompt cache, --spec with lookup drafts and restart points are the
+        // two-card path's. Measured 2026-10-05 (Q6_K, one B70, 2.4K / 10.7K-token prompts): prefill 190 / 173 -> 818 / 827
+        // tok/s, decode 13.1 / 12.5 -> 21.9 / 20.2. IE_QWEN35_ONE_CARD_SPLIT=0 keeps the F16 Qwen35DenseModel; other
+        // files (Q4_K_M, ...) stay on it.
+        const bool one_card_split = [&] {
+            if (opts.n_gpus > 1) return false;
+            if (const char* v = std::getenv("IE_QWEN35_ONE_CARD_SPLIT"); v && *v == '0') return false;
+            const auto* t = e->gguf_.find_tensor("blk.0.ffn_up.weight");
+            return t && (t->dtype == DType::kQ8_0 || t->dtype == DType::kQ6_K || t->dtype == DType::kQ5_K);
+        }();
+        const bool use_split = !use_tp && (opts.n_gpus > 1 || std::getenv("IE_QWEN35_Q8") || one_card_split);
+        if (one_card_split) std::fprintf(stderr, "[qwen35] one card: the split model's kernels on one stage (IE_QWEN35_ONE_CARD_SPLIT=0 = the previous one-card path)\n");
         if (use_tp) {
             // P2P transfers are OFF everywhere (2026-08-16): on this client bridge
             // peer READS return garbage (standalone test: 100% corrupt) and peer
@@ -1030,11 +1042,9 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                 pcfg.max_prefix_len = opts.max_ctx;
                 if (const char* s = std::getenv("IE_PROMPT_CACHE_MAX_PREFIX"))
                     if (unsigned v = unsigned(std::atoi(s))) pcfg.max_prefix_len = v;
-                // Entry cap (IE_PROMPT_CACHE_MAX_ENTRIES): the cache's VRAM
-                // worst case is max_entries × a full-depth endpoint. At long
-                // --ctx that unbounded product is what overcommitted VRAM and
-                // took the GPU driver (and the desktop) down on 2026-08-26 —
-                // the load-time budget check below now accounts for it.
+                // Entry cap (IE_PROMPT_CACHE_MAX_ENTRIES). The cache's bytes are bounded by
+                // what the cards have free (q_prompt_cache_room, P4 B60), not by a count
+                // of full contexts.
                 if (const char* s = std::getenv("IE_PROMPT_CACHE_MAX_ENTRIES"))
                     if (unsigned v = unsigned(std::atoi(s))) pcfg.max_entries = v;
                 e->split_cache_cfg_ = pcfg;
@@ -1058,13 +1068,9 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             // lanes use as lane 0). (--int8-kv with --parallel > 1 is refused at the CLI; init_lanes refuses it too.)
             const bool q27_lanes_on = !e->spec_ &&
                                       [] { const char* v = std::getenv("IE_QWEN35_LANES"); return !(v && *v == '0'); }();
-            // P4 B30: no --parallel = lanes (never the joint-step path), as many as the [budget] check below allows and then
-            // init_lanes finds free (lanes_auto.hpp)
-            const bool q27_auto = opts.parallel == kLanesAuto &&
-                                  lanes_auto_plan(LanesArch::kQwen35Split, e->fleet_.size(), q27_lanes_on && e->fleet_.size() == 2,
-                                                  opts.slot_ctx).measure;
+            // P4 B60: no --parallel = ONE request lane on the 27B (as it has been in practice); --parallel N sets the count
+            const bool q27_auto = false;
             const bool q27_lanes = (opts.parallel > 1 && q27_lanes_on) || q27_auto;
-            uint32_t q27_budget_n = 1;   // (auto: the most lanes the [budget] check allows)
             if (opts.parallel > 1 && !q27_lanes)
                 std::fprintf(stderr, "[qwen35split] --parallel %u: the joint-step path (%s)\n", opts.parallel,
                              e->spec_ ? "--spec" : "IE_QWEN35_LANES=0");
@@ -1082,133 +1088,12 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                 if (auto m = e->qvis_load_tower(); !m.empty()) { err = m; return nullptr; }
                 vis_bytes = e->qvis_tower_->gpu_weight_bytes() + e->qvis_tower_->gpu_scratch_bytes(kVisMaxPatches);
             }
-            // --- Load-time VRAM budget check (added after the 2026-08-26
-            // desktop crash). This stack has NO free-VRAM query and driver
-            // OOM at run time is NOT graceful — it killed the xe driver and
-            // rebooted the machine. So the worst case is computed HERE, from
-            // arithmetic, and an over-committed config is refused with the
-            // numbers instead of loaded on hope. Worst case per card =
-            // weights + live KV @max_ctx + DeltaNet + decode banks + prompt
-            // cache at its configured caps + a flat workspace reserve. ---
-            {
-                auto& model = e->qwen35_split_model_;
-                uint32_t sctx = opts.slot_ctx ? opts.slot_ctx : 65536u;
-                sctx = std::min<uint32_t>(sctx, opts.max_ctx);
-                const std::vector<uint64_t> wbytes = model.device_bytes();
-                const uint64_t reserve = uint64_t(2) << 30;   // workspaces/partials/logits
-                // card d's worst case but the banks; a bank = kv_slot + dnb (P4 B30: the auto pick and the check share it)
-                struct Budget { uint64_t gmem = 0, weights = 0, kv_live = 0, kv_slot = 0, dnb = 0, cache = 0, vision = 0; };
-                auto budget_of = [&](uint32_t d) {
-                    Budget b;
-                    b.gmem = e->fleet_.dev(d).device()
-                        .get_info<sycl::info::device::global_mem_size>();
-                    b.weights = d < wbytes.size() ? wbytes[d] : 0;
-                    b.vision = d == model.head_dev() ? vis_bytes : 0;   // P4 B45: the tower's card (weights + the scratch cap)
-                    if (model.dev_has_kv(d)) {
-                        const auto& kc = model.kv_cache(d).config();
-                        const uint64_t per_tok = uint64_t(kc.n_layers_full) *
-                            kc.n_kv_heads * kc.head_dim * 2 /*K+V*/ * 2 /*fp16*/;
-                        b.kv_live = per_tok * kc.max_ctx;
-                        b.kv_slot = per_tok * sctx;
-                    }
-                    if (model.dev_has_dn(d)) {
-                        const auto& dn = model.dn_state(d);
-                        b.dnb = dn.state_elems_per_layer() * dn.config().n_layers_linear * 4 +
-                                dn.conv_elems_per_layer()  * dn.config().n_layers_linear * 2;
-                    }
-                    if (e->prompt_cache_on_) {
-                        const uint64_t ep_tok = std::min<uint64_t>(
-                            e->split_cache_cfg_.max_prefix_len, opts.max_ctx);
-                        uint64_t per_tok = 0;
-                        if (model.dev_has_kv(d)) {
-                            const auto& kc = model.kv_cache(d).config();
-                            per_tok = uint64_t(kc.n_layers_full) * kc.n_kv_heads *
-                                      kc.head_dim * 2 * 2;
-                        }
-                        b.cache = uint64_t(e->split_cache_cfg_.max_entries) *
-                                  (per_tok * ep_tok + b.dnb);
-                    }
-                    return b;
-                };
-                // P4 B45 (4): a resident vision tower on the head card can push that card over the line (ctx 32768 + the
-                // BF16 tower: 33.0 of 34.2 GB, 2026-10-02): the prompt cache's prefix bound then shrinks to the largest
-                // multiple of 512 that fits (q27_cache_fit, lanes_auto.hpp) instead of the load refusing. IE_PROMPT_CACHE_MAX_PREFIX
-                // stays the explicit bound: set, nothing shrinks and the refusal below stands.
-                if (vis_bytes && e->prompt_cache_on_ && !std::getenv("IE_PROMPT_CACHE_MAX_PREFIX")) {
-                    const uint32_t d = model.head_dev();
-                    const Budget b = budget_of(d);
-                    const uint64_t banks = opts.parallel > 1 ? (q27_lanes ? opts.parallel - 1 : opts.parallel) * (b.kv_slot + b.dnb) : 0;
-                    uint64_t per_tok = 0;
-                    if (model.dev_has_kv(d)) {
-                        const auto& kc = model.kv_cache(d).config();
-                        per_tok = uint64_t(kc.n_layers_full) * kc.n_kv_heads * kc.head_dim * 2 * 2;
-                    }
-                    const uint32_t pre0 = std::min<uint32_t>(e->split_cache_cfg_.max_prefix_len, opts.max_ctx);
-                    const Q27CacheFit fit = q27_cache_fit(b.gmem, b.weights + b.kv_live + b.dnb + banks + b.vision + reserve,
-                                                          e->split_cache_cfg_.max_entries, per_tok, b.dnb, pre0);
-                    if (fit.shrunk) {
-                        std::fprintf(stderr, "[budget] card %u: prompt cache max %.1f -> %.1f GB (prefix %u -> %u tokens) to fit the vision "
-                                             "tower (IE_PROMPT_CACHE_MAX_PREFIX sets the bound explicitly)\n",
-                                     d, b.cache / 1e9, fit.cache_bytes / 1e9, pre0, fit.max_prefix);
-                        e->split_cache_cfg_.max_prefix_len = fit.max_prefix;
-                        e->fleet_cache_.set_max_prefix_len(fit.max_prefix);
-                    }
-                }
-                uint32_t n_par = std::max<uint32_t>(opts.parallel, 1u);
-                if (q27_auto) {   // P4 B30: the most lanes, up to 16, whose banks keep every card within the 92 % below
-                    std::vector<LanesCardRoom> room;
-                    for (uint32_t d = 0; d < e->fleet_.size(); ++d) {
-                        const Budget b = budget_of(d);
-                        room.push_back(q27_budget_room(b.gmem, b.weights + b.kv_live + b.dnb + b.cache + b.vision + reserve, b.kv_slot + b.dnb));
-                    }
-                    n_par = q27_budget_n = lanes_auto_fit(room, kLanesAutoMax);
-                }
-                // P4 B54 (2026-10-04): no load is refused here any more. The prompt cache's worst case
-                // (max_entries full-depth snapshots: 99 GB a card at --ctx 250000) was what refused; the cache now gets a
-                // per-card byte budget = what the card has left under the 92 % line, and insert() evicts the least
-                // recently used snapshots (or skips one that alone does not fit) to stay inside it. A card whose
-                // weights + context + banks alone pass the line gets a WARNING line, not a refusal.
-                uint64_t cache_room = UINT64_MAX;
-                bool cache_over = false;
-                for (uint32_t d = 0; d < e->fleet_.size(); ++d) {
-                    const Budget b = budget_of(d);
-                    // (the lanes: n_par - 1 extra, lane 0 is the live state; the joint step: n_par banks)
-                    const uint64_t banks = (n_par > 1) ? (q27_lanes ? n_par - 1 : n_par) * (b.kv_slot + b.dnb) : 0;
-                    const uint64_t total = b.weights + b.kv_live + b.dnb + banks + b.cache + b.vision + reserve;
-                    char line[320];
-                    if (b.vision)   // P4 B45: the vision tower's card
-                        std::snprintf(line, sizeof line,
-                            "[budget] card %u: weights %.1f + kv %.1f + banks %.1f + "
-                            "cache-max %.1f + vision %.1f + reserve 2.0 = %.1f GB of %.1f GB\n",
-                            d, b.weights / 1e9, b.kv_live / 1e9,
-                            banks / 1e9, b.cache / 1e9, b.vision / 1e9, total / 1e9, b.gmem / 1e9);
-                    else
-                    std::snprintf(line, sizeof line,
-                        "[budget] card %u: weights %.1f + kv %.1f + banks %.1f + "
-                        "cache-max %.1f + reserve 2.0 = %.1f GB of %.1f GB\n",
-                        d, b.weights / 1e9, b.kv_live / 1e9,
-                        banks / 1e9, b.cache / 1e9, total / 1e9, b.gmem / 1e9);
-                    std::fputs(line, stderr);
-                    // P4 B57: the in-place restart points' copies (ie/dn_ladder.hpp: up to 16 + 2 DeltaNet states a card,
-                    // allocated on first use) come out of what the prompt cache may use
-                    const bool lad_cfg = e->prompt_cache_on_ && !opts.int8_kv && n_par <= 1 &&
-                                         ![] { const char* v = std::getenv("IE_DN_LADDER"); return v && *v == '0'; }();
-                    const uint64_t line92 = uint64_t(0.92 * double(b.gmem)), fixed = total - b.cache + (lad_cfg ? 18ull * b.dnb : 0);
-                    if (fixed > line92)
-                        std::fprintf(stderr, "[budget] WARNING card %u: weights + context + banks need %.1f GB, over 92 %% of the "
-                                             "card (%.1f GB); the load goes on (no refusal)\n", d, fixed / 1e9, line92 / 1e9);
-                    cache_room = std::min(cache_room, fixed < line92 ? line92 - fixed : uint64_t(1));
-                    if (total > line92) cache_over = true;
-                }
-                if (e->prompt_cache_on_ && cache_over) {
-                    e->fleet_cache_.set_limits(e->split_cache_cfg_.max_entries, cache_room);
-                    std::fprintf(stderr, "[budget] prompt cache: up to %u saved prompts in %.1f GB a card (what the cards have left); "
-                                         "the oldest are dropped to stay inside it\n",
-                                 e->split_cache_cfg_.max_entries, cache_room / 1e9);
-                }
-            }
-            // P4 B45: the tower onto the head card now that the budget passed -- before the lanes, so the auto-fit's free-VRAM
-            // measure (init_lanes) sees it.
+            // P4 B60 (2026-10-05): there is NO load-time memory rule here any more. The block that stood here priced a "worst
+            // case" (weights + context + banks + the prompt cache at max_entries full-depth snapshots) and refused or shrank
+            // the load from it. A load is tried as asked: what the user sets is what is allocated, and an allocation the card
+            // cannot make fails as itself. The prompt cache gets what the cards really have left, measured after everything
+            // else is allocated (q_prompt_cache_room below).
+            // P4 B45: the tower onto the head card before the lanes, so their free-VRAM measure sees it.
             if (vis_bytes) { if (auto m = e->qvis_upload_tower(); !m.empty()) { err = m; return nullptr; } }
             // --parallel>1: allocate the per-slot decode banks and spawn the
             // joint-step scheduler (Phase 2b). Bank alloc failure is a clean
@@ -1219,30 +1104,16 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                 constexpr uint64_t kReserve = 1536ull << 20;   // per card, left free after the lanes (the crown's pick, not measured)
                 const uint32_t pf = q27_prefill_chunk(opts.max_ctx, std::getenv("IE_QWEN35_PREFILL_CHUNK"));
                 const uint32_t lane_ctx = q27_lane_ctx(opts.slot_ctx, opts.max_ctx);
-                LanesAutoFit fit;   // P4 B30 auto: init_lanes picks, within the budget's bound, what the free VRAM holds
-                fit.n_max = q27_budget_n;
-                if (auto m = e->qwen35_split_model_.init_lanes(opts.parallel, lane_ctx, pf, kReserve,
-                                                               q27_auto && q27_budget_n > 1 ? &fit : nullptr);
+                if (auto m = e->qwen35_split_model_.init_lanes(opts.parallel, lane_ctx, pf, kReserve, nullptr);
                     !m.empty()) {
                     err = "qwen35 split --parallel " + (q27_auto ? std::string("auto") : std::to_string(opts.parallel)) + ": " + m +
                           " (IE_QWEN35_LANES=0 serves them through the joint-step path)";
                     return nullptr;
                 }
                 e->lane_ctx_ = e->qwen35_split_model_.n_lanes() > 1 ? lane_ctx : 0u;   // P4 B38
-                if (q27_auto) {
-                    opts.parallel = e->opts_.parallel = e->qwen35_split_model_.n_lanes();
-                    std::fprintf(stderr, "%s\n", (q27_budget_n > 1
-                        ? lanes_auto_line("qwen35", opts.parallel, lane_ctx, "the most, up to the " + std::to_string(q27_budget_n) +
-                                          " the [budget] check above allows, that the free VRAM holds beside the 1.50 GiB "
-                                          "reserve, the logits and the rows partials", fit.cards)
-                        : lanes_auto_line("qwen35", 1, 0, "the [budget] check above has no room for a lane at ctx " +
-                                                              std::to_string(lane_ctx))).c_str());
-                }
             } else if (opts.parallel == kLanesAuto) {   // P4 B30: no lanes on this load
                 opts.parallel = e->opts_.parallel = 1;
-                std::fprintf(stderr, "%s\n", lanes_auto_line("qwen35", 1, 0, e->spec_ ? "--spec (the joint-step path is explicit only)"
-                                                                     : !q27_lanes_on ? "IE_QWEN35_LANES=0"
-                                                                                     : "the lanes need the two-card split").c_str());
+                std::fprintf(stderr, "%s\n", lanes_auto_line("qwen35", 1, 0, "the 27B's default").c_str());
             } else if (opts.parallel > 1) {
                 uint32_t sctx = opts.slot_ctx ? opts.slot_ctx : 65536u;
                 sctx = std::min<uint32_t>(sctx, opts.max_ctx);
@@ -1257,6 +1128,7 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                     opts.parallel, sctx);
                 e->stepper_spawn_();
             }
+            e->q_prompt_cache_room(e->qwen35_split_model_, "qwen35");
             vocab = qcfg.dense.vocab;
         } else {
         if (auto m = e->qwen35_.load(e->alloc_, e->gguf_, qcfg); !m.empty()) { err = "model: " + m; return nullptr; }
@@ -1513,16 +1385,24 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             std::fprintf(stderr, "[spec] gemma4 MTP head: %s\n", head_path.c_str());
         }
         vocab = gcfg.vocab;
-    } else if (e->arch_ == ModelArch::kQwen35Moe && opts.n_gpus > 1) {
+    } else if (e->arch_ == ModelArch::kQwen35Moe &&
+               (opts.n_gpus > 1 || [&] {   // P4 B58: one card takes the split model (one stage) for Q8_0 / Q6_K / Q5_K files
+                    if (const char* v = std::getenv("IE_Q35MOE_ONE_CARD_SPLIT"); v && *v == '0') return false;
+                    const auto* t = e->gguf_.find_tensor("token_embd.weight");
+                    return t && (t->dtype == DType::kQ8_0 || t->dtype == DType::kQ6_K || t->dtype == DType::kQ5_K);
+                }())) {
         // Crown (kQwen35Moe) all-Q8_0 LAYER-SPLIT across the fleet. The ~34 GiB Q8_0
         // crown won't fit one 32 GB card and the single-GPU QwenModel has no other
         // multi-GPU path. Per-card weights + KV/DeltaNet; host-logits bounce like the
         // 27B split. The single-GPU crown (model_) is untouched → PPL gate safe.
         QwenConfig cfg;
-        if (auto m = e->fleet_.init(opts.n_gpus, "B70", false, /*shared_ctx=*/false); !m.empty()) { err = "fleet: " + m; return nullptr; }
-        if (e->fleet_.size() < 2) { err = "layer-split needs >=2 GPUs (have " +
+        const uint32_t q35m_cards = std::max<uint32_t>(opts.n_gpus, 1u);
+        if (auto m = e->fleet_.init(q35m_cards, "B70", false, /*shared_ctx=*/false); !m.empty()) { err = "fleet: " + m; return nullptr; }
+        if (q35m_cards > 1 && e->fleet_.size() < 2) { err = "layer-split needs >=2 GPUs (have " +
                                           std::to_string(e->fleet_.size()) + ")"; return nullptr; }
-        LayerPlan plan = LayerPlan::contiguous(cfg.n_layers, opts.n_gpus);
+        if (q35m_cards == 1)
+            std::fprintf(stderr, "[qwen35moe] one card: the split model's kernels on one stage (IE_Q35MOE_ONE_CARD_SPLIT=0 = the previous one-card path)\n");
+        LayerPlan plan = LayerPlan::contiguous(cfg.n_layers, q35m_cards);
         if (auto m = e->qwen35moe_split_model_.load(e->fleet_, plan, e->gguf_, cfg, opts.max_ctx, opts.int8_kv); !m.empty())
             { err = "model: " + m; return nullptr; }
         e->qwen35moe_split_ = true;
@@ -1568,8 +1448,9 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         // lane's sticky checkpoint (P4 B29) and, with the prompt cache on, kLanesAutoCacheFloor for its snapshots
         const bool q35m_lanes_on = [] { const char* v = std::getenv("IE_Q35MOE_LANES"); return !(v && *v == '0'); }();
         const bool q35m_auto = opts.parallel == kLanesAuto &&
-                               lanes_auto_plan(LanesArch::kCrownSplit, e->fleet_.size(), q35m_lanes_on && e->fleet_.size() == 2,
-                                               opts.slot_ctx).measure;
+                               // (P4 B58: the lanes run on one card too -- one stage; the plan's "two cards" rule is asked as 2)
+                               lanes_auto_plan(LanesArch::kCrownSplit, std::max<uint32_t>(uint32_t(e->fleet_.size()), 2u),
+                                               q35m_lanes_on && e->fleet_.size() <= 2, opts.slot_ctx).measure;
         if ((opts.parallel > 1 && q35m_lanes_on) || q35m_auto) {
             constexpr uint64_t kReserve = 1536ull << 20;   // per card, left free after the lanes (a pick, unverified)
             const uint32_t pf = q35m_prefill_chunk(opts.max_ctx, std::getenv("IE_QWEN36_NO_MOE_ONEDNN"),
@@ -1594,6 +1475,7 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             std::fprintf(stderr, "%s\n", lanes_auto_line("qwen35moe", 1, 0, q35m_lanes_on ? "the lanes need two cards"
                                                                                          : "IE_Q35MOE_LANES=0").c_str());
         if (opts.parallel == kLanesAuto) opts.parallel = e->opts_.parallel = e->qwen35moe_split_model_.n_lanes();
+        if (e->qwen35moe_split_model_.n_lanes() <= 1) e->q_prompt_cache_room(e->qwen35moe_split_model_, "qwen35moe");   // (the lanes set theirs in q35m_lanes_init)
         vocab = e->qwen35moe_split_model_.config().vocab;
     } else if (e->arch_ == ModelArch::kGlm5Next) {
         auto* b=(e->glm5_=std::make_unique<Glm5Bundle>()).get();
@@ -1634,9 +1516,9 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         // A slot contains gate/up/down. Ring 8 + optional 16 fill-lane
         // buffers + two prefetch buffers, with the measured pin overhead.
         const uint64_t host_reserve=(8ull<<30)+max_expert*3*26*opts.n_gpus*2;
-        if(!host_available || host_available<host_reserve) {
-            err="glm5next: insufficient available host RAM for load scratch and expert staging";return nullptr;
-        }
+        if(!host_available || host_available<host_reserve)   // P4 B61: a warning, the load goes on as asked
+            std::fprintf(stderr,"[glm5next] WARNING: %.1f GiB of system RAM reported available, %.1f GiB wanted for load scratch and expert "
+                                "staging; the load goes on\n",host_available/1073741824.,host_reserve/1073741824.);
         std::fprintf(stderr,"[mem-plan] glm5next: %.2f GiB mmap expert banks; host staging/load reserve %.2f GiB, available %.2f GiB\n",host_experts/1073741824.,host_reserve/1073741824.,host_available/1073741824.);
         if (b->split) {
             if (auto m=b->a1.init(kGpuNameFilter,1); !m.empty()) { err="glm5next gpu1: "+m; return nullptr; }
@@ -2846,7 +2728,7 @@ public:
         : m_(m), cache_(cache), tok_(tok), pf_chunk_(pf_chunk), H_(m.config().hidden), V_(m.config().vocab), rows_(rows),
           pipeline_(pipeline),
           drain_([] { const char* v = std::getenv("IE_Q35MOE_TURN_DRAIN"); return v && *v == '1'; }()),
-          pipe_(m.n_lanes(), pf_chunk, H_ / 2, 2,   // the residual [T, hidden] fp16 = hidden / 2 floats a row
+          pipe_(m.n_lanes(), pf_chunk, H_ / 2, m.n_devices(),   // the residual [T, hidden] fp16 = hidden / 2 floats a row; P4 B58: one stage a card
                 [this](uint32_t s, const Glm5LanePipe::Step& st) { return stage(s, st); },
                 [this](uint32_t s, std::span<const Glm5LanePipe::Step> steps, float* gw) { return stage_rows(s, steps, gw); },
                 Qwen35MoeSplitModel::kMaxRows, group_cap, pipeline) {
@@ -2916,7 +2798,9 @@ public:
     // P4 B29 Fix B (q35m_lanes.hpp Q35mSticky): a lane whose in-place checkpoint the prompt extends is preferred; otherwise an
     // empty lane, then the smallest capacity, then the least recently used. Sticky off: no lane serves more than another
     // (every restore is the shared cache's).
-    uint32_t own_match(uint32_t lane, std::span<const int32_t> ids) const override { return sticky_.match(lane, ids); }
+    uint32_t own_match(uint32_t lane, std::span<const int32_t> ids) const override {
+        return std::max(sticky_.match(lane, ids), lad_best(lane, ids));   // (P4 B59: the lead lane's restart points too)
+    }
     bool occupied(uint32_t lane) const override { return sticky_.end(lane) > 0; }
     uint32_t last_end(uint32_t lane) const override { return sticky_.end(lane); }
 
@@ -2926,7 +2810,7 @@ public:
     std::string init_sticky(uint64_t reserve) {
         if (const char* v = std::getenv("IE_Q35MOE_STICKY_LANES"); v && *v == '0') return "IE_Q35MOE_STICKY_LANES=0";
         const uint32_t n = m_.n_lanes();
-        for (uint32_t dev = 0; dev < 2; ++dev) {
+        for (uint32_t dev = 0; dev < m_.n_devices(); ++dev) {
             if (!m_.dev_has_dn(dev)) continue;
             m_.select_lane(0);
             const DeltaNetState& d = m_.dn_state(dev);
@@ -2943,7 +2827,7 @@ public:
         ckdn_.resize(uint64_t(n) * 2);
         for (uint32_t l = 0; l < n; ++l) {
             m_.select_lane(l);
-            for (uint32_t dev = 0; dev < 2; ++dev) {
+            for (uint32_t dev = 0; dev < m_.n_devices(); ++dev) {
                 if (!m_.dev_has_dn(dev)) continue;
                 auto c = std::make_unique<DeltaNetState>();
                 if (auto e = c->init(m_.fleet()->dev(dev), m_.dn_state(dev).config()); !e.empty()) {
@@ -2955,6 +2839,28 @@ public:
         }
         sticky_.resize(n);
         sticky_.on = true;
+        // P4 B59: the lead lane's in-place restart points (ie/dn_ladder.hpp's idea on lane 0, the lane that holds the long
+        // conversation): kLadSlots copies of its DeltaNet state, one taken whenever a piece of its prompt passes a multiple
+        // of the step. Allocated here, before the prompt cache measures its budget. IE_Q35MOE_LANE_LADDER=0 off.
+        if (const char* v = std::getenv("IE_Q35MOE_LANE_LADDER"); !(v && *v == '0')) {
+            lad_step_ = dn_ladder_step(m_.lane_ctx(0), kLadSlots, 8192u);
+            lad_dn_.resize(size_t(kLadSlots) * 2);
+            bool ok = true;
+            m_.select_lane(0);
+            for (uint32_t sl = 0; sl < kLadSlots && ok; ++sl)
+                for (uint32_t dev = 0; dev < m_.n_devices() && ok; ++dev) {
+                    if (!m_.dev_has_dn(dev)) continue;
+                    auto c = std::make_unique<DeltaNetState>();
+                    ok = c->init(m_.fleet()->dev(dev), m_.dn_state(dev).config()).empty();
+                    if (ok) lad_dn_[size_t(sl) * 2 + dev] = std::move(c);
+                }
+            if (!ok) { lad_dn_.clear(); std::fprintf(stderr, "[qwen35moe] lead-lane restart points OFF: no room for the copies\n"); }
+            else {
+                lad_on_ = true;
+                std::fprintf(stderr, "[qwen35moe] lead-lane restart points ON: lane 0 keeps up to %u copies of its DeltaNet state, one about "
+                                     "every %u tokens of its prompt (IE_Q35MOE_LANE_LADDER=0 = off)\n", kLadSlots, lad_step_);
+            }
+        }
         return {};
     }
     uint64_t sticky_mib() const { return ck_mib_; }
@@ -2969,14 +2875,27 @@ public:
         source.clear();   // (--parallel 1 reports no cache source on this arch)
         std::lock_guard<std::mutex> cl(cache_mu_);
         // P4 B29 Fix B: the lane's own checkpoint, in place, when it serves at least as much as the shared cache would
-        if (const uint32_t own = sticky_.match(lane, *rq.ids); Q35mSticky::own_wins(own, peek_locked(rq))) {
-            if (auto e = restore_own(lane, own); e.empty()) { reused = own; return {}; }
+        const uint32_t own = sticky_.match(lane, *rq.ids), peek = peek_locked(rq);
+        // P4 B59: the lead lane's restart point, when it is deeper than the lane's one checkpoint and at least as deep as
+        // the shared cache's hit (an edit in the middle of the conversation, or a conversation the cache could not keep)
+        if (const uint32_t lad = lad_best(lane, *rq.ids); lad > own && lad >= peek) {
+            if (auto e = lad_restore(lane, lad); e.empty()) {
+                if (sticky_.end(lane) > lad) sticky_.drop(lane);   // (its rows past `lad` are about to be overwritten)
+                std::fprintf(stderr, "[q35m lanes] lane %u restart in place at %u of %zu (its checkpoint had %u, the prompt cache %u)\n",
+                             lane, lad, rq.ids->size(), own, peek);
+                reused = lad;
+                return {};
+            } else std::fprintf(stderr, "[q35m lanes] lane %u restart at %u: %s; the checkpoint, the cache or a full prefill\n", lane, lad, e.c_str());
+        }
+        if (Q35mSticky::own_wins(own, peek)) {
+            if (auto e = restore_own(lane, own); e.empty()) { lad_set_live(lane, *rq.ids, own); reused = own; return {}; }
             else std::fprintf(stderr, "[q35m lanes] lane %u in-place restore at %u: %s; the cache or a full prefill\n", lane, own, e.c_str());
         }
         sticky_.drop(lane);   // the lane's rows are about to be overwritten (a cache restore or a new sequence)
         Q35mLaneView view{m_, lane};
         reused = cache_ ? fleet_cache_restore(view, *cache_, *rq.ids, "crown-split-cache") : 0;
         if (!reused) m_.reset_lane_state(lane);   // a new sequence (a failed restore's half-copied state goes too)
+        lad_set_live(lane, *rq.ids, reused);      // (P4 B59: the copies the prompt shares up to `reused` stay; 0 drops all)
         return {};
     }
     // P4 B39: the prompt's tail [snap_at, T) through the pipe behind the snapshot boundary (q35m_plan pipe_tail), unless the
@@ -3040,9 +2959,10 @@ public:
         // when the model's reset below throws (the B9 gate's finding 1)
         const std::string pe = pipe_.reset_lane(lane);
         sticky_.drop(lane);   // (P4 B29)
+        lad_set_live(lane, {}, 0);   // (P4 B59)
         try {
             m_.reset_lane_state(lane);
-            for (uint32_t d = 0; d < 2; ++d) m_.fleet()->dev(d).queue().wait();
+            for (uint32_t d = 0; d < m_.n_devices(); ++d) m_.fleet()->dev(d).queue().wait();
         } catch (const sycl::exception& x) { return x.what(); }
         return pe;
     }
@@ -3230,7 +3150,7 @@ private:
         }
         if (sticky_.on) {
             std::string e;
-            for (uint32_t dev = 0; dev < 2 && e.empty(); ++dev)
+            for (uint32_t dev = 0; dev < m_.n_devices() && e.empty(); ++dev)
                 if (m_.dev_has_dn(dev)) e = ckdn_[uint64_t(lane) * 2 + dev]->copy_from(m_.fleet()->dev(dev).queue(), m_.lane_dn_state(lane, dev));
             if (e.empty()) sticky_.set(lane, ids, pos);
             else { sticky_.drop(lane); std::fprintf(stderr, "[q35m lanes] lane %u checkpoint at %u: %s\n", lane, pos, e.c_str()); }
@@ -3251,6 +3171,7 @@ private:
         catch (const sycl::exception& x) { e = x.what(); }
         if (!e.empty()) { try { m_.fleet()->dev(s).queue().wait(); } catch (...) {} }   // nothing of a failed step still runs
         else if (s == m_.head_dev() && look != 1) lg_[st.lane] = m_.logits();
+        if (e.empty()) lad_track(s, st.lane, st.ids, st.T, st.pos0, look);   // (P4 B59)
         return e;
     }
     // P4 B14: one card's part of a group's step (G >= 2 lanes, one decode row each); card 1 leaves row r's logits at
@@ -3267,6 +3188,8 @@ private:
         if (!e.empty()) { try { m_.fleet()->dev(s).queue().wait(); } catch (...) {} }
         else if (s == m_.head_dev())
             for (uint32_t r = 0; r < G; ++r) lg_[lanes[r]] = m_.rows_logits() + uint64_t(r) * V_;
+        if (e.empty() && lad_on_ && s == 0)   // (P4 B59: the lead lane's decode row keeps its token record in step)
+            for (uint32_t r = 0; r < G; ++r) if (lanes[r] == 0) lad_track(0, 0, &ids[r], 1, pos[r], /*look=*/1);
         return e;
     }
     // Chunks on the lane, card 1 of chunk k beside card 0 of chunk k + 1 (per card the same launches in the same order as
@@ -3274,6 +3197,18 @@ private:
     std::string run_chunks(uint32_t lane, const int32_t* ids, std::span<const LanesChunk> ch, const std::function<bool()>& stop,
                            size_t& done) {
         done = 0;
+        if (m_.n_devices() == 1) {   // P4 B58: one card, one stage: the chunks in order
+            for (size_t k = 0; k < ch.size(); ++k) {
+                if (k > 0 && stop && stop()) break;
+                std::string e0;
+                try { e0 = m_.forward_stage(0, lane, ids + ch[k].first, ch[k].second, ch[k].first, xb_[0].data()); }
+                catch (const sycl::exception& x) { e0 = x.what(); }
+                if (!e0.empty()) return "card 0: " + e0;
+                lad_track(0, lane, ids + ch[k].first, ch[k].second, ch[k].first, 0);
+                ++done;
+            }
+            return {};
+        }
         sycl::half* wb2[2] = {xb_[0].data(), xb_[1].data()};
         std::future<std::string> bfut;
         std::string err;
@@ -3285,13 +3220,18 @@ private:
             try { e0 = m_.forward_stage(0, lane, ids + p0, n, p0, wb); }
             catch (const sycl::exception& x) { e0 = x.what(); }
             if (!e0.empty()) { err = "card 0: " + e0; break; }
+            lad_track(0, lane, ids + p0, n, p0, 0);
             if (bfut.valid()) {
                 if (auto e = bfut.get(); !e.empty()) { err = "card 1: " + e; break; }
                 ++done;
             }
             Qwen35MoeSplitModel* mp = &m_;
-            bfut = std::async(std::launch::async, [mp, lane, wb, n, p0]() -> std::string {
-                try { return mp->forward_stage(1, lane, nullptr, n, p0, wb); }
+            bfut = std::async(std::launch::async, [this, mp, lane, wb, n, p0]() -> std::string {
+                try {
+                    std::string e1 = mp->forward_stage(1, lane, nullptr, n, p0, wb);
+                    if (e1.empty()) lad_track(1, lane, nullptr, n, p0, 0);
+                    return e1;
+                }
                 catch (const sycl::exception& x) { return x.what(); }
             });
         }
@@ -3303,10 +3243,96 @@ private:
         return err;
     }
 
+    // ---- P4 B59: the lead lane's restart points -----------------------------------------------------------------------
+    // lad_live_ = the tokens lane 0's state covers, kept in step by every forward on the lane (card 0's stage: a piece at
+    // the record's end appends, one below it truncates first -- a lookup round's redo -- and one past it means the record
+    // is unknown until prefix_prepare sets it). A copy is taken on each card right after its part of a step that passes a
+    // multiple of lad_step_ (never a lookup round: its rows may be rolled back); a slot counts once both cards hold the
+    // same depth. All under lad_mu_ (two stage threads, the serial worker, the serve mutex's own_match).
+    static constexpr uint32_t kLadSlots = 16;
+    bool     lad_on_ = false;
+    uint32_t lad_step_ = 0;
+    std::vector<std::unique_ptr<DeltaNetState>> lad_dn_;   // [slot * 2 + card]
+    uint32_t lad_depth_[kLadSlots][2] = {};
+    std::vector<int32_t> lad_live_;
+    bool     lad_live_ok_ = false;
+    mutable std::mutex lad_mu_;
+    uint32_t lad_slot_depth(uint32_t sl) const {   // (lad_mu_ held) the slot's depth when every card agrees, else 0
+        uint32_t d = 0;
+        for (uint32_t dev = 0; dev < m_.n_devices(); ++dev) {
+            if (!lad_dn_[size_t(sl) * 2 + dev]) continue;
+            if (!lad_depth_[sl][dev] || (d && lad_depth_[sl][dev] != d)) return 0;
+            d = lad_depth_[sl][dev];
+        }
+        return d;
+    }
+    // the deepest restart point the lane has at or below what `ids` shares with its record, leaving >= 1 row to read
+    uint32_t lad_best(uint32_t lane, std::span<const int32_t> ids) const {
+        if (!lad_on_ || lane != 0 || ids.empty()) return 0;
+        std::lock_guard<std::mutex> g(lad_mu_);
+        if (!lad_live_ok_) return 0;
+        const uint32_t lim = std::min<uint32_t>(dn_ladder_lcp(lad_live_, ids), uint32_t(ids.size()) - 1);
+        uint32_t best = 0;
+        for (uint32_t sl = 0; sl < kLadSlots; ++sl)
+            if (const uint32_t d = lad_slot_depth(sl); d && d <= lim && d > best) best = d;
+        return best;
+    }
+    void lad_drop_above(uint32_t d) {   // (lad_mu_ held)
+        for (auto& row : lad_depth_) for (uint32_t& x : row) if (x > d) x = 0;
+    }
+    // prefix_prepare / reset_lane: lane 0's state now covers ids[0, depth) (0 = nothing, or unknown)
+    void lad_set_live(uint32_t lane, std::span<const int32_t> ids, uint32_t depth) {
+        if (!lad_on_ || lane != 0) return;
+        std::lock_guard<std::mutex> g(lad_mu_);
+        const uint32_t keep = depth ? std::min<uint32_t>(lad_live_ok_ ? dn_ladder_lcp(lad_live_, ids) : 0u, depth) : 0u;
+        lad_drop_above(keep);
+        lad_live_.assign(ids.begin(), ids.begin() + std::min<size_t>(depth, ids.size()));
+        lad_live_ok_ = true;
+    }
+    std::string lad_restore(uint32_t lane, uint32_t depth) {
+        std::lock_guard<std::mutex> g(lad_mu_);
+        uint32_t sl = kLadSlots;
+        for (uint32_t k = 0; k < kLadSlots; ++k) if (lad_slot_depth(k) == depth) { sl = k; break; }
+        if (sl == kLadSlots) return "no copy at that depth";
+        for (uint32_t dev = 0; dev < m_.n_devices(); ++dev) {
+            if (m_.dev_has_dn(dev))
+                if (auto e = m_.lane_dn_state(lane, dev).copy_from(m_.fleet()->dev(dev).queue(), *lad_dn_[size_t(sl) * 2 + dev]); !e.empty()) {
+                    lad_drop_above(0); lad_live_.clear(); lad_live_ok_ = false;
+                    return e;
+                }
+            if (m_.dev_has_kv(dev)) {
+                KvCache& kv = m_.lane_kv_cache(lane, dev);
+                for (uint32_t li = 0; li < kv.config().n_layers_full; ++li) kv.set_length(li, depth);
+            }
+        }
+        lad_drop_above(depth);
+        lad_live_.resize(depth);
+        return {};
+    }
+    // card `dev` finished its part of a step of T rows at pos0 on `lane` (ids: card 0 only). look != 0: no copy.
+    void lad_track(uint32_t dev, uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, int look) {
+        if (!lad_on_ || lane != 0) return;
+        std::lock_guard<std::mutex> g(lad_mu_);
+        if (dev == 0) {
+            if (pos0 == 0) { lad_live_.clear(); lad_live_ok_ = true; lad_drop_above(0); }
+            if (!lad_live_ok_ || pos0 > lad_live_.size() || !ids) { lad_live_.clear(); lad_live_ok_ = false; lad_drop_above(0); return; }
+            if (pos0 < lad_live_.size()) { lad_live_.resize(pos0); lad_drop_above(pos0); }
+            lad_live_.insert(lad_live_.end(), ids, ids + T);
+        }
+        if (look || !lad_live_ok_ || !m_.dev_has_dn(dev)) return;
+        const uint32_t d = pos0 + T;
+        if (d / lad_step_ == pos0 / lad_step_) return;   // the step passed no multiple of lad_step_
+        const uint32_t sl = (d / lad_step_) % kLadSlots;
+        lad_depth_[sl][dev] = 0;
+        if (m_.lane_dn_state(lane, dev).ready() &&
+            lad_dn_[size_t(sl) * 2 + dev]->copy_from(m_.fleet()->dev(dev).queue(), m_.lane_dn_state(lane, dev)).empty())
+            lad_depth_[sl][dev] = d;
+    }
+
     // P4 B29 Fix B: the lane back to its checkpoint at `depth`: the DeltaNet + conv state copied back on every card that has
     // DeltaNet layers, every full-attention layer's KV length set to `depth` (its rows below are the lane's own). By index.
     std::string restore_own(uint32_t lane, uint32_t depth) {
-        for (uint32_t dev = 0; dev < 2; ++dev) {
+        for (uint32_t dev = 0; dev < m_.n_devices(); ++dev) {
             if (m_.dev_has_dn(dev)) {
                 const DeltaNetState* c = ckdn_[uint64_t(lane) * 2 + dev].get();
                 if (!c) return "no checkpoint on card " + std::to_string(dev);
@@ -3367,7 +3393,7 @@ std::string Engine::q35m_lanes_init() {
         gcap = uint32_t(std::clamp(std::atoi(v), 0, int(Qwen35MoeSplitModel::kMaxRows)));
     // P4 B34: the lane pipeline on by default; IE_Q35MOE_LANE_PIPELINE=0 = one piece of a lane in the pipe at a time (B10-B33)
     const char* lpv = std::getenv("IE_Q35MOE_LANE_PIPELINE");
-    const bool lpipe = !(lpv && std::string(lpv) == "0");
+    const bool lpipe = !(lpv && std::string(lpv) == "0") && m.n_devices() > 1;   // (P4 B58: one stage has nothing to look ahead to)
     auto lm = std::make_unique<Q35mLanesModel>(m, prompt_cache_on_ ? &fleet_cache_ : nullptr, tok_, stop_ids_, tool_call_ids_, pf,
                                                rows, gcap, lpipe);
     if (auto e = lm->init(); !e.empty()) return e;
@@ -3399,7 +3425,7 @@ std::string Engine::q35m_lanes_init() {
         const uint32_t ents0 = fleet_cache_.config().max_entries;
         uint64_t budget = UINT64_MAX, free_min = UINT64_MAX;
         bool query = true;
-        for (uint32_t d = 0; d < 2 && budget; ++d) {
+        for (uint32_t d = 0; d < m.n_devices() && budget; ++d) {
             const sycl::device dv = m.fleet()->dev(d).device();
             if (!dv.has(sycl::aspect::ext_intel_free_memory)) { budget = 0; query = false; break; }
             const uint64_t fr = dv.get_info<sycl::ext::intel::info::device::free_memory>();
@@ -3609,7 +3635,7 @@ public:
                   uint32_t pf_chunk, bool pipeline, bool rows, uint32_t group_cap)
         : m_(m), cache_(cache), tok_(tok), pf_chunk_(pf_chunk), pipeline_(pipeline), H_(m.config().dense.hidden),
           V_(m.config().dense.vocab), rows_(rows),
-          pipe_(m.n_lanes(), pf_chunk, H_ / 2, 2,   // the residual [T, hidden] fp16 = hidden / 2 floats a row
+          pipe_(m.n_lanes(), pf_chunk, H_ / 2, m.n_devices(),   // the residual [T, hidden] fp16 = hidden / 2 floats a row; P4 B58: one stage a card
                 [this](uint32_t s, const Glm5LanePipe::Step& st) { return stage(s, st); },
                 [this](uint32_t s, std::span<const Glm5LanePipe::Step> steps, float* gw) { return stage_rows(s, steps, gw); },
                 Qwen35SplitModel::kMaxRows, group_cap) {
@@ -3710,7 +3736,7 @@ public:
         try {
             m_.select_lane(lane);
             m_.reset_state();
-            for (uint32_t d = 0; d < 2; ++d) m_.fleet()->dev(d).queue().wait();
+            for (uint32_t d = 0; d < m_.n_devices(); ++d) m_.fleet()->dev(d).queue().wait();
         } catch (const sycl::exception& x) { return x.what(); }
         return pe;
     }
@@ -3842,6 +3868,17 @@ private:
     std::string run_pieces(uint32_t lane, const int32_t* ids, std::span<const Q27Piece> ps, const std::function<bool()>& stop,
                            size_t& done) {
         done = 0;
+        if (m_.n_devices() == 1) {   // P4 B58: one card, one stage: the pieces in order
+            for (size_t k = 0; k < ps.size(); ++k) {
+                if (k > 0 && stop && stop()) break;
+                std::string e0;
+                try { e0 = m_.forward_stage(0, lane, ids + ps[k].pos0, ps[k].rows, ps[k].pos0, xb_[0].data(), ps[k].pk); }
+                catch (const std::exception& x) { e0 = x.what(); }
+                if (!e0.empty()) return "card 0: " + e0;
+                ++done;
+            }
+            return {};
+        }
         sycl::half* wb2[2] = {xb_[0].data(), xb_[1].data()};
         std::future<std::string> bfut;
         std::string err;

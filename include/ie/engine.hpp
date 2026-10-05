@@ -386,7 +386,7 @@ private:
     // published to per-slot outboxes. Cancellation = want_stop, honored at
     // step boundaries. ---
     // Effective split-path prompt-cache caps (recorded at init so the VRAM
-    // budget check can price the cache's worst case).
+    // prompt cache was configured).
     FleetPrefixCacheConfig split_cache_cfg_{};
     struct BatchStepper {
         struct Slot {
@@ -418,6 +418,35 @@ private:
     // P4 B57: in-place restart points of the live sequence on the 27B / 35B splits at one request lane (ie/dn_ladder.hpp).
     // ladder_epoch_ counts every time the live state was replaced under a running request (a yield's unstash): that
     // request then stops taking copies.
+    // P4 B60: the prompt cache's room on a split model = the VRAM each card has free NOW (measured: weights, context,
+    // lanes and the vision tower are allocated), less what is still to be allocated at the first request: the working
+    // buffers (kWorkBytes) and the restart points' copies. No count of "full contexts"; the cache evicts its oldest
+    // entries to stay inside the room and skips a snapshot that alone does not fit. IE_PROMPT_CACHE_VRAM_MIB sets it.
+    template <class Model> void q_prompt_cache_room(Model& m, const char* tag) {
+        if (!prompt_cache_on_) return;
+        constexpr uint64_t kWorkBytes = uint64_t(2) << 30;
+        uint64_t room = UINT64_MAX;
+        for (uint32_t d = 0; d < m.n_devices(); ++d) {
+            const sycl::device dv = m.fleet()->dev(d).device();
+            if (!dv.has(sycl::aspect::ext_intel_free_memory)) { room = 0; break; }
+            const uint64_t fr = dv.get_info<sycl::ext::intel::info::device::free_memory>();
+            uint64_t later = kWorkBytes;
+            if (m.dev_has_dn(d) && !opts_.int8_kv && m.n_lanes() <= 1 && !(std::getenv("IE_DN_LADDER") && *std::getenv("IE_DN_LADDER") == '0')) {
+                const auto& dn = m.dn_state(d);
+                later += 18ull * dn.config().n_layers_linear * (dn.state_elems_per_layer() * 4 + dn.conv_elems_per_layer() * 2);
+            }
+            room = std::min(room, fr > later ? fr - later : uint64_t(1));
+        }
+        if (const char* s = std::getenv("IE_PROMPT_CACHE_VRAM_MIB"))
+            if (unsigned v = unsigned(std::atoi(s))) room = uint64_t(v) << 20;
+        if (!room || room == UINT64_MAX) {
+            std::fprintf(stderr, "[%s] prompt cache: the cards do not report free memory; its entries are bounded by count only\n", tag);
+            return;
+        }
+        fleet_cache_.set_limits(fleet_cache_.config().max_entries, room);
+        std::fprintf(stderr, "[%s] prompt cache: %.1f GB a card -- what the cards have free after the model, the context and the lanes, "
+                             "less the first request's working buffers; the oldest saved prompts are dropped to stay inside it\n", tag, room / 1e9);
+    }
     DnLadder ladder_;
     bool     ladder_tried_ = false;
     uint64_t ladder_epoch_ = 0;
