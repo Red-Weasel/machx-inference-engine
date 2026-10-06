@@ -1,7 +1,7 @@
 
 # Mach X — LLM Inference Engine for Intel Arc
 
-**A C++/SYCL local LLM inference engine for Intel Arc GPUs, built and tuned on two Arc Pro B70 cards. XMX kernels, quantized models and multi-GPU execution. New in v0.2.20: one Arc Pro B70 now runs the Qwen models on the same fast code as two — Qwen3.8-27B (Q6_K) reads at about 820 tok/s and writes at 22 (33 with `--spec`), the 35B-A3B class (Q5_K_M) reads at about 1,300 and writes at 87 — and a load is tried as asked: memory estimates warn, they do not refuse. Since v0.2.18, replies that copy text already in the conversation are written several times faster with `--spec` (a 1,800-token file edit: 108 s → 28 s on the 27B, 24 s → 7 s on the 35B-A3B class, 69 s → 31 s on Flash-Next) and a conversation edited in the middle restarts from a saved point.**
+**A C++/SYCL local LLM inference engine for Intel Arc GPUs, built and tuned on two Arc Pro B70 cards: XMX kernels, quantized models, multi-GPU execution, an OpenAI-compatible server — and now text-to-video.**
 
 ![License](https://img.shields.io/badge/license-Apache%202.0-blue)
 ![Language](https://img.shields.io/badge/C%2B%2B20-SYCL%20%2F%20DPC%2B%2B-orange)
@@ -11,32 +11,152 @@
 ![Multi-GPU](https://img.shields.io/badge/multi--GPU-tensor--parallel-success)
 [![Release](https://img.shields.io/github/v/release/Red-Weasel/machx-inference-engine)](https://github.com/Red-Weasel/machx-inference-engine/releases)
 
-Intel Arc is a genuinely capable AI GPU that inference tooling has mostly ignored. **Mach X is built for it from the metal up** — no fork of llama.cpp, no PyTorch, no vendor runtime. Hand-written SYCL kernels (XMX matrix engines, int-dot quantized GEMV, tiled FlashAttention), an OpenAI-compatible server, tensor-parallel multi-GPU, and day-one support for the newest model architectures — often running them fast on Arc *before* anyone else does.
+**Latest**
+
+- **Video, October 5–6:** [LTX-2.5](docs/ltx25/LTX25_ON_ARC.md) makes 5 seconds of 1280×704 video with sound in about 21 s on two Arc Pro B70 cards (stock PyTorch: 79 s).
+- **v0.2.20, October 5:** one Arc Pro B70 now runs the Qwen models on the same fast code as two — Qwen3.8-27B (Q6_K) reads at about 820 tok/s and writes at 22 (33 with `--spec`); the 35B-A3B class (Q5_K_M) reads at about 1,300 and writes at 87 — and a load is tried as asked: memory estimates warn, they do not refuse. [Details](#new-in-v0220)
+- **v0.2.18, October 5:** replies that copy text already in the conversation are written several times faster with `--spec` (a 1,800-token file edit: 108 s → 28 s on the 27B, 24 s → 7 s on the 35B-A3B class, 69 s → 31 s on Flash-Next), and a conversation edited in the middle restarts from a saved point. [Details](#new-in-v0218)
+- **v0.2.13, October 4:** prompts are read 1.4–3.7× faster on the Qwen models (Qwen3.8-27B: 1,037 → 2,962 tok/s). [Details](#new-in-v0213)
+
+Intel Arc is a genuinely capable AI GPU that inference tooling has mostly ignored. **Mach X is built for it from the metal up** — no fork of llama.cpp, no PyTorch in the language-model engine (the video pipeline uses PyTorch's Intel GPU build), no vendor runtime. Hand-written SYCL kernels (XMX matrix engines, int-dot quantized GEMV, tiled FlashAttention), an OpenAI-compatible server, tensor-parallel multi-GPU, and day-one support for the newest model architectures — often running them fast on Arc *before* anyone else does.
 
 ---
 
 ## ⚡ What people run on it
 
-The seven models this engine is tuned for, each on **two Arc Pro B70 cards** (64 GB VRAM) with host RAM holding the
-experts that do not fit. Dates, workloads and methods are in [Benchmarks](#benchmarks).
-Figures without a date were measured September 26–27, 2026 on the driver stack v0.2.0 shipped on; figures dated
-September 29 – October 1 were measured for v0.2.6 on that same stack; earlier dates are from the previous driver stack.
+One video model and seven language models, each run on **two Arc Pro B70 cards** (64 GB VRAM), with host RAM holding the
+experts that do not fit. Dates, workloads and methods are in [Benchmarks](#benchmarks); every date is 2026.
 
-| model | weights | prefill | decode | also |
-|---|---|---:|---:|---|
-| **MiMo-V2.6-Flash** | 178 GB safetensors (FP8 dense, MXFP4 experts), 256 GB RAM | **438–483** tok/s at 4–6K; **434–438** at 32K, **322** at 120K (September 22) | **23.1–23.9** tok/s chat, **16.7–16.9** without the drafter; **24.3** on agent-style copy edits (September 22); with `ie serve --parallel 2` / `4`, **28.38** / **28.46** tok/s together (×1.25 / ×1.27 against one drafted request in the same run; September 26) | released and running the same day: its bundled DFlash drafter (speculative decoding), **native vision**, tool calls, thinking on/off, 120K context verified, other conversations kept in host memory, up to 16 requests at once in `ie serve` (`--parallel N`, [below](#several-requests-at-once-request-lanes)). |
-| **DeepSeek-V4.1-Flash** | 475 GB safetensors (FP8 dense, MXFP4 experts), 256 GB RAM | **304** tok/s at 2K, **319** at 32K–223K (September 16–17) | **12.8** tok/s chat, **14.0** in agent loops (September 17–18); with `ie serve --parallel 2`, **25.1–25.8** tok/s together (×1.68–1.69 against one request in the same run) | native vision, tool calls, 223K context, 1–2 s follow-up turns from the prompt cache, a disk prompt cache that survives rebuilds, up to 16 requests at once in `ie serve` (`--parallel N`, [below](#several-requests-at-once-request-lanes); 25.7 tok/s together at 16). |
-| **DeepSeek-V4-Flash** | 155 GB GGUF (MXFP4 experts, Q8_0 dense) | **571** tok/s at 4K | **26.1** tok/s at 4K, **32.7** short | tool calls, prompt cache; measured on the previous driver stack (September 11, 2026) |
-| **GLM-5.3-Flash** | UD-Q4_K_XL GGUF, host-resident experts | **156.4** tok/s at 16K | **14.0–14.4** tok/s at 16K | MTP draft, two-GPU pipelined prefill, request lanes in a test tool (two lanes ×1.68 against one request; `ie serve` runs GLM one request at a time) |
-| **Qwen3.8-Flash** (Flash-Next) | 104 GB UD-Q4_K_XL GGUF | **495–502** tok/s pipelined, once warm | **37.1–38.2** tok/s chat, **44.4–44.6** code (lossless speculative) | native vision, up to 16 requests at once in `ie serve` (two at **59.0–62.6** tok/s together, ×1.94–2.06; 16 at **118.4** with row batching) |
-| **Qwen3.6-35B-A3B class** | Q8_0 GGUF, split over both cards | a 2K-token prompt in **1.28 s** (October 2, with v0.2.8's attention threshold set by environment on the v0.2.6 build; 1.41 s at v0.2.6's threshold), 8K in **5.96 s**, 32K in **48.4 s** (one request, cold, wall time for the prompt plus one token; October 1) | **85.7** tok/s on a short prompt (October 1); **60.9** at a 33K-token prompt (September 30) | up to 16 requests at once in `ie serve`, the lane count picked at load: 16 at **414.1** tok/s together, 25.9 each (October 1); a 15-agent replay with a shared-prompt wave in **116.3–116.5 s** (October 2; v0.2.6 measured 131.3–132.4 s in the same session and 139.7 s on October 1; [New in v0.2.8](#new-in-v028)); XML tool calls and reasoning returned in the OpenAI fields; native Q6_K / Q5_K. Measured on community fine-tunes of the model; image input at `--parallel 1` with `--mmproj` (the 35B-A3B Distill projector, mm.2 2048; GPU-gated separately). |
-| **Qwen3.8-27B** | Q8_0 GGUF | **945** tok/s at 2K | **24.5** tok/s (tensor-parallel + speculative); both August 15–26. Q6_K **22.0** and Q5_K_M **24.0** tok/s on the two-card split (one request, September 29) | prompt cache (layer-split), up to 16 requests at once in `ie serve` with row batching: 16 at **153.5** tok/s together, 17.2–17.3 alone (`--ctx 8192 --parallel 16`, October 1, on a community fine-tune; the same run with the new Q8_0 GEMV kernels switched off gives 113.8, and v0.2.0's figure, 108.0, was measured with `--ctx 16384 --slot-ctx 4096`) |
+### 🆕 New: video with LTX-2.5
+
+<table>
+<tr>
+<td width="64" align="center" valign="middle"><img src="docs/images/logo-ltx.png" width="48" height="48" alt="Lightricks LTX"></td>
+<td align="left" valign="middle"><b>LTX-2.5</b> · Lightricks' text-to-video model, with sound<br>
+<b>5 s of 1280×704 video in about 21 s</b> on two Arc Pro B70 cards (stock PyTorch: 79 s) · <b>a clip every 17 s</b> with one process per card · loads in 20 s</td>
+</tr>
+</table>
+
+- **What runs:** the transformer is stored in 8 bits (the Q8_0 layout, 19 GB, so a whole copy fits one 32 GB card). Both cards work in every block, the 8-bit weights go straight into the XMX multiply through Mach X's own video kernels, and the model card's two-stage flow does the rest (8 steps at half size, a 2× upscale, 3 steps at full size). Measured October 5–6.
+- **Not the language-model engine:** the video pipeline runs in Python on PyTorch's Intel GPU build, with Mach X kernels called on PyTorch's own queue. The video scripts are not in this repository yet.
+- **Quality:** the Mach X kernels add no loss of their own against stock operations on the same 8-bit weights (28.4 dB PSNR, 0.954 SSIM); the 8-bit weights themselves cost about 26 dB against bf16 — the same scenes, with small changes in detail.
+- **Known issue:** about one clip in 30 comes out invalid (all NaN) on the test machine. The script catches it, saves the evidence and makes the clip again once; the cause is not found yet.
+- **Every step, the rejected experiments and the numbers:** [LTX-2.5 on two Arc Pro B70 cards](docs/ltx25/LTX25_ON_ARC.md).
+
+### Language models
+
+<table>
+<thead>
+<tr>
+<th align="left" colspan="2">Model</th>
+<th align="left">Weights</th>
+<th align="left">Prefill <sub>tok/s</sub></th>
+<th align="left">Decode <sub>tok/s</sub></th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td width="48" align="center" valign="middle"><img src="docs/images/logo-qwen.png" width="36" height="36" alt="Qwen"></td>
+<td align="left" valign="middle" nowrap><b>Qwen3.8-27B</b><br><sub>dense · measured Oct 4–5<br>prompt cache · vision · 16 lanes</sub></td>
+<td align="left" valign="middle" nowrap>Q8_0 GGUF</td>
+<td align="left" valign="middle" nowrap><b>2,962</b> <sub>2.4K</sub><br><b>3,001</b> <sub>10.7K</sub></td>
+<td align="left" valign="middle" nowrap><b>24.3</b> <sub>with <code>--spec</code></sub><br><b>17.1</b> <sub>plain</sub></td>
+</tr>
+<tr>
+<td width="48" align="center" valign="middle"><img src="docs/images/logo-qwen.png" width="36" height="36" alt="Qwen"></td>
+<td align="left" valign="middle" nowrap><b>Qwen3.8-35B-A3B</b><br><sub>MoE · measured Oct 4–5<br>16 lanes · 15-agent replay in 77 s</sub></td>
+<td align="left" valign="middle" nowrap>Q8_0 GGUF</td>
+<td align="left" valign="middle" nowrap><b>2,896</b> <sub>2.4K</sub><br><b>2,808</b> <sub>10.7K</sub></td>
+<td align="left" valign="middle" nowrap><b>78.2</b> <sub>at 2.4K</sub><br><b>72.5</b> <sub>at 10.7K</sub></td>
+</tr>
+<tr>
+<td width="48" align="center" valign="middle"><img src="docs/images/logo-qwen.png" width="36" height="36" alt="Qwen"></td>
+<td align="left" valign="middle" nowrap><b>Qwen3.8-Flash-Next</b><br><sub>MoE · measured Oct 4–5<br>native vision · 16 lanes</sub></td>
+<td align="left" valign="middle" nowrap>UD-Q4_K_XL GGUF<br><sub>104 GB</sub></td>
+<td align="left" valign="middle" nowrap><b>470</b> <sub>new text</sub><br><b>688</b> <sub>repeated prompt</sub></td>
+<td align="left" valign="middle" nowrap><b>28.7</b> <sub>plain</sub><br><b>40.7</b> <sub>copy edits, <code>--spec</code></sub></td>
+</tr>
+<tr>
+<td width="48" align="center" valign="middle"><img src="docs/images/logo-mimo.png" width="36" height="36" alt="Xiaomi MiMo"></td>
+<td align="left" valign="middle" nowrap><b>Xiaomi MiMo-V2.6-Flash</b><br><sub>MoE · measured Sep 27<br>native vision · tool calls · 120K context</sub></td>
+<td align="left" valign="middle" nowrap>FP8 + MXFP4<br><sub>178 GB safetensors</sub></td>
+<td align="left" valign="middle" nowrap><b>438–483</b> <sub>at 4–6K</sub><br><b>322</b> <sub>at 120K</sub></td>
+<td align="left" valign="middle" nowrap><b>23.1–23.9</b> <sub>with drafter</sub><br><b>16.7–16.9</b> <sub>plain</sub></td>
+</tr>
+<tr>
+<td width="48" align="center" valign="middle"><img src="docs/images/logo-deepseek.png" width="36" height="36" alt="DeepSeek"></td>
+<td align="left" valign="middle" nowrap><b>DeepSeek-V4.1-Flash</b><br><sub>MoE · measured Sep 16–27<br>native vision · tool calls · 223K context</sub></td>
+<td align="left" valign="middle" nowrap>FP8 + MXFP4<br><sub>475 GB safetensors</sub></td>
+<td align="left" valign="middle" nowrap><b>304</b> <sub>at 2K</sub><br><b>319</b> <sub>at 32K–223K</sub></td>
+<td align="left" valign="middle" nowrap><b>14.9–15.3</b> <sub>one request</sub><br><b>25.1–25.8</b> <sub>two lanes together</sub></td>
+</tr>
+<tr>
+<td width="48" align="center" valign="middle"><img src="docs/images/logo-deepseek.png" width="36" height="36" alt="DeepSeek"></td>
+<td align="left" valign="middle" nowrap><b>DeepSeek-V4-Flash</b><br><sub>MoE · measured Sep 11<br>tool calls · prompt cache</sub></td>
+<td align="left" valign="middle" nowrap>MXFP4 + Q8_0<br><sub>155 GB GGUF</sub></td>
+<td align="left" valign="middle" nowrap><b>571</b> <sub>at 4K</sub></td>
+<td align="left" valign="middle" nowrap><b>26.1</b> <sub>at 4K</sub><br><b>32.7</b> <sub>short prompt</sub></td>
+</tr>
+<tr>
+<td width="48" align="center" valign="middle"><img src="docs/images/logo-glm.png" width="36" height="36" alt="Z.ai GLM"></td>
+<td align="left" valign="middle" nowrap><b>GLM-5.3-Flash</b><br><sub>MoE · measured Sep 27<br>MTP draft · pipelined prefill</sub></td>
+<td align="left" valign="middle" nowrap>UD-Q4_K_XL GGUF<br><sub>host-resident experts</sub></td>
+<td align="left" valign="middle" nowrap><b>156.4</b> <sub>at 16K</sub></td>
+<td align="left" valign="middle" nowrap><b>14.0–14.4</b> <sub>at 16K</sub><br><b>12.6–12.8</b> <sub>as served</sub></td>
+</tr>
+</tbody>
+</table>
+
+<sub>Prefill is prompt reading and decode is writing, in tokens per second; 2.4K and 10.7K are prompt lengths in tokens (`ie-prompt-bench`, prompt cache off, greedy). "Plain" is without speculative decoding; `--spec` is the engine's lookup drafts. Qwen figures were measured on community fine-tunes of the models: the 35B-A3B on the Qwen3.8-35B-A3B Distill (the September 26 – October 1 rows of [Benchmarks](#benchmarks) used a Qwen3.6-35B-A3B fine-tune). GLM's 14.0–14.4 is the standalone runner with its MTP draft and 12.6–12.8 the served configuration; Flash-Next's decode with its MTP head in the standalone runner is 37.1–38.2 chat and 44.4–44.6 code (September 27), and `ie serve` does not load that head. Every figure, with its date and conditions, is listed below.</sub>
+
+<details>
+<summary><b>Every figure, with its date and conditions</b></summary>
+
+**Qwen3.8-27B** · Q8_0 GGUF, split over both cards
+- **Prefill:** 2,962 / 3,001 tok/s at 2.4K / 10.7K tokens (`ie-prompt-bench`, prompt cache off, greedy; October 4, v0.2.13; it was 1,037 / 820 before). Q6_K: 1,378 / 1,549. An earlier version of this table said 945 tok/s at 2K, measured in August.
+- **Decode:** 17.1 tok/s plain; 24.3 with `--spec` (`ie serve`, temperature 0.7, short prompt) and 29.7 as the median of five short prompts (bench, greedy). Q6_K 21.5 / 19.8 plain, 26.9 / 21.6 with `--spec`; Q5_K 23.3 / 21.4 and 26.3 / 22.9 (2.4K / 10.7K-token prompts, October 4–5). An August figure of 24.5 tok/s used the opt-in tensor-parallel path (`IE_QWEN35_TP`) with speculative decoding.
+- **Serving:** prompt cache (layer-split); 16 requests at once at 153.5 tok/s together, 17.2–17.3 alone (`--ctx 8192 --parallel 16`, October 1); a reply that returns a file with one identifier renamed (1,800 tokens, temperature 0.7) takes 108.5 s plain and 28.4 s with `--spec`.
+- **One card** (Q6_K, October 5): prefill 823 / 830, decode 22.0 / 20.4, 32.6 / 19.8 with `--spec`.
+
+**Qwen3.8-35B-A3B** · Q8_0 GGUF, split over both cards; measured on community fine-tunes (October 4–5: the Qwen3.8-35B-A3B Distill; earlier rows: a Qwen3.6-35B-A3B fine-tune, where this README says "35B-A3B class")
+- **Prefill:** 2,896 / 2,808 tok/s at 2.4K / 10.7K tokens (October 4, v0.2.13; it was 1,816 / 1,256). One request, cold prompt: 2K in 1.28 s (October 2), 8K in 5.96 s, 32K in 48.4 s (October 1, before v0.2.13).
+- **Decode:** 78.2 / 72.5 tok/s plain at 2.4K / 10.7K tokens (October 4–5); 85.7 on a short prompt (October 1); 60.9 at a 33K-token prompt (September 30). One card, Q5_K_M: 87.2 / 82.9 (October 5).
+- **Serving:** up to 16 requests at once, the lane count picked at load: 16 at 414.1 tok/s together, 25.9 each (October 1); the 15-agent replay takes 77.1–77.2 s (October 4; 116.1 s before v0.2.13); a file edit takes 24.3 s plain and 7.1 s with `--spec`; XML tool calls and reasoning in the OpenAI fields; native Q6_K / Q5_K; image input at `--parallel 1` with `--mmproj`.
+
+**Qwen3.8-Flash-Next** · UD-Q4_K_XL GGUF (104 GB)
+- **Prefill:** 470 tok/s on text it had not seen and 688 on a repeated prompt (bench, October 4; it was 241 / 487); 495–502 pipelined once warm (standalone runner, September 27).
+- **Decode:** 28.7 / 28.2 tok/s plain at 2.4K / 10.7K tokens (October 4–5); with `--spec` lookup drafts 40.7 on a copy prompt (26.9 plain). In the standalone runner with its MTP head: 37.1–38.2 chat, 44.4–44.6 code (lossless speculative, K=3, September 27); `ie serve` does not load that head.
+- **Serving:** native vision; up to 16 requests at once (two at 59.0–62.6 tok/s together, ×1.94–2.06; 16 at 118.4 with row batching and 128.0 at `--ctx 8192`); a file edit takes 68.7 s plain and 30.7 s with `--spec`.
+
+**Xiaomi MiMo-V2.6-Flash** · 178 GB safetensors (FP8 dense, MXFP4 experts), 256 GB RAM
+- **Prefill:** 438–483 tok/s at 4–6K; 434–438 at 32K, 322 at 120K (September 22–27).
+- **Decode:** 23.1–23.9 tok/s chat with its DFlash drafter, 16.7–16.9 without; 24.3 on agent-style copy edits (September 22); with `ie serve --parallel 2` / `4`, 28.38 / 28.46 tok/s together (×1.25 / ×1.27 against one drafted request in the same run; September 26).
+- **Also:** released and running the same day; its bundled DFlash drafter, native vision, tool calls, thinking on/off, 120K context verified, other conversations kept in host memory, up to 16 requests at once in `ie serve` (`--parallel N`, [below](#several-requests-at-once-request-lanes)).
+
+**DeepSeek-V4.1-Flash** · 475 GB safetensors (FP8 dense, MXFP4 experts), 256 GB RAM
+- **Prefill:** 304 tok/s at 2K, 319 at 32K–223K (September 16–17).
+- **Decode:** 12.8 tok/s chat, 14.0 in agent loops (September 17–18); 14.9–15.3 for one request on two tool-calling prompts (September 27); with `ie serve --parallel 2`, 25.1–25.8 together (×1.68–1.69 against one request in the same run); 25.7 together at 16.
+- **Also:** native vision, tool calls, 223K context, 1–2 s follow-up turns from the prompt cache, a disk prompt cache that survives rebuilds, up to 16 requests at once in `ie serve` (`--parallel N`, [below](#several-requests-at-once-request-lanes)).
+
+**DeepSeek-V4-Flash** · 155 GB GGUF (MXFP4 experts, Q8_0 dense)
+- **Prefill** 571 tok/s at 4K; **decode** 26.1 tok/s at 4K, 32.7 on a short prompt; tool calls, prompt cache. Measured on the previous driver stack (September 11).
+
+**GLM-5.3-Flash** · UD-Q4_K_XL GGUF, host-resident experts
+- **Prefill:** 156.4 tok/s at 16K (September 27).
+- **Decode:** 14.0–14.4 tok/s at 16K in the standalone runner (`ie-glm5next-run`, MTP draft); 12.64 / 12.76 for one request in the served configuration. `ie serve` refuses speculative decoding for GLM and runs it one request at a time.
+- **Also:** MTP draft, two-GPU pipelined prefill, request lanes in a test tool (two lanes ×1.68 against one request).
+
+</details>
+
+**Also runs:** <img src="docs/images/logo-openai.png" width="22" height="22" alt="OpenAI" align="middle"> gpt-oss-120B (the former flagship) and 20B · <img src="docs/images/logo-gemma.svg" width="22" height="22" alt="Gemma" align="middle"> Gemma-4 31B and 26B-A4B · the Qwen3, Qwen3-Next and Qwen2.5 families · Llama-, Mistral-, Phi- and Granite-compatible GGUFs. See [Supported architectures](#supported-architectures).
 
 Everything runs behind one OpenAI-compatible server (`ie serve`) with tool calls. Since v0.2.0, `ie supervise` puts
 several servers — one per card set — behind **one endpoint that routes by model name**, and the
 [Dream Agent Harness](https://github.com/Red-Weasel/Dream-Agent-Harness) drives either one as a local agent. Since
 v0.2.6, `ie serve` picks its own number of request lanes and serves a lead with up to 15 sub-agents on the 35B-A3B
 class ([New in v0.2.6](#new-in-v026)).
+
+<sub>Logos are trademarks of their owners and identify the models only; they imply no endorsement.</sub>
 
 ![DeepSeek-V4.1-Flash running locally in the Dream Agent Harness, served by Mach X on two Arc Pro B70 cards](docs/images/dream-deepseek-v41.png)
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
