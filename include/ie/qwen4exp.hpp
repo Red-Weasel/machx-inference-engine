@@ -387,6 +387,9 @@ public:
     // Draft K tokens greedily from the current state (after a forward whose
     // sampled next token is t_next at position pos). Fills draft[0..K).
     std::string mtp_draft(int32_t t_next, uint32_t pos, uint32_t K, int32_t* draft);
+    // P4 B63: the main state was rewound (a restart, a rollback): the head's one-row carry is no longer the row before
+    // the next ingest. Its KV and indexer rows are positional and rewind themselves at the next ingest.
+    void mtp_rewind() noexcept { mtp_have_carry_ = false; }
     // Logits for EVERY row of the last forward (verify step): mixed_ still
     // holds all T final-merge rows. out: device [T, vocab] f16.
     std::string logits_rows(uint32_t T, sycl::half* out);
@@ -406,6 +409,17 @@ public:
     // state before the round at `depth`; look_restore() rewinds to it. Independent of the prompt cache's slot above.
     std::string look_snapshot(uint32_t depth);
     std::string look_restore();
+    // P4 B62: the same contents kept in pinned HOST memory (no VRAM: this model's cards are full of expert cache), for
+    // the engine's in-place restart points: state_save copies the recurrent state at `depth` out, state_restore puts it
+    // back and sets the KV depth markers (the KV and the QSA indexer rows below stay in place).
+    struct StateCopy {
+        PinnedBytes dn_state, dn_conv, ple_conv;
+        PleHistory hist{};
+        std::vector<uint32_t> blk_done;
+        uint32_t depth = 0;
+    };
+    std::string state_save(StateCopy& c, uint32_t depth);
+    std::string state_restore(const StateCopy& c);
 
     // -- spec-verify mode ---------------------------------------------------
     // While on, forward() with T in [2,16] computes every row with kernels
@@ -496,6 +510,9 @@ private:
     PleHistory  snap_ple_hist_{};
     std::vector<uint32_t> snap_blk_done_;
     uint32_t    snap_depth_ = 0;
+    std::vector<int32_t> blkpos3_host_;     // P4 B62: the indexer's block-key positions with an image staged
+    int32_t*    d_blkpos3_ = nullptr;       //   [3, blocks of one call] on this stage's card
+    size_t      blkpos3_cap_ = 0;
     float*      look_dn_state_ = nullptr;   // P4 B56: look_snapshot's slot
     sycl::half* look_dn_conv_  = nullptr;
     float*      look_ple_conv_ = nullptr;

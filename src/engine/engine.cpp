@@ -103,6 +103,23 @@ struct Q4eBundle {
         uint64_t rounds = 0, drafted = 0, hits = 0, redo = 0, plain = 0;
         double   ms_round = 0, ms_redo = 0, ms_plain = 0;
     } look;
+    // P4 B62: the in-place restart points' copies, per stage, in pinned host memory (ie/dn_ladder_plan.hpp keeps the depths)
+    std::vector<Qwen4ExpModel::StateCopy> lad_a, lad_b;
+    uint32_t lad_step = 0, lad_k = 0;                          // fwd_pipelined's regular copies (0 = none)
+    std::vector<std::pair<uint32_t, uint32_t>> lad_taken;      // (slot, depth) it took
+    std::string lad_take(uint32_t slot, uint32_t depth) {
+        if (lad_a.size() <= slot) { lad_a.resize(slot + 1); lad_b.resize(slot + 1); }
+        std::string m = A.state_save(lad_a[slot], depth);
+        if (m.empty() && split) m = B.state_save(lad_b[slot], depth);
+        if (!m.empty()) lad_a[slot].depth = 0;
+        return m;
+    }
+    std::string lad_restore(uint32_t slot) {
+        if (slot >= lad_a.size() || !lad_a[slot].depth || (split && lad_b[slot].depth != lad_a[slot].depth)) return "no copy in the slot";
+        std::string m = A.state_restore(lad_a[slot]);
+        if (m.empty() && split) m = B.state_restore(lad_b[slot]);
+        return m;
+    }
     Qwen4ExpModel& tail() { return split ? B : A; }
     std::string look_init(uint32_t rows, uint32_t vocab, uint32_t min_match) {
         if (look.rows) return {};
@@ -142,6 +159,10 @@ struct Q4eBundle {
                          (unsigned long long)s.redo, (unsigned long long)s.plain,
                          double(s.rounds + s.hits + s.plain) / double(s.rounds + s.redo + s.plain), s.ms_round, s.ms_redo, s.ms_plain,
                          (unsigned long long)s.resyncs);
+        if (std::getenv("IE_Q4E_LOOKUP_STATS") && spec.rounds)
+            std::fprintf(stderr, "[qwen4exp SPEC] draft rounds=%llu, rows answered without a forward=%llu (%.2f tokens a round)\n",
+                         (unsigned long long)spec.rounds, (unsigned long long)spec.hits, double(spec.rounds + spec.hits) / double(spec.rounds));
+        spec.rounds = spec.hits = 0;
         if (std::getenv("IE_Q4E_LOOKUP_STATS") && s.plain)
             std::fprintf(stderr, "[qwen4exp LOOKUP] drafts cut at a listed change: %llu (%zu listed); plain steps: %llu no repeat, %llu blocked, "
                          "%llu draft too short\n", (unsigned long long)s.cuts, s.miss_tok.size(), (unsigned long long)s.why_nomatch,
@@ -153,6 +174,7 @@ struct Q4eBundle {
     }
     std::string look_flush() {
         Look& s = look;
+        if (auto e = spec_resolve(); !e.empty()) return e;   // (P4 B63)
         if (s.next < s.n_rows) {
             const uint32_t accepted = s.next;
             const uint32_t n_rows0 = s.n_rows; (void)n_rows0;
@@ -194,6 +216,15 @@ struct Q4eBundle {
         if (s.blocked) --s.blocked;
         sycl::queue& qt = tail().queue();
         const uint64_t row_bytes = uint64_t(s.V) * sizeof(sycl::half);
+        if (spec.n) {   // P4 B63: a draft round's rows
+            if (spec.next < spec.n && pos == spec.base + spec.next && token == spec.batch[spec.next]) {
+                qt.memcpy(logits_host, s.d_all + uint64_t(spec.next) * s.V, row_bytes).wait();
+                ++spec.next; ++spec.hits;
+                if (spec.next == spec.n) return spec_resolve();
+                return {};
+            }
+            if (auto e = spec_resolve(); !e.empty()) return e;
+        }
         if (s.next < s.n_rows && pos == s.base + s.next && token == s.vin[s.next]) {
             qt.memcpy(logits_host, s.d_all + uint64_t(s.next) * s.V, row_bytes).wait();
             ++s.next; ++s.hits;
@@ -244,6 +275,11 @@ struct Q4eBundle {
         if (d.size() < 2) d.clear();
         if (d.empty()) { if (had) ++s.why_short; else if (s.blocked) ++s.why_blocked; else ++s.why_nomatch; }
         const auto t0 = std::chrono::steady_clock::now();
+        if (d.empty() && mtp_on && mtp_ok && mtp_to == pos && pos != 0 && pos + mtp_k + 1 <= max_pos && mtp_k + 1 <= s.rows) {
+            std::string m = spec_round(token, pos, logits_host);   // P4 B63: no repeat to copy: the head drafts
+            s.ms_plain += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            return m;
+        }
         if (d.empty()) {
             ++s.plain;
             std::string m = fwd(&token, 1, pos);
@@ -256,9 +292,10 @@ struct Q4eBundle {
         for (uint32_t j = 1; j < Vr; ++j) s.vin[j] = d[j - 1];
         std::string m = A.look_snapshot(pos);
         if (m.empty() && split) m = B.look_snapshot(pos);
-        if (m.empty()) m = fwd(s.vin.data(), Vr, pos);
+        if (m.empty()) m = fwd(s.vin.data(), Vr, pos, /*feed=*/false);
         if (m.empty()) m = tail().logits_rows(Vr, s.d_all);
         if (!m.empty()) return m;
+        mtp_feed(s.vin.data(), Vr, pos);   // (P4 B63: after the rows' logits were taken)
         qt.memcpy(logits_host, s.d_all, row_bytes).wait();   // row 0 = this position
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         s.ms_round += ms;
@@ -267,14 +304,96 @@ struct Q4eBundle {
         ++s.rounds; s.drafted += d.size();
         return {};
     }
-    std::string fwd(const int32_t* t, uint32_t T, uint32_t pos) {
+    // feed = false: the caller reads the rows' logits first (logits_rows reads the workspace the head's ingest reuses)
+    // and calls mtp_feed itself
+    std::string fwd(const int32_t* t, uint32_t T, uint32_t pos, bool feed = true) {
+        std::string m;
         if (split) {
-            std::string m = A.forward_range(t, T, pos, nullptr, wide.data(), nullptr);
-            if (!m.empty()) return m;
-            return B.forward_range(t, T, pos, p2p ? nullptr : wide.data(),
-                                   nullptr, nullptr, /*wide_in_device=*/p2p);
-        }
-        return A.forward(t, T, pos, nullptr);
+            m = A.forward_range(t, T, pos, nullptr, wide.data(), nullptr);
+            if (m.empty()) m = B.forward_range(t, T, pos, p2p ? nullptr : wide.data(),
+                                               nullptr, nullptr, /*wide_in_device=*/p2p);
+        } else m = A.forward(t, T, pos, nullptr);
+        if (m.empty() && feed) mtp_feed(t, T, pos);
+        return m;
+    }
+    // ---- P4 B63: the MTP draft head in the engine (tools/qwen4exp_spec2.cpp's loop as a step of the decode loop) ------
+    // The head is one decoder layer on the tail stage with a positional KV of its own: every committed forward is
+    // ingested (mtp_feed), a rewind clears its one-row carry. mtp_to = the positions ingested for the live sequence;
+    // a forward that starts past it (a restore the head did not see) turns drafting off until a sequence starts at 0.
+    bool     mtp_on = false, mtp_ok = false;
+    uint32_t mtp_to = 0, mtp_k = 3;
+    GgufReader mtp_g;
+    // --spec at one request lane WITH --spec-head <mtp-head.gguf> (or IE_Q4E_MTP_HEAD): the MTP draft head. Call after the
+    // tail stage's load() and BEFORE its init_runtime (the expert cache budgets around the head's ~4.7 GiB). "" = loaded
+    // or no path given; a message = given and failed.
+    std::string mtp_load(const std::string& model_path, std::string path, const GgufReader& main_g, uint32_t K) {
+        namespace fs = std::filesystem;
+        if (path.empty()) if (const char* v = std::getenv("IE_Q4E_MTP_HEAD")) path = v;
+        (void)model_path;
+        // Only on an explicit path. Measured 2026-10-05 (UD-Q4_K_XL, both cards): decode 28.7 / 28.3 -> 30.8 / 33.7 tok/s
+        // greedy (2.7-3.0 tokens a round, but a 4-row verify costs two plain steps), no gain at temperature 0.7, prefill
+        // 502 -> 412 tok/s (the head ingests every chunk) and ~4.7 GiB less expert cache on the tail card: not a default.
+        if (path.empty()) return {};
+        if (auto e = mtp_g.open(path); !e.empty()) return "mtp head " + path + ": " + e;
+        if (auto e = tail().load_mtp(mtp_g, split ? &main_g : nullptr); !e.empty()) return "mtp head: " + e;
+        mtp_on = true;
+        // (K = 3 only for now: measured 2026-10-05, 800 greedy tokens equal to plain decoding at K = 3; at K = 5 the tokens
+        // differed and it was slower -- not investigated)
+        mtp_k = std::min<uint32_t>(3u, std::max<uint32_t>(2u, K));
+        std::fprintf(stderr, "[qwen4exp] --spec: MTP draft head %s (K=%u; every token is verified with the exact kernels: the tokens are plain "
+                             "decoding's)\n", path.c_str(), mtp_k);
+        return {};
+    }
+    void mtp_feed(const int32_t* t, uint32_t T, uint32_t pos) {
+        if (!mtp_on) return;
+        if (pos == 0) { mtp_ok = true; mtp_to = 0; }
+        if (!mtp_ok) return;
+        if (pos > mtp_to) { mtp_ok = false; return; }
+        if (pos < mtp_to) tail().mtp_rewind();
+        if (!tail().mtp_ingest(t, T, pos).empty()) { mtp_ok = false; return; }
+        mtp_to = pos + T;
+    }
+    // the live state was set to `depth` by a restore / restart (0 = a new sequence follows)
+    void mtp_sync(uint32_t depth) {
+        if (!mtp_on) return;
+        if (depth == 0) { mtp_ok = true; mtp_to = 0; tail().mtp_rewind(); return; }
+        if (!mtp_ok || depth > mtp_to) { mtp_ok = false; return; }
+        tail().mtp_rewind();
+        mtp_to = depth;
+    }
+    // A draft round in flight: rows [0, n) of batch at `base`, verified with the exact kernels (spec-verify mode: each row
+    // is the T = 1 step's bytes, each stage checkpoints its state after every row); `next` rows were followed.
+    struct Spec { std::vector<int32_t> batch; uint32_t base = 0, n = 0, next = 0; uint64_t rounds = 0, hits = 0; } spec;
+    std::string spec_resolve() {   // adopt the followed rows on both stages, ingest them into the head
+        Spec& s = spec;
+        if (!s.n) return {};
+        const uint32_t acc = s.next;
+        s.n = s.next = 0;
+        std::string m = A.commit_verify(acc);
+        if (m.empty() && split) m = B.commit_verify(acc);
+        if (!m.empty()) return "spec commit: " + m;
+        tail().mtp_rewind();   // (the verify forward's rows are in wide_: the carry before them is the round's first input row)
+        if (!tail().mtp_ingest(s.batch.data(), acc, s.base).empty()) mtp_ok = false; else mtp_to = s.base + acc;
+        return {};
+    }
+    std::string spec_round(int32_t token, uint32_t pos, sycl::half* logits_host) {
+        Spec& s = spec;
+        const uint32_t K = mtp_k;
+        s.batch.assign(K + 1, 0);
+        s.batch[0] = token;
+        if (auto e = tail().mtp_draft(token, pos, K, s.batch.data() + 1); !e.empty()) return "draft: " + e;
+        A.set_spec_verify(true); if (split) B.set_spec_verify(true);
+        std::string m;
+        if (split) {
+            m = A.forward_range(s.batch.data(), K + 1, pos, nullptr, wide.data(), nullptr);
+            if (m.empty()) m = B.forward_range(s.batch.data(), K + 1, pos, p2p ? nullptr : wide.data(), nullptr, nullptr, p2p);
+        } else m = A.forward(s.batch.data(), K + 1, pos, nullptr);
+        A.set_spec_verify(false); if (split) B.set_spec_verify(false);
+        if (m.empty()) m = tail().logits_rows(K + 1, look.d_all);
+        if (!m.empty()) return "spec verify: " + m;
+        tail().queue().memcpy(logits_host, look.d_all, uint64_t(look.V) * sizeof(sycl::half)).wait();
+        s.base = pos; s.n = K + 1; s.next = 1; ++s.rounds;
+        return {};
     }
     // Chunk-PIPELINED prefill over the split (run2's certified overlap: A
     // runs chunk k+1 while B runs chunk k; B is sequential with itself via
@@ -301,6 +420,11 @@ struct Q4eBundle {
         std::future<std::string> bfut;
         std::string err;
         uint32_t done = 0;
+        // P4 B63: the draft head ingests the chunks in order on B when the run starts where its record ends
+        if (mtp_on && pos == 0) { mtp_ok = true; mtp_to = 0; }
+        const bool mtp_feeding = mtp_on && mtp_ok && pos <= mtp_to;
+        if (mtp_feeding && pos < mtp_to) B.mtp_rewind();
+        if (mtp_on && !mtp_feeding) mtp_ok = false;
         for (uint32_t k = 0; done < count; ++k) {
             const uint32_t n = std::min(PC, count - done);
             float* wb = wb2[k & 1];
@@ -309,15 +433,31 @@ struct Q4eBundle {
                                          wb, nullptr); !e.empty()) {
                 err = "A: " + e; break;
             }
+            // P4 B62: a restart point where this chunk passes a multiple of lad_step: each stage copies its state right
+            // after ITS part of the chunk, so the pipeline is not cut (a cut cost ~2.4 s on a 15.7K-token prompt)
+            Qwen4ExpModel::StateCopy* lb = nullptr;
+            const uint32_t ld = pos + done + n;
+            if (lad_step && lad_k && ld / lad_step > (pos + done) / lad_step) {
+                const uint32_t sl = (ld / lad_step - 1) % lad_k;
+                if (sl < lad_a.size() && sl < lad_b.size() && A.state_save(lad_a[sl], ld).empty()) {
+                    lb = &lad_b[sl]; lb->depth = 0;
+                    lad_taken.emplace_back(sl, ld);
+                }
+            }
             if (bfut.valid())
                 if (auto e = bfut.get(); !e.empty()) { err = "B: " + e; break; }
             Qwen4ExpModel* Bp = &B;
             const uint32_t bn = n, bpos = pos + done, bank = k & 1;
-            bfut = std::async(std::launch::async, [Bp, wb, bn, bpos, banks, bank]() {
+            const int32_t* bt = t + done;
+            const bool feed = mtp_feeding;
+            bfut = std::async(std::launch::async, [Bp, wb, bn, bpos, banks, bank, lb, ld, bt, feed]() {
                 if (banks) Bp->use_wide_bank(bank);
-                return Bp->forward_range(nullptr, bn, bpos,
+                std::string e = Bp->forward_range(nullptr, bn, bpos,
                                          banks ? nullptr : wb, nullptr, nullptr,
                                          /*wide_in_device=*/banks);
+                if (e.empty() && lb) (void)Bp->state_save(*lb, ld);   // (a failed copy leaves depth 0: the slot does not count)
+                if (e.empty() && feed) e = Bp->mtp_ingest(bt, bn, bpos);   // (P4 B63: the head reads every chunk)
+                return e;
             });
             done += n;
         }
@@ -325,6 +465,8 @@ struct Q4eBundle {
             const std::string e = bfut.get();
             if (err.empty() && !e.empty()) err = "B: " + e;
         }
+        if (!err.empty()) lad_taken.clear();
+        if (mtp_feeding) { if (err.empty()) mtp_to = pos + count; else mtp_ok = false; }
         if (banks) B.use_wide_bank(0);
         if (p2p) A.set_wide_peer(B.wide_device());
         return err;
@@ -347,6 +489,7 @@ struct Q4eBundle {
         if (serve) serve->shutdown();   // the pipe's stage threads and the serial worker end before the models go
         serve.reset();
         look_free();   // (P4 B56: on the tail stage's queue, before the models go)
+        lad_a.clear(); lad_b.clear();   // (P4 B62: pinned host memory of the stages' queues)
         lanes.reset();
     }
 };
@@ -1647,10 +1790,17 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         if (opts.parallel > 1 && n_lanes == 1)
             std::fprintf(stderr, "[qwen4exp] --parallel %u: time-sliced (%s)\n", opts.parallel,
                          lanes_off ? "IE_Q4E_LANES=0" : "request lanes need two cards");
+        if (opts.spec && n_lanes > 1)
+            std::fprintf(stderr, "[qwen4exp] --spec: lookup drafts run at one request lane; with --parallel %u they are off\n", opts.parallel);
         const uint32_t hi = b->split ? b->cfg.n_layers / 2 : b->cfg.n_layers;
         if (auto m = b->A.load(e->alloc_, e->gguf_, b->cfg, 0, 0, hi); !m.empty()) {
             err = "qwen4exp A: " + m; e->q4e_.reset(); return nullptr;
         }
+        // P4 B63: --spec at one lane loads the MTP draft head onto the tail stage, before that stage sizes its expert cache
+        const bool q4e_mtp = opts.spec && n_lanes == 1 && ![] { const char* v = std::getenv("IE_Q4E_MTP"); return v && *v == '0'; }();
+        if (q4e_mtp && !b->split)
+            if (auto m = b->mtp_load(gguf_path, opts.spec_head, e->gguf_, opts.spec_k); !m.empty())
+                std::fprintf(stderr, "[qwen4exp] %s -- lookup drafts only\n", m.c_str());
         if (auto m = b->A.init_runtime(opts.max_ctx, chunk, n_lanes, lane_ctx); !m.empty()) {
             err = "qwen4exp A runtime: " + m; e->q4e_.reset(); return nullptr;
         }
@@ -1666,6 +1816,9 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             if (auto m = b->B.load(b->a1, e->gguf_, b->cfg, 0, hi, b->cfg.n_layers); !m.empty()) {
                 err = "qwen4exp B: " + m; e->q4e_.reset(); return nullptr;
             }
+            if (q4e_mtp)
+                if (auto m = b->mtp_load(gguf_path, opts.spec_head, e->gguf_, opts.spec_k); !m.empty())
+                    std::fprintf(stderr, "[qwen4exp] %s -- lookup drafts only\n", m.c_str());
             if (auto m = b->B.init_runtime(opts.max_ctx, chunk, n_lanes, lane_ctx); !m.empty()) {
                 err = "qwen4exp B runtime: " + m; e->q4e_.reset(); return nullptr;
             }
@@ -2210,6 +2363,7 @@ std::string Engine::qvis_stage(const std::vector<int32_t>& ids) {
     // Pad runs in prompt order must match the pending images one-to-one.
     qvis_rows_.clear();
     qvis_spans_.clear();
+    qvis_hash_.clear();
     std::vector<Qwen4VisGrid> grids;
     size_t img = 0;
     for (uint32_t t = 0; t < ids.size(); ) {
@@ -2226,6 +2380,13 @@ std::string Engine::qvis_stage(const std::vector<int32_t>& ids) {
         if (auto e = qvis_tower_->encode_gpu(va, im.px.data(), im.H, im.W, emb);
             !e.empty()) return "vision encode: " + e;
         qvis_spans_.push_back({t, n});
+        {   // P4 B62: the image's identity for the restart points (its pad ids cannot tell one image from another)
+            uint64_t h = 0xCBF29CE484222325ull ^ (uint64_t(im.H) << 32 | im.W);
+            const unsigned char* pb = reinterpret_cast<const unsigned char*>(im.px.data());
+            const size_t nb = im.px.size() * sizeof(float);
+            for (size_t i = 0; i + 8 <= nb; i += 8) { uint64_t w; std::memcpy(&w, pb + i, 8); h = (h ^ w) * 0x100000001B3ull; h ^= h >> 29; }
+            qvis_hash_.push_back(h);
+        }
         grids.push_back({t, gh2, gw2});
         qvis_rows_.insert(qvis_rows_.end(), emb.begin(), emb.end());
         ++img;
@@ -4449,37 +4610,74 @@ GenerateResult Engine::generate(const std::string& prompt,
     auto ladder_model = [&](auto&& fn) { return qwen35_split_ ? fn(qwen35_split_model_) : fn(qwen35moe_split_model_); };
     if (!ladder_tried_) {
         ladder_tried_ = true;
+        const bool lad_q4e = q4e_ && !q4e_->serve;   // P4 B62: Flash-Next at one request lane (copies in host RAM)
         const bool arch_ok = (qwen35_split_ && !qwen35_tp_ && qwen35_split_model_.n_lanes() <= 1 && qwen35_split_model_.n_slot_banks() == 0) ||
-                             (qwen35moe_split_ && qwen35moe_split_model_.n_lanes() <= 1);
+                             (qwen35moe_split_ && qwen35moe_split_model_.n_lanes() <= 1) || lad_q4e;
         const char* off = std::getenv("IE_DN_LADDER");
         if (arch_ok && prompt_cache_on_ && !opts_.int8_kv && !(off && *off == '0')) {
             constexpr uint32_t kRegular = 16;
             const char* sv = std::getenv("IE_DN_LADDER_STEP");
             const uint32_t step = dn_ladder_step(opts_.max_ctx, kRegular, sv && std::atoi(sv) > 0 ? uint32_t(std::atoi(sv)) : 8192u);
-            const uint32_t nd = ladder_model([](auto& m) { return m.n_devices(); });
+            const uint32_t nd = lad_q4e ? 0u : ladder_model([](auto& m) { return m.n_devices(); });
             ladder_.init(nd, step, kRegular);
             uint64_t mb = 0;
             for (uint32_t d = 0; d < nd; ++d) mb = std::max<uint64_t>(mb, ladder_model([&](auto& m) { return ladder_.slot_bytes(m, d); }) >> 20);
+            if (lad_q4e) { q4e_->lad_k = kRegular; q4e_->lad_a.resize(kRegular + 2); q4e_->lad_b.resize(kRegular + 2); }
+            if (lad_q4e)
+                std::fprintf(stderr, "[dn-ladder] Flash-Next in-place restart points ON: a copy of the recurrent state every %u tokens while a "
+                                     "prompt is read (up to %u), one at the conversation boundary and one at the reply's end, kept in pinned "
+                                     "system RAM (IE_DN_LADDER=0 = off)\n", step, kRegular);
+            else
             std::fprintf(stderr, "[dn-ladder] in-place restart points ON: a copy of the DeltaNet state every %u tokens while a prompt is read "
                                  "(up to %u), one at the prompt's end and one at the reply's end; %llu MiB a copy a card, allocated on first use "
                                  "(IE_DN_LADDER=0 = off)\n", step, kRegular, (unsigned long long)mb);
         }
     }
-    bool lad = ladder_.on && !qvis_active_ && (qwen35_split_ || qwen35moe_split_);
+    const bool lad_q4e = q4e_ && !q4e_->serve;
+    // P4 B62: an image request keeps its restart points: the ladder's token record carries, at every image position, a
+    // key made of that image's hash (negative, so never a token id), and a different image at the same place ends the
+    // shared part there. IE_DN_LADDER_VISION=0 = image requests take no restart points (as before).
+    std::vector<int32_t> lad_key;
+    bool lad_vis_ok = !qvis_active_;
+    if (qvis_active_ && ladder_.on && qvis_hash_.size() == qvis_spans_.size() &&
+        ![] { const char* v = std::getenv("IE_DN_LADDER_VISION"); return v && *v == '0'; }()) {
+        lad_key.assign(ids.begin(), ids.end());
+        for (size_t k = 0; k < qvis_spans_.size(); ++k) {
+            const auto [t0, n] = qvis_spans_[k];
+            for (uint32_t j = 0; j < n && t0 + j < lad_key.size(); ++j)
+                lad_key[t0 + j] = -2 - int32_t((qvis_hash_[k] ^ (uint64_t(j) * 0x9E3779B97F4A7C15ull)) >> 34);
+        }
+        lad_vis_ok = true;
+    }
+    const std::vector<int32_t>& lad_ids = lad_key.empty() ? ids : lad_key;
+    bool lad = ladder_.on && lad_vis_ok && (qwen35_split_ || qwen35moe_split_ || lad_q4e);
     const uint64_t lad_epoch = ladder_epoch_;
     uint32_t lad_shared = 0;   // the leading tokens this prompt shares with the live sequence
     if (lad) {
-        const uint32_t L = lad_shared = dn_ladder_lcp(ladder_.live, ids);
+        const uint32_t L = lad_shared = dn_ladder_lcp(ladder_.live, lad_ids);
         const int slot = L ? ladder_.plan.best(std::min<uint32_t>(L, uint32_t(ids.size()) - 1)) : -1;
+        if (std::getenv("IE_DN_LADDER_DEBUG")) {
+            std::string ds;
+            for (uint32_t d : ladder_.plan.depth) ds += " " + std::to_string(d);
+            std::fprintf(stderr, "[dn-ladder debug] live %zu, prompt %zu, shared %u, slot %d; depths:%s\n", ladder_.live.size(), ids.size(), L, slot, ds.c_str());
+        }
         const uint32_t c = slot >= 0 ? ladder_.plan.depth[uint32_t(slot)] : 0;
-        uint32_t M = 0;   // what the prompt cache would restore (fleet_cache_restore's rule)
-        if (c) {
+        uint32_t M = 0;   // what the prompt cache would restore (fleet_cache_restore's rule; Flash-Next: its one snapshot)
+        if (c && lad_q4e) {
+            const std::vector<int32_t>& st = q4e_->snap_tokens;
+            const uint32_t D = q4e_->A.snapshot_depth();
+            if (D > 0 && st.size() == size_t(D) && size_t(D) < ids.size() && std::equal(st.begin(), st.end(), ids.begin())) M = D;
+        } else if (c && !qvis_active_) {   // (an image request restores nothing from the prompt cache)
             const auto hit = fleet_cache_.find_longest_match(ids);
             if (hit.kv && hit.dn && hit.match_len < ids.size()) M = hit.match_len;
         }
         if (c && c >= M) {
             const auto t_r = std::chrono::steady_clock::now();
-            const std::string e = ladder_model([&](auto& m) { return ladder_.restore(m, uint32_t(slot)); });
+            std::string e;
+            if (lad_q4e) {
+                e = q4e_->lad_restore(uint32_t(slot));
+                if (e.empty()) { ladder_.plan.drop_above(c); ladder_.live.resize(std::min<size_t>(ladder_.live.size(), c)); ++ladder_.restores; }
+            } else e = ladder_model([&](auto& m) { return ladder_.restore(m, uint32_t(slot)); });
             if (e.empty()) {
                 restored = c;
                 std::fprintf(stderr, "[dn-ladder] restart in place at %u of %zu (the live sequence shares %u; the prompt cache had %u): %.1f ms\n",
@@ -4696,6 +4894,7 @@ GenerateResult Engine::generate(const std::string& prompt,
             if (v >= 1 && uint32_t(v) <= opts_.max_ctx) pf_chunk = uint32_t(v);
         }
     }
+    if (q4e_) q4e_->mtp_sync(restored);   // P4 B63: the draft head follows the live state's depth
     if (q4e_ && restored > 0) {
         // Restore path skips the pos==0 reset, so staging from any previous
         // request must be dropped by hand; this request's (if any) re-arms.
@@ -4795,7 +4994,14 @@ GenerateResult Engine::generate(const std::string& prompt,
             std::getenv("IE_Q4E_NO_PIPELINE") == nullptr;
         if (q4e_pipeline && q4e_ && q4e_->split && !gate_.contended() &&
             end > pos && (end - pos) > 1024) {
-            if (pos == 0) { q4e_->A.reset_state(); q4e_->B.reset_state(); }
+            if (pos == 0) {
+                q4e_->A.reset_state(); q4e_->B.reset_state();
+                // P4 B62: the reset wipes the image staging (the vision rows and the M-RoPE table), as q4e_forward's
+                // does -- which re-arms it. This branch did not: an image prompt of more than 2,048 tokens was read
+                // WITHOUT its image (a green square answered "red circle"; every release that pipelines, back to
+                // v0.2.10 at least).
+                qvis_apply();
+            }
             if (auto m = q4e_->fwd_pipelined(ids.data() + pos, end - pos, pos);
                 m.empty()) {
                 pos = end;
@@ -4860,7 +5066,7 @@ GenerateResult Engine::generate(const std::string& prompt,
                 if (se.empty()) {
                     gate_.release();
                     gate_.acquire();
-                    se = q4e_unstash();
+                    se = q4e_unstash(); ladder_.clear(); ++ladder_epoch_; q4e_->mtp_ok = false;   // (P4 B62 / B63)
                     if (!se.empty()) { slot_err = se; break; }
                     if (pos < ids.size())
                         q.memcpy(d_ids_ + pos, ids.data() + pos,
@@ -4875,13 +5081,30 @@ GenerateResult Engine::generate(const std::string& prompt,
     // P4 B57: a prompt is read up to each regular ladder depth on the way, and a copy taken there (both cards idle)
     auto ladder_take = [&](uint32_t slot, uint32_t depth) {
         if (!lad || ladder_epoch_ != lad_epoch || !ladder_.on) { lad = false; return; }
-        if (const std::string e = ladder_model([&](auto& m) { return ladder_.take(m, slot, depth); }); !e.empty()) {
+        std::string e;
+        if (lad_q4e) {
+            ladder_.plan.depth[slot] = 0;
+            e = q4e_->lad_take(slot, depth);
+            if (e.empty()) { ladder_.plan.depth[slot] = depth; ++ladder_.takes; }
+        } else e = ladder_model([&](auto& m) { return ladder_.take(m, slot, depth); });
+        if (!e.empty()) {
             std::fprintf(stderr, "[dn-ladder] off: %s\n", e.c_str());
             lad = false;
         }
     };
     auto prefill_plain = prefill_to;
     auto prefill_lad = [&](uint32_t end, bool whole_pk = false) {
+        if (lad_q4e) {   // P4 B62: Flash-Next's regular copies are taken inside its pipelined prefill (no cut)
+            const bool on = lad && ladder_epoch_ == lad_epoch;
+            q4e_->lad_step = on ? ladder_.plan.step : 0;
+            q4e_->lad_taken.clear();
+            prefill_plain(end, whole_pk);
+            if (on && ladder_epoch_ == lad_epoch && !pf_abort && slot_err.empty())
+                for (const auto& [sl, d] : q4e_->lad_taken)
+                    if (d <= pos && sl < ladder_.plan.n_regular) { ladder_.plan.depth[sl] = d; ++ladder_.takes; }
+            q4e_->lad_step = 0; q4e_->lad_taken.clear();
+            return;
+        }
         while (lad && ladder_epoch_ == lad_epoch && !pf_abort && slot_err.empty()) {
             const uint32_t d = ladder_.plan.next_regular(pos, end);
             if (!d) break;
@@ -5323,11 +5546,11 @@ GenerateResult Engine::generate(const std::string& prompt,
                 const int32_t wrong = (pick + 1 < int32_t(vocab())) ? pick + 1 : 0;
                 q.memcpy(d_ids_ + pos, &wrong, sizeof(wrong)).wait();
                 forward_step(q, d_ids_ + pos, /*T=*/1, pos).wait();
-                se = q4e_unstash();
+                se = q4e_unstash(); ladder_.clear(); ++ladder_epoch_; q4e_->mtp_ok = false;   // (P4 B62 / B63)
             } else if (se.empty()) {
                 gate_.release();
                 gate_.acquire();
-                se = q4e_unstash();
+                se = q4e_unstash(); ladder_.clear(); ++ladder_epoch_; q4e_->mtp_ok = false;   // (P4 B62 / B63)
             }
             if (!se.empty()) {
                 res.finish_reason = "error: q4e-slot: " + se;
@@ -5420,7 +5643,7 @@ GenerateResult Engine::generate(const std::string& prompt,
         pos >= ids.size() && uint64_t(pos) <= uint64_t(ids.size()) + generated.size()) {
         if (pos > ids.size()) ladder_take(ladder_.plan.slot_reply_end(), pos);
         if (lad) {
-            ladder_.live.assign(ids.begin(), ids.end());
+            ladder_.live.assign(lad_ids.begin(), lad_ids.end());
             ladder_.live.insert(ladder_.live.end(), generated.begin(), generated.begin() + std::ptrdiff_t(pos - ids.size()));
         }
     }

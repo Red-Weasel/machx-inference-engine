@@ -738,6 +738,7 @@ private:
     std::vector<QvisPendingImage> qvis_pending_;
     std::vector<float>   qvis_rows_;      // concat merged rows, span order
     std::vector<std::pair<uint32_t, uint32_t>> qvis_spans_;  // (t0, n)
+    std::vector<uint64_t> qvis_hash_;                        // P4 B62: per span, the image's hash (the restart points' key)
     std::vector<int32_t> qvis_pos3_;      // [3, n_prompt]
     int32_t              qvis_delta_ = 0;
     bool                 qvis_active_ = false;

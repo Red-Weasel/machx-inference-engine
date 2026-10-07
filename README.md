@@ -20,6 +20,7 @@
 **Latest**
 
 - **Video, October 5–6:** [LTX-2.5](docs/ltx25/LTX25_ON_ARC.md) makes 5 seconds of 1280×704 video with sound in about 21 s on two Arc Pro B70 cards (stock PyTorch: 79 s).
+- **v0.2.21, October 7 — Flash-Next sees long images:** Flash-Next answered image prompts of more than 2,048 tokens as if there were no image (v0.2.10 through v0.2.20); fixed. A conversation edited in the middle restarts from a saved point on Flash-Next too (28.5 → 18.4 s on a 15.7K-token prompt), and image conversations keep their restart points (second turn on Flash-Next 24.8 → 3.0 s). `--spec` is now offered for the 35B-A3B class and Flash-Next. [Details](#new-in-v0221)
 - **v0.2.20, October 5 — one card:** an Arc Pro B70 now runs the Qwen models on the same fast code as two cards. On **one** card the 27B at Q6_K reads **823 tok/s** (it was 190) and writes 22 (33 with `--spec`), and the 35B-A3B class at Q5_K_M reads **1,337** (that file did not load before) and writes 87. A load is tried as asked: memory estimates warn, they do not refuse. [Details](#new-in-v0220)
 - **v0.2.18, October 5:** replies that copy text already in the conversation are written several times faster with `--spec` (a 1,800-token file edit: 108 s → 28 s on the 27B, 24 s → 7 s on the 35B-A3B class, 69 s → 31 s on Flash-Next), and a conversation edited in the middle restarts from a saved point. [Details](#new-in-v0218)
 - **v0.2.13, October 4 — two cards:** prompts are read 1.4–3.7× faster on the Qwen models. The 27B goes from 1,037 to **2,962 tok/s** at Q8_0 and from 987 to 1,378 at Q6_K; the 35B-A3B class at Q8_0 from 1,816 to 2,896. [Details](#new-in-v0213)
@@ -134,7 +135,7 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 **Qwen3.8-Flash-Next** · UD-Q4_K_XL GGUF (104 GB)
 - **Prefill:** 470 tok/s on text it had not seen and 688 on a repeated prompt (bench, October 4; it was 241 / 487); 495–502 pipelined once warm (standalone runner, September 27).
 - **Decode:** 28.7 / 28.2 tok/s plain at 2.4K / 10.7K tokens (October 4–5); with `--spec` lookup drafts 40.7 on a copy prompt (26.9 plain). In the standalone runner with its MTP head: 37.1–38.2 chat, 44.4–44.6 code (lossless speculative, K=3, September 27); `ie serve` does not load that head.
-- **Serving:** native vision; up to 16 requests at once (two at 59.0–62.6 tok/s together, ×1.94–2.06; 16 at 118.4 with row batching and 128.0 at `--ctx 8192`); a file edit takes 68.7 s plain and 30.7 s with `--spec`.
+- **Serving:** native vision; up to 16 requests at once (two at 59.0–62.6 tok/s together, ×1.94–2.06; 16 at 118.4 with row batching and 128.0 at `--ctx 8192`); a file edit takes 68.7 s plain and 30.7 s with `--spec`. Image prompts longer than 2,048 tokens are read with the image since v0.2.21 (v0.2.10 through v0.2.20 dropped it).
 
 **Xiaomi MiMo-V2.6-Flash** · 178 GB safetensors (FP8 dense, MXFP4 experts), 256 GB RAM
 - **Prefill:** 438–483 tok/s at 4–6K; 434–438 at 32K, 322 at 120K (September 22–27).
@@ -168,6 +169,87 @@ class ([New in v0.2.6](#new-in-v026)).
 
 ![DeepSeek-V4.1-Flash running locally in the Dream Agent Harness, served by Mach X on two Arc Pro B70 cards](docs/images/dream-deepseek-v41.png)
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
+
+---
+
+<a id="new-in-v0221"></a>
+## 🆕 New in v0.2.21
+
+Everything since [v0.2.20](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.20). Every figure was
+measured on October 5, 2026, on two Arc Pro B70 cards, on community fine-tunes of the models, old path against new path on
+the same day; "serve" is `ie serve` with an OpenAI client, greedy unless a line says otherwise.
+
+### Flash-Next reads long image prompts with the image
+
+An image prompt of more than 2,048 tokens was answered by Flash-Next as if there were no image (v0.2.10 through v0.2.20). A
+picture of a green square was described correctly at 281 and 1,318 prompt tokens and as "a red circle" or "a blue circle" at
+2,199, 5,697 and 16,747. The pipelined prefill (the path for prompts over 2,048 tokens) resets both stages and did not stage
+the picture again afterwards, so the model saw image-pad embeddings at plain positions; `IE_Q4E_NO_PIPELINE=1` had been right
+before the fix, which is how it was isolated. Now both test images are right at all four lengths and in a two-picture
+conversation. The indexer's pooled block keys also take the picture's position streams, as its query already did
+(`IE_Q4E_QSA_MROPE_KEYS=0` reverts that part; the evidence for it is weak).
+
+### A conversation edited in the middle restarts from a saved point on Flash-Next, and image conversations keep theirs
+
+The restart points of v0.2.18 now cover Flash-Next at one request lane. Its recurrent state (DeltaNet state and conv, the PLE
+conv and history, the indexer's block count) is copied to pinned **host** memory, because the cards are full of expert cache,
+at the conversation boundary, at the reply's end and wherever a 2,048-token chunk of the pipelined prefill passes a multiple
+of the step; each stage takes its copy right after its own part of the chunk, so the pipeline is not cut. On a 15.7K-token
+prompt (`ie serve --ctx 65536`): one line changed two thirds in 28.5 → **18.4 s**, back to the first prompt 28.5 → 18.4 s, the
+edited prompt with another question 26.4 → 16.2 s; the first read costs nothing (29.1 s against 29.0). All six replies equal
+with the restart points on and off. `IE_DN_LADDER=0` turns them off.
+
+Image conversations keep their restart points too (27B and 35B-A3B splits, Flash-Next): the token record carries the picture's
+hash at every image position, so the same picture shares its start and a different picture of the same size ends the shared
+part where it starts. The second turn of a 16.7K-token image conversation:
+
+| second turn of a 16.7K-token image conversation | before | v0.2.21 |
+|---|---:|---:|
+| Qwen3.8-27B | 10.2 s | **4.5 s** |
+| 35B-A3B class | 7.2 s | **1.0 s** |
+| Flash-Next | 24.8 s | **3.0 s** |
+
+The 35B-A3B replies were byte-equal (five requests, two pictures) and so was Flash-Next's first conversation; Flash-Next's
+other follow-up was token-equal for 151 tokens of reasoning and then words its answer differently (the 32-token tail is read
+in another chunk shape). `IE_DN_LADDER_VISION=0` turns the image part off.
+
+### `--spec` is offered for the 35B-A3B class and Flash-Next
+
+`ie capabilities` reported `features.speculative` only for the dense 27B and Gemma-4, so a client's load screen had no switch
+for the other two even though `--spec` works there. It now reports it for the 35B-A3B class (lookup drafts across the request
+lanes) and Flash-Next (lookup drafts at one request lane: with `--parallel` above 1 they are off, and the load says so; they
+are not used on image requests). What the switch does is described in [New in v0.2.18](#new-in-v0218).
+
+### Flash-Next's MTP draft head: opt-in, and measured as not worth turning on
+
+`--spec --spec-head <mtp-head.gguf>` (or `IE_Q4E_MTP_HEAD`) at one request lane loads the model's multi-token-prediction head
+onto the tail stage (5.2 GB, a separate file taken from the base model's repository; it is not found by itself). Every committed
+forward is fed to it, and where there is no repeat to copy a round drafts three tokens and checks four rows with the exact
+verify kernels. The tokens are plain decoding's (800 greedy bench tokens and the restore / restart test equal); a draft of five
+gave different tokens and was slower, so it stays at three. Measured on the UD-Q4_K_XL file, both cards:
+
+| Flash-Next, MTP head on, against off | off | on |
+|---|---:|---:|
+| bench decode, greedy | 28.7 / 28.3 tok/s | **30.8 / 33.7** (2.7–3.0 tokens a round) |
+| bench decode at temperature 0.7 | | no gain |
+| prefill | 502 tok/s | 412 |
+| serve, two long reasoning replies | 36.5 / 36.0 s | 34.1 / 33.8 |
+| serve, an ordinary question at temperature 0.7 | 9.0 s | 9.4 |
+| serve, a 1,800-token file edit with `--spec` | 30.7 s | 33.5 |
+
+A four-row check costs two plain steps and the head takes about 4.7 GiB of expert cache, so it is a small greedy gain against
+a slower read; it is off unless a path is given. `IE_Q4E_MTP=0` keeps it off even with a path.
+
+### What is still slow, and not checked
+
+- **Re-checked for this release on October 7, on the build that was published:** Flash-Next with the vision tower answered both pictures correctly at 281, 1,318, 2,386, 6,617 and 16,747 prompt tokens (10 of 10); a 15.6K-token text prompt took 21.0 s to read and 12.4 s after one line changed two thirds in (a restart in place at token 8,192, 4.6 ms); `ie capabilities` reports `speculative` for Flash-Next; the capabilities, CLI-help and ChatML host tests pass. The 27B and 35B-A3B class were not loaded again: their figures above are the October 5 ones.
+- **The standalone runner's Flash-Next figures with the head** (37.1–38.2 chat and 44.4–44.6 code tok/s, September 27, greedy,
+  96 tokens, the base model) were not reproduced in `ie serve`. A side-by-side run of both on the same served file would say
+  why; until then the table above is what the server does.
+- **Flash-Next's restart points and lookup drafts are for one request lane**; the lanes do not have them. The MTP head is one
+  lane, greedy, and is not combined with images.
+- **Not covered:** a copy cursor or change list on the 27B and 35B-A3B class (small expected gain, skipped).
+- Everything listed under [New in v0.2.20](#new-in-v0220) still holds.
 
 ---
 

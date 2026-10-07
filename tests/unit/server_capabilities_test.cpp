@@ -115,6 +115,7 @@ int main() {
  unsetenv("IE_SERVE_TEMP");
  const std::string q36="https://huggingface.co/Qwen/Qwen3.6-35B-A3B";
  auto moe=check("qwen35moe",true,"<think> enable_thinking",{{"general.name","Ours"},{"general.base_model.0.repo_url",q36}});
+ assert(moe.at("features").at("speculative").get<bool>());   // v0.2.21: --spec (lookup drafts) is offered for the 35B-A3B class
  // the plain Qwen3.6-35B-A3B (same template as the distill): no row, library defaults
  auto base=check("qwen35moe",true,"<think> enable_thinking",{{"general.name","Qwen_Qwen3.6 35B A3B"},{"general.base_model.0.repo_url",q36}});
  assert(base["recommended"].is_null() && base["defaults"]["temperature"]==0.7 && base["defaults"]["top_k"]==40);
@@ -123,6 +124,8 @@ int main() {
  assert(!moe["recommended"]["instruct"].contains("max_output"));   // the distill states no instruct cap
  assert(moe["recommended"]["effort"]==json::object() && moe["defaults"]["temperature"]==0.6);
  auto fnx=check("qwen4exp",true,q38);
+ assert(fnx.at("features").at("speculative").get<bool>());   // v0.2.21: and for Flash-Next (one lane)
+ assert(!check("glm5next",true).at("features").at("speculative").get<bool>());   // GLM still refuses speculative decoding in the server
  assert(fnx["recommended"]["source_url"]=="https://huggingface.co/Qwen/Qwen3.8-Flash-Next");
  assert(check("glm5next",true)["recommended"].is_null());   // GLM by name only
  auto g=check("glm5next",true,"",{{"general.name","GLM 5.3 Flash"}});

@@ -343,7 +343,7 @@ see the README's "A load is tried as asked".
 
 ## Lookup drafts and restart points (v0.2.18)
 
-`--spec` turns the lookup drafts on (on the 27B together with its MTP draft head); without it decoding is unchanged.
+`--spec` turns the lookup drafts on (on the 27B together with its MTP draft head; since v0.2.21 `ie capabilities` offers it for the 35B-A3B class and Flash-Next too, where the drafts run on the lanes / at one lane); without it decoding is unchanged.
 The restart points are on by default with the prompt cache. Figures and conditions: the README's "New in v0.2.18".
 
 | switch | what it controls |
@@ -354,7 +354,11 @@ The restart points are on by default with the prompt cache. Figures and conditio
 | `IE_Q35MOE_LOOKUP`, `IE_Q35MOE_LOOKUP_ROWS` (128), `IE_Q35MOE_LOOKUP_MIN` (16) | 35B-A3B split at `--parallel 1` |
 | `IE_Q35MOE_LANES_LOOKUP`, `IE_Q35MOE_LOOKUP_GAP` (2) | 35B-A3B split with request lanes: lookup rounds on the lanes; the steps every other decoding lane makes between two rounds |
 | `IE_Q4E_LOOKUP`, `IE_Q4E_LOOKUP_MIN` (32), `IE_Q4E_LOOKUP_ROWS` (512) | Flash-Next at `--parallel 1` |
-| `IE_DN_LADDER`, `IE_DN_LADDER_STEP` (8192) | in-place restart points on the 27B and 35B-A3B splits (one lane, prompt cache on): copies of the DeltaNet state while a prompt is read; the spacing doubles until 16 copies cover `--ctx` |
+| `IE_DN_LADDER`, `IE_DN_LADDER_STEP` (8192) | in-place restart points on the 27B and 35B-A3B splits and, since v0.2.21, Flash-Next (one lane, prompt cache on): copies of the DeltaNet state while a prompt is read; the spacing doubles until 16 copies cover `--ctx` |
+| `IE_DN_LADDER_VISION` | `=0`: image requests do not use the restart points (27B and 35B-A3B splits, Flash-Next) |
+| `IE_Q4E_QSA_MROPE_KEYS` | `=0`: Flash-Next's indexer block keys ignore the picture's position streams (the v0.2.20 behaviour) |
+| `IE_Q4E_MTP_HEAD`, `IE_Q4E_MTP` | Flash-Next at one request lane with `--spec`: the path of the MTP head file (the same as `--spec-head`; none is found by itself); `IE_Q4E_MTP=0` never loads it |
+| `IE_Q4E_NO_PIPELINE`, `IE_Q4E_DENSE_OK=<n>` | diagnostics: the serial prefill instead of the pipelined one; dense attention up to n positions |
 
 Diagnostics: `IE_Q35MOE_LOOKUP_STATS=1` / `IE_Q4E_LOOKUP_STATS=1` print a request's lookup counts; `/health` carries a
 `lookup` object on the 35B-A3B lanes; a restart prints a `[dn-ladder]` line.

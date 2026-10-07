@@ -545,6 +545,13 @@ inline sycl::event cast_f32_to_f16(sycl::queue& q, const float* x, sycl::half* y
     });
 }
 
+// P4 B62 diagnostic: IE_Q4E_DENSE_OK=<positions> keeps exact dense attention up to that context (default: the indexer's
+// top_k + 3). Dense attention is O(context) per row: a diagnostic, not a setting.
+static uint32_t q4e_dense_ok_override() {
+    static const uint32_t v = [] { const char* e = std::getenv("IE_Q4E_DENSE_OK"); return e ? uint32_t(std::max(0, std::atoi(e))) : 0u; }();
+    return v;
+}
+
 // ---- QSA indexer kernels (spec docs/qwen4/10_qsa_sparse_attention.md) -----
 
 // Pool 4 raw keys (fp32 mean) -> RMS norm (gamma pre-folded) -> partial rope
@@ -569,6 +576,42 @@ inline sycl::event qsa_pool_norm_rope(sycl::queue& q, const sycl::half* raw,
         for (int d = 0; d < 128; ++d) v[d] = v[d] * r * gamma[d];
         const float pos = float(b * 4);
         for (int rr = 0; rr < 32; ++rr) {
+            const float ang = pos * sycl::exp(-2.f * float(rr) / 64.f * sycl::log(theta));
+            const float c = sycl::cos(ang), sn = sycl::sin(ang);
+            const float a = v[rr], bb = v[rr + 32];
+            v[rr]      = a * c - bb * sn;
+            v[rr + 32] = a * sn + bb * c;
+        }
+        float* o = out + uint64_t(b) * 128;
+        for (int d = 0; d < 128; ++d) o[d] = v[d];
+    });
+}
+
+// P4 B62: the same with the block's position taken per frequency from the three M-RoPE streams (pos3 = [3, nb], block
+// i's first token; owner(rr) = rr % 3 as rope_imrope3). With an image in the prompt the indexer's QUERY is roped with
+// those streams; pooled keys roped at the plain position b * 4 are off by the image's rope delta against it for every
+// token after the image. IE_Q4E_QSA_MROPE_KEYS=0 = the plain positions. (Measured 2026-10-05 on a 16.7K-token image
+// conversation: four of five replies equal either way, the fifth answered with these keys and ran out of its 420
+// tokens thinking without them; not compared against the reference implementation.)
+inline sycl::event qsa_pool_norm_rope_m3(sycl::queue& q, const sycl::half* raw,
+                                         const float* gamma, float* out,
+                                         uint32_t b0, uint32_t nb, const int32_t* pos3,
+                                         float theta, float eps) {
+    return q.parallel_for(sycl::range<1>(nb), [=](sycl::id<1> i) {
+        const uint32_t b = b0 + uint32_t(i);
+        float v[128];
+        for (int d = 0; d < 128; ++d) {
+            float sm = 0.f;
+            for (int j = 0; j < 4; ++j)
+                sm += float(raw[(uint64_t(b) * 4 + j) * 128 + d]);
+            v[d] = sm * 0.25f;
+        }
+        float ss = 0.f;
+        for (int d = 0; d < 128; ++d) ss += v[d] * v[d];
+        const float r = sycl::rsqrt(ss / 128.f + eps);
+        for (int d = 0; d < 128; ++d) v[d] = v[d] * r * gamma[d];
+        for (int rr = 0; rr < 32; ++rr) {
+            const float pos = float(pos3[size_t(rr % 3) * nb + size_t(i)]);
             const float ang = pos * sycl::exp(-2.f * float(rr) / 64.f * sycl::log(theta));
             const float c = sycl::cos(ang), sn = sycl::sin(ang);
             const float a = v[rr], bb = v[rr + 32];
@@ -1864,7 +1907,7 @@ std::string Qwen4ExpModel::mtp_layer_fwd(uint32_t T, uint32_t start_pos) {
     rope_partial(q, ak_, d_pos_, ak_, T, cfg_.n_kv_heads, HD, cfg_.rope_dim, cfg_.rope_theta);
     sycl::half* kc = mtp_.kv.k_ptr();
     sycl::half* vc = mtp_.kv.v_ptr();
-    const uint32_t dense_ok = cfg_.indexer_top_k ? cfg_.indexer_top_k + 3 : UINT32_MAX;
+    const uint32_t dense_ok = q4e_dense_ok_override() ? q4e_dense_ok_override() : cfg_.indexer_top_k ? cfg_.indexer_top_k + 3 : UINT32_MAX;
     // indexer maintenance (side cache + block keys)
     if (cfg_.indexer_top_k) {
         const uint32_t IHD = cfg_.indexer_head_dim;
@@ -2307,6 +2350,40 @@ std::string Qwen4ExpModel::look_restore() {
     blk_done_ = look_blk_done_;
     for (uint32_t L = layer_lo_; L < layer_hi_; ++L)
         if (full_idx_[L] >= 0) kv_.set_length(uint32_t(full_idx_[L]), look_depth_);
+    return {};
+}
+
+// P4 B62: look_snapshot / look_restore over pinned host memory (pinned: a pageable host copy stalls, see the bank views).
+std::string Qwen4ExpModel::state_save(StateCopy& c, uint32_t depth) {
+    sycl::queue& q = alloc_->queue();
+    const uint64_t se = dn_.state_elems_per_layer() * dn_.config().n_layers_linear * sizeof(float);
+    const uint64_t ce = dn_.conv_elems_per_layer() * dn_.config().n_layers_linear * sizeof(sycl::half);
+    const uint64_t pe = ple_conv_state_ ? uint64_t(kPleStateRows) * kPleSI * sizeof(float) : 0;
+    c.depth = 0;
+    c.dn_state.bind(&q); c.dn_conv.bind(&q); c.ple_conv.bind(&q);
+    if ((se && !c.dn_state.resize(se)) || (ce && !c.dn_conv.resize(ce)) || (pe && !c.ple_conv.resize(pe)))
+        return "qwen4exp state_save: pinned host alloc failed";
+    if (se) q.memcpy(c.dn_state.data(), dn_.state_ptr(), se);
+    if (ce) q.memcpy(c.dn_conv.data(), dn_.conv_state_ptr(), ce);
+    if (pe) q.memcpy(c.ple_conv.data(), ple_conv_state_, pe);
+    q.wait();
+    c.hist = ple_hist_;
+    c.blk_done = blk_done_;
+    c.depth = depth;
+    return {};
+}
+
+std::string Qwen4ExpModel::state_restore(const StateCopy& c) {
+    if (!c.depth) return "qwen4exp state_restore: no copy";
+    sycl::queue& q = alloc_->queue();
+    if (c.dn_state.size()) q.memcpy(dn_.state_ptr(), c.dn_state.data(), c.dn_state.size());
+    if (c.dn_conv.size())  q.memcpy(dn_.conv_state_ptr(), c.dn_conv.data(), c.dn_conv.size());
+    if (c.ple_conv.size() && ple_conv_state_) q.memcpy(ple_conv_state_, c.ple_conv.data(), c.ple_conv.size());
+    q.wait();
+    ple_hist_ = c.hist;
+    blk_done_ = c.blk_done;
+    for (uint32_t L = layer_lo_; L < layer_hi_; ++L)
+        if (full_idx_[L] >= 0) kv_.set_length(uint32_t(full_idx_[L]), c.depth);
     return {};
 }
 
@@ -2995,7 +3072,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             sycl::half* vc = kv_.v_ptr() + per_layer_kv * li;
             // Dense == QSA exactly while every query's visible set fits the
             // budget: n_ctx <= top_k + ratio - 1 (2051 on the real file).
-            const uint32_t dense_ok =
+            const uint32_t dense_ok = q4e_dense_ok_override() ? q4e_dense_ok_override() :
                 cfg_.indexer_top_k ? cfg_.indexer_top_k + 3 : UINT32_MAX;
             // ---- QSA indexer maintenance (every chunk, cheap): raw keys are
             // cached un-normed/un-roped; complete blocks pool ONCE. ----------
@@ -3019,6 +3096,27 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                          idx_kraw_, uint64_t(T) * IHD * sizeof(sycl::half));
                 const uint32_t nb_tot = (start_pos + T) / 4;
                 if (nb_tot > blk_done_[li]) {
+                    static const bool m3_keys = [] { const char* v = std::getenv("IE_Q4E_QSA_MROPE_KEYS"); return !(v && *v == '0'); }();
+                    if (mrope_n_ && m3_keys) {   // P4 B62: an image in the prompt: the block keys take the M-RoPE streams too
+                        const uint32_t b0 = blk_done_[li], nbn = nb_tot - b0;
+                        blkpos3_host_.resize(size_t(3) * nbn);
+                        for (uint32_t st = 0; st < 3; ++st)
+                            for (uint32_t i = 0; i < nbn; ++i) {
+                                const uint32_t ap = (b0 + i) * 4;
+                                blkpos3_host_[size_t(st) * nbn + i] = ap < mrope_n_ ? mrope3_[size_t(st) * mrope_n_ + ap]
+                                                                                    : int32_t(ap) + mrope_delta_;
+                            }
+                        if (!d_blkpos3_) {   // once, for the whole context's blocks
+                            blkpos3_cap_ = size_t(3) * (max_ctx_ / 4 + 1);
+                            d_blkpos3_ = static_cast<int32_t*>(alloc_->malloc(blkpos3_cap_ * sizeof(int32_t)));
+                            if (d_blkpos3_) owned_.push_back(d_blkpos3_);
+                        }
+                        if (!d_blkpos3_ || blkpos3_cap_ < size_t(3) * nbn) { block_err_ = "qwen4exp: block-key position table alloc failed"; return; }
+                        q.memcpy(d_blkpos3_, blkpos3_host_.data(), blkpos3_host_.size() * sizeof(int32_t)).wait();
+                        qsa_pool_norm_rope_m3(q, idx_kcache_ + uint64_t(li) * max_ctx_ * IHD, w.idx_k_norm,
+                                              blk_keys_ + uint64_t(li) * (max_ctx_ / 4) * IHD, b0, nbn, d_blkpos3_,
+                                              cfg_.rope_theta, eps);
+                    } else
                     qsa_pool_norm_rope(q, idx_kcache_ + uint64_t(li) * max_ctx_ * IHD,
                                        w.idx_k_norm,
                                        blk_keys_ + uint64_t(li) * (max_ctx_ / 4) * IHD,
@@ -4359,7 +4457,7 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
         rope_partial(q, aq_, d_pos_, aq_, G, cfg_.n_q_heads, HD, cfg_.rope_dim, cfg_.rope_theta);
         rope_partial(q, ak_, d_pos_, ak_, G, cfg_.n_kv_heads, HD, cfg_.rope_dim, cfg_.rope_theta);
         const uint32_t li = uint32_t(full_idx_[L]);
-        const uint32_t dense_ok = cfg_.indexer_top_k ? cfg_.indexer_top_k + 3 : UINT32_MAX;
+        const uint32_t dense_ok = q4e_dense_ok_override() ? q4e_dense_ok_override() : cfg_.indexer_top_k ? cfg_.indexer_top_k + 3 : UINT32_MAX;
         const uint32_t IHD = cfg_.indexer_head_dim;
         const uint32_t IQW = cfg_.indexer_n_heads * IHD;
         if (cfg_.indexer_top_k) {

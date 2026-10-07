@@ -70,7 +70,10 @@ std::string server_capabilities_json(const std::string& model_path) {
         arch == ModelArch::kQwen35Dense || arch == ModelArch::kQwen3Next ||
         arch == ModelArch::kGemma4 || arch == ModelArch::kQwen4Exp ||
         arch == ModelArch::kDeepSeek4 || arch == ModelArch::kDeepSeek41 || arch == ModelArch::kMimo26;
-    const bool spec = generic || arch == ModelArch::kQwen35Dense || arch == ModelArch::kGemma4;
+    // v0.2.21: the 35B-A3B class (lookup drafts on the request lanes, P4 B55) and Flash-Next (lookup drafts at one lane, B56; its
+    // MTP head only with a --spec-head path, B63) take --spec too, so a client's load screen can offer it.
+    const bool spec = generic || arch == ModelArch::kQwen35Dense || arch == ModelArch::kGemma4 ||
+        arch == ModelArch::kQwen35Moe || arch == ModelArch::kQwen4Exp;
     // int8 KV is only offered where the Engine uses ordinary KvCache; multi-GPU
     // and concurrency combinations remain subject to Engine's load validation.
     const bool kv8 = generic || is_dense_arch(arch) || arch == ModelArch::kQwen35Moe ||

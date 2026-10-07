@@ -1,9 +1,10 @@
 # IE Engine — v1 RELEASE
 
-> **Current release: v0.2.20 (October 2026).** This file is the record of the first release, of June 9, 2026, kept as
+> **Current release: v0.2.21 (October 2026).** This file is the record of the first release, of June 9, 2026, kept as
 > written; its figures are for one Arc Pro B70 and a Q4_K_M model and are not comparable with the two-card figures
-> below. Later releases are described in the README ("New in v0.2.20", "New in v0.2.18", "New in v0.2.13", "New in v0.2.8", "New in v0.2.6", "In v0.2.0") and in the GitHub
+> below. Later releases are described in the README ("New in v0.2.21", "New in v0.2.20", "New in v0.2.18", "New in v0.2.13", "New in v0.2.8", "New in v0.2.6", "In v0.2.0") and in the GitHub
 > release notes:
+> [v0.2.21](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.21),
 > [v0.2.20](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.20),
 > [v0.2.18](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.18),
 > [v0.2.13](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.13),
@@ -11,6 +12,16 @@
 > [v0.2.6](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.6),
 > [v0.2.0](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.0),
 > [v0.1.0](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.1.0).
+>
+> **v0.2.21 in short** (two Arc Pro B70 cards, measured October 5, 2026):
+> - Flash-Next read image prompts of more than 2,048 tokens without the image (v0.2.10 through v0.2.20); fixed, both test
+>   pictures are right at 281 to 16,747 prompt tokens.
+> - Restart points on Flash-Next (one lane): a 15.7K-token prompt with one line changed two thirds in 28.5 -> 18.4 s; image
+>   conversations keep theirs (second turn of a 16.7K-token image conversation: 27B 10.2 -> 4.5 s, 35B-A3B class 7.2 -> 1.0 s,
+>   Flash-Next 24.8 -> 3.0 s).
+> - `--spec` is offered by `ie capabilities` for the 35B-A3B class and Flash-Next, so a client's load screen can show it.
+> - Flash-Next's MTP draft head, opt-in (`--spec --spec-head <file>`): greedy decode 28.7 / 28.3 -> 30.8 / 33.7 tok/s, nothing at
+>   temperature 0.7, prefill 502 -> 412; off unless a path is given.
 >
 > **v0.2.20 in short** (Arc Pro B70 cards, measured October 5, 2026):
 > - One card runs the Qwen models on the two-card code: Qwen3.8-27B Q6_K prefill 190 / 173 -> 823 / 830 tok/s and decode
