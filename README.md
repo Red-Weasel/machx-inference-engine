@@ -20,9 +20,11 @@
 **Latest**
 
 - **Video, October 5–6:** [LTX-2.5](docs/ltx25/LTX25_ON_ARC.md) makes 5 seconds of 1280×704 video with sound in about 21 s on two Arc Pro B70 cards (stock PyTorch: 79 s).
-- **v0.2.20, October 5:** one Arc Pro B70 now runs the Qwen models on the same fast code as two — Qwen3.8-27B (Q6_K) reads at about 820 tok/s and writes at 22 (33 with `--spec`); the 35B-A3B class (Q5_K_M) reads at about 1,300 and writes at 87 — and a load is tried as asked: memory estimates warn, they do not refuse. [Details](#new-in-v0220)
+- **v0.2.20, October 5 — one card:** an Arc Pro B70 now runs the Qwen models on the same fast code as two cards. On **one** card the 27B at Q6_K reads **823 tok/s** (it was 190) and writes 22 (33 with `--spec`), and the 35B-A3B class at Q5_K_M reads **1,337** (that file did not load before) and writes 87. A load is tried as asked: memory estimates warn, they do not refuse. [Details](#new-in-v0220)
 - **v0.2.18, October 5:** replies that copy text already in the conversation are written several times faster with `--spec` (a 1,800-token file edit: 108 s → 28 s on the 27B, 24 s → 7 s on the 35B-A3B class, 69 s → 31 s on Flash-Next), and a conversation edited in the middle restarts from a saved point. [Details](#new-in-v0218)
-- **v0.2.13, October 4:** prompts are read 1.4–3.7× faster on the Qwen models (Qwen3.8-27B: 1,037 → 2,962 tok/s). [Details](#new-in-v0213)
+- **v0.2.13, October 4 — two cards:** prompts are read 1.4–3.7× faster on the Qwen models. The 27B goes from 1,037 to **2,962 tok/s** at Q8_0 and from 987 to 1,378 at Q6_K; the 35B-A3B class at Q8_0 from 1,816 to 2,896. [Details](#new-in-v0213)
+
+<sub>Why 2,962 and 823 are not a slowdown: reading speed depends on the card count and the file. The same 27B reads 2,962 tok/s at Q8_0 on two cards, 1,378 at Q6_K on two cards and 823 at Q6_K on one card.</sub>
 
 Intel Arc is a genuinely capable AI GPU that inference tooling has mostly ignored. **Mach X is built for it from the metal up** — no fork of llama.cpp, no PyTorch in the language-model engine (the video pipeline uses PyTorch's Intel GPU build), no vendor runtime. Hand-written SYCL kernels (XMX matrix engines, int-dot quantized GEMV, tiled FlashAttention), an OpenAI-compatible server, tensor-parallel multi-GPU, and day-one support for the newest model architectures — often running them fast on Arc *before* anyone else does.
 
