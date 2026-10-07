@@ -1,4 +1,8 @@
 
+<div align="center">
+
+<img src="docs/images/machx-logo.png" alt="Mach X" width="420">
+
 # Mach X — LLM Inference Engine for Intel Arc
 
 **A C++/SYCL local LLM inference engine for Intel Arc GPUs, built and tuned on two Arc Pro B70 cards: XMX kernels, quantized models, multi-GPU execution, an OpenAI-compatible server — and now text-to-video.**
@@ -10,6 +14,8 @@
 ![Vision](https://img.shields.io/badge/vision-VLM%20ready-purple)
 ![Multi-GPU](https://img.shields.io/badge/multi--GPU-tensor--parallel-success)
 [![Release](https://img.shields.io/github/v/release/Red-Weasel/machx-inference-engine)](https://github.com/Red-Weasel/machx-inference-engine/releases)
+
+</div>
 
 **Latest**
 
