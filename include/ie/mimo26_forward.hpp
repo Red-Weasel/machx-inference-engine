@@ -58,6 +58,12 @@ struct Mimo26Options {
 struct Mimo26LayerStats {
     double   ms = 0, moe_ms = 0;
     uint32_t experts_static = 0, experts_pinned = 0, experts_mmap = 0;
+    // the expert tier's split of moe_ms (Ds41TierStats): the CPU miss leg's wall and the worker's compute inside it, and
+    // the GPU group loop's wall, which the leg overlaps
+    uint32_t experts_cpu = 0, cpu_runs = 0;
+    double   cpu_ms = 0, cpu_work_ms = 0, groups_ms = 0;
+    double   prep_ms = 0, tail_ms = 0;   // B66: the tier's prep (sort, packing, gather, the leg's start) and tail (join, scatter)
+    uint64_t pcie_bytes = 0;             // B66: pinned experts copied to VRAM
 };
 
 class Mimo26Forward {
@@ -72,6 +78,16 @@ public:
     // T <= max_tokens rows at positions [pos0, pos0 + T); pos0 must equal n_pos() (the caches hold [0, pos0)).
     // logits: all_rows ? [T, vocab] : [1, vocab] (the last row), fp32 on the host.
     std::string forward(const int32_t* ids, uint32_t T, uint32_t pos0, std::vector<float>& logits, bool all_rows);
+    // B66 prototype, B67 the engine's --parallel 1 prefill: a prompt's chunks of C rows with the two cards as pipeline stages --
+    // card 0 runs chunk i + 1 while card 1 runs chunk i; each chunk's run_card calls are forward()'s, so the bits are the serial
+    // loop's. Two cards, no image positions, the active lane from n_pos; the last chunk's logits. With feature capture (DFlash),
+    // `on_feats` gets each chunk's captured rows (what features() / feat_rows() give after each serial forward) right after card 1
+    // has run the chunk, ON A HELPER THREAD (card 1's), in chunk order. Two chunks' buffers at any length. The two tiers' CPU legs
+    // run at once: each gets half its E-cores for the call.
+    // (B66 / B67: the pipelined prefill)
+    using FeatSink = std::function<std::string(const float* feats, uint32_t rows, uint32_t pos0)>;
+    std::string forward_pipelined(const int32_t* ids, uint32_t n, uint32_t C, std::vector<float>& logits, const FeatSink& on_feats = {});
+    bool pipelined_admissible() const;   // B67: forward_pipelined takes this forward now (two cards, no pipe, no diagnostics)
     // Vision (P6.2, docs/mimo26/00_PORT_PLAN.md; V4.1's Phase 56 shape). An image position carries a NEGATIVE id, unique
     // per image and slot: the prefix cache's match reads it off the id. Its stream row comes from the provider, not
     // from the embedding table: `row` [dim] f32 for absolute position `pos`, "" on success. Positions stay 1-D.
@@ -119,7 +135,14 @@ public:
     // P4 B5: from inside a done callback (the last card's stage thread) only -- the lanes of the group whose callbacks are running,
     // in callback order (the lanes a finishing group resubmits meet in one group again, B3's pgate_). Empty on any other thread.
     const std::vector<uint32_t>& pipe_cb_lanes() const;
-    std::string pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool all_rows);
+    // B67 `ahead` (the pipelined prefill in the lanes): the lane's next step queued behind
+    // the one it has in flight, at that step's end position, from any thread -- so card 0 runs prefill chunk i + 1 while card 1
+    // runs chunk i. At most two steps per lane besides one whose done callback is running; the earlier one must not be all_rows
+    // (nothing may rewind it). The steps run in order and every one runs forward()'s launches on the lane's caches, so the bits
+    // are the serial chunks'. A callback's resubmit with a step still queued behind it takes the queued step's end as well.
+    // While a lane has two steps, each card's CPU expert leg gets half its team (both legs run at once; the bits do not depend
+    // on the team size). Never two steps of one lane in one group.
+    std::string pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool all_rows, bool ahead = false);
     std::string pipe_reset_lane(uint32_t lane);   // an idle lane forgets its positions (a new sequence) while the pipe runs
     // P4 B4: the lane keeps positions [0, n) (n <= its n_pos; the rows it drops stay written, as rewind()) -- an idle lane, or
     // the lane whose done callback is running, from that thread (a speculative verify's rejected rows, docs/mimo26/P4_B4_SERVE.md)
@@ -244,7 +267,7 @@ private:
     // one after another in the call's host buffers -- the serial forward's members (one segment: the active lane), or in the
     // pipe the lanes stage 0 grouped (B3). Attention runs per segment; everything else over the call's T rows. One segment at
     // r0 = 0 issues the launches the pre-group forward issued, on the same pointers.
-    struct Seg { uint32_t lane = 0, T = 0, pos0 = 0, r0 = 0; bool all_rows = false; float* feat = nullptr; std::vector<float>* logits = nullptr; };
+    struct Seg { uint32_t lane = 0, T = 0, pos0 = 0, r0 = 0; bool all_rows = false; float* feat = nullptr; std::vector<float>* logits = nullptr; uint32_t slot = 0; };
     struct Call {
         uint32_t T = 0;                                     // rows over the segments
         float* x = nullptr; const int32_t* pos = nullptr;   // [T, dim] the residual in / out, [T] positions (host)
@@ -276,11 +299,18 @@ private:
     // B2: the pipe's per-lane host buffers (the residual crossing the cards, positions, features, logits) and its in-flight step
     struct LaneState {
         uint32_t cap = 0, n_pos = 0, hi_end = 0; std::vector<std::vector<std::pair<sycl::half*, sycl::half*>>> kv;
-        std::vector<float> h_x, h_feat, logits; std::vector<int32_t> h_pos;
+        // B67: a step's host buffers (the residual crossing the cards, positions, features) and its rows, per slot: slot 0 for a
+        // step with no other of the lane's steps queued (as before), slot 1 for one queued behind another (`ahead`, allocated at
+        // its first use) -- the two steps a lane can have never share one
+        struct Buf { std::vector<float> h_x, h_feat; std::vector<int32_t> h_pos; uint32_t T = 0, pos0 = 0; bool all_rows = false; };
+        Buf buf[2];
+        std::vector<float> logits;
         // in_flight: claimed by pipe_submit (check-and-set under pmu_) and held through the step AND its done callback -- only the
         // callback's own thread may submit the lane again meanwhile (in_cb, cb_tid; resub = it did), so no other thread rewrites
-        // the lane's buffers while the callback reads its features (B2 gate note 7)
-        bool in_flight = false, in_cb = false, resub = false; std::thread::id cb_tid; uint32_t T = 0, pos0 = 0; bool all_rows = false;
+        // the lane's buffers while the callback reads its features (B2 gate note 7). B67: `steps` = the lane's steps submitted whose
+        // callback has not returned (in_flight while > 0; 2 or 3 only with `ahead`), sub_end / sub_slot = the latest one's end and slot
+        bool in_flight = false, in_cb = false, resub = false; std::thread::id cb_tid;
+        uint32_t steps = 0, sub_end = 0, sub_slot = 0;
         VisionProvider vis;   // the lane's image rows (forward only: the pipe refuses image positions)
     };
     std::vector<std::vector<LaneTierStats>> lane_tier_;   // [lane][card]
@@ -297,7 +327,8 @@ private:
     std::vector<std::thread> stage_th_;
     std::vector<std::unique_ptr<Group>> groups_;   // the pool (one per lane + one)
     std::deque<Group*> gfree_;
-    std::deque<uint32_t> lq_;
+    std::deque<std::pair<uint32_t, uint32_t>> lq_;   // (lane, slot) in submit order
+    std::vector<int> nth_full_;   // B67: each card's CPU leg team at pipe_start (halved while a lane has two steps)
     std::vector<std::deque<Group*>> pq_;
     mutable std::mutex pmu_; std::condition_variable pcv_;
     uint32_t pbusy_ = 0; bool pstop_ = false, pgate_ = false, ppaused_ = false; std::string perr_;

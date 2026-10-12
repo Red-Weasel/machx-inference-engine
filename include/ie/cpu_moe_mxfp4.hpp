@@ -35,7 +35,23 @@ void cpu_expert_mxfp4(const void* slot, const Ds4SlotLayout& lay, const float* x
 // same block order, FMAs and final sum per row), but each weight block is read and decoded once for all R rows
 // instead of once per row -- the per-row cost was the ~19 MB weight read. `scratch` holds R * 2 * EF floats.
 constexpr uint32_t kCpuExpertRows = 8;
+// B66, on by default: the SwiGLU (spans of 64 entries) and the worker's fp16 / fp32 row stores run on the whole team instead
+// of one thread; every entry is the same function of the same input, so the results are bit-identical (MiMo A-B-A:
+// -7.6 % ms/token on top of the 1 ms blocktime). IE_CPU_MXFP4_TEAM=0 restores v0.2.21's serial form.
+bool cpu_mxfp4_team();
 void cpu_expert_mxfp4_rows(const void* slot, const Ds4SlotLayout& lay, const float* const* xs, uint32_t R,
                            float* scratch, float* out, float swiglu_limit, int nthreads);
+
+// B66: a list of experts in ONE team region. Each thread takes an even share of every expert's gate / up rows and their
+// SwiGLU entries, then (one barrier) its share of the down rows, and hands those output entries to `store`; the next
+// expert's gate / up go to the other half of the scratch, so one barrier per expert suffices. Every entry is computed as
+// cpu_expert_mxfp4 (R = 1) / cpu_expert_mxfp4_rows (R > 1) computes it -- the same row dot per output row, the same
+// scalar SwiGLU per entry -- so the results are bit-identical; the per-expert path opens ~5 regions per expert.
+struct CpuExpertJob { const void* slot; const float* xs[kCpuExpertRows]; uint32_t R; uint32_t out_row; };
+// entries [k0, k1) of output row `row` (job.out_row + r), fp32 at src[0 .. k1 - k0)
+using CpuRowStore = void (*)(void* ctx, uint32_t row, uint32_t k0, uint32_t k1, const float* src);
+constexpr size_t cpu_experts_fused_scratch(uint32_t H, uint32_t EF) { return size_t(2) * kCpuExpertRows * 2 * EF + size_t(kCpuExpertRows) * H; }
+void cpu_experts_mxfp4_fused(const CpuExpertJob* jobs, size_t n, const Ds4SlotLayout& lay, float* scratch,
+                             float swiglu_limit, int nthreads, CpuRowStore store, void* ctx);
 
 }  // namespace ie

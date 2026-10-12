@@ -164,7 +164,7 @@ set_source_files_properties(ops/cpu_moe_gemv.cpp PROPERTIES
   COMPILE_OPTIONS "-mavx2;-mfma;-fopenmp")
 # The V4.1 decode miss path (docs/deepseek41/34): the CPU MXFP4 expert GEMV, AVX2 + FMA + an OpenMP team.
 set_source_files_properties(ops/cpu_moe_mxfp4.cpp PROPERTIES
-  COMPILE_OPTIONS "-mavx2;-mfma;-fopenmp")
+  COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-fopenmp")
 # The V4.1 expert tier reads and packs experts on OpenMP reader threads (docs/deepseek41/23):
 # without this the pragmas are silently ignored and every fill runs on one thread.
 set_source_files_properties(model/deepseek41_experts.cpp PROPERTIES

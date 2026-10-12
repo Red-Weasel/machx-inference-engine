@@ -20,6 +20,7 @@
 **Latest**
 
 - **Video, October 5–6:** [LTX-2.5](docs/ltx25/LTX25_ON_ARC.md) makes 5 seconds of 1280×704 video with sound in about 21 s on two Arc Pro B70 cards (stock PyTorch: 79 s).
+- **v0.2.23, October 12 — MiMo faster:** MiMo-V2.6-Flash writes **23–26 % faster** with the same tokens (27.8–28.3 tok/s with its drafter, 21.8–23.3 before) and reads long prompts up to **43 % faster** in `ie serve` (37,810 tokens: 92.5 → 53.4 s). DeepSeek-V4.1-Flash decodes about 7 % faster. [Details](#new-in-v0223)
 - **v0.2.21, October 7 — Flash-Next sees long images:** Flash-Next answered image prompts of more than 2,048 tokens as if there were no image (v0.2.10 through v0.2.20); fixed. A conversation edited in the middle restarts from a saved point on Flash-Next too (28.5 → 18.4 s on a 15.7K-token prompt), and image conversations keep their restart points (second turn on Flash-Next 24.8 → 3.0 s). `--spec` is now offered for the 35B-A3B class and Flash-Next. [Details](#new-in-v0221)
 - **v0.2.20, October 5 — one card:** an Arc Pro B70 now runs the Qwen models on the same fast code as two cards. On **one** card the 27B at Q6_K reads **823 tok/s** (it was 190) and writes 22 (33 with `--spec`), and the 35B-A3B class at Q5_K_M reads **1,337** (that file did not load before) and writes 87. A load is tried as asked: memory estimates warn, they do not refuse. [Details](#new-in-v0220)
 - **v0.2.18, October 5:** replies that copy text already in the conversation are written several times faster with `--spec` (a 1,800-token file edit: 108 s → 28 s on the 27B, 24 s → 7 s on the 35B-A3B class, 69 s → 31 s on Flash-Next), and a conversation edited in the middle restarts from a saved point. [Details](#new-in-v0218)
@@ -87,10 +88,10 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 </tr>
 <tr>
 <td width="48" align="center" valign="middle"><img src="docs/images/logo-mimo.png" width="36" height="36" alt="Xiaomi MiMo"></td>
-<td align="left" valign="middle" nowrap><b>Xiaomi MiMo-V2.6-Flash</b><br><sub>MoE · measured Sep 27<br>native vision · tool calls · 120K context</sub></td>
+<td align="left" valign="middle" nowrap><b>Xiaomi MiMo-V2.6-Flash</b><br><sub>MoE · measured Oct 12<br>native vision · tool calls · 120K context</sub></td>
 <td align="left" valign="middle" nowrap>FP8 + MXFP4<br><sub>178 GB safetensors</sub></td>
-<td align="left" valign="middle" nowrap><b>438–483</b> <sub>at 4–6K</sub><br><b>322</b> <sub>at 120K</sub></td>
-<td align="left" valign="middle" nowrap><b>23.1–23.9</b> <sub>with drafter</sub><br><b>16.7–16.9</b> <sub>plain</sub></td>
+<td align="left" valign="middle" nowrap><b>596–630</b> <sub>at 5–6K</sub><br><b>708–716</b> <sub>at 38K</sub></td>
+<td align="left" valign="middle" nowrap><b>27.8–28.3</b> <sub>with drafter</sub><br><b>16.9–18.9</b> <sub>plain</sub></td>
 </tr>
 <tr>
 <td width="48" align="center" valign="middle"><img src="docs/images/logo-deepseek.png" width="36" height="36" alt="DeepSeek"></td>
@@ -138,8 +139,8 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 - **Serving:** native vision; up to 16 requests at once (two at 59.0–62.6 tok/s together, ×1.94–2.06; 16 at 118.4 with row batching and 128.0 at `--ctx 8192`); a file edit takes 68.7 s plain and 30.7 s with `--spec`. Image prompts longer than 2,048 tokens are read with the image since v0.2.21 (v0.2.10 through v0.2.20 dropped it).
 
 **Xiaomi MiMo-V2.6-Flash** · 178 GB safetensors (FP8 dense, MXFP4 experts), 256 GB RAM
-- **Prefill:** 438–483 tok/s at 4–6K; 434–438 at 32K, 322 at 120K (September 22–27).
-- **Decode:** 23.1–23.9 tok/s chat with its DFlash drafter, 16.7–16.9 without; 24.3 on agent-style copy edits (September 22); with `ie serve --parallel 2` / `4`, 28.38 / 28.46 tok/s together (×1.25 / ×1.27 against one drafted request in the same run; September 26).
+- **Prefill:** 596–630 tok/s at 5.4–6K and 708–716 at 38K in `ie serve`, the two cards reading overlapping pieces of the prompt (v0.2.23, October 12; 416–465 and 409–414 with that off, same build); earlier builds 434–438 at 32K and 322 at 120K (September 22–27).
+- **Decode:** 27.8–28.3 tok/s with its DFlash drafter on seven agent-style prompts and 16.9–18.9 without (v0.2.23, October 12; 21.8–23.3 and 14.1–14.7 with the new code switched off, same tokens); four requests at once 25.6 tok/s together (20.6 off). Earlier builds: 23.1–23.9 chat with the drafter, 24.3 on agent-style copy edits (September 22); `--parallel 2` / `4` 28.38 / 28.46 together (September 26).
 - **Also:** released and running the same day; its bundled DFlash drafter, native vision, tool calls, thinking on/off, 120K context verified, other conversations kept in host memory, up to 16 requests at once in `ie serve` (`--parallel N`, [below](#several-requests-at-once-request-lanes)).
 
 **DeepSeek-V4.1-Flash** · 475 GB safetensors (FP8 dense, MXFP4 experts), 256 GB RAM
@@ -169,6 +170,69 @@ class ([New in v0.2.6](#new-in-v026)).
 
 ![DeepSeek-V4.1-Flash running locally in the Dream Agent Harness, served by Mach X on two Arc Pro B70 cards](docs/images/dream-deepseek-v41.png)
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
+
+---
+
+<a id="new-in-v0223"></a>
+## 🆕 New in v0.2.23
+
+Everything since [v0.2.21](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.21) (v0.2.22 was not
+published). Every figure was measured on October 12, 2026, on two Arc Pro B70 cards with MiMo-V2.6-Flash-RL, the new code
+against the same build with its switches set to the old behaviour; greedy unless a line says otherwise.
+
+### MiMo-V2.6-Flash writes 23–26 % faster, with the same tokens
+
+MiMo's decode is bound by memory traffic: the routed experts that are not in VRAM either cross PCIe or run on the CPU's
+E-cores, and both share the same RAM. The CPU half got cheaper: a layer's whole list of CPU experts runs in one parallel
+region with one barrier per expert (it was about five regions per expert), the MXFP4 weights decode through an fp16 table
+with a 2 KB prefetch, the elementwise work is split over the team, and the hand-offs between the GPU thread and the CPU
+team spin for up to 2 ms before they sleep. The FP8 dense projections of a decode step read each weight once for up to
+eight rows. Which experts go to the CPU and which to the GPU is unchanged, so every expert is rounded where it was.
+
+| MiMo-V2.6-Flash | old code | v0.2.23 |
+|---|---:|---:|
+| decode with its DFlash drafter, 7 agent-style prompts x 128 tokens (two A-B-A runs) | 21.8–23.3 tok/s | **27.8–28.3** |
+| decode without the drafter (2 prompts) | 14.1–14.7 tok/s | **16.9–18.9** |
+| four requests at once in `ie serve`, decode together | 20.6 tok/s | **25.6** |
+
+The generated tokens equal v0.2.21's in every arm (7 x 128). DeepSeek-V4.1-Flash runs the same CPU expert code: decode about
+7 % faster (11.3 → 11.8–12.3 tok/s on a 5.7K-token prompt), prefill about 4 %, the text byte-identical in four runs.
+
+### MiMo-V2.6-Flash reads long prompts up to 43 % faster in `ie serve`
+
+A prompt is read in 2,048-token pieces, and the two cards used to take turns on each piece. Now card 0 reads the next piece
+while card 1 finishes the current one; every piece is computed as before, so a request's reply is the same.
+
+| `ie serve`, one request at a time | old | v0.2.23 |
+|---|---:|---:|
+| 6,003-token prompt, request lanes (the default) | 13.4 s | **9.6 s** |
+| 5,466 / 5,403 tokens, lanes | 12.9 / 12.2 s | **9.2 / 8.7 s** |
+| 37,810 tokens, lanes | 92.5 s | **53.4 s** |
+| 6,003 / 37,810 tokens, `--parallel 1` | 12.9 / 91.3 s | **9.5 / 53.0 s** |
+
+The replies were identical, and the lane test tool, which runs with the CPU expert path off, found the logits equal byte
+for byte (two lanes and three prompts; one lane and a 37.8K-token prompt). The overlap is used while one request is reading; when a second request
+is busy the pieces go one at a time, as before. Two requests at the same time can get other replies than in v0.2.21:
+the overlap changes the order of the two requests' steps, and v0.2.21 gives the same replies when the second request
+arrives a few seconds later (checked). Image prompts keep the old path.
+
+### Switches
+
+Each restores the old behaviour: `IE_MIMO26_PIPE_PREFILL=0` (the prompt overlap), `IE_DS41_CPU_FUSED=0`,
+`IE_CPU_MXFP4_PF=0`, `IE_CPU_MXFP4_F16=0`, `IE_CPU_MXFP4_TEAM=0`, `IE_DS41_CPU_SPIN_US=0`, `IE_DS41_CPU_BLOCKTIME=0` (the CPU
+expert code), `IE_MIMO26_FP8_LUT=1` (the FP8 projections).
+
+### What is still slow, and not checked
+
+- **Long-context decode on MiMo:** at 30K tokens a full-attention layer takes 3.65 ms for the eight rows of a drafted step
+  (0.55 for one row), bound by the per-key softmax chain. A matrix-engine version would be faster but changes the rounding;
+  not done.
+- **Not checked:** a client that leaves in the middle of an overlapped prompt read (in the test the server noticed only at
+  the end of the prompt, old and new alike).
+- **Other models:** their code did not change. The 35B-A3B class (16 lanes, 262K context), Flash-Next and the 27B were
+  loaded on this build: replies with thinking on and off and tool calls as before, and on the 35B four requests at once equal
+  to one at a time. One sampled 27B request showed the known mid-sentence `</think>` phantom tool call.
+- Everything listed under [New in v0.2.21](#new-in-v0221) still holds.
 
 ---
 

@@ -59,6 +59,9 @@ struct Mimo26Serve {
         bool parked = false;                      // a step is due and not submitted (the pipe was paused, or the lane is new)
         std::vector<float> first_logits, scratch; // the prompt's last row (kPromptReady); the sampler's copy of a row
         std::vector<int32_t> rows; uint32_t pend = 0;   // the step in flight: its ids (a decode step), or its prefill rows
+        // B67 (the pipelined prefill): a prefill chunk's rows queued behind `pend` (0 = none), and the next prompt position to submit
+        // (prefill_at + pend + pend2)
+        uint32_t pend2 = 0, sub_at = 0;
         bool df_on = false; uint32_t df_pass = 0, df_acc = 0; std::string df_reason;   // the drafter follows the lane; off after a fault
         uint64_t tick = 0;                        // the lane's last release (larger = more recent): the LRU idle lane is taken first
         std::chrono::steady_clock::time_point t_sub{};

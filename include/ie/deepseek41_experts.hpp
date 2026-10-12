@@ -9,6 +9,7 @@
 // grouped launch -- a DS4GemmJob takes any bank -- so the cache needs no change.
 #pragma once
 
+#include "ie/cpu_moe_mxfp4.hpp"
 #include "ie/deepseek4_experts.hpp"
 #include "ie/deepseek41.hpp"
 #include "ie/expert_stream.hpp"
@@ -17,6 +18,7 @@
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <atomic>
 #include <condition_variable>
 #include <functional>
 #include <memory>
@@ -84,6 +86,7 @@ struct Ds41TierStats {
     uint32_t experts_static = 0, experts_pinned = 0, experts_mmap = 0;   // occupied experts by tier, this call
     uint32_t stream_hits = 0;            // of experts_pinned: served from a stream slot with no transfer (the cache's counter)
     uint32_t experts_cpu = 0;            // of experts_pinned: misses computed on the CPU from the arena (Phase 13, T = 1 only)
+    uint32_t cpu_runs = 0;               // B66: the distinct experts among them (each read once from the arena)
     uint32_t experts_mmap_file = 0;      // of experts_mmap: filled by one direct pread from the expert file (Phase 15 C2)
     double   ms_cpu = 0;                 // the CPU leg's wall, dispatch to join (overlaps the groups)
     double   ms_cpu_work = 0;            // the worker's own compute time inside that leg
@@ -174,6 +177,11 @@ public:
     // The CPU miss split's cores for THIS tier, set before init (docs/deepseek41/42 step 3: under
     // expert parallel each card's tier gets its own half of the E-cores); empty = the env / default.
     void set_cpu_cores(std::string cores) { cpu_cores_override_ = std::move(cores); }
+    // B66: the leg's team size for the next calls (1..its cores; the team's first n threads, each pinned to its core in the
+    // core list's order); only between calls. Bits do not depend on it (rows are independent).
+    void set_cpu_threads(int n) { if (!cpu_.cores.empty()) cpu_.nthreads = std::max(1, std::min(n, int(cpu_.cores.size()))); }
+    int  cpu_threads() const { return cpu_.nthreads; }
+    int  cpu_core_count() const { return int(cpu_.cores.size()); }
     // The CPU leg's PCIe share of the pinned misses at 2..kMaxRows rows (CpuMiss::qstar_multi; IE_DS41_QSTAR_MULTI at init). A
     // caller whose rows come from SEVERAL sequences (MiMo-V2.6 P4 B3 groups: the rows share almost no experts, so an expert
     // carries ~1 row and the split is closer to the one-row q*) sets its own share before moe() and restores this one after.
@@ -262,6 +270,7 @@ private:
         uint32_t cont_rows = 2048; float qstar_cont = 0.30f; bool f32 = false;   // f32: this request also writes h_rows32
         uint32_t max_rows() const { return std::max(kMaxRows, cont_rows); }
         std::thread th; std::mutex mu; std::condition_variable cv; bool stop = false, pending = false, done = true;
+        std::atomic<bool> pending_a{false}, done_a{true};   // B66: pending / done for a short spin before the cv sleep
         const Ds4SlotLayout* lay = nullptr; float limit = 0.f;
         struct Item { const void* slot; uint32_t row, tok; };
         std::vector<Item> work;                               // (arena slot, its packed row, that row's token)
@@ -271,7 +280,10 @@ private:
         uint64_t x_bytes = 0;                                 // its size (pinned_bytes counts it)
         std::optional<sycl::context> x_ctx;                   // its context: the destructor frees it when free_storage never ran
         std::vector<float> scratch, out;                      // host: per row of a run, EF*2 and H
+        std::vector<float> fscratch;                          // B66: cpu_experts_mxfp4_fused's (cpu_experts_fused_scratch)
+        std::vector<CpuExpertJob> jobs;                       // B66: the work list's runs, one job per expert
         double work_ms = 0;                                   // the last request's compute time
+        uint32_t runs = 0;                                    // B66: the last request's distinct experts
         sycl::half* h_rows = nullptr;                         // pinned host: the rows, [max_rows * top_k, H] fp16, in work order
         float* h_rows32 = nullptr;                            // the same rows fp32 for a continuation chunk: the XMX route lands fp32
     };

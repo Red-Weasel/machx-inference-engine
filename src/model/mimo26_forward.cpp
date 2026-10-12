@@ -10,6 +10,9 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -269,6 +272,9 @@ std::string Mimo26Forward::upload_card(Card& c) {
         }
         // P4 B2: pipelined lanes run both cards' CPU legs at once -- each on its own half of the E-cores (V4.1's split)
         if (opt_.split_cpu_cores && cards_.size() == 2 && !std::getenv("IE_DS41_CPU_CORES")) c.tier.set_cpu_cores(ci == 0 ? "8-13" : "14-19");
+        // B66: card 1's team on the same E-cores in rotated order, so a half team of each card (forward_pipelined's two legs at
+        // once) lands on disjoint cores: card 0's first 6 threads on 8-13, card 1's on 14-19; a whole team is unchanged
+        else if (cards_.size() == 2 && ci == 1 && !std::getenv("IE_DS41_CPU_CORES")) c.tier.set_cpu_cores("14-19,8-13");
         // the claim can overshoot what the driver hands out (allocator padding): an AUTO count gives back a slot per layer
         // at a time -- those experts fall to the pinned tier, a speed cost, not a correctness one
         std::string te;
@@ -590,6 +596,9 @@ std::string Mimo26Forward::run_card(Card& c, size_t ci, const Call& k) {
             stats_[L].moe_ms = ms_since(tm);
             const auto& ts = c.tier.last();
             stats_[L].experts_static = ts.experts_static; stats_[L].experts_pinned = ts.experts_pinned; stats_[L].experts_mmap = ts.experts_mmap;
+            stats_[L].experts_cpu = ts.experts_cpu; stats_[L].cpu_runs = ts.cpu_runs; stats_[L].cpu_ms = ts.ms_cpu; stats_[L].cpu_work_ms = ts.ms_cpu_work;
+            stats_[L].groups_ms = ts.ms_groups;
+            stats_[L].prep_ms = ts.ms_prep; stats_[L].tail_ms = ts.ms_tail; stats_[L].pcie_bytes = ts.bytes_pinned_to_vram;
             if (T <= kDecodeRows) {   // a lane's step to its counters; a group's (several lanes' rows) to the card's group counters
                 LaneTierStats& ls = k.segs.size() == 1 ? lane_tier_[k.segs[0].lane][ci] : group_tier_[ci];
                 ls.experts_static += ts.experts_static; ls.experts_pinned += ts.experts_pinned; ls.stream_hits += ts.stream_hits;
@@ -742,6 +751,82 @@ std::string Mimo26Forward::forward(const int32_t* ids, uint32_t T, uint32_t pos0
     return {};
 }
 
+bool Mimo26Forward::pipelined_admissible() const {
+    return cards_.size() == 2 && !piping() && !(probe_layer_ >= 0 || profiling_ || g_profiler);
+}
+
+std::string Mimo26Forward::forward_pipelined(const int32_t* ids, uint32_t n, uint32_t C, std::vector<float>& logits, const FeatSink& on_feats) {
+    if (cards_.size() != 2) return "forward_pipelined: needs two cards";
+    if (piping()) return "forward_pipelined: the lane pipe is running";
+    if (probe_layer_ >= 0 || profiling_ || g_profiler) return "forward_pipelined: the diagnostics are serial-only";
+    if (C == 0 || C > opt_.max_tokens || n == 0) return "forward_pipelined: chunk out of range or no rows";
+    const auto& cfg = m_->config();
+    const uint32_t H = cfg.dim, pos0 = n_pos_;
+    if (pos0 + n > cap_) return "context capacity " + std::to_string(cap_) + " exceeded";
+    for (uint32_t t = 0; t < n; ++t)   // every id before any work
+        if (ids[t] < 0 || uint32_t(ids[t]) >= cfg.vocab_size) return "forward_pipelined: token id " + std::to_string(ids[t]) + " (image positions are not supported)";
+    // B67: two chunks' buffers, chunk i in ring[i % 2] -- card 0 refills a slot once card 1 is done with the chunk two back and its
+    // features are handed over, so the memory is two chunks' at any prompt length (the prototype kept every chunk's)
+    struct Chunk { Call k; std::vector<float> x, feat, lg; std::vector<int32_t> pos; };
+    Chunk ring[2];
+    for (auto& c : ring) { c.x.resize(size_t(std::min(C, n)) * H); c.pos.resize(std::min(C, n)); c.feat.resize(h_feat_.size()); }
+    const size_t nch = (n + C - 1) / C;
+    const uint8_t* emb = m_->embed.w->data;
+    auto fill = [&](size_t i) {   // the chunk's embeddings and its call
+        const uint32_t off = uint32_t(i) * C, T = std::min(C, n - off);
+        Chunk& c = ring[i % 2];
+        for (uint32_t t = 0; t < T; ++t) {
+            mimo26_bf16_to_f32(emb + size_t(ids[off + t]) * H * 2, H, c.x.data() + size_t(t) * H);
+            c.pos[t] = int32_t(pos0 + off + t);
+        }
+        c.k = Call{}; c.k.T = T; c.k.x = c.x.data(); c.k.pos = c.pos.data();
+        c.k.segs.push_back({lane_, T, pos0 + off, 0, false, c.feat.data(), &c.lg});
+    };
+    // both cards' CPU legs run at once: without the fixed split, each tier's team is halved for the call (card 0's first
+    // threads on 8-13, card 1's on 14-19, see init) and restored after
+    std::vector<int> nth0;
+    if (!opt_.split_cpu_cores)
+        for (auto& cp : cards_) { nth0.push_back(cp->tier.cpu_threads()); if (cp->tier_on) cp->tier.set_cpu_threads(cp->tier.cpu_core_count() / 2); }
+    struct Restore { std::vector<std::unique_ptr<Card>>& cs; std::vector<int>& n; ~Restore() { for (size_t i = 0; i < n.size(); ++i) if (cs[i]->tier_on) cs[i]->tier.set_cpu_threads(n[i]); } } restore{cards_, nth0};
+    // stage 0 on this thread, stage 1 on a helper: chunk i reaches card 1 once card 0 has finished it (its residual in its x); the
+    // helper then hands the chunk's captured rows to on_feats (the serial loop's order: chunk i's features before chunk i + 1's card 1)
+    std::mutex mu; std::condition_variable cv; size_t ready = 0, done1 = 0; bool failed0 = false, failed1 = false; std::string err0, err1;
+    std::thread st1([&] {
+        for (size_t i = 0; i < nch; ++i) {
+            { std::unique_lock<std::mutex> lk(mu); cv.wait(lk, [&] { return ready > i || failed0; }); if (ready <= i) return; }
+            Chunk& c = ring[i % 2];
+            try {
+                if (auto e = run_card(*cards_[1], 1, c.k); !e.empty()) err1 = e;
+                else if (!feat_layers_.empty() && on_feats) {
+                    const uint32_t T = c.k.T, rows = std::min(T, feat_max_);
+                    if (auto f = on_feats(c.feat.data(), rows, pos0 + uint32_t(i) * C + T - rows); !f.empty()) err1 = "features: " + f;
+                }
+            } catch (const std::exception& e) { err1 = std::string("threw: ") + e.what(); }
+            { std::lock_guard<std::mutex> lk(mu); if (err1.empty()) done1 = i + 1; else failed1 = true; }
+            cv.notify_all();
+            if (!err1.empty()) return;
+        }
+    });
+    for (size_t i = 0; i < nch; ++i) {
+        { std::unique_lock<std::mutex> lk(mu); cv.wait(lk, [&] { return i < 2 || done1 + 2 > i || failed1; }); if (failed1) break; }
+        fill(i);
+        try { if (auto e = run_card(*cards_[0], 0, ring[i % 2].k); !e.empty()) err0 = e; }
+        catch (const std::exception& e) { err0 = std::string("threw: ") + e.what(); }
+        { std::lock_guard<std::mutex> lk(mu); if (err0.empty()) ready = i + 1; else failed0 = true; }
+        cv.notify_all();
+        if (!err0.empty()) break;
+    }
+    st1.join();
+    if (!err0.empty()) return "forward_pipelined card 0: " + err0;
+    if (!err1.empty()) return "forward_pipelined card 1: " + err1;
+    logits = std::move(ring[(nch - 1) % 2].lg);
+    n_pos_ = pos0 + n;
+    hi_end_ = std::max(hi_end_, n_pos_);
+    feat_rows_ = 0;
+    n_calls_ += uint32_t(nch);
+    return {};
+}
+
 // ---- P4 B2: card-pipelined lanes -----------------------------------------------------------------------------------------
 
 std::string Mimo26Forward::pipe_start(PipeDone done, uint32_t group_lanes, uint32_t group_rows) {
@@ -753,13 +838,16 @@ std::string Mimo26Forward::pipe_start(PipeDone done, uint32_t group_lanes, uint3
     const auto& cfg = m_->config();
     lanes_[lane_].n_pos = n_pos_; lanes_[lane_].hi_end = hi_end_;   // the active lane's positions live in lanes_ while the pipe runs
     for (auto& ln : lanes_) {
-        if (ln.h_x.empty()) {
-            ln.h_x.resize(size_t(opt_.max_tokens) * cfg.dim);
-            ln.h_pos.resize(opt_.max_tokens);
+        if (ln.buf[0].h_x.empty()) {
+            ln.buf[0].h_x.resize(size_t(opt_.max_tokens) * cfg.dim);
+            ln.buf[0].h_pos.resize(opt_.max_tokens);
         }
-        ln.h_feat.resize(h_feat_.size());
-        ln.in_flight = false; ln.in_cb = false; ln.resub = false;
+        ln.buf[0].h_feat.resize(h_feat_.size());
+        if (!ln.buf[1].h_x.empty()) ln.buf[1].h_feat.resize(h_feat_.size());
+        ln.in_flight = false; ln.in_cb = false; ln.resub = false; ln.steps = 0; ln.sub_slot = 0;
     }
+    if (nth_full_.empty())   // (once: pipe_pause / pipe_stop give the tiers their full teams back)
+        for (auto& cp : cards_) nth_full_.push_back(cp->tier.cpu_threads());
     // B3: the group pool -- a lane is in at most one group, so lanes + 1 groups always leave one for stage 0 to form; a
     // multi-lane group holds at most kDecodeRows rows (a one-lane group reads the lane's own buffers)
     groups_.clear(); gfree_.clear(); lq_.clear();
@@ -796,13 +884,14 @@ std::string Mimo26Forward::pipe_start(PipeDone done, uint32_t group_lanes, uint3
     return {};
 }
 
-std::string Mimo26Forward::pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool all_rows) {
+std::string Mimo26Forward::pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, bool all_rows, bool ahead) {
     if (!piping()) return "pipe_submit: the pipe is not running";
     if (lane >= lanes_.size()) return "pipe_submit: lane " + std::to_string(lane) + " of " + std::to_string(lanes_.size());
     LaneState& ln = lanes_[lane];
     // claim the lane (check-and-set under the lock): an idle lane from any thread; a lane inside its done callback only from that
-    // callback's thread, once (B2 gate note 7)
-    bool fresh = false;
+    // callback's thread, once (B2 gate note 7); B67: `ahead` -- a second step behind the lane's one in flight, from any thread
+    bool fresh = false, resub = false;
+    uint32_t want = 0, slot = 0;   // the position the step must start at; its buffers
     {
         std::lock_guard<std::mutex> lk(pmu_);
         if (!perr_.empty()) return "pipe_submit: a stage failed: " + perr_;
@@ -810,33 +899,48 @@ std::string Mimo26Forward::pipe_submit(uint32_t lane, const int32_t* ids, uint32
         // already gone and strand the lane half-stepped, or start while the serial API owns the cards
         if (pstop_) return "pipe_submit: the pipe is stopping";
         if (ppaused_) return "pipe_submit: the pipe is paused";
+        const bool own_cb = ln.in_flight && ln.in_cb && ln.cb_tid == std::this_thread::get_id();
+        const uint32_t queued = ln.steps - (own_cb ? 1u : 0u);   // the lane's steps besides one whose callback this thread runs
         if (ln.in_flight) {
-            if (!ln.in_cb || ln.cb_tid != std::this_thread::get_id()) return "pipe_submit: lane " + std::to_string(lane) + " has a step in flight";
-            if (ln.resub) return "pipe_submit: lane " + std::to_string(lane) + " was already resubmitted from its callback";
+            if (own_cb && !ln.resub) resub = true;
+            else if (!ahead) {
+                if (!own_cb) return "pipe_submit: lane " + std::to_string(lane) + " has a step in flight";
+                return "pipe_submit: lane " + std::to_string(lane) + " was already resubmitted from its callback";
+            } else if (queued >= 2) return "pipe_submit: lane " + std::to_string(lane) + " has two steps queued";
+            else if (ln.buf[ln.sub_slot].all_rows) return "pipe_submit: lane " + std::to_string(lane) + ": no step queues behind an all_rows step";
         } else { ln.in_flight = true; ++pbusy_; fresh = true; }
+        // a step queued behind another starts at its end and takes the other slot (the steps before it are done with slot 0's
+        // buffers, or only a callback on this thread still reads that slot's features); a step alone starts at n_pos, slot 0
+        want = queued ? ln.sub_end : ln.n_pos;
+        slot = queued ? 1u - ln.sub_slot : 0u;
+        if (!fresh) ++ln.steps; else ln.steps = 1;
     }
-    auto unclaim = [&](std::string e) {   // a refused step gives a fresh claim back (a callback's lane stays in flight until it returns)
-        if (fresh) { std::lock_guard<std::mutex> lk(pmu_); ln.in_flight = false; --pbusy_; }
+    auto unclaim = [&](std::string e) {   // a refused step gives its claim back (a callback's lane stays in flight until it returns)
+        std::lock_guard<std::mutex> lk(pmu_);
+        if (--ln.steps == 0) { ln.in_flight = false; --pbusy_; }
         return e;
     };
     const auto& cfg = m_->config();
     if (T == 0 || T > opt_.max_tokens) return unclaim("pipe_submit: T out of range");
-    if (pos0 != ln.n_pos) return unclaim("pipe_submit: lane " + std::to_string(lane) + ": pos0 " + std::to_string(pos0) + " != n_pos " + std::to_string(ln.n_pos));
+    if (pos0 != want) return unclaim("pipe_submit: lane " + std::to_string(lane) + ": pos0 " + std::to_string(pos0) + " != " + std::to_string(want));
     if (pos0 + T > ln.cap) return unclaim("pipe_submit: lane " + std::to_string(lane) + ": context capacity " + std::to_string(ln.cap) + " exceeded");
     const uint32_t H = cfg.dim;
+    LaneState::Buf& bf = ln.buf[slot];
+    if (bf.h_x.empty()) { bf.h_x.resize(size_t(opt_.max_tokens) * H); bf.h_pos.resize(opt_.max_tokens); bf.h_feat.resize(h_feat_.size()); }
     const uint8_t* emb = m_->embed.w->data;
     for (uint32_t t = 0; t < T; ++t) {   // the embeddings: forward()'s host gather, into the lane's own buffer
         const int32_t id = ids[t];
         if (id < 0) return unclaim("pipe_submit: image positions are serial-only (forward)");
         if (uint32_t(id) >= cfg.vocab_size) return unclaim("pipe_submit: token id " + std::to_string(id) + " out of range");
-        mimo26_bf16_to_f32(emb + size_t(id) * H * 2, H, ln.h_x.data() + size_t(t) * H);
-        ln.h_pos[t] = int32_t(pos0 + t);
+        mimo26_bf16_to_f32(emb + size_t(id) * H * 2, H, bf.h_x.data() + size_t(t) * H);
+        bf.h_pos[t] = int32_t(pos0 + t);
     }
-    ln.T = T; ln.pos0 = pos0; ln.all_rows = all_rows;
+    bf.T = T; bf.pos0 = pos0; bf.all_rows = all_rows;
     {
         std::lock_guard<std::mutex> lk(pmu_);
-        if (!fresh) ln.resub = true;   // the callback's resubmit: the lane's in-flight count carries over
-        lq_.push_back(lane);            // stage 0 groups the waiting lanes in this order
+        if (resub) ln.resub = true;      // the callback's resubmit: the lane's in-flight count carries over
+        ln.sub_end = pos0 + T; ln.sub_slot = slot;
+        lq_.push_back({lane, slot});     // stage 0 groups the waiting lanes in this order
     }
     pcv_.notify_all();
     return {};
@@ -846,7 +950,7 @@ std::string Mimo26Forward::pipe_reset_lane(uint32_t lane) {
     if (lane >= lanes_.size()) return "pipe_reset_lane: lane " + std::to_string(lane) + " of " + std::to_string(lanes_.size());
     std::lock_guard<std::mutex> lk(pmu_);
     LaneState& ln = lanes_[lane];   // an idle lane, or -- from its own done callback -- the lane whose sequence just ended
-    if (ln.in_flight && !(ln.in_cb && ln.cb_tid == std::this_thread::get_id() && !ln.resub))
+    if (ln.in_flight && !(ln.in_cb && ln.cb_tid == std::this_thread::get_id() && !ln.resub && ln.steps == 1))   // (B67: not with a step queued behind)
         return "pipe_reset_lane: lane " + std::to_string(lane) + " has a step in flight";
     ln.n_pos = 0; ln.hi_end = 0;
     return {};
@@ -856,7 +960,7 @@ std::string Mimo26Forward::pipe_rewind_lane(uint32_t lane, uint32_t n) {
     if (lane >= lanes_.size()) return "pipe_rewind_lane: lane " + std::to_string(lane) + " of " + std::to_string(lanes_.size());
     std::lock_guard<std::mutex> lk(pmu_);
     LaneState& ln = lanes_[lane];   // (the pipe_reset_lane rule: an idle lane, or the lane whose callback is running, from that thread)
-    if (ln.in_flight && !(ln.in_cb && ln.cb_tid == std::this_thread::get_id() && !ln.resub))
+    if (ln.in_flight && !(ln.in_cb && ln.cb_tid == std::this_thread::get_id() && !ln.resub && ln.steps == 1))   // (B67: not with a step queued behind)
         return "pipe_rewind_lane: lane " + std::to_string(lane) + " has a step in flight";
     if (n < ln.n_pos) ln.n_pos = n;
     return {};
@@ -889,6 +993,7 @@ std::string Mimo26Forward::pipe_pause() {
         e = perr_;
     }
     n_pos_ = lanes_[lane_].n_pos; hi_end_ = lanes_[lane_].hi_end; feat_rows_ = 0;   // the serial path's active lane, as after pipe_stop
+    for (size_t c = 0; c < nth_full_.size(); ++c) if (cards_[c]->tier_on) cards_[c]->tier.set_cpu_threads(nth_full_[c]);   // (B67: no step runs)
     return e;
 }
 
@@ -925,10 +1030,13 @@ void Mimo26Forward::stage_loop(size_t s) {
                 const uint32_t cap = group_lanes_ ? group_lanes_ : std::max<uint32_t>(1, (pbusy_ + nc - 1) / nc);
                 g->segs.clear(); g->T = 0;
                 while (!lq_.empty() && g->segs.size() < cap) {   // (B5: group_rows_ = the draft budget, <= kDecodeRows)
-                    LaneState& ln = lanes_[lq_.front()];
-                    if (!g->segs.empty() && g->T + ln.T > group_rows_) break;
-                    g->segs.push_back({lq_.front(), ln.T, ln.pos0, g->T, ln.all_rows, ln.h_feat.data(), &ln.logits});
-                    g->T += ln.T; lq_.pop_front();
+                    const auto [li, sl] = lq_.front();
+                    LaneState& ln = lanes_[li]; LaneState::Buf& bf = ln.buf[sl];
+                    if (!g->segs.empty() && g->T + bf.T > group_rows_) break;
+                    bool twice = false; for (const Seg& sg : g->segs) twice = twice || sg.lane == li;
+                    if (twice) break;                       // (B67: a lane's second step waits for the next group)
+                    g->segs.push_back({li, bf.T, bf.pos0, g->T, bf.all_rows, bf.h_feat.data(), &ln.logits, sl});
+                    g->T += bf.T; lq_.pop_front();
                     if (g->T > group_rows_) break;          // a lone step of more rows
                 }
             } else {
@@ -938,15 +1046,25 @@ void Mimo26Forward::stage_loop(size_t s) {
             }
         }
         if (s == 0) {   // the group's rows: a one-lane group reads the lane's buffers, a multi-lane group gathers them into its own
-            if (g->segs.size() == 1) { LaneState& ln = lanes_[g->segs[0].lane]; g->x = ln.h_x.data(); g->pos = ln.h_pos.data(); }
+            if (g->segs.size() == 1) { LaneState::Buf& bf = lanes_[g->segs[0].lane].buf[g->segs[0].slot]; g->x = bf.h_x.data(); g->pos = bf.h_pos.data(); }
             else {
                 g->x = g->h_x.data(); g->pos = g->h_pos.data();
                 for (const Seg& sg : g->segs) {
-                    const LaneState& ln = lanes_[sg.lane];
-                    std::copy_n(ln.h_x.data(), size_t(sg.T) * H, g->x + size_t(sg.r0) * H);
-                    std::copy_n(ln.h_pos.data(), sg.T, g->pos + sg.r0);
+                    const LaneState::Buf& bf = lanes_[sg.lane].buf[sg.slot];
+                    std::copy_n(bf.h_x.data(), size_t(sg.T) * H, g->x + size_t(sg.r0) * H);
+                    std::copy_n(bf.h_pos.data(), sg.T, g->pos + sg.r0);
                 }
             }
+        }
+        // B67: while a lane has two steps (a pipelined prefill) both cards' CPU legs run at once -- each gets half its team (card 0's
+        // first threads on 8-13, card 1's on 14-19, see init); otherwise the full team. Speed only: the leg's bits do not depend on it.
+        if (!opt_.split_cpu_cores && cards_[s]->tier_on && s < nth_full_.size()) {
+            bool two = false;
+            {
+                std::lock_guard<std::mutex> lk(pmu_);
+                for (const LaneState& ln : lanes_) two = two || ln.steps - (ln.in_cb ? 1u : 0u) >= 2;
+            }
+            cards_[s]->tier.set_cpu_threads(two ? cards_[s]->tier.cpu_core_count() / 2 : nth_full_[s]);
         }
         Call k; k.T = g->T; k.x = g->x; k.pos = g->pos; k.segs = g->segs;
         std::string e;
@@ -961,7 +1079,7 @@ void Mimo26Forward::stage_loop(size_t s) {
                     if (g->segs.size() > 1) perr_ += " of " + std::to_string(g->segs.size()) + " lanes";
                     perr_ += "), card " + std::to_string(s) + ": " + e;
                 }
-                for (const Seg& sg : g->segs) { lanes_[sg.lane].in_flight = false; --pbusy_; }
+                for (const Seg& sg : g->segs) { LaneState& ln = lanes_[sg.lane]; if (--ln.steps == 0) { ln.in_flight = false; --pbusy_; } }
                 gfree_.push_back(g);
             }
             pcv_.notify_all();
@@ -990,14 +1108,14 @@ void Mimo26Forward::stage_loop(size_t s) {
             { std::lock_guard<std::mutex> lk(pmu_); ln.in_cb = true; ln.resub = false; ln.cb_tid = std::this_thread::get_id(); }
             std::string ce;
             if (pdone_) {
-                try { pdone_(sg.lane, ln.logits, ln.h_feat.data(), rows); }
+                try { pdone_(sg.lane, ln.logits, sg.feat, rows); }
                 catch (const std::exception& ex) { ce = std::string("done callback threw: ") + ex.what(); }
                 catch (...) { ce = "done callback threw a non-std exception"; }
             }
             std::lock_guard<std::mutex> lk(pmu_);
             if (!ce.empty() && perr_.empty()) perr_ = "lane " + std::to_string(sg.lane) + ": " + ce;
             ln.in_cb = false;
-            if (!ln.resub) { ln.in_flight = false; --pbusy_; }   // resubmitted: its in-flight count carries over to the next step
+            if (--ln.steps == 0) { ln.in_flight = false; --pbusy_; }   // resubmitted (or a step queued behind): the lane stays in flight
             ln.resub = false;
         }
         {
@@ -1020,6 +1138,7 @@ std::string Mimo26Forward::pipe_stop() {
     pcv_.notify_all();
     for (auto& t : stage_th_) t.join();
     stage_th_.clear(); pq_.clear(); lq_.clear(); gfree_.clear(); groups_.clear(); pdone_ = nullptr; ppaused_ = false;
+    for (size_t c = 0; c < nth_full_.size(); ++c) if (cards_[c]->tier_on) cards_[c]->tier.set_cpu_threads(nth_full_[c]);   // (B67)
     if (!was_paused) { n_pos_ = lanes_[lane_].n_pos; hi_end_ = lanes_[lane_].hi_end; feat_rows_ = 0; }   // back to the serial path's active lane
     std::string e; std::swap(e, perr_);
     return e;

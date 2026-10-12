@@ -30,9 +30,11 @@
 // Rows [P, P + M) of B and C against A, fp32 bytes: identical rows, the first differing row and the largest |diff|. The result is
 // REPORTED ([info] and a SPLIT-ROWS line), not gated: whether MiMo's T > 8 prefill kernels are split-invariant is what it
 // measures. --invariant-only stops after it.
+// --ahead (B67, with --pipeline): every lane's prefill chunk i + 1 is queued behind chunk i (pipe_submit `ahead`: card 0 runs it
+// while card 1 runs chunk i), each chunk's callback then submitting the one after -- the same identity checks against solo.
 //   usage: ie-mimo26-lanes-test <model_dir> --prompt-file F [--prompt-file F ...] [--lanes L] [--n N] [--ctx C]
 //          [--lane-ctx C2] [--chunk C] [--no-dflash] [--slot-arm] [--cpu-miss] [--pipeline] [--aba] [--split]
-//          [--group-lanes G] [--stream-slots S] [--invariant] [--invariant-m M1,M2,...] [--invariant-start P] [--invariant-only]
+//          [--group-lanes G] [--stream-slots S] [--invariant] [--invariant-m M1,M2,...] [--invariant-start P] [--invariant-only] [--ahead]
 #include "ie/expert_stream.hpp"      // ds4_expert_priority_read_layers
 #include "ie/mimo26.hpp"
 #include "ie/mimo26_dflash.hpp"
@@ -177,13 +179,13 @@ int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr, "usage: ie-mimo26-lanes-test <model_dir> --prompt-file F [--prompt-file F ...] [--lanes L] [--n N] [--ctx C] "
                              "[--lane-ctx C2] [--chunk C] [--no-dflash] [--slot-arm] [--cpu-miss] [--pipeline] [--aba] [--split] "
-                             "[--group-lanes G] [--stream-slots S] [--invariant] [--invariant-m M1,M2,...] [--invariant-start P] [--invariant-only]\n");
+                             "[--group-lanes G] [--stream-slots S] [--invariant] [--invariant-m M1,M2,...] [--invariant-start P] [--invariant-only] [--ahead]\n");
         return 2;
     }
     const std::string dir = argv[1];
     std::vector<std::string> files;
     uint32_t lanes = 2, N = 64, ctx = 16384, lane_ctx = 0, C = 2048, group_lanes = 0, stream_slots = 8;
-    bool use_df = true, slot_arm = false, cpu_miss = false, pipeline = false, aba = false, split = false, invariant = false;
+    bool use_df = true, slot_arm = false, cpu_miss = false, pipeline = false, aba = false, split = false, invariant = false, ahead = false;
     std::vector<uint32_t> inv_m{9, 16, 38, 46, 64, 239};   // (B16) the split-rows check's remainder sizes
     uint32_t inv_start = 8; bool inv_only = false;
     for (int i = 2; i < argc; ++i) {
@@ -199,6 +201,7 @@ int main(int argc, char** argv) {
         else if (a == "--slot-arm") slot_arm = true;
         else if (a == "--cpu-miss") cpu_miss = true;
         else if (a == "--pipeline") pipeline = true;
+        else if (a == "--ahead") ahead = true;
         else if (a == "--aba") aba = true;
         else if (a == "--split") split = true;
         else if (a == "--group-lanes") group_lanes = uint32_t(std::atol(val().c_str()));
@@ -513,6 +516,7 @@ int main(int argc, char** argv) {
     std::mutex cb_mu;                                  // the callback's state (one stage thread calls it; main holds it while seeding)
     std::string cb_err;
     std::vector<uint32_t> pend(lanes, 0);             // the rows of each lane's step in flight
+    std::vector<uint32_t> pend2(lanes, 0), sub_at(lanes, 0);   // (B67 --ahead) a prefill chunk queued behind it; the next position to submit
     std::vector<std::chrono::steady_clock::time_point> t_sub(lanes);
     const auto t_pipe = std::chrono::steady_clock::now();
     std::vector<uint32_t> wave;                        // the first wave's lanes: the steady window is while all of them decode
@@ -524,9 +528,12 @@ int main(int argc, char** argv) {
         ie::Mimo26Lane& ln = set.lane(l);
         std::string e;
         t_sub[l] = std::chrono::steady_clock::now();
-        if (ln.phase == ie::Mimo26Lane::Phase::kPrefill) {
-            pend[l] = std::min<uint32_t>(opt.max_tokens, uint32_t(ln.prompt.size()) - ln.prefill_at);
-            e = fwd.pipe_submit(l, ln.prompt.data() + ln.prefill_at, pend[l], ln.prefill_at, false);
+        if (ln.phase == ie::Mimo26Lane::Phase::kPrefill) {   // (B67 --ahead: and the chunk after it, queued behind)
+            for (int k = 0; k < (ahead ? 2 : 1) && e.empty() && sub_at[l] < ln.prompt.size() && !pend2[l]; ++k) {
+                const uint32_t n = std::min<uint32_t>(opt.max_tokens, uint32_t(ln.prompt.size()) - sub_at[l]);
+                e = fwd.pipe_submit(l, ln.prompt.data() + sub_at[l], n, sub_at[l], false, k == 1);
+                if (e.empty()) { (pend[l] ? pend2[l] : pend[l]) = n; sub_at[l] += n; }
+            }
         } else {
             if (df) {
                 Trace& t = inter[size_t(seq_of[l])];
@@ -545,7 +552,7 @@ int main(int argc, char** argv) {
     auto start = [&](uint32_t l) -> bool {            // a fresh sequence on a possibly dirty lane (in the callback)
         if (auto e = fwd.pipe_reset_lane(l); !e.empty()) { fail(e); return false; }
         if (df) { if (auto e = df->select_lane(l); !e.empty()) { fail(e); return false; } df->reset(); }
-        set.lane(l).live.clear();
+        set.lane(l).live.clear(); pend[l] = pend2[l] = 0; sub_at[l] = set.lane(l).prefill_at;
         return submit(l);
     };
     auto on_done = [&](uint32_t l, const std::vector<float>& logits, const float* feats, uint32_t rows) {
@@ -558,10 +565,11 @@ int main(int argc, char** argv) {
         if (df) if (auto e = df->select_lane(l); !e.empty()) { fail(e); return; }
         if (ln.phase == ie::Mimo26Lane::Phase::kPrefill) {
             const uint32_t n = pend[l], at0 = ln.prefill_at;
+            pend[l] = pend2[l]; pend2[l] = 0;
             if (df) if (auto e = df->add_context(feats, rows, at0 + n - rows, rows); !e.empty()) { fail("dflash context: " + e); return; }
             ln.live.insert(ln.live.end(), ln.prompt.begin() + at0, ln.prompt.begin() + at0 + n);
             ln.prefill_at += n; t.prefill_ms += step;
-            if (ln.prefill_at < ln.prompt.size()) { submit(l); return; }
+            if (ln.prefill_at < ln.prompt.size()) { if (sub_at[l] < ln.prompt.size()) submit(l); return; }
             t.logits.push_back(fnv(logits));
             ln.phase = ie::Mimo26Lane::Phase::kDecode;
         } else {
@@ -592,7 +600,7 @@ int main(int argc, char** argv) {
     {
         std::lock_guard<std::mutex> lk(cb_mu);
         wave = admit();
-        for (uint32_t l : wave) { set.lane(l).live.clear(); if (!submit(l)) break; }
+        for (uint32_t l : wave) { set.lane(l).live.clear(); pend[l] = pend2[l] = 0; sub_at[l] = set.lane(l).prefill_at; if (!submit(l)) break; }
     }
     const std::string pe = fwd.pipe_stop();
     const double pipe_ms = ms_since(t_pipe);

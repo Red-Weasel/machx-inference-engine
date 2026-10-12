@@ -687,6 +687,10 @@ set_target_properties(ie_mimo26_profile PROPERTIES OUTPUT_NAME "ie-mimo26-profil
 add_executable(ie_mimo26_attn_bench mimo26_attn_bench.cpp)
 target_link_libraries(ie_mimo26_attn_bench PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_mimo26_attn_bench PROPERTIES OUTPUT_NAME "ie-mimo26-attn-bench")
+# B66: the FP8 dense GEMV and its candidate variants at MiMo's qkv shapes, timed and compared bit for bit
+add_executable(ie_mimo26_fp8_bench mimo26_fp8_bench.cpp)
+target_link_libraries(ie_mimo26_fp8_bench PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_mimo26_fp8_bench PROPERTIES OUTPUT_NAME "ie-mimo26-fp8-bench")
 # MiMo-V2.6 P3b gate (b): a follow-up turn on decode-written caches vs a cold prefill
 add_executable(ie_mimo26_reuse mimo26_reuse.cpp)
 target_link_libraries(ie_mimo26_reuse PRIVATE ie_core ie_sycl_flags)

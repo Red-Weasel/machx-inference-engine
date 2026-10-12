@@ -598,7 +598,29 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
     };
     std::vector<float> logits;
     const uint32_t chunk = b.fwd.max_tokens();
-    for (uint32_t off = L; off < ids.size(); off += chunk) {
+    // B67: a prompt of two or more chunks without image positions, on two cards -> the pipelined prefill (forward_pipelined: card 0
+    // runs chunk i + 1 while card 1 runs chunk i; the loop's chunks, so its bits); the drafter's context takes each chunk's rows right
+    // after card 1 has run it (on that card's helper thread, in order), and the liveness probe runs once, at the end.
+    // IE_MIMO26_PIPE_PREFILL=0: the loop below.
+    static const bool pipe_prefill = [] { const char* v = std::getenv("IE_MIMO26_PIPE_PREFILL"); return !(v && *v == '0'); }();
+    uint32_t from = L;   // the loop's first position
+    if (pipe_prefill && ids.size() - L > chunk && b.fwd.pipelined_admissible() &&
+        std::none_of(ids.begin() + L, ids.end(), [](int32_t id) { return id < 0; })) {
+        auto sink = [&](const float* f, uint32_t rows, uint32_t p0) -> std::string {
+            if (!df_on) return {};
+            std::string e;
+            try { e = b.dflash->add_context(f, rows, p0, rows); } catch (const std::exception& x) { e = std::string("dflash: ") + x.what(); }
+            if (!e.empty()) df_fail(e);
+            return {};
+        };
+        if (auto e = b.fwd.forward_pipelined(ids.data() + L, uint32_t(ids.size()) - L, chunk, logits, sink); !e.empty()) {
+            b.live.clear(); b.fwd.reset(); b.cache.live_lost();
+            r.finish_reason = "error: mimo_v2 prefill: " + e; return r;
+        }
+        b.live.insert(b.live.end(), ids.begin() + L, ids.end());
+        from = uint32_t(ids.size());
+    }
+    for (uint32_t off = from; off < ids.size(); off += chunk) {
         const uint32_t n = std::min<uint32_t>(chunk, uint32_t(ids.size()) - off);
         if (auto e = b.fwd.forward(ids.data() + off, n, off, logits, false); !e.empty()) {
             b.live.clear(); b.fwd.reset(); b.cache.live_lost();
@@ -878,10 +900,18 @@ void serve_submit(Mimo26Bundle& b, SLane& l, uint32_t li) {
     l.parked = false; l.t_sub = std::chrono::steady_clock::now();
     std::string e;
     if (l.phase == SPhase::kPrefill) {
-        const uint32_t left = uint32_t(l.prompt.size()) - l.prefill_at;
-        const uint32_t cap = (serve_busy(s) > 1 || s.turn_waiters) ? s.mix_chunk : b.fwd.max_tokens();
-        l.pend = std::min(left, cap); ++l.chunks;
-        e = b.fwd.pipe_submit(li, l.prompt.data() + l.prefill_at, l.pend, l.prefill_at, false);
+        // B67: with the lane alone on two cards the chunk after it is queued behind it (`ahead`: card 0 runs chunk i + 1 while card 1
+        // runs chunk i; the same chunks, so the serial bits), and each chunk's callback then submits the one after the queued one.
+        // IE_MIMO26_PIPE_PREFILL=0: one chunk at a time.
+        static const bool pipe_prefill = [] { const char* v = std::getenv("IE_MIMO26_PIPE_PREFILL"); return !(v && *v == '0'); }();
+        const bool alone = serve_busy(s) == 1 && !s.turn_waiters;
+        const uint32_t cap = alone ? b.fwd.max_tokens() : s.mix_chunk;
+        for (int k = 0; k < 2 && e.empty() && l.sub_at < l.prompt.size() && !l.pend2; ++k) {
+            if (k == 1 && !(pipe_prefill && alone && b.fwd.n_cards() == 2)) break;
+            const uint32_t n = std::min(uint32_t(l.prompt.size()) - l.sub_at, cap);
+            e = b.fwd.pipe_submit(li, l.prompt.data() + l.sub_at, n, l.sub_at, false, k == 1);
+            if (e.empty()) { (l.pend ? l.pend2 : l.pend) = n; l.sub_at += n; ++l.chunks; }
+        }
     } else {
         l.pend = 0;
         e = b.fwd.pipe_submit(li, l.rows.data(), uint32_t(l.rows.size()), b.fwd.lane_pos(li), l.rows.size() > 1);
@@ -908,18 +938,20 @@ void serve_done(Mimo26Bundle& b, uint32_t li, const std::vector<float>& logits, 
                             serve_ms(s.run_t0), (unsigned long long)s.runs, serve_decoding(s));
     if (l.phase == SPhase::kPrefill) {
         const uint32_t n = l.pend, at0 = l.prefill_at;
+        l.pend = l.pend2; l.pend2 = 0;                                  // (B67: the chunk queued behind, if any, is the one in flight now)
         serve_df_ctx(b, l, li, feats, frows, at0 + n - frows, frows);
         l.live.insert(l.live.end(), l.prompt.begin() + at0, l.prompt.begin() + at0 + n);
         l.prefill_at += n;
         if (l.prefill_at < l.prompt.size()) {
-            if (l.want_stop) serve_end(s, l, "abort", false);           // the client left during the prompt
+            // the client left during the prompt; B67: with a chunk still queued, the lane's caches run past its live ids -- cleared
+            if (l.want_stop) serve_end(s, l, "abort", l.pend != 0);
             else if (s.pause || s.stopping) l.parked = true;
-            else serve_submit(b, l, li);
+            else if (l.sub_at < l.prompt.size()) serve_submit(b, l, li);   // (B67: unless the prompt's last chunk is queued already)
             s.cv.notify_all();                                          // (the request thread's liveness probe)
             return;
         }
         l.first_logits = logits;                                        // the prompt's last row, sampled under the turn
-        l.phase = SPhase::kPromptReady;
+        l.phase = SPhase::kPromptReady; l.parked = false;               // (B67: a pause may have parked it while its last chunk ran)
         s.cv.notify_all();
         return;
     }
@@ -1095,7 +1127,7 @@ GenerateResult mimo26_run_lanes(Mimo26Bundle& b, const std::vector<int32_t>& ids
     const uint32_t lane = uint32_t(li);
     SLane& l = s.lanes[lane];
     l.busy = true; l.phase = SPhase::kPrefill; l.finish.clear(); l.want_stop = false; l.lost = false; l.parked = false;
-    l.outbox.clear(); l.drafts.clear(); l.first_logits.clear(); l.rows.clear(); l.pend = 0; l.steps = 0; l.chunks = 0;
+    l.outbox.clear(); l.drafts.clear(); l.first_logits.clear(); l.rows.clear(); l.pend = 0; l.pend2 = 0; l.steps = 0; l.chunks = 0;
     l.df_on = b.dflash != nullptr; l.df_pass = l.df_acc = 0; l.df_reason.clear(); l.cb_ms = l.samp_ms = l.dfctx_ms = l.draft_ms = 0;
     l.acc_kept = 4.0; l.acc_miss = 1.0; l.shared_passes = 0;   // (B5: the acceptance prior, 0.8)
     l.vitals = vit != nullptr;
@@ -1128,7 +1160,7 @@ GenerateResult mimo26_run_lanes(Mimo26Bundle& b, const std::vector<int32_t>& ids
         if (L == 0) b.fwd.reset();
         if (b.dflash) { if (L == 0) b.dflash->reset(); else b.dflash->rewind(L); }
         r.restore_ms = serve_ms(t_pf); r.cached_tokens = L; r.cache_source = b.prefix_reuse ? source : "";
-        l.prompt = ids; l.prefill_at = L;
+        l.prompt = ids; l.prefill_at = L; l.sub_at = L;
         l.parked = true;   // the first chunk is due: the turn's release submits it
     }
     serve_release_turn(b, lk);

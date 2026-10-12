@@ -13,6 +13,7 @@
 #include "ie/expert_stream.hpp"
 #include "ie/kernel_profiler.hpp"
 #include "ie/mimo26.hpp"
+#include "ie/deepseek41_experts.hpp"
 #include "ie/mimo26_dflash.hpp"
 #include "ie/mimo26_forward.hpp"
 #include "ie/ngram_draft.hpp"
@@ -32,7 +33,7 @@
 int main(int argc, char** argv) {
     if (argc < 3) { std::fprintf(stderr, "usage: ie-mimo26-run <model_dir> (--prompt TEXT | --prompt-file FILE) [--n N] [--chunk C] [--ctx MAX] [--static S] [--pinned P] [--stream Q] [--no-special] [--ranking FILE] [--kprof] [--kprof-prefill] [--lookup] [--dflash K] [--dflash-minp P] [--dflash-log FILE] [--spec-longest] [--reserve-mib N]\n"); return 2; }
     const std::string model = argv[1];
-    std::vector<std::pair<std::string, std::string>> prompts; uint32_t N = 32, C = 512, ctx = 4096; bool special = true; std::string ranking_path; bool kprof = false, kprof_pf = false, lookup = false; uint32_t dflash_k = 0; float dflash_minp = 0.f; std::string dflash_log; bool spec_longest = false;
+    std::vector<std::pair<std::string, std::string>> prompts; uint32_t N = 32, C = 512, ctx = 4096; bool special = true; std::string ranking_path; bool kprof = false, kprof_pf = false, lookup = false, pipe_pf = false; uint32_t dflash_k = 0; float dflash_minp = 0.f; std::string dflash_log; bool spec_longest = false;
     ie::Mimo26Options opt;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i]; auto val = [&]() -> std::string { if (i + 1 >= argc) { std::fprintf(stderr, "%s needs a value\n", a.c_str()); std::exit(2); } return argv[++i]; };
@@ -48,6 +49,8 @@ int main(int argc, char** argv) {
         else if (a == "--no-special") special = false;
         else if (a == "--ranking") ranking_path = val();
         else if (a == "--kprof") kprof = true;
+        else if (a == "--pipe-prefill") pipe_pf = true;   // B66 prototype: halves each leg's team during the prefill
+        else if (a == "--split-cores") opt.split_cpu_cores = true;                        // its serial baseline: the same core split
         else if (a == "--kprof-prefill") kprof_pf = true;
         else if (a == "--lookup") lookup = true;
         else if (a == "--dflash") dflash_k = uint32_t(std::atol(val().c_str()));
@@ -138,13 +141,31 @@ int main(int argc, char** argv) {
     ie::KernelProfiler kpp;   // --kprof-prefill
     if (kprof_pf) { ie::g_profiler = &kpp; kpp.begin_step(); }
     const auto t_pf = std::chrono::steady_clock::now();
+    // B66: the prefill chunks' expert-tier split, summed over their layers (as the decode tally)
+    double pf_layers = 0, pf_moe = 0, pf_groups = 0, pf_cpu = 0, pf_cpu_work = 0, pf_prep = 0, pf_tail = 0; uint64_t pf_pcie = 0, pf_cpu_rows = 0; uint32_t pf_chunks = 0;
+    if (pipe_pf) {   // B66 prototype: the chunks with the cards as pipeline stages (no DFlash, no profiling)
+        auto feats = [&](const float* f, uint32_t rows, uint32_t p0) -> std::string {   // the drafter's context, chunk by chunk
+            if (!dflash_k) return {};
+            const auto t0 = std::chrono::steady_clock::now();
+            if (auto e = df.add_context(f, rows, p0, rows); !e.empty()) return e;
+            t_ctx += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); return {};
+        };
+        if (auto e = fwd.forward_pipelined(ids.data(), uint32_t(ids.size()), C, logits, feats); !e.empty()) { std::fprintf(stderr, "pipelined prefill: %s\n", e.c_str()); return 1; }
+    } else
     for (uint32_t off = 0; off < ids.size(); off += C) {
         const uint32_t n = std::min<uint32_t>(C, uint32_t(ids.size()) - off);
         if (auto e = fwd.forward(ids.data() + off, n, off, logits, false); !e.empty()) { std::fprintf(stderr, "prefill at %u: %s\n", off, e.c_str()); return 1; }
+        ++pf_chunks;
+        for (const auto& s : fwd.stats()) { pf_layers += s.ms; pf_moe += s.moe_ms; pf_groups += s.groups_ms; pf_cpu += s.cpu_ms; pf_cpu_work += s.cpu_work_ms;
+                                             pf_prep += s.prep_ms; pf_tail += s.tail_ms; pf_pcie += s.pcie_bytes; pf_cpu_rows += s.experts_cpu; }
         if (!add_ctx(fwd.feat_rows(), off + n - fwd.feat_rows(), fwd.feat_rows())) return 1;
     }
     const double pf_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_pf).count();
     std::printf("prefill: %.2f s (%.1f tok/s)\n", pf_s, ids.size() / pf_s);
+    if (pf_chunks) std::printf("per prefill chunk (%u): layers %.1f ms, expert tiers %.1f, GPU groups %.1f, CPU leg %.1f (compute %.1f), prep %.1f, "
+                               "tail %.1f, CPU expert rows %.0f, PCIe %.2f GB of pinned experts\n", pf_chunks, pf_layers / pf_chunks, pf_moe / pf_chunks,
+                               pf_groups / pf_chunks, pf_cpu / pf_chunks, pf_cpu_work / pf_chunks, pf_prep / pf_chunks, pf_tail / pf_chunks,
+                               double(pf_cpu_rows) / pf_chunks, double(pf_pcie) / pf_chunks / 1e9);
     if (kprof_pf) report(kpp, (ids.size() + C - 1) / C, "chunk", pf_s * 1000);
 
     std::vector<int32_t> out;
@@ -162,11 +183,23 @@ int main(int argc, char** argv) {
         return true;
     };
     uint32_t n_pass = 0, n_rows = 0, n_acc = 0, n_plain = 0;
+    // every decode forward's expert-tier split, summed over its layers (Mimo26LayerStats): where a step's time goes
+    double t_step = 0, t_moe = 0, t_groups = 0, t_cpu = 0, t_cpu_work = 0, t_cpu_over = 0; uint64_t n_cpu_exp = 0, n_cpu_runs = 0; uint32_t n_fwd = 0;
+    double t_prep = 0, t_tail = 0; uint64_t n_pcie = 0;
+    auto tally = [&] {
+        ++n_fwd;
+        for (const auto& s : fwd.stats()) {
+            t_step += s.ms; t_moe += s.moe_ms; t_groups += s.groups_ms; t_cpu += s.cpu_ms; t_cpu_work += s.cpu_work_ms;
+            t_cpu_over += std::max(0.0, s.cpu_ms - s.groups_ms); n_cpu_exp += s.experts_cpu; n_cpu_runs += s.cpu_runs;
+            t_prep += s.prep_ms; t_tail += s.tail_ms; n_pcie += s.pcie_bytes;
+        }
+    };
     if (!lookup && !dflash_k) {
         for (uint32_t k = 0; k < N; ++k) {
             const int32_t next = argmax(logits.data(), V);
             if (!put(next)) break;
             if (auto e = fwd.forward(&next, 1, fwd.n_pos(), logits, false); !e.empty()) { std::fprintf(stderr, "\ndecode step %u: %s\n", k, e.c_str()); return 1; }
+            tally();
         }
     } else {   // the engine's lookup loop, greedy (src/engine/mimo26_engine.cpp); --dflash drafts when lookup has no copy
         ie::Ds41NgramIndex idx; if (lookup) idx.reset(ids);
@@ -190,11 +223,13 @@ int main(int argc, char** argv) {
             const uint32_t pos = fwd.n_pos();
             if (d.empty()) {
                 if (auto e = fwd.forward(&id, 1, pos, logits, false); !e.empty()) { std::fprintf(stderr, "\ndecode at %u: %s\n", pos, e.c_str()); return 1; }
+                tally();
                 if (!add_ctx(1, pos, 1)) return 1;
                 ++n_plain; id = argmax(logits.data(), V); continue;
             }
             rows.assign(1, id); rows.insert(rows.end(), d.begin(), d.end());
             if (auto e = fwd.forward(rows.data(), uint32_t(rows.size()), pos, vlg, true); !e.empty()) { std::fprintf(stderr, "\nverify at %u: %s\n", pos, e.c_str()); return 1; }
+            tally();
             uint32_t acc = 0; int32_t next = -1; bool ended = false, drop_last = false;
             for (uint32_t r = 0; r <= d.size(); ++r) {
                 const int32_t a = argmax(vlg.data() + size_t(r) * V, V);
@@ -228,6 +263,14 @@ int main(int argc, char** argv) {
     if (lookup) std::printf("lookup: %u verify passes (%u rows, %u drafts accepted), %u plain steps\n", n_pass, n_rows, n_acc, n_plain);
     if (dflash_k) std::printf("dflash: %u passes (%u rows, %u drafts accepted = %.2f per pass), drafter %.1f ms/call over %u calls, context %.1f ms/pass\n",
                               df_pass, df_rows, df_acc, df_pass ? double(df_acc) / df_pass : 0.0, df_calls ? t_draft / df_calls : 0.0, df_calls, df_pass ? t_ctx / df_pass : 0.0);
+    uint64_t slot_bytes = 0;   // one routed expert's weights (gate, up, down planes), as the CPU leg reads them
+    { ie::Ds4SlotLayout lay; if (ie::ds41_slot_layout(m.config().dim, m.config().moe_inter_dim, lay).empty()) slot_bytes = lay.bytes; }
+    if (n_fwd) std::printf("per decode forward (%u): layers %.1f ms, expert tiers %.1f, GPU groups %.1f, CPU leg %.1f (compute %.1f, "
+                           "past the groups %.1f), CPU expert rows %.1f in %.1f experts (%.1f GB/s of expert weights)\n", n_fwd, t_step / n_fwd,
+                           t_moe / n_fwd, t_groups / n_fwd, t_cpu / n_fwd, t_cpu_work / n_fwd, t_cpu_over / n_fwd, double(n_cpu_exp) / n_fwd,
+                           double(n_cpu_runs) / n_fwd, t_cpu_work > 0 ? double(n_cpu_runs) * double(slot_bytes) / (t_cpu_work * 1e6) : 0.0);
+    if (n_fwd) std::printf("per decode forward, the tier's prep %.1f ms and tail %.1f ms, PCIe %.2f GB of pinned experts\n",
+                           t_prep / n_fwd, t_tail / n_fwd, double(n_pcie) / n_fwd / 1e9);
     double moe = 0, all = 0; uint32_t es = 0, ep = 0, em = 0;
     for (const auto& s : fwd.stats()) { moe += s.moe_ms; all += s.ms; es += s.experts_static; ep += s.experts_pinned; em += s.experts_mmap; }
     std::printf("last step: %.1f ms over the layers, %.1f ms in the expert tiers; experts static %u / pinned %u / mmap %u\n", all, moe, es, ep, em);

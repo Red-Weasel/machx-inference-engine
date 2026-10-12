@@ -472,6 +472,7 @@ void Ds41ExpertTier::cpu_start(sycl::queue& q) {
     if (!cpu_.x) { cpu_.on = false; std::fprintf(stderr, "[ds41 tier] CPU miss path OFF: the pinned activation staging (%zu MiB) could not be allocated\n", size_t(cpu_.max_rows()) * H_ * 4 >> 20); return; }
     std::fill_n(cpu_.x, size_t(cpu_.max_rows()) * H_, 0.f);
     cpu_.lay = &lay_; cpu_.scratch.assign(size_t(kCpuExpertRows) * 2 * EF_, 0.f); cpu_.out.assign(size_t(kCpuExpertRows) * H_, 0.f);
+    cpu_.fscratch.assign(cpu_experts_fused_scratch(H_, EF_), 0.f);
     cpu_.h_rows = sycl::malloc_host<sycl::half>(size_t(cpu_.max_rows()) * TK_ * H_, q);
     if (cpu_.cont_rows > CpuMiss::kMaxRows || src_.fp32_out)   // fp32_out: decode rows land fp32 too
         cpu_.h_rows32 = sycl::malloc_host<float>(size_t(std::max(cpu_.cont_rows, CpuMiss::kMaxRows)) * TK_ * H_, q);
@@ -535,33 +536,89 @@ void Ds41ExpertTier::cpu_stop() {
 }
 
 // The worker: one OpenMP team, every thread pinned to its core once, then requests forever.
+namespace {
+// B66: the leg's hand-offs (a layer's work to the worker, its end to the host thread) spin up to IE_DS41_CPU_SPIN_US
+// (default 2000 us; 0 = none) on the flag before the mutex / cv sleep they always end in -- a futex wake from an idle
+// core costs tens of us, twice per layer. Scheduling only: the work and its order are unchanged.
+void cpu_spin(const std::atomic<bool>& flag) {
+    static const int us = [] { const char* v = std::getenv("IE_DS41_CPU_SPIN_US"); return v ? std::max(0, std::atoi(v)) : 2000; }();
+    if (us <= 0 || flag.load(std::memory_order_acquire)) return;
+    const auto end = std::chrono::steady_clock::now() + std::chrono::microseconds(us);
+    while (!flag.load(std::memory_order_acquire)) {
+        for (int i = 0; i < 64; ++i) _mm_pause();
+        if (std::chrono::steady_clock::now() >= end) return;
+    }
+}
+}  // namespace
+
 void Ds41ExpertTier::cpu_run() {
     const auto& cores = cpu_.cores;
-    kmp_set_blocktime(0);                 // this thread's team too (see init)
+    // this thread's team too (see init). B66: the team spins 1 ms after a region before it sleeps, so a leg's back-to-back
+    // regions (three per expert) find it awake; the team owns its own cores. Scheduling only, bit-identical. MiMo A-B-A,
+    // 7 held-out prompts: -11.9 % ms/token. IE_DS41_CPU_BLOCKTIME=N sets N ms; =0 is v0.2.21's sleep-at-once.
+    const char* bt = std::getenv("IE_DS41_CPU_BLOCKTIME");
+    kmp_set_blocktime(bt ? std::max(0, std::atoi(bt)) : 1);
     #pragma omp parallel num_threads(cpu_.nthreads)
     {
         cpu_set_t set; CPU_ZERO(&set); CPU_SET(cores[size_t(omp_get_thread_num()) % cores.size()], &set);
         sched_setaffinity(0, sizeof set, &set);
     }
     for (;;) {
+        cpu_spin(cpu_.pending_a);   // B66: a layer's leg usually arrives within the spin; else the cv sleep below
         std::unique_lock<std::mutex> lk(cpu_.mu);
         cpu_.cv.wait(lk, [&] { return cpu_.pending || cpu_.stop; });
         if (cpu_.stop) return;
-        cpu_.pending = false; lk.unlock();
+        cpu_.pending = false; cpu_.pending_a.store(false, std::memory_order_relaxed); lk.unlock();
         const auto tw = std::chrono::steady_clock::now();
         size_t i_row = 0;
+        cpu_.runs = 0;
+        // B66: the whole list in one team region (cpu_experts_mxfp4_fused): one barrier per expert instead of ~5 regions,
+        // the stores done by the thread that computed the entries; bit-identical (cpu_moe_mxfp4_test section 5).
+        // IE_DS41_CPU_FUSED=0 keeps the per-expert loop below.
+        static const bool fused = [] { const char* v = std::getenv("IE_DS41_CPU_FUSED"); return !(v && *v == '0'); }();
+        if (fused) {
+            cpu_.jobs.clear();
+            for (size_t i = 0; i < cpu_.work.size();) {   // the runs, as the loop below forms them
+                size_t j = i + 1;
+                while (j < cpu_.work.size() && j - i < kCpuExpertRows && cpu_.work[j].slot == cpu_.work[i].slot) ++j;
+                CpuExpertJob jb{}; jb.slot = cpu_.work[i].slot; jb.R = uint32_t(j - i); jb.out_row = uint32_t(i);
+                for (uint32_t r = 0; r < jb.R; ++r) jb.xs[r] = cpu_.x + size_t(cpu_.work[i + r].tok) * H_;
+                cpu_.jobs.push_back(jb);
+                i = j;
+            }
+            cpu_.runs = uint32_t(cpu_.jobs.size());
+            struct Rows { sycl::half* h; float* h32; bool f32; uint32_t H; } rows{cpu_.h_rows, cpu_.h_rows32, cpu_.f32, H_};
+            cpu_experts_mxfp4_fused(cpu_.jobs.data(), cpu_.jobs.size(), *cpu_.lay, cpu_.fscratch.data(), cpu_.limit, cpu_.nthreads,
+                [](void* c, uint32_t row, uint32_t k0, uint32_t k1, const float* src) {
+                    auto& d = *static_cast<Rows*>(c);
+                    sycl::half* dst = d.h + size_t(row) * d.H + k0;
+                    for (uint32_t k = 0; k < k1 - k0; ++k) dst[k] = sycl::half(src[k]);   // as the GPU stores its own (fp16)
+                    if (d.f32) std::copy_n(src, k1 - k0, d.h32 + size_t(row) * d.H + k0);   // and fp32, for the XMX route
+                }, &rows);
+        } else
         for (size_t i = 0; i < cpu_.work.size();) {
             // the run of rows on one expert (the leg lists an expert's rows together): its weights are read once for the
             // run (cpu_expert_mxfp4_rows, bit-identical per row); a lone row keeps the one-row kernel
             size_t j = i + 1;
             while (j < cpu_.work.size() && j - i < kCpuExpertRows && cpu_.work[j].slot == cpu_.work[i].slot) ++j;
             const uint32_t R = uint32_t(j - i);
+            ++cpu_.runs;
             if (R == 1) cpu_expert_mxfp4(cpu_.work[i].slot, *cpu_.lay, cpu_.x + size_t(cpu_.work[i].tok) * H_, cpu_.scratch.data(), cpu_.out.data(), cpu_.limit, cpu_.nthreads);
             else {
                 const float* xs[kCpuExpertRows];
                 for (uint32_t r = 0; r < R; ++r) xs[r] = cpu_.x + size_t(cpu_.work[i + r].tok) * H_;
                 cpu_expert_mxfp4_rows(cpu_.work[i].slot, *cpu_.lay, xs, R, cpu_.scratch.data(), cpu_.out.data(), cpu_.limit, cpu_.nthreads);
             }
+            if (cpu_mxfp4_team()) {   // B66: the same stores, the R rows' entries split over the team (each entry its own conversion)
+                const size_t n = size_t(R) * H_, base = i_row * H_;
+                const float* o = cpu_.out.data();
+                #pragma omp parallel for schedule(static) num_threads(cpu_.nthreads)
+                for (int64_t k = 0; k < int64_t(n); ++k) {
+                    cpu_.h_rows[base + size_t(k)] = sycl::half(o[k]);
+                    if (cpu_.f32) cpu_.h_rows32[base + size_t(k)] = o[k];
+                }
+                i_row += R;
+            } else
             for (uint32_t r = 0; r < R; ++r, ++i_row) {
                 const float* o = cpu_.out.data() + size_t(r) * H_;
                 sycl::half* dst = cpu_.h_rows + i_row * H_; for (uint32_t k = 0; k < H_; ++k) dst[k] = sycl::half(o[k]);   // the row, as the GPU stores its own (fp16)
@@ -570,7 +627,7 @@ void Ds41ExpertTier::cpu_run() {
             i = j;
         }
         cpu_.work_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tw).count();
-        lk.lock(); cpu_.done = true; lk.unlock(); cpu_.cv.notify_all();
+        lk.lock(); cpu_.done = true; cpu_.done_a.store(true, std::memory_order_release); lk.unlock(); cpu_.cv.notify_all();
     }
 }
 
@@ -658,7 +715,8 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
             q.memcpy(cpu_.x, x, size_t(T) * H * 4).wait();      // the activations, host side
             cpu_.f32 = T > CpuMiss::kMaxRows || src_.fp32_out;   // the rows the XMX route's fp32 scatter reads
             if (cpu_.f32 && !cpu_.h_rows32) return "tier: the CPU leg has no fp32 row staging";
-            { std::lock_guard<std::mutex> lk(cpu_.mu); cpu_.pending = true; cpu_.done = false; }
+            { std::lock_guard<std::mutex> lk(cpu_.mu); cpu_.pending = true; cpu_.done = false;
+              cpu_.done_a.store(false, std::memory_order_relaxed); cpu_.pending_a.store(true, std::memory_order_release); }
             cpu_.cv.notify_all();
             cpu_leg = true; tc = std::chrono::steady_clock::now();
             st_.experts_cpu = uint32_t(cpu_.work.size());
@@ -927,8 +985,9 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
     }
     const auto t4 = std::chrono::steady_clock::now();
     if (cpu_leg) {   // Phase 20: the CPU experts' rows land in their packed positions before the export wait / the scatter
+        cpu_spin(cpu_.done_a);   // B66: the leg usually ends within the spin; else the cv sleep below
         { std::unique_lock<std::mutex> lk(cpu_.mu); cpu_.cv.wait(lk, [&] { return cpu_.done; }); }
-        st_.ms_cpu = ms_since(tc); st_.ms_cpu_work = cpu_.work_ms;
+        st_.ms_cpu = ms_since(tc); st_.ms_cpu_work = cpu_.work_ms; st_.cpu_runs = cpu_.runs;
         for (size_t i = 0; i < cpu_.work.size();) {          // one copy per run of consecutive packed rows (an expert's rows at least)
             size_t j = i + 1; while (j < cpu_.work.size() && cpu_.work[j].row == cpu_.work[j - 1].row + 1) ++j;
             if (f32_rows) q.memcpy(bws_.y_f32 + uint64_t(cpu_.work[i].row) * H, cpu_.h_rows32 + i * H, (j - i) * H * 4);   // the fp32 scatter reads y_f32

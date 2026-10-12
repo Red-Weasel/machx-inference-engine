@@ -7,6 +7,7 @@
 #include "ie/kernel_profiler.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -506,12 +507,107 @@ static sycl::event mimo26_gemv_fp8_t(sycl::queue& q, const sycl::half* x, uint32
     });
 }
 
+// B66: the same GEMV, bit for bit, with the block's 32 weights decoded once by bits and then each activation row in turn
+// (the table kernel above holds all M rows' activations at once). The E4M3 code's 7 magnitude bits placed in an fp16's
+// exponent / mantissa field are the value times 2^-8 (normals and subnormals), so times 256 it is the table's value
+// exactly; 0x7F / 0xFF (the NaN code; real weights carry none) is NaN. Per row the products and their order are the table
+// kernel's (k = 4j..4j+3, then 16+4j..16+4j+3, j = 0..3), so every output is identical (ie-mimo26-fp8-bench: all
+// shapes, M 1/4/8). qkv at M 8, NR 2: 0.33-0.37 -> 0.19 ms on one B70. IE_MIMO26_FP8_LUT=1 keeps the table kernel.
+static inline float mimo26_e4m3_bits(uint32_t v) {
+    const uint16_t h = uint16_t(((v & 0x80u) << 8) | ((v & 0x7Fu) << 7));
+    const float f = float(sycl::bit_cast<sycl::half>(h)) * 256.f;
+    return (v & 0x7Fu) == 0x7Fu ? sycl::bit_cast<float>(0x7FC00000u | ((v & 0x80u) << 24)) : f;
+}
+
+template <int M, int NC, int NR>
+static sycl::event mimo26_gemv_fp8_wf(sycl::queue& q, const sycl::half* x, uint32_t x_stride, const uint8_t* w, const float* srow,
+                                      float* y, uint32_t K, uint32_t N, const std::vector<sycl::event>& deps) {
+    // NR output rows per sub-group: each converted activation block feeds the NR rows' products (a step's 2..8 rows:
+    // NR 2, x1.18-1.60 over NR 1 at M 8); per row the same products in the same order
+    constexpr int SG_SIZE = 16, WG_ITEMS = NC * SG_SIZE;
+    const uint32_t blocks = K / 32, SK = K / 128;
+    const uint32_t n_wgs = (N + NC * NR - 1) / (NC * NR);
+    return ie::ps(q, "mimo26_gemv_fp8", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(uint64_t(n_wgs) * WG_ITEMS, WG_ITEMS),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const uint32_t lid = uint32_t(it.get_local_id(0)), wgid = uint32_t(it.get_group(0));
+            const uint32_t sg_id = lid / SG_SIZE, lane = lid % SG_SIZE, n0 = (wgid * NC + sg_id) * NR;
+            if (n0 >= N) return;
+            float acc[NR][M];
+            #pragma unroll
+            for (int r = 0; r < NR; ++r)
+                #pragma unroll
+                for (int m = 0; m < M; ++m) acc[r][m] = 0.f;
+            for (uint32_t b = lane; b < blocks; b += SG_SIZE) {
+                float dw[NR][32], sc[NR];   // dw[r][k]: row n0 + r's weight of the block's column k
+                #pragma unroll
+                for (int r = 0; r < NR; ++r) {
+                    const uint32_t n = sycl::min(n0 + uint32_t(r), N - 1);   // a tail row repeats the last real row (not stored)
+                    const auto* w128 = reinterpret_cast<const sycl::vec<uint32_t, 4>*>(w + uint64_t(n) * K + uint64_t(b) * 32);
+                    const sycl::vec<uint32_t, 4> wa = w128[0], wb = w128[1];
+                    #pragma unroll
+                    for (int j = 0; j < 4; ++j) {
+                        const uint32_t v = wa[j], u = wb[j];
+                        dw[r][4 * j + 0] = mimo26_e4m3_bits(v & 0xFFu);         dw[r][4 * j + 1] = mimo26_e4m3_bits((v >> 8) & 0xFFu);
+                        dw[r][4 * j + 2] = mimo26_e4m3_bits((v >> 16) & 0xFFu); dw[r][4 * j + 3] = mimo26_e4m3_bits(v >> 24);
+                        dw[r][16 + 4 * j + 0] = mimo26_e4m3_bits(u & 0xFFu);         dw[r][16 + 4 * j + 1] = mimo26_e4m3_bits((u >> 8) & 0xFFu);
+                        dw[r][16 + 4 * j + 2] = mimo26_e4m3_bits((u >> 16) & 0xFFu); dw[r][16 + 4 * j + 3] = mimo26_e4m3_bits(u >> 24);
+                    }
+                    sc[r] = srow[uint64_t(n) * SK + (b >> 2)];
+                }
+                #pragma unroll
+                for (int m = 0; m < M; ++m) {
+                    const auto* xv = reinterpret_cast<const sycl::vec<sycl::half, 8>*>(x + uint64_t(m) * x_stride + uint64_t(b) * 32);
+                    float xm[32];
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const sycl::vec<sycl::half, 8> t = xv[i];
+                        #pragma unroll
+                        for (int e = 0; e < 8; ++e) xm[8 * i + e] = float(t[e]);
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < NR; ++r) {
+                        float bacc = 0.f;
+                        #pragma unroll
+                        for (int j = 0; j < 4; ++j) {
+                            bacc += dw[r][4 * j + 0] * xm[4 * j + 0];
+                            bacc += dw[r][4 * j + 1] * xm[4 * j + 1];
+                            bacc += dw[r][4 * j + 2] * xm[4 * j + 2];
+                            bacc += dw[r][4 * j + 3] * xm[4 * j + 3];
+                            bacc += dw[r][16 + 4 * j + 0] * xm[16 + 4 * j + 0];
+                            bacc += dw[r][16 + 4 * j + 1] * xm[16 + 4 * j + 1];
+                            bacc += dw[r][16 + 4 * j + 2] * xm[16 + 4 * j + 2];
+                            bacc += dw[r][16 + 4 * j + 3] * xm[16 + 4 * j + 3];
+                        }
+                        acc[r][m] += sc[r] * bacc;
+                    }
+                }
+            }
+            #pragma unroll
+            for (int r = 0; r < NR; ++r)
+                #pragma unroll
+                for (int m = 0; m < M; ++m) {
+                    const float red = sycl::reduce_over_group(it.get_sub_group(), acc[r][m], sycl::plus<float>());
+                    if (lane == 0 && n0 + uint32_t(r) < N) y[uint64_t(m) * N + n0 + r] = red;
+                }
+        });
+    });
+}
+
 template <int M>
 static sycl::event mimo26_gemv_fp8_m(sycl::queue& q, const sycl::half* x, uint32_t x_stride, const uint8_t* w, const float* srow,
                                      float* y, uint32_t K, uint32_t N, const std::vector<sycl::event>& deps) {
-    if (N <= 256u) return mimo26_gemv_fp8_t<M, 4>(q, x, x_stride, w, srow, y, K, N, deps);
-    if (N % 32u == 0) return mimo26_gemv_fp8_t<M, 16>(q, x, x_stride, w, srow, y, K, N, deps);
-    return mimo26_gemv_fp8_t<M, 8>(q, x, x_stride, w, srow, y, K, N, deps);
+    static const bool lut = [] { const char* v = std::getenv("IE_MIMO26_FP8_LUT"); return v && *v == '1'; }();
+    if (lut) {
+        if (N <= 256u) return mimo26_gemv_fp8_t<M, 4>(q, x, x_stride, w, srow, y, K, N, deps);
+        if (N % 32u == 0) return mimo26_gemv_fp8_t<M, 16>(q, x, x_stride, w, srow, y, K, N, deps);
+        return mimo26_gemv_fp8_t<M, 8>(q, x, x_stride, w, srow, y, K, N, deps);
+    }
+    if (N <= 256u) return mimo26_gemv_fp8_wf<M, 4, 1>(q, x, x_stride, w, srow, y, K, N, deps);
+    if (M >= 2) return mimo26_gemv_fp8_wf<M, 8, 2>(q, x, x_stride, w, srow, y, K, N, deps);
+    if (N % 32u == 0) return mimo26_gemv_fp8_wf<M, 16, 1>(q, x, x_stride, w, srow, y, K, N, deps);
+    return mimo26_gemv_fp8_wf<M, 8, 1>(q, x, x_stride, w, srow, y, K, N, deps);
 }
 
 sycl::event mimo26_gemv_fp8(sycl::queue& q, const sycl::half* x, uint32_t x_stride, const uint8_t* w8, const float* srow,

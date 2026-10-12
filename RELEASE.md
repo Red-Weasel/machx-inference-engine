@@ -1,9 +1,10 @@
 # IE Engine — v1 RELEASE
 
-> **Current release: v0.2.21 (October 2026).** This file is the record of the first release, of June 9, 2026, kept as
+> **Current release: v0.2.23 (October 2026).** This file is the record of the first release, of June 9, 2026, kept as
 > written; its figures are for one Arc Pro B70 and a Q4_K_M model and are not comparable with the two-card figures
-> below. Later releases are described in the README ("New in v0.2.21", "New in v0.2.20", "New in v0.2.18", "New in v0.2.13", "New in v0.2.8", "New in v0.2.6", "In v0.2.0") and in the GitHub
+> below. Later releases are described in the README ("New in v0.2.23", "New in v0.2.21", "New in v0.2.20", "New in v0.2.18", "New in v0.2.13", "New in v0.2.8", "New in v0.2.6", "In v0.2.0") and in the GitHub
 > release notes:
+> [v0.2.23](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.23),
 > [v0.2.21](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.21),
 > [v0.2.20](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.20),
 > [v0.2.18](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.18),
@@ -12,6 +13,14 @@
 > [v0.2.6](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.6),
 > [v0.2.0](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.0),
 > [v0.1.0](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.1.0).
+>
+> **v0.2.23 in short** (two Arc Pro B70 cards, measured October 12, 2026; v0.2.22 was not published):
+> - MiMo-V2.6-Flash decode 23-26 % faster with the same tokens as v0.2.21: 21.8-23.3 -> 27.8-28.3 tok/s with its DFlash
+>   drafter (7 agent-style prompts), 14.1-14.7 -> 16.9-18.9 without, four requests at once 20.6 -> 25.6 together. The CPU
+>   expert path runs a layer in one parallel region with a cheaper MXFP4 decoder; the FP8 decode projections read each
+>   weight once for up to eight rows. DeepSeek-V4.1-Flash shares the CPU path: decode about 7 % faster, text identical.
+> - MiMo-V2.6-Flash prompt reading in `ie serve`: card 0 reads the next 2,048-token piece while card 1 finishes the current
+>   one; 6,003 tokens 13.4 -> 9.6 s, 37,810 tokens 92.5 -> 53.4 s, replies identical (`IE_MIMO26_PIPE_PREFILL=0` = off).
 >
 > **v0.2.21 in short** (two Arc Pro B70 cards, measured October 5, 2026):
 > - Flash-Next read image prompts of more than 2,048 tokens without the image (v0.2.10 through v0.2.20); fixed, both test
