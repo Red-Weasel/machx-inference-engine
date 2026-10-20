@@ -65,6 +65,7 @@ int main(int argc, char** argv) {
         const auto& l = s.launch;
         assert((l.cards == std::vector<uint32_t>{0, 1}) && l.port == 11460 && l.max_queue == 16);
         assert(l.engine.max_ctx == 250000 && l.engine.n_gpus == 2 && l.engine.prefill_chunk == 512);
+        assert(l.engine.prefill_chunk_set);   // a layout's prefill_chunk counts as given
         assert(l.engine.cpu_threads == 12 && !l.engine.prompt_cache && !l.engine.int8_kv && !l.engine.spec);
         assert(l.engine.spec_k == 3 && l.vram_reserve_gib == 2.5);
         const auto& sp = l.defaults.sampling;

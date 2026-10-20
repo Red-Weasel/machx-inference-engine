@@ -293,6 +293,112 @@ sycl::event gemm_fp16_t(sycl::queue& q,
 }
 }
 
+// Split-K for the few-row GEMMs of a prefill MoE (2026-10-20): at M <= ~300 the tiles above put ~32 work-groups on
+// the B70's 32 Xe cores and each walks all of K in BK=16 steps (two barriers each), so the GEMM is latency bound
+// (~0.2 ms for M 16-48, N 2048, K 4096: ~1.3 TFLOP/s). Here a work-group runs KS groups of sub-groups side by side,
+// group s on the K quarter [s*K/KS, (s+1)*K/KS); the KS partial tiles are summed in SLM in a fixed order (s = 0..KS-1)
+// and only rows < M are stored. Deterministic, but the K summation order differs from gemm_fp16's.
+namespace {
+template<int BM, int BN, int SGM, int KS>
+sycl::event gemm_fp16_splitk_t(sycl::queue& q,
+                               const fp16* A, const fp16* B, float* C,
+                               uint32_t M, uint32_t N, uint32_t K,
+                               const std::vector<sycl::event>& deps) {
+    constexpr int SG_SIZE = 16, BK = 16, SGN = 32, TM = 8, TN = 16, TK = 16;
+    constexpr int M_REPEAT = SGM / TM, N_REPEAT = SGN / TN;
+    constexpr int SG_PER_K = (BM / SGM) * (BN / SGN);
+    constexpr int GROUP_ITEMS = SG_PER_K * SG_SIZE;          // lanes of one K group
+    constexpr int WG_ITEMS = GROUP_ITEMS * KS;
+    static_assert(BM * BK == GROUP_ITEMS * 8 && BK * BN == GROUP_ITEMS * 8, "one 8-half load per lane per tile");
+    const uint32_t wgs_m = (M + BM - 1) / BM;
+    const uint32_t wgs_n = N / BN;
+    const uint32_t KQ = K / KS;                               // caller: K % (KS * BK) == 0
+
+    return ie::ps(q, "gemm_fp16_splitk", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        sycl::local_accessor<fp16, 1> A_smem(sycl::range<1>(KS * BM * BK), h);
+        sycl::local_accessor<fp16, 1> B_smem(sycl::range<1>(KS * BK * BN), h);
+        sycl::local_accessor<float, 1> P(sycl::range<1>(KS * BM * BN), h);
+
+        h.parallel_for(sycl::nd_range<2>({wgs_m, uint64_t(wgs_n) * WG_ITEMS}, {1, WG_ITEMS}),
+                       [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const int lid    = int(it.get_local_id(1));
+            const int ks     = lid / GROUP_ITEMS;                 // this lane's K group
+            const int glid   = lid % GROUP_ITEMS;
+            const int sg_id  = glid / SG_SIZE;
+            const int sg_row = sg_id / (BN / SGN);
+            const int sg_col = sg_id % (BN / SGN);
+            const int wg_m   = int(it.get_group(0)) * BM;
+            const int wg_n   = int(it.get_group(1)) * BN;
+            auto sg = it.get_sub_group();
+            fp16* As = A_smem.get_multi_ptr<sycl::access::decorated::no>().get() + ks * BM * BK;
+            fp16* Bs = B_smem.get_multi_ptr<sycl::access::decorated::no>().get() + ks * BK * BN;
+
+            mat::joint_matrix<sycl::sub_group, float, mat::use::accumulator, TM, TN> acc[M_REPEAT][N_REPEAT];
+            #pragma unroll
+            for (int mr = 0; mr < M_REPEAT; ++mr)
+                #pragma unroll
+                for (int nr = 0; nr < N_REPEAT; ++nr)
+                    mat::joint_matrix_fill(sg, acc[mr][nr], 0.0f);
+
+            const int ar = glid * 8 / BK, ac = glid * 8 % BK;     // this lane's 8 halves of the A tile
+            const int br = glid * 8 / BN, bc = glid * 8 % BN;     // and of the B tile
+            const bool a_ok = wg_m + ar < int(M);
+            const fp16* Ap = A + uint64_t(wg_m + ar) * K + uint64_t(ks) * KQ + ac;
+            const fp16* Bp = B + (uint64_t(ks) * KQ + br) * N + wg_n + bc;
+            using v8 = sycl::vec<fp16, 8>;
+            for (uint32_t kb = 0; kb < KQ; kb += BK) {
+                *reinterpret_cast<v8*>(As + ar * BK + ac) =
+                    a_ok ? *reinterpret_cast<const v8*>(Ap + kb) : v8(fp16(0));
+                *reinterpret_cast<v8*>(Bs + br * BN + bc) = *reinterpret_cast<const v8*>(Bp + uint64_t(kb) * N);
+                sycl::group_barrier(it.get_group());
+                #pragma unroll
+                for (int mr = 0; mr < M_REPEAT; ++mr) {
+                    mat::joint_matrix<sycl::sub_group, fp16, mat::use::a, TM, TK, mat::layout::row_major> a_tile;
+                    mat::joint_matrix_load(sg, a_tile, A_smem.get_multi_ptr<sycl::access::decorated::no>() +
+                                               ks * BM * BK + (sg_row * SGM + mr * TM) * BK, BK);
+                    #pragma unroll
+                    for (int nr = 0; nr < N_REPEAT; ++nr) {
+                        mat::joint_matrix<sycl::sub_group, fp16, mat::use::b, TK, TN, mat::layout::row_major> b_tile;
+                        mat::joint_matrix_load(sg, b_tile, B_smem.get_multi_ptr<sycl::access::decorated::no>() +
+                                                   ks * BK * BN + sg_col * SGN + nr * TN, BN);
+                        mat::joint_matrix_mad(sg, acc[mr][nr], a_tile, b_tile, acc[mr][nr]);
+                    }
+                }
+                sycl::group_barrier(it.get_group());
+            }
+
+            #pragma unroll
+            for (int mr = 0; mr < M_REPEAT; ++mr)
+                #pragma unroll
+                for (int nr = 0; nr < N_REPEAT; ++nr)
+                    mat::joint_matrix_store(sg, acc[mr][nr], P.get_multi_ptr<sycl::access::decorated::no>() +
+                                                ks * BM * BN + (sg_row * SGM + mr * TM) * BN + sg_col * SGN + nr * TN,
+                                            BN, mat::layout::row_major);
+            sycl::group_barrier(it.get_group());
+            for (int e = lid; e < BM * BN; e += WG_ITEMS) {
+                const int r = e / BN, c = e % BN;
+                if (wg_m + r >= int(M)) continue;
+                float v = P[e];
+                #pragma unroll
+                for (int s2 = 1; s2 < KS; ++s2) v += P[s2 * BM * BN + e];
+                C[uint64_t(wg_m + r) * N + wg_n + c] = v;
+            }
+        });
+    });
+}
+}  // namespace
+
+bool gemm_fp16_splitk_ok(uint32_t M, uint32_t N, uint32_t K) {
+    return M > 0 && N % 64 == 0 && K % 64 == 0 && K >= 256;
+}
+
+sycl::event gemm_fp16_splitk(sycl::queue& q, const fp16* A, const fp16* B, float* C,
+                             uint32_t M, uint32_t N, uint32_t K,
+                             const std::vector<sycl::event>& deps) {
+    return gemm_fp16_splitk_t<64, 64, 16, 4>(q, A, B, C, M, N, K, deps);
+}
+
 // Small expert batches otherwise execute a mostly empty 128-row tile.
 // Keep the original path for large batches and shapes outside the measured
 // aligned range. N selects enough workgroups to occupy the GPU.

@@ -313,6 +313,10 @@ struct MtpHead {
     // first-index ties, row[0]-NaN corner). For verify-row argmax off-TU.
     static sycl::event argmax_row_device(sycl::queue& q, const sycl::half* row,
                                          uint32_t vocab, int32_t* d_out);
+
+    // The draft's host copies: through `alloc` (pinned stage) when q is its queue, else a direct blocking copy.
+    void d2h(sycl::queue& q, void* dst, const void* src, size_t n);
+    void h2d_async(sycl::queue& q, void* dst, const void* src, size_t n);
 };
 
 class Qwen35DenseModel {

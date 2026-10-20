@@ -20,6 +20,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -186,7 +187,7 @@ DenseQuantPtr upload_f32_proj_fp16(DeviceAllocator& alloc, const GgufTensorInfo*
     }
     void* d = alloc.malloc(K * Npad * sizeof(sycl::half));
     if (!d) { err = "malloc failed (ssm proj)"; return out; }
-    alloc.queue().memcpy(d, staging.data(), K * Npad * sizeof(sycl::half)).wait();
+    alloc.h2d(d, staging.data(), K * Npad * sizeof(sycl::half));
     owned.push_back(d);
     out.p = d; out.dt = DType::kF16;
     return out;
@@ -338,8 +339,8 @@ std::string Qwen35SplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
             auto* ddd = static_cast<uint16_t*>(a.malloc(dd.size() * sizeof(uint16_t)));
             if (!dqs || !ddd) { e = "Q8_0 SoA alloc"; return w; }
             own.push_back(dqs); own.push_back(ddd);
-            a.queue().memcpy(dqs, qs.data(), qs.size()).wait();
-            a.queue().memcpy(ddd, dd.data(), dd.size() * sizeof(uint16_t)).wait();
+            a.h2d(dqs, qs.data(), qs.size());
+            a.h2d(ddd, dd.data(), dd.size() * sizeof(uint16_t));
             w.q8_qs = dqs; w.q8_d = ddd;
             bytes += qs.size() + dd.size() * sizeof(uint16_t);
         } else if ((t->dtype == DType::kQ6_K || t->dtype == DType::kQ5_K) && w.K % 256 == 0 && split_kq) {
@@ -356,10 +357,10 @@ std::string Qwen35SplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
             void* p[4] = {a.malloc(n_lo), a.malloc(n_hi), a.malloc(n_sc), a.malloc(n_d)};
             for (void* x : p) if (x) own.push_back(x);   // freed with the model even when one allocation failed
             if (!p[0] || !p[1] || !p[2] || !p[3]) { e = "K-quant c32 alloc"; return w; }
-            a.queue().memcpy(p[0], lo.data(), n_lo).wait();   // one copy at a time, as the Q8_0 branch does
-            a.queue().memcpy(p[1], hi.data(), n_hi).wait();
-            a.queue().memcpy(p[2], sc.data(), n_sc).wait();
-            a.queue().memcpy(p[3], dd.data(), n_d).wait();
+            a.h2d(p[0], lo.data(), n_lo);   // one copy at a time, as the Q8_0 branch does
+            a.h2d(p[1], hi.data(), n_hi);
+            a.h2d(p[2], sc.data(), n_sc);
+            a.h2d(p[3], dd.data(), n_d);
             w.kq = t->dtype;
             w.kq_lo = static_cast<uint8_t*>(p[0]); w.kq_hi = p[1]; w.kq_sc = p[2]; w.kq_d = p[3];
             bytes += n_lo + n_hi + n_sc + n_d;
@@ -850,7 +851,7 @@ std::string Qwen35SplitModel::forward(const int32_t* input_ids, uint32_t T,
         auto& q = fleet_->dev(plan_.embed_dev).queue();
         int32_t* d_ids = ws_[plan_.embed_dev].ids;   // persistent [T] (ensure_ws)
         if (!d_ids) return "d_ids alloc failed";
-        q.memcpy(d_ids, input_ids, T * sizeof(int32_t)).wait();
+        fleet_->dev(plan_.embed_dev).h2d(d_ids, input_ids, T * sizeof(int32_t));
         if (token_embd_dtype_ == DType::kQ4_K)
             embedding_lookup_q4k(q, d_ids, token_embd_, ws_[plan_.embed_dev].x, T, H);
         else if (token_embd_dtype_ == DType::kQ8_0)
@@ -1250,8 +1251,8 @@ std::string Qwen35SplitModel::forward(const int32_t* input_ids, uint32_t T,
             // Spec verify: lm_head over ALL T rows (batched int-dot via
             // spec_verify_gemv_) → [T, vocab]; the host row is the last one.
             sgemv(hd, w.x_normed, output_, all_logits_dev, H, V, T).wait();
-            q.memcpy(out_logits_host, all_logits_dev + uint64_t(T - 1) * V,
-                     uint64_t(V) * sizeof(sycl::half)).wait();
+            fleet_->dev(hd).d2h(out_logits_host, all_logits_dev + uint64_t(T - 1) * V,
+                                uint64_t(V) * sizeof(sycl::half));
         } else {
         const sycl::half* last = w.x_normed + uint64_t(T - 1) * H;
         sycl::half* d_logits = w.logits;   // persistent [V] (ensure_ws)
@@ -1259,7 +1260,7 @@ std::string Qwen35SplitModel::forward(const int32_t* input_ids, uint32_t T,
         // lm_head is a single-vector GEMV → sgemv with T=1 (Q8_0-SoA int-dot when packed).
         sgemv(hd, last, output_, d_logits, H, V, 1).wait();
         g_dp27.sync(hd);
-        q.memcpy(out_logits_host, d_logits, uint64_t(V) * sizeof(sycl::half)).wait();
+        fleet_->dev(hd).d2h(out_logits_host, d_logits, uint64_t(V) * sizeof(sycl::half));
         }
         mark(q, pf_head);   // final norm + lm_head + logits bounce
         g_dp27.phase(DecodeProf::kHead);
@@ -1664,7 +1665,7 @@ std::string Qwen35SplitModel::forward_slots(uint32_t N, const int32_t* ids,
     auto embed_group = [&](sycl::queue& q0, const int32_t* g_ids, uint32_t n) -> std::string {
         int32_t* d_ids = ws_[plan_.embed_dev].ids;
         if (!d_ids) return "d_ids alloc failed";
-        q0.memcpy(d_ids, g_ids, n * sizeof(int32_t));
+        fleet_->dev(plan_.embed_dev).h2d_async(d_ids, g_ids, n * sizeof(int32_t));   // no host wait, as before
         if (token_embd_dtype_ == DType::kQ4_K)
             embedding_lookup_q4k(q0, d_ids, token_embd_, ws_[plan_.embed_dev].x, n, H);
         else if (token_embd_dtype_ == DType::kQ8_0)
@@ -1675,10 +1676,10 @@ std::string Qwen35SplitModel::forward_slots(uint32_t N, const int32_t* ids,
             embedding_lookup_q6k(q0, d_ids, token_embd_, ws_[plan_.embed_dev].x, n, H);
         return {};
     };
-    auto upload_pos = [&](sycl::queue& qq, uint32_t dev, const uint32_t* g_pos, uint32_t n) {
+    auto upload_pos = [&](sycl::queue&, uint32_t dev, const uint32_t* g_pos, uint32_t n) {
         std::vector<int32_t> pos(n);
         for (uint32_t t = 0; t < n; ++t) pos[t] = int32_t(g_pos[t]);
-        qq.memcpy(ws_[dev].positions, pos.data(), n * sizeof(int32_t)).wait();
+        fleet_->dev(dev).h2d(ws_[dev].positions, pos.data(), n * sizeof(int32_t));
     };
 
     // ---- 2-card GROUP PIPELINE — MEASURED SLOWER, kept OPT-IN ONLY so the
@@ -1694,21 +1695,16 @@ std::string Qwen35SplitModel::forward_slots(uint32_t N, const int32_t* ids,
         const uint32_t nA = (N + 1) / 2;
         const uint32_t off[2] = {0, nA};
         const uint32_t cnt[2] = {nA, N - nA};
-        static std::vector<sycl::half> hstage[2];
-        sycl::event ev_feed[2];
-        bool ev_valid[2] = {false, false};
         for (int g = 0; g < 2; ++g) {
             const uint32_t n = cnt[g];
             if (n == 0) break;
             const uint32_t o = off[g];
-            if (hstage[g].size() < uint64_t(n) * H) hstage[g].resize(uint64_t(n) * H);
             upload_pos(q0, 0, positions + o, n);
             if (auto m = embed_group(q0, ids + o, n); !m.empty()) return m;
             if (auto m = stage_card_slots(0, n, positions + o, slots + o); !m.empty()) return m;
-            if (ev_valid[g]) ev_feed[g].wait();
-            q0.memcpy(hstage[g].data(), ws_[0].x, uint64_t(n) * H * sizeof(sycl::half)).wait();
-            ev_feed[g] = q1.memcpy(ws_[1].x, hstage[g].data(), uint64_t(n) * H * sizeof(sycl::half));
-            ev_valid[g] = true;
+            // 2026-10-20: through the source card's pinned stage (was a pageable static vector and an async feed from it);
+            // blocking, so card 1 finishes the previous group first -- this opt-in path was already the slower one
+            fleet_->copy_across(0, ws_[1].x, 1, ws_[0].x, uint64_t(n) * H * sizeof(sycl::half));
             upload_pos(q1, 1, positions + o, n);
             if (auto m = stage_card_slots(1, n, positions + o, slots + o); !m.empty()) return m;
             // head for this group (q1 in-order → after the group's layers)
@@ -1717,8 +1713,7 @@ std::string Qwen35SplitModel::forward_slots(uint32_t N, const int32_t* ids,
         }
         q1.wait();
         if (out_logits_host)
-            q1.memcpy(out_logits_host, d_slot_logits_,
-                      uint64_t(N) * V * sizeof(sycl::half)).wait();
+            fleet_->dev(1).d2h(out_logits_host, d_slot_logits_, uint64_t(N) * V * sizeof(sycl::half));
         return {};
     }
 
@@ -1745,8 +1740,7 @@ std::string Qwen35SplitModel::forward_slots(uint32_t N, const int32_t* ids,
         rms_norm_f32w(q, w.x, output_norm_, w.x_normed, N, H, eps);
         sgemv(hd, w.x_normed, output_, d_slot_logits_, H, V, N).wait();
         if (out_logits_host)
-            q.memcpy(out_logits_host, d_slot_logits_,
-                     uint64_t(N) * V * sizeof(sycl::half)).wait();
+            fleet_->dev(hd).d2h(out_logits_host, d_slot_logits_, uint64_t(N) * V * sizeof(sycl::half));
     }
     return {};
 }
@@ -1896,7 +1890,7 @@ std::string Qwen35SplitModel::embed_rows(const int32_t* ids, uint32_t n) {
     auto& q = fleet_->dev(plan_.embed_dev).queue();
     Workspace& w = ws_[plan_.embed_dev];
     if (!w.ids) return "d_ids alloc failed";
-    q.memcpy(w.ids, ids, n * sizeof(int32_t)).wait();
+    fleet_->dev(plan_.embed_dev).h2d(w.ids, ids, n * sizeof(int32_t));
     const uint32_t H = cfg_.dense.hidden;
     if (token_embd_dtype_ == DType::kQ4_K)      embedding_lookup_q4k(q, w.ids, token_embd_, w.x, n, H);
     else if (token_embd_dtype_ == DType::kQ8_0) embedding_lookup_q8_0(q, w.ids, token_embd_, w.x, n, H);
@@ -1936,24 +1930,24 @@ void Qwen35SplitModel::clear_vision() {
 // as forward() did before B45.
 void Qwen35SplitModel::upload_positions(uint32_t dev, uint32_t start, uint32_t T) {
     Workspace& w = ws_[dev];
-    auto& q = fleet_->dev(dev).queue();
     std::vector<int32_t> pos(T);
     for (uint32_t t = 0; t < T; ++t) pos[t] = int32_t(start + t);
-    q.memcpy(w.positions, pos.data(), T * sizeof(int32_t)).wait();
+    fleet_->dev(dev).h2d(w.positions, pos.data(), T * sizeof(int32_t));
     if (mrope_n_) {
         std::vector<int32_t> p3(size_t(3) * T);
         qwen4_mrope3_slice(mrope3_.data(), mrope_n_, mrope_delta_, start, T, p3.data());
-        q.memcpy(w.positions3, p3.data(), p3.size() * sizeof(int32_t)).wait();
+        fleet_->dev(dev).h2d(w.positions3, p3.data(), p3.size() * sizeof(int32_t));
     }
 }
 
-// The staged projector rows over the piece's gathered embedding rows (f16 row memcpys on the embed card's in-order
-// queue: after the gather, before layer 0). vis_rows_ outlives the copies (cleared at the next request's clear_vision).
-void Qwen35SplitModel::splice_vision(sycl::queue& q, sycl::half* x, uint32_t start, uint32_t T) {
+// The staged projector rows over the piece's gathered embedding rows (f16 row copies on the embed card's in-order
+// queue: after the gather, before layer 0), through the embed card's pinned stage (blocking).
+void Qwen35SplitModel::splice_vision(sycl::queue&, sycl::half* x, uint32_t start, uint32_t T) {
     if (vis_spans_.empty()) return;
     const uint32_t H = cfg_.dense.hidden;
     for (const Qwen4VisSplice& r : qwen4_vis_splice_ranges(vis_spans_, start, T))
-        q.memcpy(x + uint64_t(r.dst) * H, vis_rows_.data() + uint64_t(r.src) * H, uint64_t(r.n) * H * sizeof(sycl::half));
+        fleet_->dev(plan_.embed_dev).h2d(x + uint64_t(r.dst) * H, vis_rows_.data() + uint64_t(r.src) * H,
+                                         uint64_t(r.n) * H * sizeof(sycl::half));
 }
 
 std::string Qwen35SplitModel::forward_stage(uint32_t dev, uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0,
@@ -1973,14 +1967,14 @@ std::string Qwen35SplitModel::forward_stage(uint32_t dev, uint32_t lane, const i
     // layers, then the residual out (card 0) or the head on the last row (card 1)
     std::vector<int32_t> pos(T);
     for (uint32_t t = 0; t < T; ++t) pos[t] = int32_t(pos0 + t);
-    q.memcpy(w.positions, pos.data(), T * sizeof(int32_t)).wait();
+    fleet_->dev(dev).h2d(w.positions, pos.data(), T * sizeof(int32_t));
     if (pos0 == 0) {
         if (dn_at(dev).ready()) dn_at(dev).reset(q);
         if (kv_at(dev).ready()) kv_at(dev).reset();
     }
     const uint64_t xb = uint64_t(T) * H * sizeof(sycl::half);
     if (dev == plan_.embed_dev) { if (auto m = embed_rows(ids, T); !m.empty()) return m; }
-    else q.memcpy(w.x, x_host, xb).wait();
+    else fleet_->dev(dev).h2d(w.x, x_host, xb);
     if (T > 1 || pk) {
         stage_card_prefill(dev, T, pos0);
     } else {
@@ -1988,7 +1982,7 @@ std::string Qwen35SplitModel::forward_stage(uint32_t dev, uint32_t lane, const i
         DeltaNetState* dn = &dn_at(dev);
         if (auto m = stage_card_rows(dev, 1, &pos0, &kv, &dn); !m.empty()) return m;
     }
-    if (dev != plan_.head_dev) { q.memcpy(x_host, w.x, xb).wait(); return {}; }
+    if (dev != plan_.head_dev) { fleet_->dev(dev).d2h(x_host, w.x, xb); return {}; }
     rms_norm_f32w(q, w.x + uint64_t(T - 1) * H, output_norm_, w.x_normed, 1, H, cfg_.dense.rms_eps);
     sgemv(dev, w.x_normed, output_, lane_logits_, H, cfg_.dense.vocab, 1).wait();
     return {};
@@ -2013,15 +2007,15 @@ std::string Qwen35SplitModel::forward_stage_rows(uint32_t dev, std::span<const u
     const uint32_t H = cfg_.dense.hidden, V = cfg_.dense.vocab;
     int32_t pos[kMaxRows];
     for (uint32_t i = 0; i < G; ++i) pos[i] = int32_t(pos0[i]);
-    q.memcpy(w.positions, pos, G * sizeof(int32_t)).wait();
+    fleet_->dev(dev).h2d(w.positions, pos, G * sizeof(int32_t));
     const uint64_t xb = uint64_t(G) * H * sizeof(sycl::half);
     if (dev == plan_.embed_dev) { if (auto m = embed_rows(ids, G); !m.empty()) return m; }
-    else q.memcpy(w.x, x_host, xb).wait();
+    else fleet_->dev(dev).h2d(w.x, x_host, xb);
     KvCache* kv[kMaxRows];
     DeltaNetState* dn[kMaxRows];
     for (uint32_t i = 0; i < G; ++i) { kv[i] = &lane_kv(lanes[i], dev); dn[i] = &lane_dn(lanes[i], dev); }
     if (auto m = stage_card_rows(dev, G, pos0, kv, dn); !m.empty()) return m;
-    if (dev != plan_.head_dev) { q.memcpy(x_host, w.x, xb).wait(); return {}; }
+    if (dev != plan_.head_dev) { fleet_->dev(dev).d2h(x_host, w.x, xb); return {}; }
     // forward_slots' head: the G rows normalised, the batched lm_head
     rms_norm_f32w(q, w.x, output_norm_, w.x_normed, G, H, cfg_.dense.rms_eps);
     sgemv_rows(dev, w.x_normed, output_, rows_logits_, H, V, G).wait();
@@ -2180,6 +2174,28 @@ void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t sta
     g_pf27.stop(dev);
 }
 
+std::string Qwen35SplitModel::ensure_pipe_feed(uint32_t rows) {
+    if (pipe_feed_[0].cap >= rows && pipe_feed_[1].cap >= rows) return {};
+    DeviceAllocator& a1 = fleet_->dev(1);
+    try { a1.queue().wait(); } catch (const sycl::exception&) {}   // no feed in flight reads the slots freed below
+    auto drop = [&] {
+        for (PipeFeed& f : pipe_feed_) { a1.free_host(f.x); a1.free_host(f.pos); a1.free_host(f.p3); f = PipeFeed{}; }
+    };
+    drop();
+    const uint32_t H = cfg_.dense.hidden;
+    for (PipeFeed& f : pipe_feed_) {
+        f.x   = static_cast<sycl::half*>(a1.malloc_host(uint64_t(rows) * H * sizeof(sycl::half)));
+        f.pos = static_cast<int32_t*>(a1.malloc_host(uint64_t(rows) * sizeof(int32_t)));
+        f.p3  = static_cast<int32_t*>(a1.malloc_host(uint64_t(rows) * 3 * sizeof(int32_t)));
+        if (!f.x || !f.pos || !f.p3) {   // both slots or neither: a half-made feed must not pass the check above
+            drop();
+            return "pipeline: pinned feed alloc failed (" + std::to_string(rows) + " rows)";
+        }
+    }
+    for (PipeFeed& f : pipe_feed_) f.cap = rows;
+    return {};
+}
+
 std::string Qwen35SplitModel::forward_pipelined(const int32_t* ids, uint32_t T_total,
                                                 uint32_t start_pos, bool reset_kv,
                                                 uint32_t chunk,
@@ -2203,19 +2219,19 @@ std::string Qwen35SplitModel::forward_pipelined(const int32_t* ids, uint32_t T_t
     }
     std::vector<int32_t> pos_all(T_total);
     for (uint32_t t = 0; t < T_total; ++t) pos_all[t] = int32_t(start_pos + t);
-    // P4 B45 vision: each chunk's [3, n] M-RoPE slice, host-side, alive until q1.wait() below (the copies are enqueued
-    // without a wait like the positions above: the host must not wait on card 1's compute).
-    std::vector<std::vector<int32_t>> p3_chunks;
+    std::vector<int32_t> p3_host;   // P4 B45 vision: this chunk's [3, n] M-RoPE slice
 
     auto& q0 = fleet_->dev(0).queue();
+    DeviceAllocator& a0 = fleet_->dev(0);
     auto& q1 = fleet_->dev(1).queue();
     // Ping-pong host staging for the residual handoff — the host waits only on
-    // card 0 (fast) and on card 1's FEED of two chunks ago (frees the buffer),
+    // card 0 (fast) and on card 1's FEED of two chunks ago (frees the slot),
     // never on card 1's compute → card 0 runs chunk c+1 while card 1 runs c.
-    std::vector<sycl::half> hstage[2];
-    hstage[0].resize(uint64_t(max_T) * H);
-    hstage[1].resize(uint64_t(max_T) * H);
-    sycl::event ev_feed[2];
+    // 2026-10-20: the slots are pinned in card 1's context (pipe_feed_); card 0's ids / positions go through its own
+    // pinned ring and its residual rows straight into the slot (host USM: copied directly), so no copy here reads
+    // pageable memory; ev_slot[s] is the LAST of slot s's copies (in-order queue).
+    if (auto m = ensure_pipe_feed(max_T); !m.empty()) return m;
+    sycl::event ev_slot[2];
     bool ev_valid[2] = {false, false};
 
     uint32_t pos = 0, c = 0, last_n = 0;
@@ -2223,15 +2239,15 @@ std::string Qwen35SplitModel::forward_pipelined(const int32_t* ids, uint32_t T_t
         const uint32_t n  = std::min<uint32_t>(chunk, T_total - pos);
         last_n = n;
         const uint32_t sp = start_pos + pos;
-        // card 0: ids + positions + embed + its layers (enqueue, in-order).
-        q0.memcpy(ws_[0].ids, ids + pos, n * sizeof(int32_t));
-        q0.memcpy(ws_[0].positions, pos_all.data() + pos, n * sizeof(int32_t));
+        // card 0: ids + positions + embed + its layers (enqueue, in-order; the uploads through card 0's pinned slots).
+        a0.h2d_async(ws_[0].ids, ids + pos, n * sizeof(int32_t));
+        a0.h2d_async(ws_[0].positions, pos_all.data() + pos, n * sizeof(int32_t));
         const int32_t* p3 = nullptr;
         if (mrope_n_) {
-            p3_chunks.emplace_back(size_t(3) * n);
-            qwen4_mrope3_slice(mrope3_.data(), mrope_n_, mrope_delta_, sp, n, p3_chunks.back().data());
-            p3 = p3_chunks.back().data();
-            q0.memcpy(ws_[0].positions3, p3, size_t(3) * n * sizeof(int32_t));
+            p3_host.resize(size_t(3) * n);
+            qwen4_mrope3_slice(mrope3_.data(), mrope_n_, mrope_delta_, sp, n, p3_host.data());
+            p3 = p3_host.data();
+            a0.h2d_async(ws_[0].positions3, p3, size_t(3) * n * sizeof(int32_t));
         }
         if (token_embd_dtype_ == DType::kQ4_K)
             embedding_lookup_q4k(q0, ws_[0].ids, token_embd_, ws_[0].x, n, H);
@@ -2247,14 +2263,17 @@ std::string Qwen35SplitModel::forward_pipelined(const int32_t* ids, uint32_t T_t
         // after the layer ops). Reusing stage s requires card 1's feed of chunk
         // c-2 to have completed (ping-pong invariant).
         const int s = int(c & 1);
-        if (ev_valid[s]) ev_feed[s].wait();
-        q0.memcpy(hstage[s].data(), ws_[0].x, uint64_t(n) * H * sizeof(sycl::half)).wait();
+        if (ev_valid[s]) ev_slot[s].wait();
+        PipeFeed& f = pipe_feed_[s];
+        a0.d2h(f.x, ws_[0].x, uint64_t(n) * H * sizeof(sycl::half));
+        std::memcpy(f.pos, pos_all.data() + pos, n * sizeof(int32_t));
+        if (p3) std::memcpy(f.p3, p3, size_t(3) * n * sizeof(int32_t));
         // card 1: feed + positions + its layers — ENQUEUE ONLY (the overlap:
         // the host loops on to card 0's next chunk while card 1 computes).
-        ev_feed[s] = q1.memcpy(ws_[1].x, hstage[s].data(), uint64_t(n) * H * sizeof(sycl::half));
+        q1.memcpy(ws_[1].x, f.x, uint64_t(n) * H * sizeof(sycl::half));
+        ev_slot[s] = q1.memcpy(ws_[1].positions, f.pos, n * sizeof(int32_t));
+        if (p3) ev_slot[s] = q1.memcpy(ws_[1].positions3, f.p3, size_t(3) * n * sizeof(int32_t));
         ev_valid[s] = true;
-        q1.memcpy(ws_[1].positions, pos_all.data() + pos, n * sizeof(int32_t));
-        if (p3) q1.memcpy(ws_[1].positions3, p3, size_t(3) * n * sizeof(int32_t));
         stage_card_prefill(1, n, sp);
         pos += n; ++c;
     }
@@ -2270,7 +2289,7 @@ std::string Qwen35SplitModel::forward_pipelined(const int32_t* ids, uint32_t T_t
         sycl::half* d_logits = w.logits;   // persistent [V] (ensure_ws, head_dev)
         if (!d_logits) return "pipeline: logits scratch missing";
         sgemv(1, w.x_normed, output_, d_logits, H, V, 1).wait();
-        q1.memcpy(out_logits_host, d_logits, uint64_t(V) * sizeof(sycl::half)).wait();
+        fleet_->dev(1).d2h(out_logits_host, d_logits, uint64_t(V) * sizeof(sycl::half));
     }
     g_pf27.report(T_total);
     return {};
@@ -2444,7 +2463,7 @@ std::string Qwen35SplitModel::spec_step(int32_t token, uint32_t pos, sycl::half*
 
     // A verified row for exactly this position and input token: its logits are already there.
     if (s.next < s.n_rows && pos == s.base + s.next && token == s.vin[s.next]) {
-        qh.memcpy(logits_host, s.d_all + uint64_t(s.next) * vocab, row_bytes).wait();
+        fleet_->dev(plan_.head_dev).d2h(logits_host, s.d_all + uint64_t(s.next) * vocab, row_bytes);
         ++s.next; ++s.hits; ++s.win_tok;
         if (s.look_round) ++s.look_hits;
         if (s.next == s.n_rows) {   // the round is used up: the state is at pos + 1, as after a plain step
@@ -2528,7 +2547,7 @@ std::string Qwen35SplitModel::spec_step(int32_t token, uint32_t pos, sycl::half*
         spec_verify_gemv_ = false;
     }
     if (!e.empty()) return e;
-    qh.memcpy(logits_host, s.d_all, row_bytes).wait();   // row 0 = this position
+    fleet_->dev(plan_.head_dev).d2h(logits_host, s.d_all, row_bytes);   // row 0 = this position
     s.base = pos; s.n_rows = Vr; s.next = 1;
     s.fast_round = fast;
     s.look_round = !look.empty();
@@ -2624,7 +2643,7 @@ std::string Qwen35SplitModel::spec_generate(const int32_t* ids, uint32_t P0,
     static const bool spec_dbg = std::getenv("IE_SPEC_DEBUG") != nullptr;
     if (spec_dbg) {
         std::vector<sycl::half> hh(H);
-        qh.memcpy(hh.data(), h_last, H * sizeof(sycl::half)).wait();
+        fleet_->dev(plan_.head_dev).d2h(hh.data(), h_last, H * sizeof(sycl::half));
         double s = 0; for (uint32_t i = 0; i < H; ++i) s += double(float(hh[i]));
         std::fprintf(stderr, "[spec-dbg split] tn=%d h_last[0..3]=%.6f %.6f %.6f %.6f sum=%.4f\n",
                      tn, float(hh[0]), float(hh[1]), float(hh[2]), float(hh[3]), s);
@@ -2675,7 +2694,7 @@ std::string Qwen35SplitModel::spec_generate(const int32_t* ids, uint32_t P0,
         for (uint32_t j = 0; j < V; ++j)
             MtpHead::argmax_row_device(qh, d_all + uint64_t(j) * vocab, vocab,
                                        d_targ + j);
-        qh.memcpy(targ.data(), d_targ, uint64_t(V) * sizeof(int32_t)).wait();
+        fleet_->dev(plan_.head_dev).d2h(targ.data(), d_targ, uint64_t(V) * sizeof(int32_t));
         const auto t2 = now();
 
         uint32_t n = 0;                     // accepted drafts (g_1..g_n)

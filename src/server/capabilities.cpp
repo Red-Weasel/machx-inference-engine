@@ -1,4 +1,5 @@
 #include "ie/server_capabilities.hpp"
+#include "ie/glm5_server.hpp"   // kGlm5PrefillChunk
 #include "ie/engine.hpp"
 #include "ie/gguf.hpp"
 #include "ie/reasoning.hpp"
@@ -49,6 +50,9 @@ std::string server_capabilities_json(const std::string& model_path) {
         if (auto e = g.open(model_path); !e.empty()) throw std::runtime_error("gguf: " + e);
         arch = detect_arch(g);
         if (auto a = g.find_kv("general.architecture")) name = a->as_string();
+        // one name per runtime: clients (Dream's launcher and model defaults) key on "glm5next";
+        // Unsloth's 2026-10-05 rewrite of the GLM-5.3-Flash GGUF says "glm5-next"
+        if (arch == ModelArch::kGlm5Next) name = "glm5next";
         if (auto t=g.find_kv("tokenizer.chat_template");t && t->type==GgufValueType::kString)chat_template=t->as_string();
         // P4 B20: what recommended_sampling matches the exact weights on
         if (auto t=g.find_kv("general.name");t && t->type==GgufValueType::kString)model_name=t->as_string();
@@ -72,7 +76,7 @@ std::string server_capabilities_json(const std::string& model_path) {
         arch == ModelArch::kQwen35Dense || arch == ModelArch::kQwen3Next ||
         arch == ModelArch::kGemma4 || arch == ModelArch::kQwen4Exp ||
         arch == ModelArch::kDeepSeek4 || arch == ModelArch::kDeepSeek41 || arch == ModelArch::kMimo26 ||
-        arch == ModelArch::kLaguna || arch == ModelArch::kInkling;
+        arch == ModelArch::kLaguna || arch == ModelArch::kInkling || arch == ModelArch::kGlm5Next;
     // v0.2.21: the 35B-A3B class (lookup drafts on the request lanes, P4 B55) and Flash-Next (lookup drafts at one lane, B56; its
     // MTP head only with a --spec-head path, B63) take --spec too, so a client's load screen can offer it.
     const bool spec = generic || arch == ModelArch::kQwen35Dense || arch == ModelArch::kGemma4 ||
@@ -109,7 +113,7 @@ std::string server_capabilities_json(const std::string& model_path) {
                      {"frequency_penalty",r6(sp.frequency_penalty)},{"seed",sp.seed},
                      {"max_tokens",sp.max_tokens==kMaxTokensUnlimited?0u:sp.max_tokens},
                      {"stop",json::array()},{"thinking",default_thinking},{"threads",0},
-                     {"prefill_chunk",256},{"parallel",1},{"slot_ctx",0},{"prompt_cache",cache}}},
+                     {"prefill_chunk",glm?kGlm5PrefillChunk:256u},{"parallel",1},{"slot_ctx",0},{"prompt_cache",cache}}},
         {"notes",json::array({"Architecture support is not a memory-fit or tensor-format guarantee.",
                              "Context overflow: reject at the server; client-side compaction is separate.",
                              "Sampling considers at most 1024 candidates; top_k=0 selects this ceiling, not the entire vocabulary.",

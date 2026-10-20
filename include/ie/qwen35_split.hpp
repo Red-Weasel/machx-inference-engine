@@ -345,6 +345,12 @@ private:
     Qwen35Config  cfg_;
     uint32_t      n_dev_ = 0;
     std::vector<Workspace> ws_;               // [dev]
+    // forward_pipelined's ping-pong feed of card 1 (2026-10-20, GitHub issue #2): pinned in card 1's own context
+    // (DeviceAllocator::malloc_host, freed with it), so card 1's async copies never read pageable host memory. Per
+    // slot: the residual rows, the positions, the M-RoPE slice; `cap` rows.
+    struct PipeFeed { sycl::half* x = nullptr; int32_t* pos = nullptr; int32_t* p3 = nullptr; uint32_t cap = 0; };
+    PipeFeed pipe_feed_[2];
+    std::string ensure_pipe_feed(uint32_t rows);
 
     std::vector<LayerW> layers_;              // global index L; ptrs on dev_of_layer[L]
     void*  token_embd_ = nullptr;  DType token_embd_dtype_ = DType::kCount;   // packed AoS (lookup)

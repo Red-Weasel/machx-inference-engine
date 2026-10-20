@@ -1335,8 +1335,8 @@ MtpHead::SoaW mtp_requant_q8_soa(DeviceAllocator& alloc, const GgufTensorInfo* t
     auto* dq = static_cast<int8_t*>(alloc.malloc(hq.size()));
     auto* dd = static_cast<uint16_t*>(alloc.malloc(hd.size() * sizeof(uint16_t)));
     if (!dq || !dd) { if (dq) alloc.free(dq); if (dd) alloc.free(dd); err = "mtp requant malloc"; return w; }
-    alloc.queue().memcpy(dq, hq.data(), hq.size()).wait();
-    alloc.queue().memcpy(dd, hd.data(), hd.size() * sizeof(uint16_t)).wait();
+    alloc.h2d(dq, hq.data(), hq.size());
+    alloc.h2d(dd, hd.data(), hd.size() * sizeof(uint16_t));
     owned.push_back(dq); owned.push_back(dd);
     w.qs = dq; w.d = dd;
     return w;
@@ -1369,8 +1369,8 @@ MtpHead::SoaW mtp_upload_q8_soa(DeviceAllocator& alloc, const GgufTensorInfo* t,
     auto* dd = static_cast<uint16_t*>(alloc.malloc(hd.size() * sizeof(uint16_t)));
     if (!dq || !dd) { if (dq) alloc.free(dq); if (dd) alloc.free(dd);
                       err = "mtp soa malloc"; return w; }
-    alloc.queue().memcpy(dq, hq.data(), hq.size()).wait();
-    alloc.queue().memcpy(dd, hd.data(), hd.size() * sizeof(uint16_t)).wait();
+    alloc.h2d(dq, hq.data(), hq.size());
+    alloc.h2d(dd, hd.data(), hd.size() * sizeof(uint16_t));
     owned.push_back(dq); owned.push_back(dd);
     w.qs = dq; w.d = dd;
     return w;
@@ -1392,7 +1392,7 @@ sycl::half* mtp_dequant_any_to_fp16(DeviceAllocator& alloc,
     }
     void* packed = alloc.malloc(t->nbytes);
     if (!packed) { err = "malloc packed"; return nullptr; }
-    alloc.queue().memcpy(packed, t->data, t->nbytes).wait();
+    alloc.h2d(packed, t->data, t->nbytes);   // pinned, 64 MiB pieces (output.weight ~1 GB; issue #2)
     auto* d = static_cast<sycl::half*>(alloc.malloc(uint64_t(K) * N * sizeof(sycl::half)));
     if (!d) { alloc.free(packed); err = "malloc fp16"; return nullptr; }
     sycl::event e;
@@ -1534,7 +1534,7 @@ std::string MtpHead::load(DeviceAllocator& a, const GgufReader& g,
         if (t->dtype != DType::kF32) { err = std::string(n) + ": expected F32"; return nullptr; }
         void* d = a.malloc(t->nbytes);
         if (!d) { err = std::string(n) + ": malloc"; return nullptr; }
-        q.memcpy(d, t->data, t->nbytes).wait();
+        a.h2d(d, t->data, t->nbytes);
         owned.push_back(d);
         return static_cast<float*>(d);
     };
@@ -1594,7 +1594,7 @@ std::string MtpHead::load(DeviceAllocator& a, const GgufReader& g,
         te_dtype = te->dtype;
         te_dev = a.malloc(te->nbytes);
         if (!te_dev) return "token_embd: malloc (MTP)";
-        q.memcpy(te_dev, te->data, te->nbytes).wait();
+        a.h2d(te_dev, te->data, te->nbytes);   // ~1 GB from the GGUF mapping: pinned, 64 MiB pieces (issue #2)
         owned.push_back(te_dev);
     }
 
@@ -1719,6 +1719,17 @@ sycl::event MtpHead::argmax_row_device(sycl::queue& q, const sycl::half* row,
     return mtp_argmax_device(q, row, vocab, d_out);
 }
 
+// The draft's host copies go through the head's allocator (pinned stage, issue #2) when q is its queue -- it always is
+// (the split and the dense model both pass the allocator's own queue); a foreign queue copies directly, as before.
+void MtpHead::d2h(sycl::queue& q, void* dst, const void* src, size_t n) {
+    if (alloc && alloc->queue() == q) alloc->d2h(dst, src, n);
+    else q.memcpy(dst, src, n).wait();
+}
+void MtpHead::h2d_async(sycl::queue& q, void* dst, const void* src, size_t n) {
+    if (alloc && alloc->queue() == q) alloc->h2d_async(dst, src, n);
+    else q.memcpy(dst, src, n).wait();
+}
+
 void MtpHead::draft(sycl::queue& q, const sycl::half* h_last, int32_t tn,
                     uint32_t p_base, uint32_t K, std::vector<int32_t>& out) {
     out.clear();
@@ -1730,7 +1741,7 @@ void MtpHead::draft(sycl::queue& q, const sycl::half* h_last, int32_t tn,
         build_x(q, h_src, e_tok);
         run_layer(q, int32_t(p_base + j));
         q.wait();
-        q.memcpy(row.data(), d_logits1, uint64_t(vocab) * sizeof(sycl::half)).wait();
+        d2h(q, row.data(), d_logits1, uint64_t(vocab) * sizeof(sycl::half));
         int32_t g = mtp_argmax_row(row.data(), vocab);
         if (tree_probe && j == 0) {
             // Measurement probe (tree-spec sizing): the draft's SECOND choice at
@@ -1755,7 +1766,7 @@ void MtpHead::draft_device_argmax(sycl::queue& q, const sycl::half* h_last,
                                   std::vector<int32_t>& out) {
     out.clear();
     if (K == 0 || K > 16) return;
-    q.memcpy(d_tok1, &tn, sizeof(int32_t));
+    h2d_async(q, d_tok1, &tn, sizeof(int32_t));
     const sycl::half* h_src = h_last;
     for (uint32_t j = 0; j < K; ++j) {
         const int32_t* e_tok = j == 0 ? d_tok1 : d_draft_ids + (j - 1);
@@ -1767,7 +1778,7 @@ void MtpHead::draft_device_argmax(sycl::queue& q, const sycl::half* h_last,
         h_src = d_x;     // build_x_device copies d_x to d_h before overwriting it
     }
     out.resize(K);
-    q.memcpy(out.data(), d_draft_ids, uint64_t(K) * sizeof(int32_t)).wait();
+    d2h(q, out.data(), d_draft_ids, uint64_t(K) * sizeof(int32_t));
 }
 
 void MtpHead::draft_device_sampled(sycl::queue& q, const sycl::half* h_last,
@@ -1776,7 +1787,7 @@ void MtpHead::draft_device_sampled(sycl::queue& q, const sycl::half* h_last,
                                    float temperature, uint32_t top_k, float top_p, float min_p, uint64_t seed0) {
     out.clear();
     if (K == 0 || K > 16) return;
-    q.memcpy(d_tok1, &tn, sizeof(int32_t));
+    h2d_async(q, d_tok1, &tn, sizeof(int32_t));
     const sycl::half* h_src = h_last;
     const uint32_t nv = draft_vocab ? std::min(draft_vocab, vocab) : vocab;
     for (uint32_t j = 0; j < K; ++j) {
@@ -1787,7 +1798,7 @@ void MtpHead::draft_device_sampled(sycl::queue& q, const sycl::half* h_last,
         h_src = d_x;     // build_x_device copies d_x to d_h before overwriting it
     }
     out.resize(K);
-    q.memcpy(out.data(), d_draft_ids, uint64_t(K) * sizeof(int32_t)).wait();
+    d2h(q, out.data(), d_draft_ids, uint64_t(K) * sizeof(int32_t));
 }
 
 std::string Qwen35DenseModel::load_mtp_head(const GgufReader& g, uint32_t max_ctx) {
@@ -1920,7 +1931,8 @@ std::string Qwen35DenseModel::spec_loop_(
 
 // ---------------------------------------------------------------------------
 // spec_generate — MTP self-speculative GREEDY decode (lifted from the validated
-// tools/ie_qwen35_spec.cpp spec_greedy lambda). Lossless vs plain greedy. The
+// tools/ie_qwen35_spec.cpp spec_greedy lambda). Near-lossless vs plain greedy: the T=V verify forward can round a
+// near-tie argmax differently from T=1 decode (measured on the split's --spec, 2026-10-15). The
 // caller has prefilled the prompt into kv/dn and supplies (h_last, tn) for the
 // last prompt position; we emit committed tokens IN ORDER through `emit`.
 // ---------------------------------------------------------------------------
@@ -1957,7 +1969,7 @@ std::string Qwen35DenseModel::spec_generate(sycl::queue& q, KvCache& kv,
 
 // ---------------------------------------------------------------------------
 // spec_generate_dspark — separate-draft GREEDY spec decode driven by the
-// target-conditioned DsparkDrafter (M2). Reuses spec_loop_'s lossless verify/
+// target-conditioned DsparkDrafter (M2). Reuses spec_loop_'s (near-lossless, as above) verify/
 // accept/commit/emit; the only differences are the draft source, the verify
 // length (block_size+1), and the conditioning (cumulative target taps instead
 // of h_last). The M1 drafter recomputes its whole context each round, so `feat`

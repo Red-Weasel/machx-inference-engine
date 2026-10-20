@@ -67,6 +67,8 @@ int main() {
     }
     assert(p.engine.cpu_threads == 12 && !p.engine.prompt_cache);
     assert(p.engine.prefill_chunk == 32 && p.engine.parallel == 2 && p.engine.slot_ctx == 8000);
+    assert(p.engine.prefill_chunk_set);                       // GLM keeps a given chunk over its own default
+    assert(!ie::parse_launch_options({"--ctx", "8192"}).engine.prefill_chunk_set);
     const auto& s = p.defaults.sampling;
     assert(s.temperature == 0 && s.top_k == 0 && s.top_p == 1 && s.min_p == .1f);
     assert(s.repeat_window == 256 && s.repeat_penalty == 1.2f);

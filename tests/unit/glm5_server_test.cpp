@@ -51,6 +51,29 @@ int main() {
     request.turns[2].tool_call_id="b"; // duplicate ids must retain wire order
     prompt=ie::build_glm5_prompt(request.turns,true,"",err);
     assert(prompt.find("<|observation|><tool_response>second</tool_response><tool_response>first</tool_response>")!=std::string::npos);
+    // The prompt cache's boundary: the render without its generation suffix, and the text the next turn starts
+    // with -- after a reply, a tool result, a reply with reasoning and a new user turn, thinking on or off.
+    for(bool think:{true,false}) {
+        const std::string tools=R"([{"type":"function","function":{"name":"read","parameters":{"type":"object"}}}])";
+        std::vector<ie::ChatTurn> conv={{"system","Be brief.",{}},{"user","Read a.txt",{}}};
+        std::string full=ie::build_glm5_prompt(conv,think,tools,err);
+        assert(err.empty());
+        for(int step=0;step<3;++step) {
+            const auto stable=ie::glm5_stable_prefix(full,think);
+            assert(!stable.empty() && full.starts_with(stable) && stable.size()<full.size());
+            assert(stable.ends_with("</tool_response>") || stable.ends_with("Read a.txt") || stable.ends_with("Thanks"));
+            if(step==0) { conv.push_back({"assistant",R"(<tool_call>{"name":"read","arguments":{"path":"a.txt"}}</tool_call>)",{}});
+                          conv.push_back({"tool","contents",{}}); }
+            if(step==1) { conv.push_back({"assistant","It says contents.",{}});
+                          conv.back().reasoning_content="the file is short"; conv.push_back({"user","Thanks",{}}); }
+            if(step==2) break;
+            const std::string next=ie::build_glm5_prompt(conv,think,tools,err);
+            assert(err.empty() && next.starts_with(stable));
+            full=next;
+        }
+        assert(ie::glm5_stable_prefix(full,!think).empty());   // the other mode's suffix is not this render's
+    }
+    assert(ie::glm5_stable_prefix("no suffix",true).empty());
     turns={{"developer","bad",{}}};
     ie::build_glm5_prompt(turns,true,"",err); assert(!err.empty());
     std::cout << "glm5_server_test: OK\n";

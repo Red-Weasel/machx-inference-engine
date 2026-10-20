@@ -92,7 +92,7 @@ T* upload(DeviceAllocator& alloc, const GgufTensorInfo* t,
             for (uint64_t i = 0; i < n; ++i) f32[i] = fp16_to_fp32(src[i]);
         void* d = alloc.malloc(n * sizeof(float));
         if (!d) { err = "malloc failed"; return nullptr; }
-        alloc.queue().memcpy(d, f32.data(), n * sizeof(float)).wait();
+        alloc.h2d(d, f32.data(), n * sizeof(float));
         owned.push_back(d);
         return static_cast<T*>(d);
     }
@@ -104,7 +104,7 @@ T* upload(DeviceAllocator& alloc, const GgufTensorInfo* t,
     }
     void* d = alloc.malloc(t->nbytes);
     if (!d) { err = "malloc failed"; return nullptr; }
-    alloc.queue().memcpy(d, t->data, t->nbytes).wait();
+    alloc.h2d(d, t->data, t->nbytes);
     owned.push_back(d);
     return static_cast<T*>(d);
 }
@@ -157,11 +157,11 @@ inline void maybe_upload_q4k_soa_v2(DeviceAllocator& alloc,
     if (!d_q || !d_sc || !d_mn || !d_d || !d_dm) return;   // OOM → AoS fallback
     owned.push_back(d_q);  owned.push_back(d_sc); owned.push_back(d_mn);
     owned.push_back(d_d);  owned.push_back(d_dm);
-    alloc.queue().memcpy(d_q,  h_q.data(),  q_n).wait();
-    alloc.queue().memcpy(d_sc, h_sc.data(), sc_n).wait();
-    alloc.queue().memcpy(d_mn, h_mn.data(), sc_n).wait();
-    alloc.queue().memcpy(d_d,  h_d.data(),  d_n * sizeof(uint16_t)).wait();
-    alloc.queue().memcpy(d_dm, h_dm.data(), d_n * sizeof(uint16_t)).wait();
+    alloc.h2d(d_q,  h_q.data(),  q_n);
+    alloc.h2d(d_sc, h_sc.data(), sc_n);
+    alloc.h2d(d_mn, h_mn.data(), sc_n);
+    alloc.h2d(d_d,  h_d.data(),  d_n * sizeof(uint16_t));
+    alloc.h2d(d_dm, h_dm.data(), d_n * sizeof(uint16_t));
     out.soa_q4_q = d_q; out.soa_q4_sc = d_sc; out.soa_q4_mn = d_mn;
     out.soa_q4_d = d_d; out.soa_q4_dmin = d_dm;
 }
@@ -210,10 +210,10 @@ inline void maybe_upload_q6k_soa_v2(DeviceAllocator& alloc,
     if (!d_lo || !d_hi || !d_sc || !d_d) return;   // OOM → AoS fallback
     owned.push_back(d_lo); owned.push_back(d_hi);
     owned.push_back(d_sc); owned.push_back(d_d);
-    alloc.queue().memcpy(d_lo, h_lo.data(), lo_n).wait();
-    alloc.queue().memcpy(d_hi, h_hi.data(), hi_n).wait();
-    alloc.queue().memcpy(d_sc, h_sc.data(), sc_n).wait();
-    alloc.queue().memcpy(d_d,  h_d.data(),  d_n * sizeof(uint16_t)).wait();
+    alloc.h2d(d_lo, h_lo.data(), lo_n);
+    alloc.h2d(d_hi, h_hi.data(), hi_n);
+    alloc.h2d(d_sc, h_sc.data(), sc_n);
+    alloc.h2d(d_d,  h_d.data(),  d_n * sizeof(uint16_t));
     out.soa_q6_lo = d_lo; out.soa_q6_hi = d_hi;
     out.soa_q6_sc = d_sc; out.soa_q6_d  = d_d;
 }
@@ -244,7 +244,7 @@ inline DenseQuantPtr upload_quant_dense(DeviceAllocator& alloc,
                 staging[k * N + n] = src[n * K + k];
         void* d = alloc.malloc(t->nbytes);
         if (!d) { err = "malloc failed"; return out; }
-        alloc.queue().memcpy(d, staging.data(), t->nbytes).wait();
+        alloc.h2d(d, staging.data(), t->nbytes);
         owned.push_back(d);
         out.p = d;
         out.dt = DType::kF16;
@@ -272,7 +272,7 @@ inline DenseQuantPtr upload_quant_dense(DeviceAllocator& alloc,
             }
         void* d = alloc.malloc(K * N * sizeof(uint16_t));
         if (!d) { err = "malloc failed"; return out; }
-        alloc.queue().memcpy(d, staging.data(), K * N * sizeof(uint16_t)).wait();
+        alloc.h2d(d, staging.data(), K * N * sizeof(uint16_t));
         owned.push_back(d);
         out.p = d;
         out.dt = DType::kF16;
@@ -287,7 +287,7 @@ inline DenseQuantPtr upload_quant_dense(DeviceAllocator& alloc,
     }
     void* d = alloc.malloc(t->nbytes);
     if (!d) { err = "malloc failed"; return out; }
-    alloc.queue().memcpy(d, t->data, t->nbytes).wait();
+    alloc.h2d(d, t->data, t->nbytes);
     owned.push_back(d);
     out.p = d;
     out.dt = t->dtype;
@@ -311,7 +311,7 @@ inline DenseQuantPtr upload_exl3(DeviceAllocator& alloc,
     auto up = [&](const GgufTensorInfo* ti) -> void* {
         void* d = alloc.malloc(ti->nbytes);
         if (!d) { err = "exl3: malloc failed"; return nullptr; }
-        alloc.queue().memcpy(d, ti->data, ti->nbytes).wait();
+        alloc.h2d(d, ti->data, ti->nbytes);
         owned.push_back(d);
         return d;
     };
@@ -339,7 +339,7 @@ inline DenseQuantPtr upload_dequant_to_fp16(DeviceAllocator& alloc,
     if (K == 0 || N == 0) { err = "dequant_to_fp16: zero dim"; return out; }
     void* packed = alloc.malloc(t->nbytes);
     if (!packed) { err = "malloc failed (packed)"; return out; }
-    alloc.queue().memcpy(packed, t->data, t->nbytes).wait();
+    alloc.h2d(packed, t->data, t->nbytes);
     auto* d = static_cast<sycl::half*>(alloc.malloc(uint64_t(K) * N * sizeof(sycl::half)));
     if (!d) { alloc.free(packed); err = "malloc failed (fp16)"; return out; }
     sycl::event e;
@@ -406,7 +406,7 @@ inline DenseQuantPtr upload_host_dequant_to_fp16(DeviceAllocator& alloc,
             staging[k * N + nn] = fp32_to_fp16(f32[nn * K + k]);
     void* d = alloc.malloc(n * sizeof(uint16_t));
     if (!d) { err = "malloc failed (host_dequant fp16)"; return out; }
-    alloc.queue().memcpy(d, staging.data(), n * sizeof(uint16_t)).wait();
+    alloc.h2d(d, staging.data(), n * sizeof(uint16_t));
     owned.push_back(d);
     out.p = d;
     out.dt = DType::kF16;
@@ -482,7 +482,7 @@ inline void* upload_embd_any_to_f16(DeviceAllocator& alloc,
     }
     void* d = alloc.malloc(n * sizeof(uint16_t));
     if (!d) { err = "malloc failed (embd f16)"; return nullptr; }
-    alloc.queue().memcpy(d, f16.data(), n * sizeof(uint16_t)).wait();
+    alloc.h2d(d, f16.data(), n * sizeof(uint16_t));
     owned.push_back(d);
     return d;
 }
@@ -654,7 +654,7 @@ inline DenseQuantPtr upload_quant_dense_permuted(DeviceAllocator& alloc,
         }
         void* d = alloc.malloc(t->nbytes);
         if (!d) { err = "malloc failed"; return out; }
-        alloc.queue().memcpy(d, staging.data(), t->nbytes).wait();
+        alloc.h2d(d, staging.data(), t->nbytes);
         owned.push_back(d);
         out.p = d; out.dt = DType::kF16;
         return out;
@@ -677,7 +677,7 @@ inline DenseQuantPtr upload_quant_dense_permuted(DeviceAllocator& alloc,
         std::memcpy(staging.data() + i * row_bytes, src + perm[i] * row_bytes, row_bytes);
     void* d = alloc.malloc(t->nbytes);
     if (!d) { err = "malloc failed"; return out; }
-    alloc.queue().memcpy(d, staging.data(), t->nbytes).wait();
+    alloc.h2d(d, staging.data(), t->nbytes);
     owned.push_back(d);
     out.p = d; out.dt = t->dtype;
     return out;

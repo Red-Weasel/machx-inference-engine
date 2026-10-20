@@ -85,6 +85,28 @@ add_executable(gemm_q4_xmx_prefill_test unit/gemm_q4_xmx_prefill_test.cpp)
 target_link_libraries(gemm_q4_xmx_prefill_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME gemm_q4_xmx_prefill_test COMMAND gemm_q4_xmx_prefill_test)
 
+# A bench, not a CTest: the tiled Q4_K / Q5_K -> B^T dequants vs the kernels they replaced (bitwise + time), on GPU1.
+add_executable(dequant_bt_bench unit/dequant_bt_bench.cpp)
+target_link_libraries(dequant_bt_bench PRIVATE ie_core ie_sycl_flags)
+
+# DeviceAllocator::h2d / d2h + DeviceFleet::copy_across through pinned stages (GitHub issue #2), on the B70s.
+add_executable(pinned_stage_test unit/pinned_stage_test.cpp)
+target_link_libraries(pinned_stage_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME pinned_stage_test COMMAND pinned_stage_test)
+set_tests_properties(pinned_stage_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# A bench, not a CTest: host <-> device copy latency, pageable vs the pinned stage vs pinned memory (issue #2), at decode sizes.
+add_executable(copy_path_bench unit/copy_path_bench.cpp)
+target_link_libraries(copy_path_bench PRIVATE ie_core ie_sycl_flags)
+
+# A bench, not a CTest: gemm_fp16_splitk vs gemm_fp16 at GLM-5.3 expert row counts (time + error vs fp64), on GPU1.
+add_executable(gemm_splitk_bench unit/gemm_splitk_bench.cpp)
+target_link_libraries(gemm_splitk_bench PRIVATE ie_core ie_sycl_flags)
+
+# A bench, not a CTest: GLM-5.3 prefill expert GEMM, rows GEMV vs dequant + XMX (IE_G5_XMX_ROWS), on GPU1.
+add_executable(glm5_moe_rows_vs_xmx_bench unit/glm5_moe_rows_vs_xmx_bench.cpp)
+target_link_libraries(glm5_moe_rows_vs_xmx_bench PRIVATE ie_core ie_sycl_flags)
+
 # Gemma 4 Q4_0 GEMV/GEMM — validates against a real Gemma QAT tensor (SKIPs if absent).
 add_executable(gemv_q4_0_test unit/gemv_q4_0_test.cpp)
 target_link_libraries(gemv_q4_0_test PRIVATE ie_core ie_sycl_flags)
@@ -598,6 +620,10 @@ add_test(NAME dn_ladder_test COMMAND dn_ladder_test)
 add_executable(glm5_server_test unit/glm5_server_test.cpp)
 target_link_libraries(glm5_server_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME glm5_server_test COMMAND glm5_server_test)
+
+add_executable(glm5_config_test unit/glm5_config_test.cpp)
+target_link_libraries(glm5_config_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME glm5_config_test COMMAND glm5_config_test)
 
 add_executable(engine_options_validation_test unit/engine_options_validation_test.cpp)
 target_link_libraries(engine_options_validation_test PRIVATE ie_core ie_sycl_flags)

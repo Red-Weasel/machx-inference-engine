@@ -314,6 +314,28 @@ public:
     // accepted rows through a normal forward afterwards).
     std::string snapshot_state();
     std::string restore_state();
+    // -- the engine's prompt cache (one live conversation) ------------------
+    // What the rows below a depth cannot rebuild: the KDA scan + conv state
+    // and the DSA open-pool rolls, copied to pinned HOST memory (the cards
+    // are full of expert cache, and the spec snapshot above keeps its own
+    // device slot). The latent KV and the completed pool keys below the depth
+    // stay in place on the card, so a copy is valid only while no forward
+    // has rewritten a row below it: the engine drops it whenever a sequence
+    // starts again at position 0. state_save copies at the live depth.
+    struct StateCopy {
+        StateCopy() = default;
+        StateCopy(const StateCopy&) = delete;
+        StateCopy& operator=(const StateCopy&) = delete;
+        ~StateCopy() { release(); }
+        void release() noexcept;
+        sycl::queue* q = nullptr;
+        uint8_t* p = nullptr;      // [scan | conv | kroll | groll]
+        uint64_t cap = 0;
+        uint32_t depth = 0;        // 0 = no copy
+    };
+    std::string state_save(StateCopy& c);
+    std::string state_restore(const StateCopy& c);
+    uint32_t    depth() const noexcept { return kv_len_; }
     // Cheaper partial-accept path: with spec-verify mode ON, a small-T
     // forward saves each KDA layer's scan/conv INPUT rows; commit_verify(n)
     // then rebuilds the exact state of the accepted prefix from the last
@@ -355,6 +377,11 @@ private:
                  uint32_t T, uint32_t N, uint32_t K,
                  sycl::half* ya16, float* ya32,
                  sycl::half* yb16, float* yb32);
+    // out[t, h, n] = sum_k W[h][n][k] * in[t, h, k] (the MLA absorbs; W GGUF-native f16 [NH][N][K], k fastest) on XMX:
+    // W transposed into q8_w16_, `in` split per head into fp16 hi + lo parts (`hi`, `lo`: NH*T*K halves each, free
+    // at the call), two gemm_fp16 per head into mmscr32_, summed and scattered into out32 (fp32) or out16 (fp16).
+    void absorb_xmx(const float* in, const sycl::half* W, sycl::half* hi, sycl::half* lo, float* out32,
+                    sycl::half* out16, uint32_t T, uint32_t NH, uint32_t N, uint32_t K);
 
     bool shutting_down_ = false;
     DeviceAllocator* alloc_ = nullptr;
@@ -432,6 +459,20 @@ private:
     sycl::half* emat_g16_ = nullptr;         // dequanted expert gate  Bt [H, EF]
     sycl::half* emat_u16_ = nullptr;         //                    up  Bt [H, EF]
     sycl::half* emat_d16_ = nullptr;         //                  down  Bt [EF, H]
+    // Prefill on XMX, read per init_runtime. IE_G5_Q8_GEMM_ROWS (default 32): a Q8_0-SoA dense projection over >= N rows
+    // dequantizes its weight once into q8_w16_ and runs gemm_fp16 instead of the T-rows int-dot GEMV, which re-reads
+    // the weight per 16 rows (prefill profile: ~30% of GPU time at chunk 1024). IE_G5_XMX_ROWS (default 32): experts
+    // with >= N rows in a call run dequant + XMX GEMM (split-K below 256 rows) instead of the rows GEMV. 0 = off for
+    // either.
+    uint64_t q8_max_kn_ = 0;                 // largest K x N among this stage's Q8_0-SoA dense weights (load)
+    uint32_t q8_gemm_rows_ = 0;              // 0 = off
+    uint32_t xmx_rows_min_ = 0;              // 0 = off
+    bool splitk_ = true;                     // IE_G5_SPLITK: the XMX experts' GEMMs below 256 rows split K (0 = off)
+    sycl::half* q8_w16_ = nullptr;           // [q8_max_kn_] fp16 scratch, W[k*N + n]
+    // IE_G5_ABSORB_XMX_ROWS (default 64, 0 = off; PPL inside the perturbation band, 2026-10-19): the MLA absorbs of a
+    // prefill call over >= N rows run as two gemm_fp16 per head (absorb_xmx, fp16 hi + lo input) instead of
+    // k_mla_kabsorb / k_mla_vabsorb. Needs q8_w16_ for the transposed weight; no buffer of its own.
+    uint32_t absorb_xmx_rows_ = 0;
     std::vector<int32_t> h_top_;             // host routing staging
     std::vector<float>   h_topw_;
     std::vector<int32_t> h_idx_;             // flat per-expert gather lists

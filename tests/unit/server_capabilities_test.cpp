@@ -1,5 +1,6 @@
 #undef NDEBUG
 #include "ie/server_capabilities.hpp"
+#include "ie/glm5_server.hpp"
 #include "ie/reasoning.hpp"
 #include "ie/recommended_sampling.hpp"
 #include "nlohmann/json.hpp"
@@ -42,24 +43,27 @@ int main() {
   for(const auto& [k,v]:kv){s(k);w(uint32_t(8));s(v);}
   while(f.tellp()%32)f.put(0);f.close();
   auto j=json::parse(ie::server_capabilities_json(path));
-  if(arch=="glm5next") {
+  const bool glm=arch=="glm5next"||arch=="glm5-next";   // glm5-next: Unsloth's 2026-10-05 rewrite, same runtime
+  if(glm) {
    assert(ie::server_reasoning_error(path,"low").empty());
    assert(!ie::server_reasoning_error(path,"medium").empty());
   }
   std::remove(path.c_str());
-  assert(j.at("architecture")==arch);assert(j.at("supported")==supported);
-  if(arch=="glm5next") {
+  assert(j.at("architecture")==(glm?"glm5next":arch));assert(j.at("supported")==supported);
+  if(glm) {
    assert(j.at("reasoning").at("effort_levels")==json({"low","high","max"}));
    assert(j.at("defaults").at("reasoning_effort")==
        (std::getenv("IE_SERVE_REASONING_EFFORT")?std::getenv("IE_SERVE_REASONING_EFFORT"):"max"));
    assert(j.at("memory_planner")=="streaming");assert(j.at("max_gpus")==2);
-   assert(!j.at("features").at("prompt_cache").get<bool>());
+   assert(j.at("features").at("prompt_cache").get<bool>());   // one live conversation (Glm5Bundle)
+   assert(j.at("defaults").at("prefill_chunk")==ie::kGlm5PrefillChunk);   // GLM's own default, not the generic 256
    assert(!j.at("features").at("speculative").get<bool>());
   }
   return j;
  };
  unsetenv("IE_G5_PIN_BANKS");unsetenv("IE_G5_ECACHE_MB");
  unsetenv("IE_G5_PIN_MAX_GIB");unsetenv("IE_G5_PIN_FLOOR_GIB");unsetenv("IE_G5_PIN_OVERHEAD");
+ check("glm5-next",true);   // reported as "glm5next": clients key on one name per runtime
  auto memory=check("glm5next",true)["memory_policy"];
  assert(memory["host_banks"]=="pinned_auto" && memory["expert_cache_bytes"]==0);
  assert(memory["pin_max_bytes"].is_null());

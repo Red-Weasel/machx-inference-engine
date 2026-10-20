@@ -119,6 +119,12 @@ std::string build_glm5_prompt(std::span<const ChatTurn> turns,bool thinking,
     return out;
 }
 
+std::string_view glm5_stable_prefix(std::string_view prompt,bool thinking) {
+    const std::string_view gen=thinking?"<|assistant|><think>":"<|assistant|><think></think>";
+    if(!prompt.ends_with(gen))return {};
+    return prompt.substr(0,prompt.size()-gen.size());
+}
+
 Glm5Completion parse_glm5_completion(std::string_view text,bool thinking,std::string_view tools_json) {
     Glm5Completion result;
     if(thinking) {

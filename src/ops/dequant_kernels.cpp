@@ -272,21 +272,81 @@ sycl::event dequant_q6_K(sycl::queue& q, const void* packed_in,
 //  Transposed full-matrix dequant → B^T fp16 [K, N] for gemm_fp16
 //  (prefill fp16-GEMM path, docs/prefill_attack_plan_2026-06-09.md E1).
 //
-//  Each lane dequants ONE super-block (column n, k-block b) into registers
-//  and writes its 256 values down column n of B^T (stride N). WG = 64
-//  consecutive columns of the same k-block, so for each fixed k the 64
-//  lanes' stores land on consecutive addresses — coalesced 128 B stores.
-//  Reads stay scalar (144/210 B per lane) but reads are 4–7× smaller than
-//  the fp16 writes, so writes dominate the traffic.
+//  Tiled (2026-10-20): a work-group of 256 lanes takes 64 consecutive columns
+//  of one k-block. It copies their 64 super-blocks to SLM with coalesced
+//  4-byte loads (row stride padded to an odd word count: no bank conflicts),
+//  then lane = 64 x quarter + column writes 64 of its column's 256 values, so
+//  each store row is 64 consecutive halves (128 B). The one-lane-per-block
+//  kernel it replaces read each 144/176 B block with scalar loads: per GLM-5.3
+//  expert matrix (8M values, warm) Q4_K 0.041 -> 0.030 ms, Q5_K 0.036 ->
+//  0.032 ms (dequant_bt_bench). Same value expressions: bit-identical output
+//  (dequant_bt_test, dequant_bt_bench).
+//  The old kernel stays as the fallback for a weight that is not 4-byte aligned.
 // ============================================================
+namespace {
+constexpr uint32_t kBtCols = 64, kBtLanes = 256;
+
+// Copy the 64 super-blocks (BW words each) of columns n0.. of k-block b into slm (row stride BW + 1 words).
+template <uint32_t BW>
+inline void bt_stage(const sycl::nd_item<2>& it, const uint32_t* Ww, uint32_t* slm, uint32_t bpc, uint32_t n0,
+                     uint32_t b) {
+    for (uint32_t w = uint32_t(it.get_local_id(1)); w < kBtCols * BW; w += kBtLanes) {
+        const uint32_t j = w / BW, c = w % BW;
+        slm[j * (BW + 1) + c] = Ww[(uint64_t(n0 + j) * bpc + b) * BW + c];
+    }
+    sycl::group_barrier(it.get_group());
+}
+
+inline uint8_t slm_byte(const uint32_t* blk, uint32_t o) { return uint8_t(blk[o >> 2] >> ((o & 3u) * 8u)); }
+}  // namespace
+
 sycl::event dequant_q4_K_to_Bt(sycl::queue& q, const void* packed_in,
                                sycl::half* out, uint32_t K, uint32_t N,
                                const std::vector<sycl::event>& deps) {
     const uint32_t blocks_per_col = K / 256;
-    constexpr uint32_t WG = 64;
     auto* W = static_cast<const block_q4_K*>(packed_in);
-
-    return ie::ps(q, "dequant_q4k_bt", [&](sycl::handler& h) {
+    if (reinterpret_cast<uintptr_t>(packed_in) % 4 == 0) {
+        constexpr uint32_t BW = sizeof(block_q4_K) / 4;   // 36
+        const auto* Ww = static_cast<const uint32_t*>(packed_in);
+        return ie::ps(q, "dequant_q4k_bt", [&](sycl::handler& h) {
+            h.depends_on(deps);
+            sycl::local_accessor<uint32_t, 1> sm(sycl::range<1>(kBtCols * (BW + 1)), h);
+            h.parallel_for(sycl::nd_range<2>({blocks_per_col, uint64_t(N / kBtCols) * kBtLanes}, {1, kBtLanes}),
+                           [=](sycl::nd_item<2> it) {
+                const uint32_t b = uint32_t(it.get_group(0));
+                const uint32_t n0 = uint32_t(it.get_group(1)) * kBtCols;
+                uint32_t* slm = sm.get_multi_ptr<sycl::access::decorated::no>().get();
+                bt_stage<BW>(it, Ww, slm, blocks_per_col, n0, b);
+                const uint32_t lid = uint32_t(it.get_local_id(1));
+                const uint32_t nl = lid % kBtCols, g = lid / kBtCols;   // column, k quarter (64 values)
+                const uint32_t* blk = slm + nl * (BW + 1);
+                const float d_super = dev_fp16_to_fp32(uint16_t(blk[0] & 0xFFFFu));
+                const float m_super = dev_fp16_to_fp32(uint16_t(blk[0] >> 16));
+                uint8_t scales[12];
+                #pragma unroll
+                for (uint32_t i = 0; i < 12; ++i) scales[i] = slm_byte(blk, 4 + i);
+                uint8_t s_lo, m_lo, s_hi, m_hi;
+                get_scale_min_k4(int(2 * g), scales, s_lo, m_lo);       // sub 2g: low nibbles, k = 64g + i
+                get_scale_min_k4(int(2 * g + 1), scales, s_hi, m_hi);   // sub 2g+1: high nibbles, k = 64g + 32 + i
+                const float scale_lo = d_super * float(s_lo), bias_lo = m_super * float(m_lo);
+                const float scale_hi = d_super * float(s_hi), bias_hi = m_super * float(m_hi);
+                sycl::half* dst = out + (uint64_t(b) * 256 + g * 64) * N + n0 + nl;
+                #pragma unroll
+                for (uint32_t w = 0; w < 8; ++w) {
+                    const uint32_t qw = blk[4 + g * 8 + w];   // qs bytes 32g + 4w .. +3
+                    #pragma unroll
+                    for (uint32_t t = 0; t < 4; ++t) {
+                        const uint8_t qb = uint8_t(qw >> (8 * t));
+                        const uint32_t i = w * 4 + t;
+                        dst[uint64_t(i) * N]      = sycl::half(scale_lo * float(qb & 0x0F) - bias_lo);
+                        dst[uint64_t(i + 32) * N] = sycl::half(scale_hi * float(qb >> 4) - bias_hi);
+                    }
+                }
+            });
+        });
+    }
+    constexpr uint32_t WG = 64;
+    return ie::ps(q, "dequant_q4k_bt_scalar", [&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::nd_range<2>({blocks_per_col, N}, {1, WG}),
                        [=](sycl::nd_item<2> it) {
@@ -564,16 +624,60 @@ sycl::event dequant_q4_moe_soa_to_Bt(sycl::queue& q, const void* soa_bank_expert
     });
 }
 
-// Q5_K → B^T fp16 [K,N]. One work-item per (block, column); unpacks the 256-elem
-// block into the transposed output (out[k*N + n]). Mirrors dequant_q6_K_to_Bt.
+// Q5_K → B^T fp16 [K,N]: the tiled scheme of dequant_q4_K_to_Bt (SLM-staged blocks, 64 consecutive halves per
+// store row); same value expressions as the one-work-item-per-(block, column) kernel kept as the unaligned fallback.
 sycl::event dequant_q5_K_to_Bt(sycl::queue& q, const void* packed_in,
                                sycl::half* out, uint32_t K, uint32_t N,
                                const std::vector<sycl::event>& deps) {
     const uint32_t blocks_per_col = K / 256;
-    constexpr uint32_t WG = 64;
     auto* W = static_cast<const block_q5_K*>(packed_in);
-
-    return ie::ps(q, "dequant_q5k_bt", [&](sycl::handler& h) {
+    if (reinterpret_cast<uintptr_t>(packed_in) % 4 == 0) {
+        constexpr uint32_t BW = sizeof(block_q5_K) / 4;   // 44: d|dmin, scales (words 1-3), qh (4-11), qs (12-43)
+        const auto* Ww = static_cast<const uint32_t*>(packed_in);
+        return ie::ps(q, "dequant_q5k_bt", [&](sycl::handler& h) {
+            h.depends_on(deps);
+            sycl::local_accessor<uint32_t, 1> sm(sycl::range<1>(kBtCols * (BW + 1)), h);
+            h.parallel_for(sycl::nd_range<2>({blocks_per_col, uint64_t(N / kBtCols) * kBtLanes}, {1, kBtLanes}),
+                           [=](sycl::nd_item<2> it) {
+                const uint32_t b = uint32_t(it.get_group(0));
+                const uint32_t n0 = uint32_t(it.get_group(1)) * kBtCols;
+                uint32_t* slm = sm.get_multi_ptr<sycl::access::decorated::no>().get();
+                bt_stage<BW>(it, Ww, slm, blocks_per_col, n0, b);
+                const uint32_t lid = uint32_t(it.get_local_id(1));
+                const uint32_t nl = lid % kBtCols, g = lid / kBtCols;
+                const uint32_t* blk = slm + nl * (BW + 1);
+                const float d  = dev_fp16_to_fp32(uint16_t(blk[0] & 0xFFFFu));
+                const float dm = dev_fp16_to_fp32(uint16_t(blk[0] >> 16));
+                uint8_t scales[12];
+                #pragma unroll
+                for (uint32_t i = 0; i < 12; ++i) scales[i] = slm_byte(blk, 4 + i);
+                uint8_t s0, m0, s1, m1;
+                get_scale_min_k4(int(2 * g), scales, s0, m0);
+                get_scale_min_k4(int(2 * g + 1), scales, s1, m1);
+                const float sc_lo = float(s0), mn_lo = float(m0), sc_hi = float(s1), mn_hi = float(m1);
+                sycl::half* dst = out + (uint64_t(b) * 256 + g * 64) * N + n0 + nl;
+                #pragma unroll
+                for (uint32_t w = 0; w < 8; ++w) {
+                    const uint32_t qlw = blk[12 + g * 8 + w];   // qs bytes 32g + 4w .. +3
+                    const uint32_t qhw = blk[4 + w];            // qh bytes 4w .. +3
+                    #pragma unroll
+                    for (uint32_t t = 0; t < 4; ++t) {
+                        const uint8_t ql = uint8_t(qlw >> (8 * t));
+                        const uint8_t qh = uint8_t(qhw >> (8 * t));
+                        const uint32_t l = w * 4 + t;
+                        const int q5_lo = (ql & 0x0F) + ((qh & (1u << (2 * g + 0))) ? 16 : 0);
+                        const int q5_hi = (ql >>   4) + ((qh & (1u << (2 * g + 1))) ? 16 : 0);
+                        const float v_lo = d * sc_lo * float(q5_lo) - dm * mn_lo;
+                        const float v_hi = d * sc_hi * float(q5_hi) - dm * mn_hi;
+                        dst[uint64_t(l) * N]      = sycl::half(v_lo);
+                        dst[uint64_t(l + 32) * N] = sycl::half(v_hi);
+                    }
+                }
+            });
+        });
+    }
+    constexpr uint32_t WG = 64;
+    return ie::ps(q, "dequant_q5k_bt_scalar", [&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::nd_range<2>({blocks_per_col, N}, {1, WG}),
                        [=](sycl::nd_item<2> it) {

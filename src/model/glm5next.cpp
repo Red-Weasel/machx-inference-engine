@@ -580,6 +580,7 @@ std::string Glm5NextModel::load_impl(DeviceAllocator* alloc, const GgufReader& g
             const uint64_t K = t->shape[0], N = t->shape[1];
             const uint64_t bytes = N * K + N * (K / 32) * 2;
             projected += bytes;
+            q8_max_kn_ = std::max(q8_max_kn_, K * N);
             placement_.push_back({std::string(t->name), "device", "Q8soa", bytes});
             jobs.push_back({t, nullptr, nullptr, dw, Lay::kQ8Soa});
             return true;
@@ -610,7 +611,7 @@ std::string Glm5NextModel::load_impl(DeviceAllocator* alloc, const GgufReader& g
     // host stage needs token_embd (the fusion embeds the drafted token) and
     // lm_head + shared_head_norm (the draft's logits); it costs that card the
     // blk.45 decoder, the head, and the MTP block's share of the expert cache.
-    static const bool mtp_head = [] {
+    const bool mtp_head = [] {   // (per load: the server sets it for IE_G5_PIPEDRAFT)
         const char* v = std::getenv("IE_G5_MTP_STAGE");
         return v && (v[0] == 'h' || v[0] == 'H' || v[0] == '0');
     }();
@@ -1282,6 +1283,51 @@ sycl::event k_mla_vabsorb(sycl::queue& q, const float* att, const sycl::half* v_
     });
 }
 
+// absorb_xmx's helpers. Wt[h][k][n] = W[h][n][k] (f16), a16[h][t][k] = half(in[(t*NH + h)*K + k]).
+sycl::event k_g5_absorb_wt(sycl::queue& q, const sycl::half* W, sycl::half* Wt, uint32_t NH, uint32_t N,
+                           uint32_t K, const std::vector<sycl::event>& deps) {
+    return ie::ps(q, "g5_absorb_wt", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<3>(NH, N, K), [=](sycl::id<3> id) {
+            const uint64_t hh = id[0], n = id[1], k = id[2];
+            Wt[(hh * K + k) * N + n] = W[(hh * N + n) * K + k];
+        });
+    });
+}
+
+// The fp32 input split into two fp16 parts, x = hi + lo (lo = the rounding error of hi): two fp16 GEMMs summed in fp32
+// keep ~22 bits of the input, where one fp16 GEMM kept 11 (that cost PPL 1.8097 -> 1.8118, ppl_abs64.log).
+sycl::event k_g5_absorb_pack(sycl::queue& q, const float* in, sycl::half* hi, sycl::half* lo, uint32_t T,
+                             uint32_t NH, uint32_t K, const std::vector<sycl::event>& deps) {
+    return ie::ps(q, "g5_absorb_pack", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<3>(NH, T, K), [=](sycl::id<3> id) {
+            const uint64_t hh = id[0], t = id[1], k = id[2];
+            const float x = in[(t * NH + hh) * K + k];
+            const sycl::half xh = sycl::half(x);
+            hi[(hh * T + t) * K + k] = xh;
+            lo[(hh * T + t) * K + k] = sycl::half(x - float(xh));
+        });
+    });
+}
+
+// c[2(h - h0)] + c[2(h - h0) + 1] (the hi and lo GEMMs; per-head rows padded to TP, gemm_fp16's tail tile)
+// -> out[t, h, n], heads h0 .. h0+G-1.
+sycl::event k_g5_absorb_scatter(sycl::queue& q, const float* c, float* out32, sycl::half* out16, uint32_t T,
+                                uint32_t TP, uint32_t NH, uint32_t h0, uint32_t G, uint32_t N,
+                                const std::vector<sycl::event>& deps) {
+    return ie::ps(q, "g5_absorb_scatter", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<3>(G, T, N), [=](sycl::id<3> id) {
+            const uint64_t g = id[0], t = id[1], n = id[2];
+            const float v = c[(2 * g * TP + t) * N + n] + c[((2 * g + 1) * TP + t) * N + n];
+            const uint64_t o = (t * NH + h0 + g) * N + n;
+            if (out32) out32[o] = v;
+            else       out16[o] = sycl::half(v);
+        });
+    });
+}
+
 // Dense causal MLA attention over the latent cache (absorbed MQA: the key AND
 // value of position j are the same latent row). One work-group per (t, h);
 // scores staged in SLM (n_ctx <= 2051 by the caller's refusal), two-pass
@@ -1910,6 +1956,36 @@ std::string Glm5NextModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk) {
     ok = ok && h16buf(kda_z16_, uint64_t(MT) * DI);
     ok = ok && f32buf(kda_out_, uint64_t(MT) * DI) && h16buf(kda_y16_, uint64_t(MT) * DI);
     ok = ok && h16buf(mmscr16_, 16384) && f32buf(mmscr32_, uint64_t(MT) * 16384);
+    // Prefill on XMX (2026-10-19, PPL-gated): Q8_0 dense projections over >= 32 rows dequantize once and run gemm_fp16
+    // (IE_G5_Q8_GEMM_ROWS, 0 = off); experts with >= 32 rows take the dequant + gemm chain (IE_G5_XMX_ROWS, 0 = off).
+    auto rows_env = [](const char* k, uint32_t dflt) {
+        const char* v = std::getenv(k);
+        return v && *v ? uint32_t(std::max(0, std::atoi(v))) : dflt;
+    };
+    xmx_rows_min_ = rows_env("IE_G5_XMX_ROWS", 32);
+    splitk_ = rows_env("IE_G5_SPLITK", 1) != 0;
+    q8_gemm_rows_ = q8_max_kn_ ? rows_env("IE_G5_Q8_GEMM_ROWS", 32) : 0;
+    if (q8_gemm_rows_ == 1) q8_gemm_rows_ = 2;   // T == 1 is decode: always the GEMV
+    if (q8_gemm_rows_) ok = ok && h16buf(q8_w16_, q8_max_kn_);
+    {   // the absorbs borrow q8_w16_ (transposed W), mla_o16_ / mla_att_ / mla_qlat_ (packed input), mmscr32_ (out)
+        const uint64_t NH = cfg_.n_q_heads, LAT = cfg_.kv_lora_rank;
+        const uint64_t KM = cfg_.key_len_mla, VM = cfg_.value_len_mla;
+        // (k absorb: hi in mla_o16_, lo in mla_att_; v absorb: hi + lo in mla_qlat_; hi + lo GEMMs of a head in
+        // mmscr32_'s 16384 columns)
+        const bool fits = q8_w16_ && NH * LAT * std::max(KM, VM) <= q8_max_kn_ && KM <= VM && KM <= 2 * LAT &&
+                          LAT <= 8192 && VM <= 8192 && LAT % 16 == 0 && VM % 16 == 0;
+        const char* env = std::getenv("IE_G5_ABSORB_XMX_ROWS");
+        const uint32_t want = rows_env("IE_G5_ABSORB_XMX_ROWS", 64);
+        // above the spec-verify window: a verify of T <= kSpecMax rows must keep decode's (fp32-input) arithmetic
+        absorb_xmx_rows_ = fits && want ? std::max<uint32_t>(want, kSpecMax + 1) : 0;
+        if (absorb_xmx_rows_)
+            std::fprintf(stderr, "[glm5next] MLA absorbs on XMX for prefill calls of >= %u rows "
+                                 "(IE_G5_ABSORB_XMX_ROWS, 0 = off)\n", absorb_xmx_rows_);
+        else if (want && env && *env)   // asked for by name and cannot run: say so (the default stays quiet)
+            std::fprintf(stderr, "[glm5next] IE_G5_ABSORB_XMX_ROWS=%u IGNORED: needs the Q8 gemm scratch "
+                                 "(IE_G5_Q8_GEMM_ROWS on, Q8_0 dense weights) large enough for a transposed absorb "
+                                 "weight\n", want);
+    }
     ok = ok && h16buf(mla_qa16_, uint64_t(MT) * cfg_.q_lora_rank);
     ok = ok && f32buf(mla_qb_, uint64_t(MT) * cfg_.n_q_heads * cfg_.key_len_mla);
     ok = ok && f32buf(mla_qlat_, uint64_t(MT) * cfg_.n_q_heads * LAT);
@@ -2646,6 +2722,16 @@ std::string Glm5NextModel::pipe_refusal() const {
 void Glm5NextModel::mm(const sycl::half* A, const Glm5DW& W, uint32_t T,
                        uint32_t N, uint32_t K, sycl::half* y16, float* y32) {
     sycl::queue& q = alloc_->queue();
+    if (W.qs && q8_gemm_rows_ && T >= q8_gemm_rows_ && q8_w16_ && uint64_t(K) * N <= q8_max_kn_ &&
+        N <= 16384 && N >= 256 && K >= 256 && K % 32 == 0 && N % 64 == 0) {   // (the big projections: the time)
+        // dequant once + XMX gemm (IE_G5_Q8_GEMM_ROWS): fp16 weight scratch, fp32 accumulate
+        dequant_q8_soa_f16(q, W.qs, W.d, q8_w16_, K, N, {});
+        // gemm_fp16 writes whole 8-row tail tiles: every C here (y32 buffers, mmscr32_) has MT = round_up(chunk, 8) rows
+        float* c = y32 ? y32 : mmscr32_;
+        gemm_fp16(q, A, q8_w16_, c, T, N, K, {});
+        if (y16) cast_fp32_to_fp16(q, c, y16, uint64_t(T) * N, {});
+        return;
+    }
     if (W.qs) {   // Q8_0-SoA residency: W8A16 GEMV, T-rows variant for T>1
         sycl::half* y = y16 ? y16 : (T == 1 ? mmscr16_
                                             : reinterpret_cast<sycl::half*>(mmscr32_));
@@ -2665,11 +2751,30 @@ void Glm5NextModel::mm(const sycl::half* A, const Glm5DW& W, uint32_t T,
     }
 }
 
+void Glm5NextModel::absorb_xmx(const float* in, const sycl::half* W, sycl::half* hi, sycl::half* lo, float* out32,
+                               sycl::half* out16, uint32_t T, uint32_t NH, uint32_t N, uint32_t K) {
+    sycl::queue& q = alloc_->queue();   // in order: each step reads what the one before wrote
+    k_g5_absorb_wt(q, W, q8_w16_, NH, N, K, {});
+    k_g5_absorb_pack(q, in, hi, lo, T, NH, K, {});
+    const uint32_t TP = (T + 7) & ~7u;                        // gemm_fp16 writes whole 8-row tail tiles
+    const uint32_t G = std::max<uint32_t>(1, std::min<uint64_t>(NH, uint64_t((max_chunk_ + 7) & ~7u) * 16384 /
+                                                                     (2 * uint64_t(TP) * N)));   // heads per mmscr32_
+    for (uint32_t h0 = 0; h0 < NH; h0 += G) {
+        const uint32_t g = std::min(G, NH - h0);
+        for (uint32_t j = 0; j < g; ++j) {
+            const sycl::half* B = q8_w16_ + uint64_t(h0 + j) * K * N;
+            gemm_fp16(q, hi + uint64_t(h0 + j) * T * K, B, mmscr32_ + uint64_t(2 * j) * TP * N, T, N, K, {});
+            gemm_fp16(q, lo + uint64_t(h0 + j) * T * K, B, mmscr32_ + uint64_t(2 * j + 1) * TP * N, T, N, K, {});
+        }
+        k_g5_absorb_scatter(q, mmscr32_, out32, out16, T, TP, NH, h0, g, N, {});
+    }
+}
+
 void Glm5NextModel::mm_dual(const sycl::half* A, const Glm5DW& Wa, const Glm5DW& Wb,
                             uint32_t T, uint32_t N, uint32_t K,
                             sycl::half* ya16, float* ya32,
                             sycl::half* yb16, float* yb32) {
-    if (!(Wa.qs && Wb.qs)) {
+    if (!(Wa.qs && Wb.qs) || (q8_gemm_rows_ && T >= q8_gemm_rows_ && N >= 256 && K >= 256)) {   // (2nd: two XMX gemms)
         mm(A, Wa, T, N, K, ya16, ya32);
         mm(A, Wb, T, N, K, yb16, yb32);
         return;
@@ -3249,7 +3354,15 @@ std::string Glm5NextModel::run_moe(uint32_t L, uint32_t T) {
         // Rows fast path (prefill): direct raw-quant multi-row GEMVs — no
         // dequant materialization (~1/7th the bytes per expert). Q6_K banks
         // (3 down layers) fall through to the dequant+gemm chain below.
-        const bool rows_ok =
+        // An expert with >= xmx_rows_min_ rows this call takes the dequant + XMX
+        // chain instead (IE_G5_XMX_ROWS, default 32; 0 = off). Its GEMMs run split-K
+        // below 256 rows (IE_G5_SPLITK): gemm_fp16 put ~32 work-groups on the card
+        // there and cost ~0.2 ms flat at 16-48 rows, so the chain only beat the rows
+        // GEMV from ~64 rows; split-K is x1.8-5 at 16-64 rows and moves the end-to-end
+        // best cutoff to 32 (results/glm53-2026-10-19/pp_r9.log: 330 vs 324 tok/s at
+        // chunk 2048, 242 vs 239 at 1408). Not bit-identical to the rows leaf (fp32
+        // XMX accumulate): PPL-gated 2026-10-19/20.
+        const bool rows_ok = !(xmx_rows_min_ && nt >= xmx_rows_min_) &&
             (w.gate_exps->dtype == DType::kQ4_K || w.gate_exps->dtype == DType::kQ5_K) &&
             (w.up_exps->dtype == DType::kQ4_K || w.up_exps->dtype == DType::kQ5_K) &&
             (w.down_exps->dtype == DType::kQ4_K || w.down_exps->dtype == DType::kQ5_K);
@@ -3302,11 +3415,17 @@ std::string Glm5NextModel::run_moe(uint32_t L, uint32_t T) {
         if (auto err = emat(u_raw, w.up_exps->dtype,   emat_u16_, H, EF, {}); !err.empty()) return err;
         if (auto err = emat(d_raw, w.down_exps->dtype, emat_d16_, EF, H, {}); !err.empty()) return err;
 
-        gemm_fp16(q, moe_xg_, emat_g16_, moe_gu_[0], nt, EF, H, {});
-        gemm_fp16(q, moe_xg_, emat_u16_, moe_gu_[1], nt, EF, H, {});
+        // few rows: K split inside the work-group (IE_G5_SPLITK, default on; gemm_splitk_bench: x1.8-5 at 16-64
+        // rows, gemm_fp16 runs ~32 work-groups there); from 256 rows gemm_fp16's own tiles are as fast or faster
+        auto eg = [&](const sycl::half* A, const sycl::half* B, float* C, uint32_t N, uint32_t K) {
+            if (splitk_ && nt < 256 && gemm_fp16_splitk_ok(nt, N, K)) gemm_fp16_splitk(q, A, B, C, nt, N, K, {});
+            else                                                     gemm_fp16(q, A, B, C, nt, N, K, {});
+        };
+        eg(moe_xg_, emat_g16_, moe_gu_[0], EF, H);
+        eg(moe_xg_, emat_u16_, moe_gu_[1], EF, H);
         ds4_swiglu_clamped(q, moe_gu_[0], moe_gu_[1], moe_gu_[0], uint64_t(nt) * EF, clamp, {});
         cast_fp32_to_fp16(q, moe_gu_[0], moe_h16_, uint64_t(nt) * EF, {});
-        gemm_fp16(q, moe_h16_, emat_d16_, moe_dn_, nt, H, EF, {});
+        eg(moe_h16_, emat_d16_, moe_dn_, H, EF);
         k_scatter_add(q, moe_dn_, idx_d, w_d, acc_dst, nt, H, {});
         return std::string{};
     };
@@ -4087,7 +4206,11 @@ std::string Glm5NextModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos)
         mm(x16_, w.q_a, T, QL, H, mla_qa16_, nullptr);
         rms_norm_f32w(q, mla_qa16_, w.q_a_norm, mla_qa16_, T, QL, cfg_.rms_eps, {});
         mm(mla_qa16_, w.q_b, T, NH * HDM, QL, nullptr, mla_qb_);
-        k_mla_kabsorb(q, mla_qb_, w.k_b, mla_qlat_, T, NH, LAT, HDM, {});
+        if (absorb_xmx_rows_ && T >= absorb_xmx_rows_)   // mla_o16_ and mla_att_ are free until the attend/v absorb
+            absorb_xmx(mla_qb_, w.k_b, mla_o16_, reinterpret_cast<sycl::half*>(mla_att_), mla_qlat_, nullptr, T,
+                       NH, LAT, HDM);
+        else
+            k_mla_kabsorb(q, mla_qb_, w.k_b, mla_qlat_, T, NH, LAT, HDM, {});
 
         mm(x16_, w.kv_a, T, LAT, H, mla_kv16_, nullptr);
         rms_norm_f32w(q, mla_kv16_, w.kv_a_norm, mla_kv16_, T, LAT, cfg_.rms_eps, {});
@@ -4188,7 +4311,12 @@ std::string Glm5NextModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos)
                                     ts, NH, LAT, n_sel_, start_pos + T, scale, {});
             }
         }
-        k_mla_vabsorb(q, mla_att_, w.v_b, mla_o16_, T, NH, LAT, cfg_.value_len_mla, {});
+        if (absorb_xmx_rows_ && T >= absorb_xmx_rows_)   // q_lat is dead once the attend has read it
+            absorb_xmx(mla_att_, w.v_b, reinterpret_cast<sycl::half*>(mla_qlat_),
+                       reinterpret_cast<sycl::half*>(mla_qlat_) + uint64_t(NH) * T * LAT, nullptr, mla_o16_, T, NH,
+                       cfg_.value_len_mla, LAT);
+        else
+            k_mla_vabsorb(q, mla_att_, w.v_b, mla_o16_, T, NH, LAT, cfg_.value_len_mla, {});
         mm(mla_o16_, w.attn_out, T, H, NH * cfg_.value_len_mla, nullptr, mix_out_);
     } else {
         // ---- KDA -----------------------------------------------------------
@@ -4488,6 +4616,59 @@ std::string Glm5NextModel::restore_state() {
     q.wait();
     kv_len_ = snap_kv_len_;
     mtp_len_ = snap_mtp_len_;
+    return {};
+}
+
+void Glm5NextModel::StateCopy::release() noexcept {
+    if (p && q) sycl::free(p, *q);
+    p = nullptr; cap = 0; depth = 0;
+}
+
+std::string Glm5NextModel::state_save(StateCopy& c) {
+    if (!alloc_) return "glm5next state_save: not loaded";
+    sycl::queue& q = alloc_->queue();
+    const uint64_t sb = uint64_t(dn_.config().n_layers_linear) * dn_.state_elems_per_layer() * 4;
+    const uint64_t cb = uint64_t(dn_.config().n_layers_linear) * dn_.conv_elems_per_layer() * 2;
+    const uint64_t rb = sparse_ && idx_kroll_ && idx_groll_ ? roll_bytes_ : 0;
+    const uint64_t need = sb + cb + 2 * rb;
+    c.depth = 0;
+    if (c.q != &q) { c.release(); c.q = &q; }
+    if (c.cap < need) {
+        c.release(); c.q = &q;
+        // pinned: a pageable host copy stalls the queue (see the bank views)
+        c.p = static_cast<uint8_t*>(sycl::malloc_host(need, q));
+        if (!c.p) return "glm5next state_save: pinned host alloc failed";
+        c.cap = need;
+    }
+    if (sb) q.memcpy(c.p, dn_.state_ptr(), sb);
+    if (cb) q.memcpy(c.p + sb, dn_.conv_state_ptr(), cb);
+    if (rb) {
+        q.memcpy(c.p + sb + cb, idx_kroll_, rb);
+        q.memcpy(c.p + sb + cb + rb, idx_groll_, rb);
+    }
+    q.wait();
+    c.depth = kv_len_;
+    return {};
+}
+
+std::string Glm5NextModel::state_restore(const StateCopy& c) {
+    if (!alloc_) return "glm5next state_restore: not loaded";
+    if (!c.depth || !c.p) return "glm5next state_restore: no copy";
+    sycl::queue& q = alloc_->queue();
+    if (c.q != &q) return "glm5next state_restore: the copy belongs to another stage";
+    if (c.depth > max_ctx_) return "glm5next state_restore: the copy is deeper than this context";
+    const uint64_t sb = uint64_t(dn_.config().n_layers_linear) * dn_.state_elems_per_layer() * 4;
+    const uint64_t cb = uint64_t(dn_.config().n_layers_linear) * dn_.conv_elems_per_layer() * 2;
+    const uint64_t rb = sparse_ && idx_kroll_ && idx_groll_ ? roll_bytes_ : 0;
+    if (c.cap < sb + cb + 2 * rb) return "glm5next state_restore: the copy is smaller than this stage's state";
+    if (sb) q.memcpy(dn_.state_ptr(), c.p, sb);
+    if (cb) q.memcpy(dn_.conv_state_ptr(), c.p + sb, cb);
+    if (rb) {
+        q.memcpy(idx_kroll_, c.p + sb + cb, rb);
+        q.memcpy(idx_groll_, c.p + sb + cb + rb, rb);
+    }
+    q.wait();
+    kv_len_ = c.depth;
     return {};
 }
 

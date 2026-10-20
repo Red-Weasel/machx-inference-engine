@@ -106,9 +106,25 @@ server rejects context overflow. Dream can instead compact its visible history
 before admission; this does not implement GPU KV shifting.
 
 GLM chat supports reasoning and native function calls mapped to OpenAI replies.
-Each request resets and prefills model state. GLM server prefix reuse, MTP,
-INT8 KV, vision and deferred tool loading remain unavailable. Standalone GLM
-pipeline/draft flags do not configure the server. CUDA projector, Jinja override,
+GLM keeps one conversation's prefix: each stage's KDA and DSA open-pool state is
+saved at the stable conversation depth (the prompt minus the open assistant
+turn) to pinned host RAM. A request whose prompt extends it restores in about
+6 ms and prefills only the new tokens (`--no-prompt-cache` turns it off; on
+2026-10-19 the second and third turns of a 9.6K-token agent conversation took
+about 10 s instead of 273-311 s). On two cards, prefill is pipelined across the cards
+(`IE_G5_NO_PIPELINE=1` = serial), and decode runs the MTP pipelined draft:
+card 0 drafts the next token while card 1 runs the current one
+(`IE_G5_PIPEDRAFT=0` = off; 13.7-13.9 vs 10.8-11.5 tok/s). Greedy output with
+`IE_G5_CPU_MISS=0` is identical to the serial, non-draft path. The GLM prefill
+chunk defaults to 2048, which is also the cap: the host expert bank streams once
+per chunk, and a 4096-token forward overflows a kernel's 32-bit range. In
+prefill, experts with at least 32 rows (`IE_G5_XMX_ROWS`; their GEMMs split K
+below 256 rows, `IE_G5_SPLITK`) and dense Q8_0
+projections with at least 32 rows (`IE_G5_Q8_GEMM_ROWS`) run as fp16 XMX GEMMs,
+and so do the MLA absorbs of calls with at least 64 rows (`IE_G5_ABSORB_XMX_ROWS`;
+0 = off for each). Wikitext PPL 1.8113 vs 1.8118 before, inside the 0.002 band
+that a reordering of the arithmetic alone moves it. INT8 KV,
+`--spec`, vision and deferred tool loading remain unavailable for GLM. CUDA projector, Jinja override,
 tensor-split and reasoning-budget flags from llama-server are not accepted as
 MachX options. Runtime generation errors produce HTTP/SSE errors.
 
@@ -162,8 +178,8 @@ depth 27/52 tokens with and without it), and the prompt-boundary snapshot keeps
 serving those turns as before. Each reply snapshot is one more LRU endpoint
 sized to its depth; `IE_PROMPT_CACHE_MAX_ENTRIES` caps the count and
 `IE_NO_GEN_CACHE=1` disables reply snapshots. The single-endpoint caches
-(Gemma-4, Qwen3.8-Flash-Next, DeepSeek-V4 host slots) and GLM (no prompt cache)
-are unchanged.
+(Gemma-4, Qwen3.8-Flash-Next, DeepSeek-V4 host slots) and GLM (one conversation's
+prefix state) are unchanged.
 
 With request lanes on the Qwen3.6-35B-A3B class (v0.2.6), the prompt cache is sized for the lanes: up to
 max(12, 2 × lanes + 8) entries inside a per-card VRAM budget (each card's free VRAM after the lanes, less a 1.5 GiB

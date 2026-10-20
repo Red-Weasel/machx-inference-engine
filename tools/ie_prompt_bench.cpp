@@ -65,7 +65,7 @@ int main(int argc, char** argv) {
         else if (a == "--warmup"      && i + 1 < argc) warmup      = uint32_t(std::atoi(argv[++i]));
         else if (a == "--max-ctx"     && i + 1 < argc) opts.max_ctx = uint32_t(std::atoi(argv[++i]));
         else if (a == "--prefill-chunk" && i + 1 < argc)
-            opts.prefill_chunk = uint32_t(std::max(1, std::atoi(argv[++i])));
+            { opts.prefill_chunk = uint32_t(std::max(1, std::atoi(argv[++i]))); opts.prefill_chunk_set = true; }
         else if (a == "--int8-kv")                     opts.int8_kv = true;
         else if (a == "--prompts-dir" && i + 1 < argc) prompts_dir = argv[++i];
         else { std::fprintf(stderr, "unknown arg: %s\n", a.c_str()); return 2; }

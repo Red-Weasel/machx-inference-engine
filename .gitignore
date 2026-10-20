@@ -61,7 +61,7 @@ tests/data/exl3/*.trellis
 # absolute /home paths and internal process detail that nothing outside this
 # machine needs.
 .claude/
-.codex/
+.codex
 CLAUDE.md
 PLAN.md
 MASTER_DEV_PLAN.md
@@ -77,3 +77,8 @@ __pycache__/
 mobile/
 package-lock.json
 *.txt.local
+
+# local tool caches (browser automation, scraping, Understand-Anything index)
+.firecrawl/
+.playwright-mcp/
+.ua/

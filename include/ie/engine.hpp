@@ -160,6 +160,7 @@ struct EngineOptions {
     uint32_t cpu_threads   = 0; // 0 preserves the model CPU expert team default
     bool     int8_kv       = false;
     uint32_t prefill_chunk = 256;    // hard cap per docs/known_bugs.md
+    bool     prefill_chunk_set = false;  // --prefill-chunk given: an arch with its own default (GLM) keeps this value
     uint32_t n_gpus        = 1;      // >1 → tensor-parallel split (dense archs only)
     uint32_t parallel      = 1;      // concurrent generations the engine admits (1-16).
                                      // >1 → generations run under the internal FIFO
@@ -193,7 +194,7 @@ struct EngineOptions {
                                      // first mtp-*.gguf next to the target. CLI: --spec-head.
     std::string spec_draft;          // dspark separate-draft GGUF (kQwen35Dense target,
                                      // e.g. *-dspark-Q4_1.gguf). Loads a target-conditioned
-                                     // DsparkDrafter; lossless GREEDY spec. CLI: --spec-draft.
+                                     // DsparkDrafter; near-lossless GREEDY spec. CLI: --spec-draft.
     std::string mmproj;              // P4 B45: the vision projector GGUF (mmproj-*.gguf) for the
                                      // Qwen3.8 family (qwen4exp Flash-Next, the qwen35 27B split).
                                      // Given, the tower is loaded and placed on its card AT LOAD
@@ -480,7 +481,7 @@ private:
             // reset_kv on the first step of a generate (pos==0). The summed logits
             // are copied into d_logits_ so the existing GPU sampler is unchanged.
             if (tp_ids_host_.size() < T) tp_ids_host_.resize(T);
-            q.memcpy(tp_ids_host_.data(), ids, T * sizeof(int32_t)).wait();
+            alloc_.d2h(tp_ids_host_.data(), ids, T * sizeof(int32_t));   // pinned stage (issue #2)
             if (auto m = tp_model_.forward(tp_ids_host_.data(), T, pos,
                                            /*reset_kv=*/(pos == 0),
                                            tp_logits_host_.data()); !m.empty())
@@ -493,7 +494,7 @@ private:
             // host logits out (model owns per-card KV/DeltaNet), bounced into
             // d_logits_ so the existing GPU sampler is unchanged.
             if (tp_ids_host_.size() < T) tp_ids_host_.resize(T);
-            q.memcpy(tp_ids_host_.data(), ids, T * sizeof(int32_t)).wait();
+            alloc_.d2h(tp_ids_host_.data(), ids, T * sizeof(int32_t));   // pinned stage (issue #2)
             if (auto m = next_model_.forward(tp_ids_host_.data(), T, pos,
                                              /*reset_kv=*/(pos == 0),
                                              tp_logits_host_.data()); !m.empty())
@@ -505,7 +506,7 @@ private:
             // Qwen3.6-27B TENSOR-PARALLEL fleet (both cards on the same token).
             // Same host-bounce as the split path: host ids in, host logits out.
             if (tp_ids_host_.size() < T) tp_ids_host_.resize(T);
-            q.memcpy(tp_ids_host_.data(), ids, T * sizeof(int32_t)).wait();
+            alloc_.d2h(tp_ids_host_.data(), ids, T * sizeof(int32_t));   // pinned stage (issue #2)
             if (auto m = qwen35_tp_model_.forward(tp_ids_host_.data(), T, pos,
                                                   /*reset_kv=*/(pos == 0),
                                                   tp_logits_host_.data()); !m.empty())
@@ -518,7 +519,7 @@ private:
             // host ids in, host logits out (model owns per-card KV/DeltaNet),
             // bounced into d_logits_ so the existing GPU sampler is unchanged.
             if (tp_ids_host_.size() < T) tp_ids_host_.resize(T);
-            q.memcpy(tp_ids_host_.data(), ids, T * sizeof(int32_t)).wait();
+            alloc_.d2h(tp_ids_host_.data(), ids, T * sizeof(int32_t));   // pinned stage (issue #2)
             if (T == 1 && q27_spec_step_) {   // P4 B48: a decode step through the model's speculative step
                 if (auto m = qwen35_split_model_.spec_step(tp_ids_host_[0], pos, tp_logits_host_.data(),
                                                            q27_draft_on_ ? &q27_draft_ : nullptr); !m.empty())
@@ -536,7 +537,7 @@ private:
             // 27B split path: host ids in, host logits out (model owns per-card
             // KV/DeltaNet), bounced into d_logits_ so the GPU sampler is unchanged.
             if (tp_ids_host_.size() < T) tp_ids_host_.resize(T);
-            q.memcpy(tp_ids_host_.data(), ids, T * sizeof(int32_t)).wait();
+            alloc_.d2h(tp_ids_host_.data(), ids, T * sizeof(int32_t));   // pinned stage (issue #2)
             if (T == 1 && q35m_look_step_) {   // P4 B53: a decode step through the model's lookup step
                 if (auto m = qwen35moe_split_model_.look_step(tp_ids_host_[0], pos, tp_logits_host_.data()); !m.empty())
                     std::fprintf(stderr, "qwen35moe_split look step: %s\n", m.c_str());
@@ -553,7 +554,7 @@ private:
             // host-bounce as the crown split: host ids in, host logits out (model
             // owns per-card KV), bounced into d_logits_ so the GPU sampler is unchanged.
             if (tp_ids_host_.size() < T) tp_ids_host_.resize(T);
-            q.memcpy(tp_ids_host_.data(), ids, T * sizeof(int32_t)).wait();
+            alloc_.d2h(tp_ids_host_.data(), ids, T * sizeof(int32_t));   // pinned stage (issue #2)
             if (auto m = q3moe_split_model_.forward(tp_ids_host_.data(), T, pos,
                                                     /*reset_kv=*/(pos == 0),
                                                     tp_logits_host_.data()); !m.empty())
@@ -566,7 +567,7 @@ private:
             // head-sharded attention (both cards compute over half the heads + half
             // the KV) + expert-sharded MoE. Same host-bounce as the other TP paths.
             if (tp_ids_host_.size() < T) tp_ids_host_.resize(T);
-            q.memcpy(tp_ids_host_.data(), ids, T * sizeof(int32_t)).wait();
+            alloc_.d2h(tp_ids_host_.data(), ids, T * sizeof(int32_t));   // pinned stage (issue #2)
             if (auto m = q3moe_tp_model_.forward(tp_ids_host_.data(), T, pos,
                                                  /*reset_kv=*/(pos == 0),
                                                  tp_logits_host_.data()); !m.empty())
@@ -578,7 +579,7 @@ private:
             // gpt-oss tensor-parallel fleet (MXFP4 experts sharded, attn replicated).
             // Same host-bounce as the other TP paths.
             if (tp_ids_host_.size() < T) tp_ids_host_.resize(T);
-            q.memcpy(tp_ids_host_.data(), ids, T * sizeof(int32_t)).wait();
+            alloc_.d2h(tp_ids_host_.data(), ids, T * sizeof(int32_t));   // pinned stage (issue #2)
             if (auto m = gptoss_tp_model_.forward(tp_ids_host_.data(), T, pos,
                                                   /*reset_kv=*/(pos == 0),
                                                   tp_logits_host_.data()); !m.empty())
@@ -641,6 +642,8 @@ private:
                                        uint32_t cache_prefix_len, bool reply_cache, uint32_t shared_prefix_len = 0,
                                        bool anchor = false);
     sycl::event glm5_forward(sycl::queue& q, const int32_t* ids, uint32_t T, uint32_t pos);
+    sycl::event glm5_logits(sycl::queue& q);
+    sycl::event glm5_host_logits(sycl::queue& q);
     GgufReader      gguf_;
     DeviceAllocator alloc_;
     ModelArch       arch_ = ModelArch::kQwen35Moe;

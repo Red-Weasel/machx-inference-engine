@@ -1,4 +1,4 @@
-// tests/unit/dequant_bt_test.cpp — P3d. Validate the new Q5_K/Q8_0 → B^T [K,N]
+// tests/unit/dequant_bt_test.cpp — P3d. Validate the Q4_K/Q5_K/Q8_0 → B^T [K,N]
 // dequant kernels against the proven flat dequant via the transpose identity:
 //   out_bt[k*N + n] == out_flat[n*K + k]
 // (the flat dequant lays a [N columns × K/blk] weight as [N][K]; _to_Bt as [K][N]).
@@ -79,6 +79,12 @@ int main() {
     const uint32_t K = 512, N = 128;
     int fails = 0;
 
+    // Q4_K (144 B, 256 elem/blk): K/256 blocks per column.
+    {
+        const auto W = rand_blocks<true>(size_t(N) * (K / 256), sizeof(ie::block_q4_K), rng);
+        fails += check(q, W, sizeof(ie::block_q4_K), K, N, "Q4_K",
+                       ie::dequant_q4_K_to_Bt, ie::dequant_q4_K);
+    }
     // Q5_K (176 B, 256 elem/blk): K/256 blocks per column.
     {
         const auto W = rand_blocks<true>(size_t(N) * (K / 256), sizeof(ie::block_q5_K), rng);
@@ -93,6 +99,6 @@ int main() {
     }
 
     if (fails) { std::fprintf(stderr, "dequant_bt_test: %d mismatch\n", fails); return 1; }
-    std::printf("dequant_bt_test: all OK (Q5_K + Q8_0 _to_Bt match flat dequant)\n");
+    std::printf("dequant_bt_test: all OK (Q4_K + Q5_K + Q8_0 _to_Bt match flat dequant)\n");
     return 0;
 }

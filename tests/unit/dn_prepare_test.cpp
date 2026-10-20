@@ -7,7 +7,7 @@
 #include <type_traits>
 #ifdef DN_PREPARE_PRIVATE
 namespace ie {
-#include "../../results/kernel-seven-2026-09-10/dn/production.inc"
+#include "dn_prepare_production.inc"   // frozen copy of results/kernel-seven-2026-09-10/dn/production.inc
 }
 #endif
 

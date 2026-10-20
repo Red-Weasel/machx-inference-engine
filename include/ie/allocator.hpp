@@ -94,8 +94,53 @@ public:
     Tensor   alloc_tensor(DType dtype, std::span<const uint64_t> shape);
     void     free_tensor(Tensor& t) noexcept;
 
+    // Host <-> device copies, at most kStageBytes per copy. Blocking; thread-safe. PAGEABLE host memory (a std::vector,
+    // the GGUF mapping) moves through a pinned buffer in this allocator's own context; USM memory (host USM of ANY
+    // context or card, which the runtime reports as host and copies at pinned speed -- copy_path_bench, 2026-10-20)
+    // is copied directly. On this stack copies from pageable memory have faulted the copying engine: -EFAULT on a
+    // fresh context (Laguna, 05458f6), and a single copy of 512 MiB or more goes through a temporary userptr mapping
+    // the copy engine can fault on (intel/compute-runtime#948). Neither can happen here. If the pinned buffer cannot
+    // be made, pageable memory is copied directly, as before.
+    static constexpr size_t kStageBytes = 64ull << 20;
+    static constexpr size_t kKernelD2hBytes = 1ull << 20;   // staged d2h up to this: a kernel, not the copy engine
+    void h2d(void* dst_dev, const void* src_host, size_t nbytes);
+    void d2h(void* dst_host, const void* src_dev, size_t nbytes);
+
+    // h2d WITHOUT a host wait, for the small per-step uploads (token ids, positions) that were async before: up to
+    // kRingSlotBytes of pageable memory is copied into one of kRingSlots pinned slots and the copy is enqueued from
+    // there (a slot is reused only after its last copy ran). USM sources are enqueued directly; larger copies take
+    // h2d (blocking, the returned event is complete). The source may be reused as soon as this returns, except a USM
+    // source, which must outlive the copy.
+    static constexpr size_t   kRingSlotBytes = 64ull << 10;
+    static constexpr uint32_t kRingSlots     = 16;
+    sycl::event h2d_async(void* dst_dev, const void* src_host, size_t nbytes);
+
+    // Pinned host memory in this allocator's context, freed with the allocator (or by free_host): the source or
+    // destination of an ASYNC copy, which must stay alive until the queue has run it.
+    void* malloc_host(size_t nbytes);
+    void  free_host(void* p) noexcept;
+
+    DeviceAllocator();
+    ~DeviceAllocator();
+    DeviceAllocator(DeviceAllocator&&) noexcept;
+    DeviceAllocator& operator=(DeviceAllocator&&) noexcept;
+
 private:
+    friend class DeviceFleet;
+    struct Stage;
+    Stage* stage();   // made with the queue (init / init_with); null when no queue
+    void   release_stage() noexcept;   // drain the queue, free the stage's pinned memory (before the queue changes)
+    uint8_t* stage_buf_locked();       // the pinned buffer, made at first use (caller holds stage()->mu); null = none
+    bool     is_usm(const void* p) const;                          // USM of any kind
+    bool     copies_direct(const void* p) const;                   // is_usm or IE_NO_PINNED_STAGE: no stage
+    void     copy_direct(void* dst, const void* src, size_t nbytes);   // kStageBytes pieces, one wait
     std::optional<sycl::queue> queue_;
+    std::unique_ptr<Stage>     stage_;
+    // init / init_with: on every return, a queue has a stage (also when the call fails and the old queue stays)
+    struct StageGuard {
+        DeviceAllocator& a;
+        ~StageGuard();
+    };
 };
 
 // P-A (multi-GPU layer-split): owns one DeviceAllocator per selected GPU. The

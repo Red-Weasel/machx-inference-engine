@@ -3,9 +3,11 @@
 #include "ie/allocator.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -120,6 +122,8 @@ bool gpu_p2p_shared_context(std::string_view name_filter,
 }
 
 std::string DeviceAllocator::init(std::string_view name_filter, uint32_t ordinal) {
+    release_stage();   // a re-init gets a new queue: the old stage belongs to the old context
+    const StageGuard sg(*this);
     // Env override: device names drift across drivers (the old "0xe223" stopped
     // matching the L0-V2 "Intel(R) Arc(TM) Pro B70 Graphics" name). IE_GPU_FILTER
     // lets the user re-point the filter without a rebuild.
@@ -198,6 +202,8 @@ std::string DeviceAllocator::init(std::string_view name_filter, uint32_t ordinal
 
 std::string DeviceAllocator::init_with(const sycl::context& ctx, const sycl::device& dev) {
     apply_runtime_defaults();
+    release_stage();
+    const StageGuard sg(*this);
     try {
         // Same properties as init(): in-order; profiling opt-in (see init()).
         if (std::getenv("IE_QUEUE_PROFILING"))
@@ -408,6 +414,228 @@ void DeviceAllocator::free(void* p) noexcept {
     sycl::free(p, *queue_);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Pinned staging (2026-10-20, GitHub issue #2: a B70 wedged after 2 h of 27B split serving, the fault on the copy
+// engine). Every pageable host <-> device copy of a model that uses h2d / d2h moves through `buf`, pinned in this
+// allocator's own context; the copies are kStageBytes at most. `host` holds malloc_host's allocations, so their
+// lifetime is the context's: the allocator frees them before its queue goes (the 27B's exit crash, 88b3f1b, was a
+// free on a dead queue).
+// ---------------------------------------------------------------------------------------------------------------
+struct DeviceAllocator::Stage {
+    std::mutex          mu;              // one copy through `buf` at a time
+    uint8_t*            buf = nullptr;
+    bool                tried = false;   // buf allocation attempted (null after = direct copies)
+    std::mutex          host_mu;
+    std::vector<void*>  host;
+    std::mutex          ring_mu;              // h2d_async's slots
+    uint8_t*            ring = nullptr;       // kRingSlots x kRingSlotBytes, pinned
+    bool                ring_tried = false;
+    sycl::event         ring_ev[kRingSlots];  // each slot's last copy (default-constructed = complete)
+    uint32_t            ring_next = 0;
+};
+
+DeviceAllocator::StageGuard::~StageGuard() {
+    if (a.queue_ && !a.stage_) a.stage_ = std::make_unique<Stage>();
+}
+
+DeviceAllocator::DeviceAllocator() = default;
+DeviceAllocator::DeviceAllocator(DeviceAllocator&&) noexcept = default;
+DeviceAllocator& DeviceAllocator::operator=(DeviceAllocator&& o) noexcept {
+    if (this != &o) { release_stage(); queue_ = std::move(o.queue_); stage_ = std::move(o.stage_); }
+    return *this;
+}
+DeviceAllocator::~DeviceAllocator() { release_stage(); }
+
+void DeviceAllocator::release_stage() noexcept {
+    if (queue_ && stage_) {
+        try { queue_->wait(); } catch (const sycl::exception&) {}   // nothing in flight reads what is freed below
+        auto free_quiet = [&](void* p) {   // after a DEVICE_LOST, sycl::free can throw: never from here (noexcept)
+            if (!p) return;
+            try { sycl::free(p, *queue_); } catch (const sycl::exception&) {}
+        };
+        free_quiet(stage_->buf);
+        free_quiet(stage_->ring);
+        for (void* p : stage_->host) free_quiet(p);
+    }
+    stage_.reset();
+}
+
+DeviceAllocator::Stage* DeviceAllocator::stage() {
+    return queue_ ? stage_.get() : nullptr;
+}
+
+uint8_t* DeviceAllocator::stage_buf_locked() {
+    if (!stage_->tried) {
+        stage_->tried = true;
+        stage_->buf = sycl::malloc_host<uint8_t>(kStageBytes, *queue_);
+        if (!stage_->buf)
+            std::fprintf(stderr, "[alloc] no pinned copy stage (%zu MiB of host USM refused): this card's pageable "
+                                 "host<->device copies go direct, in %zu MiB pieces\n", kStageBytes >> 20, kStageBytes >> 20);
+    }
+    return stage_->buf;
+}
+
+// USM memory needs no stage: host USM is pinned (of any context or card: the runtime reports it as host and copies
+// it at pinned speed, copy_path_bench 2026-10-20), and device or shared USM is the runtime's own. A 0.02 us query.
+// IE_NO_PINNED_STAGE=1 copies everything directly, as before 2026-10-20 (an A/B and emergency switch).
+static bool no_pinned_stage() {
+    static const bool off = std::getenv("IE_NO_PINNED_STAGE") != nullptr;
+    return off;
+}
+bool DeviceAllocator::is_usm(const void* p) const {
+    return sycl::get_pointer_type(p, queue_->get_context()) != sycl::usm::alloc::unknown;
+}
+bool DeviceAllocator::copies_direct(const void* p) const { return no_pinned_stage() || is_usm(p); }
+
+// kStageBytes pieces on the in-order queue, one wait: no single copy reaches compute-runtime#948's 512 MiB.
+void DeviceAllocator::copy_direct(void* dst, const void* src, size_t nbytes) {
+    sycl::event last;
+    for (size_t off = 0; off < nbytes; off += kStageBytes)
+        last = queue_->memcpy(static_cast<uint8_t*>(dst) + off, static_cast<const uint8_t*>(src) + off,
+                              std::min(kStageBytes, nbytes - off));
+    last.wait();
+}
+
+// IE_COPY_STATS=1: per path and size, the calls and wall time of h2d / d2h / h2d_async / copy_across (the wall includes
+// waiting for the work queued before a copy), printed at exit. A diagnostic: off, each copy pays one branch.
+namespace {
+enum CopyPath { kH2dStage, kH2dDirect, kD2hStage, kD2hDirect, kH2dRing, kAcross, kPaths };
+const char* const kPathName[kPaths] = {"h2d stage", "h2d direct", "d2h stage", "d2h direct", "h2d ring", "across"};
+const char* const kSizeName[4] = {"<=4K", "<=64K", "<=1M", ">1M"};
+struct CopyStats {
+    std::atomic<uint64_t> calls[kPaths][4] = {}, ns[kPaths][4] = {}, bytes[kPaths][4] = {};
+    void print() const {
+        for (int p = 0; p < kPaths; ++p)
+            for (int b = 0; b < 4; ++b)
+                if (const uint64_t c = calls[p][b].load())
+                    std::fprintf(stderr, "[copy-stats] %-10s %-7s %9llu calls %12.1f MB %10.1f ms %8.1f us/call\n",
+                                 kPathName[p], kSizeName[b],
+                                 (unsigned long long)c, bytes[p][b].load() / 1e6, ns[p][b].load() / 1e6,
+                                 ns[p][b].load() / 1e3 / double(c));
+    }
+};
+CopyStats* copy_stats() {
+    static CopyStats* s = std::getenv("IE_COPY_STATS") ? new CopyStats : nullptr;   // never freed: see below
+    return s;
+}
+struct CopyTimer {
+    CopyStats* st; CopyPath p; size_t n; std::chrono::steady_clock::time_point t0;
+    CopyTimer(CopyPath p_, size_t n_) : st(copy_stats()), p(p_), n(n_) { if (st) t0 = std::chrono::steady_clock::now(); }
+    ~CopyTimer() {
+        if (!st) return;
+        const int b = n <= 4096 ? 0 : n <= 65536 ? 1 : n <= (1u << 20) ? 2 : 3;
+        st->calls[p][b] += 1;
+        st->bytes[p][b] += n;
+        st->ns[p][b] += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - t0).count());
+    }
+};
+[[maybe_unused]] const int copy_stats_print = [] {
+    if (copy_stats()) std::atexit([] { copy_stats()->print(); });   // printed, not deleted: a late copy stays safe
+    return 0;
+}();
+}  // namespace
+
+void DeviceAllocator::h2d(void* dst_dev, const void* src_host, size_t nbytes) {
+    Stage* s = stage();
+    if (!s || nbytes == 0) return;
+    if (copies_direct(src_host)) { CopyTimer t(kH2dDirect, nbytes); copy_direct(dst_dev, src_host, nbytes); return; }
+    CopyTimer t(kH2dStage, nbytes);
+    std::lock_guard<std::mutex> lk(s->mu);
+    if (!stage_buf_locked()) { copy_direct(dst_dev, src_host, nbytes); return; }
+    for (size_t off = 0; off < nbytes; off += kStageBytes) {
+        const size_t c = std::min(kStageBytes, nbytes - off);
+        std::memcpy(s->buf, static_cast<const uint8_t*>(src_host) + off, c);
+        queue_->memcpy(static_cast<uint8_t*>(dst_dev) + off, s->buf, c).wait();
+    }
+}
+
+// The small staged device -> host copies (the lanes' hidden-row hand-off, sampled tokens, TP ids: pageable
+// destinations; USM destinations such as the split's pinned logits row are copied directly) as a kernel on this queue
+// writing the pinned stage, not a copy-engine copy. Measured 2026-10-20 (copy_path_bench --engines, xe fdinfo
+// cycles): a d2h into pinned memory of 10 KiB runs on the copy engine (bcs) and, after a step's kernels, waits for
+// the compute -> copy-engine hand-off (+0.15 ms a token on the 27B split's lanes); into pageable memory the driver
+// reads it across the BAR on the CPU, ~19 us per KiB. The kernel stays on the compute engine, ~6 us. Own-context
+// pinned memory, same queue, host wait: not the falsified cross-card EU reads of allocator.cpp's all-reduce notes.
+class ie_alloc_d2h_stage_u32;
+class ie_alloc_d2h_stage_u8;
+static void d2h_by_kernel(sycl::queue& q, void* dst_pinned, const void* src_dev, size_t nbytes) {
+    if (nbytes % 4 == 0 && reinterpret_cast<uintptr_t>(src_dev) % 4 == 0) {
+        auto* d = static_cast<uint32_t*>(dst_pinned);
+        const auto* s = static_cast<const uint32_t*>(src_dev);
+        q.parallel_for<ie_alloc_d2h_stage_u32>(sycl::range<1>(nbytes / 4), [=](sycl::id<1> i) { d[i] = s[i]; }).wait();
+    } else {
+        auto* d = static_cast<uint8_t*>(dst_pinned);
+        const auto* s = static_cast<const uint8_t*>(src_dev);
+        q.parallel_for<ie_alloc_d2h_stage_u8>(sycl::range<1>(nbytes), [=](sycl::id<1> i) { d[i] = s[i]; }).wait();
+    }
+}
+
+void DeviceAllocator::d2h(void* dst_host, const void* src_dev, size_t nbytes) {
+    Stage* s = stage();
+    if (!s || nbytes == 0) return;
+    if (copies_direct(dst_host)) { CopyTimer t(kD2hDirect, nbytes); copy_direct(dst_host, src_dev, nbytes); return; }
+    CopyTimer t(kD2hStage, nbytes);
+    std::lock_guard<std::mutex> lk(s->mu);
+    if (!stage_buf_locked()) { copy_direct(dst_host, src_dev, nbytes); return; }
+    static const bool no_kernel = std::getenv("IE_NO_D2H_KERNEL") != nullptr;   // A/B: the copy-engine copy instead
+    if (nbytes <= kKernelD2hBytes && !no_kernel) {
+        d2h_by_kernel(*queue_, s->buf, src_dev, nbytes);
+        std::memcpy(dst_host, s->buf, nbytes);
+        return;
+    }
+    for (size_t off = 0; off < nbytes; off += kStageBytes) {
+        const size_t c = std::min(kStageBytes, nbytes - off);
+        queue_->memcpy(s->buf, static_cast<const uint8_t*>(src_dev) + off, c).wait();
+        std::memcpy(static_cast<uint8_t*>(dst_host) + off, s->buf, c);
+    }
+}
+
+sycl::event DeviceAllocator::h2d_async(void* dst_dev, const void* src_host, size_t nbytes) {
+    Stage* s = stage();
+    if (!s || nbytes == 0) return {};
+    if (is_usm(src_host)) return queue_->memcpy(dst_dev, src_host, nbytes);   // the caller keeps it alive, as before
+    if (no_pinned_stage()) { queue_->memcpy(dst_dev, src_host, nbytes).wait(); return {}; }   // the source is free on return
+    if (nbytes <= kRingSlotBytes) {
+        CopyTimer t(kH2dRing, nbytes);
+        std::lock_guard<std::mutex> lk(s->ring_mu);
+        if (!s->ring_tried) {
+            s->ring_tried = true;
+            s->ring = sycl::malloc_host<uint8_t>(kRingSlotBytes * kRingSlots, *queue_);
+        }
+        if (s->ring) {
+            const uint32_t i = s->ring_next;
+            s->ring_next = (i + 1) % kRingSlots;
+            s->ring_ev[i].wait();   // the slot's previous copy has run (kRingSlots copies ago: done long since)
+            uint8_t* slot = s->ring + size_t(i) * kRingSlotBytes;
+            std::memcpy(slot, src_host, nbytes);
+            s->ring_ev[i] = queue_->memcpy(dst_dev, slot, nbytes);
+            return s->ring_ev[i];
+        }
+    }
+    h2d(dst_dev, src_host, nbytes);
+    return {};
+}
+
+void* DeviceAllocator::malloc_host(size_t nbytes) {
+    Stage* s = stage();
+    if (!s || nbytes == 0) return nullptr;
+    void* p = sycl::malloc_host(nbytes, *queue_);
+    if (p) { std::lock_guard<std::mutex> lk(s->host_mu); s->host.push_back(p); }
+    return p;
+}
+
+void DeviceAllocator::free_host(void* p) noexcept {
+    if (!p || !stage_) return;
+    {
+        std::lock_guard<std::mutex> lk(stage_->host_mu);
+        auto it = std::find(stage_->host.begin(), stage_->host.end(), p);
+        if (it == stage_->host.end()) return;
+        stage_->host.erase(it);
+    }
+    try { sycl::free(p, *queue_); } catch (const sycl::exception&) {}   // noexcept (DEVICE_LOST can make it throw)
+}
+
 Tensor DeviceAllocator::alloc_tensor(DType dtype, std::span<const uint64_t> shape) {
     Tensor t{};
     if (shape.empty() || shape.size() > kMaxDims) return t;
@@ -532,10 +760,27 @@ void DeviceFleet::copy_across(uint32_t si, void* dst, uint32_t di,
         return;
     }
     // Host bounce: src(dev si) → host → dst(dev di). Robust on any board; the
-    // layer-split boundary copy is small so this is cheap.
-    std::vector<unsigned char> host(nbytes);
-    devs_[si].queue().memcpy(host.data(), src, nbytes).wait();
-    devs_[di].queue().memcpy(dst, host.data(), nbytes).wait();
+    // layer-split boundary copy is small so this is cheap. Through the source card's pinned stage (2026-10-20): the
+    // source card copies into its own pinned buffer and the destination card copies from it (host USM of another
+    // context copies at pinned speed, copy_path_bench). It was a fresh pageable std::vector per call, every token
+    // and chunk of every split model. IE_NO_PINNED_STAGE=1 keeps the vector.
+    static const bool no_stage = std::getenv("IE_NO_PINNED_STAGE") != nullptr;
+    DeviceAllocator::Stage* ss = devs_[si].stage();
+    if (!ss || nbytes == 0) return;
+    CopyTimer t(kAcross, nbytes);
+    std::lock_guard<std::mutex> lk(ss->mu);
+    uint8_t* sb = no_stage ? nullptr : devs_[si].stage_buf_locked();
+    if (!sb) {
+        std::vector<unsigned char> host(nbytes);
+        devs_[si].queue().memcpy(host.data(), src, nbytes).wait();
+        devs_[di].queue().memcpy(dst, host.data(), nbytes).wait();
+        return;
+    }
+    for (size_t off = 0; off < nbytes; off += DeviceAllocator::kStageBytes) {
+        const size_t c = std::min(DeviceAllocator::kStageBytes, nbytes - off);
+        devs_[si].queue().memcpy(sb, static_cast<const uint8_t*>(src) + off, c).wait();
+        devs_[di].queue().memcpy(static_cast<uint8_t*>(dst) + off, sb, c).wait();
+    }
 }
 
 void DeviceFleet::ensure_ar_pin(uint64_t n_elem) {

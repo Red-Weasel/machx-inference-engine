@@ -884,17 +884,175 @@ struct Q35mLanes {
     }
 };
 
+// The GLM diagnostics that keep function-static state (Glm5NextModel::pipe_refusal's list): with one set, the two
+// stages never run concurrently -- no pipelined prefill, no pipelined draft.
+static bool glm5_serial_diagnostics() {
+    for (const char* k : {"IE_QUEUE_PROFILING", "IE_G5_DUMP_WIDE", "IE_G5_DUMP_MOE", "IE_G5_NAN_PROBE", "IE_G5_TRACE_FIRST"})
+        if (std::getenv(k)) return true;
+    return false;
+}
+// The MTP pipelined draft at decode on two cards (Glm5Bundle::draft_step). ON by default since the 2026-10-19 serve
+// gate (decode 10.9-11.5 -> 13.2-13.6 tok/s, prefill -4%; with IE_G5_CPU_MISS=0 greedy replies identical to plain
+// decode, results/glm53-2026-10-19); IE_G5_PIPEDRAFT=0 turns it off.
+static bool glm5_pipedraft_requested() {
+    const char* v = std::getenv("IE_G5_PIPEDRAFT");
+    return !(v && *v == '0') && !glm5_serial_diagnostics();
+}
+
 struct Glm5Bundle {
     Glm5NextConfig cfg;
     DeviceAllocator a1;
     Glm5NextModel A, B;
     bool split = false;
-    std::vector<float> wide;
-    ~Glm5Bundle() { A.shutdown(); if (split) B.shutdown(); }
+    uint32_t chunk = 0;            // the load's prefill chunk: each stage's workspaces hold this many rows
+    std::vector<float> wide;       // stage handoff [chunk, hc, H]
+    std::vector<float> wide_b;     // the pipelined prefill's second parity buffer
+    // The prompt cache: one live conversation, all-or-nothing like Flash-Next's (the KDA state cannot be truncated).
+    // Each stage's state at the stable conversation depth in pinned host memory, and the tokens it was taken over;
+    // restored when the next prompt extends those tokens. The rows below it stay on the cards, so a sequence that
+    // starts again at position 0 drops it (Engine::glm5_forward and the pipelined prefill's caller).
+    Glm5NextModel::StateCopy snap_a, snap_b;
+    std::vector<int32_t> snap_tokens;
+    ~Glm5Bundle() {
+        A.shutdown(); if (split) B.shutdown();
+        snap_a.release(); snap_b.release();
+        if (dr.hid_d) sycl::free(dr.hid_d, A.queue());
+    }
     std::string fwd(const int32_t* ids, uint32_t n, uint32_t pos) {
         if (!split) return A.forward(ids, n, pos, nullptr);
         if (auto m=A.forward_range(ids,n,pos,nullptr,wide.data(),nullptr); !m.empty()) return m;
+        dr.last_rows = n;
         return B.forward_range(ids,n,pos,wide.data(),nullptr,nullptr);
+    }
+    // MTP pipelined draft at decode (two cards, default on; IE_G5_PIPEDRAFT=0 off: ie-glm5next-run's --pipedraft,
+    // docs/glm53/CAMPAIGN_2026-09-02.md G5', DECODE_HOST_WAITS_2026-09-10.md G6: 12.61 -> 14.5-14.9 tok/s at 16K,
+    // greedy). The stages run serially per token, so card 0 idles while card 1 runs stage B. While B runs token t at
+    // pos, card 0 drafts the next token with the MTP head (its kit on stage A) and runs A on the draft at pos + 1
+    // behind a KDA snapshot. The next step takes that work when the token the ENGINE'S SAMPLER picked is the draft,
+    // else restores A and runs it on the real token, so every token comes from the sampler over B's logits. With the
+    // CPU expert leg off (IE_G5_CPU_MISS=0) the logits are the plain decode's bit for bit; with it on, the cache
+    // admissions of a rejected draft and q*_A 0.5 move which experts take the CPU's Q8 path, a rounding difference
+    // of the same kind as any other schedule change (README: q* routing differs between schedules).
+    struct Draft {
+        bool on = false;                  // the load carries the kit on stage A
+        bool live = false;                // this request decodes through draft_step
+        uint32_t last_rows = 0;           // rows of the last tail-stage forward: its last mean row is hidden(pos - 1)
+        std::vector<float> wd[2];         // A's wide output [hc, H] by parity; wd[cur] feeds the next B
+        uint32_t cur = 0;
+        bool spec = false;                // A ran ahead on (tok, pos), past the committed stream
+        int32_t tok = -1;
+        uint32_t pos = 0;
+        std::vector<float> hid[2];        // hidden(pos - 1) host rows, ping-pong by round
+        uint32_t par = 0;
+        float* hid_d = nullptr;           // the row on card 0, the MTP step's input
+        std::vector<sycl::half> lg;       // the draft's logits, host
+        uint64_t steps = 0, taken = 0;
+    } dr;
+    std::string draft_begin(uint32_t pos) {
+        dr.live = false;
+        const uint32_t H = cfg.hidden;
+        if (!dr.on || !split) return "no MTP kit on stage A";
+        if (!dr.last_rows) return "no tail-stage forward seeds the first draft";
+        if (!dr.hid_d && !(dr.hid_d = sycl::malloc_device<float>(H, A.queue()))) return "draft row alloc failed";
+        for (auto& h : dr.hid) h.resize(H);
+        for (auto& w : dr.wd) w.resize(uint64_t(cfg.hc_count) * H);
+        dr.lg.resize(cfg.vocab);
+        B.queue().memcpy(dr.hid[0].data(), B.mean_rows() + uint64_t(dr.last_rows - 1) * H, uint64_t(H) * 4).wait();
+        dr.par = 0; dr.cur = 0; dr.spec = false; dr.steps = dr.taken = 0;
+        A.mtp_reset(pos);   // the head attends over this generation's positions only
+        dr.live = true;
+        return {};
+    }
+    // One decode step: token t at pos in, the tail's fp16 logits [vocab] in logits_host out.
+    std::string draft_step(int32_t t, uint32_t pos, sycl::half* logits_host) {
+        const uint32_t H = cfg.hidden, V = cfg.vocab;
+        if (dr.spec && dr.tok == t && dr.pos == pos) ++dr.taken;
+        else {
+            if (dr.spec) if (auto e = A.restore_state(); !e.empty()) return "draft restore: " + e;
+            if (auto e = A.forward_range(&t, 1, pos, nullptr, dr.wd[dr.cur].data(), nullptr); !e.empty()) return "stage A: " + e;
+        }
+        dr.spec = false;
+        ++dr.steps;
+        const uint32_t par = dr.par, nxt = dr.cur ^ 1;
+        int32_t d = -1;
+        std::future<std::string> fa = std::async(std::launch::async, [&, par, nxt]() -> std::string {
+            sycl::queue& qa = A.queue();
+            qa.memcpy(dr.hid_d, dr.hid[par].data(), uint64_t(H) * 4).wait();
+            if (auto e = A.mtp_step(dr.hid_d, t, pos); !e.empty()) return "mtp: " + e;
+            qa.memcpy(dr.lg.data(), A.logits(), uint64_t(V) * 2).wait();
+            float mx = -1e30f;
+            for (uint32_t v = 0; v < V; ++v) if (float(dr.lg[v]) > mx) { mx = float(dr.lg[v]); d = int32_t(v); }
+            if (d < 0) return {};   // no finite draft logit: no speculative run (the next step runs A itself)
+            if (auto e = A.snapshot_state(); !e.empty()) return e;
+            return A.forward_range(&d, 1, pos + 1, nullptr, dr.wd[nxt].data(), nullptr);
+        });
+        std::string eb = B.forward_range(&t, 1, pos, dr.wd[dr.cur].data(), nullptr, nullptr);
+        if (eb.empty()) {
+            dr.last_rows = 1;
+            B.queue().memcpy(logits_host, B.logits(), uint64_t(V) * 2);
+            B.queue().memcpy(dr.hid[par ^ 1].data(), B.mean_rows(), uint64_t(H) * 4).wait();   // hidden(pos)
+        }
+        const std::string ea = fa.get();
+        if (!eb.empty()) return "stage B: " + eb;
+        if (!ea.empty()) return "draft: " + ea;
+        dr.spec = d >= 0; dr.tok = d; dr.pos = pos + 1;
+        dr.cur = nxt; dr.par ^= 1;
+        return {};
+    }
+    // After the request's last step: A back on the committed stream (both stages at one depth).
+    std::string draft_end() {
+        dr.live = false;
+        std::string m;
+        if (dr.spec) m = A.restore_state();
+        dr.spec = false;
+        if (dr.steps)
+            std::fprintf(stderr, "[glm5-draft] %llu steps, %llu drafts taken (%.1f%%)\n", (unsigned long long)dr.steps,
+                         (unsigned long long)dr.taken, 100.0 * double(dr.taken) / double(dr.steps));
+        return m;
+    }
+    // Chunk-PIPELINED prefill over the split (ie-glm5next-run's --prefill --pipeline, gated 2026-09-04: 32 greedy
+    // tokens after an 8000-token prefill byte-identical to serial, 42.8 -> 75.8 tok/s): stage A runs chunk k+1 on
+    // card 0 while stage B runs chunk k on card 1. Each stage sees its chunks in order, so its state is the serial
+    // sequence's. A(k+1) writes wide[(k+1)&1] while B(k) reads wide[k&1]; A(k+2) starts only after B(k) returned.
+    // The caller owns the pos == 0 reset. A failed range leaves the stages at different depths.
+    std::string fwd_pipelined(const int32_t* ids, uint32_t count, uint32_t pos) {
+        if (!split || count <= chunk) return "glm5next pipeline: not applicable";
+        if (wide_b.size() < wide.size()) wide_b.resize(wide.size());
+        float* wb[2] = {wide.data(), wide_b.data()};
+        const uint32_t nck = (count + chunk - 1) / chunk;
+        auto rows = [&](uint32_t k) { return std::min(chunk, count - k * chunk); };
+        auto stage_a = [&](uint32_t k) {
+            return A.forward_range(ids + uint64_t(k) * chunk, rows(k), pos + k * chunk, nullptr, wb[k & 1], nullptr);
+        };
+        std::future<std::string> fa = std::async(std::launch::async, stage_a, 0u);
+        std::string err;
+        for (uint32_t k = 0; k < nck; ++k) {
+            if (auto e = fa.get(); !e.empty()) { err = "stage A: " + e; break; }
+            if (k + 1 < nck) fa = std::async(std::launch::async, stage_a, k + 1);
+            if (auto e = B.forward_range(ids + uint64_t(k) * chunk, rows(k), pos + k * chunk, wb[k & 1], nullptr, nullptr);
+                !e.empty()) { err = "stage B: " + e; break; }
+            dr.last_rows = rows(k);
+        }
+        if (fa.valid()) {
+            const std::string e = fa.get();
+            if (err.empty() && !e.empty()) err = "stage A: " + e;
+        }
+        return err;
+    }
+    uint32_t snap_depth() const { return snap_a.depth && (!split || snap_b.depth == snap_a.depth) ? snap_a.depth : 0; }
+    void drop() { snap_tokens.clear(); snap_a.depth = 0; snap_b.depth = 0; }
+    std::string snap() {
+        drop();
+        std::string m = A.state_save(snap_a);
+        if (m.empty() && split) m = B.state_save(snap_b);
+        if (m.empty() && split && snap_b.depth != snap_a.depth) m = "the stages are at different depths";
+        if (!m.empty()) drop();
+        return m;
+    }
+    std::string rest() {
+        std::string m = A.state_restore(snap_a);
+        if (m.empty() && split) m = B.state_restore(snap_b);
+        return m;
     }
 };
 
@@ -1035,7 +1193,8 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         // different executor. Refuse them rather than inherit runner state.
         for (const char* key : {"IE_G5_MTP","IE_G5_EP_DECODE","IE_G5_PP_STREAM","IE_G5_ECACHE_PAD"}) {
             const char* v=std::getenv(key);
-            if (v) {
+            // (the two-card MTP pipelined draft sets IE_G5_MTP itself and budgets the kit)
+            if (v && !(glm5_pipedraft_requested() && opts.n_gpus==2 && std::string_view(key)=="IE_G5_MTP")) {
                 err=std::string("glm5next server does not support ")+key+"; unset it before serving"; return nullptr;
             }
         }
@@ -1635,13 +1794,50 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
     } else if (e->arch_ == ModelArch::kGlm5Next) {
         auto* b=(e->glm5_=std::make_unique<Glm5Bundle>()).get();
         if (auto m=read_glm5next_config(e->gguf_,b->cfg); !m.empty()) { err="glm5next config: "+m; return nullptr; }
+        // Prefill streams the whole host expert bank over PCIe once per chunk (0.2% expert-cache hits in prefill), so
+        // the chunk sets the prefill rate (serve 2026-10-19, 9.6K-token prompt, pipelined: 256 -> 74 tok/s, 1024 ->
+        // 148). The 256 EngineOptions default is a Qwen bound: GLM takes its own unless --prefill-chunk was given;
+        // IE_G5_PREFILL_CHUNK overrides both. Each chunk row costs ~1.4 MB of VRAM out of the decode expert cache.
+        uint32_t want_chunk=opts.prefill_chunk_set?opts.prefill_chunk:kGlm5PrefillChunk;
+        if (const char* c=std::getenv("IE_G5_PREFILL_CHUNK"); c && *c) want_chunk=uint32_t(std::max(0,std::atoi(c)));
         if (!opts.max_ctx || (b->cfg.ctx_train && opts.max_ctx>b->cfg.ctx_train) ||
-            !opts.prefill_chunk || opts.prefill_chunk>8192) {
-            err="glm5next requires context within the model training limit and prefill chunk 1..8192"; return nullptr;
+            !want_chunk || want_chunk>kGlm5MaxPrefillChunk) {
+            err="glm5next requires context within the model training limit and prefill chunk 1.."+
+                std::to_string(kGlm5MaxPrefillChunk)+" (larger chunks overflow a kernel's 32-bit range)"; return nullptr;
         }
-        const uint32_t chunk=std::min(opts.prefill_chunk,opts.max_ctx);
+        if (want_chunk!=opts.prefill_chunk)
+            std::fprintf(stderr,"[glm5next] prefill chunk %u -> %u (%s)\n",opts.prefill_chunk,want_chunk,
+                         std::getenv("IE_G5_PREFILL_CHUNK")?"$IE_G5_PREFILL_CHUNK":"GLM default: the expert bank streams once per chunk");
+        const uint32_t chunk=std::min(want_chunk,opts.max_ctx);
         e->opts_.prefill_chunk=chunk;
+        b->chunk=chunk;   // the pipelined forward width; runtime buffers below are sized max(chunk, 8)
         b->split=opts.n_gpus==2;
+        // Two cards and a GGUF with the MTP block (IE_G5_PIPEDRAFT=0 = off): the MTP pipelined draft at decode
+        // (Glm5Bundle::draft_step). The kit goes on stage A, the card that idles while B runs, before anything is
+        // planned: plan_device_weights reads these switches, so stage A's weights below include it, and its latent
+        // cache joins stage A's runtime reserve. q*_A 0.5 is the runner's lever 4 for this mode (stage A's link idles
+        // while B runs, so A fills more of its misses on the GPU: B's round 80 -> 67 ms, 2026-09-02 glm5t).
+        const bool pipedraft=b->split && b->cfg.nextn_predict_layers>0 && glm5_pipedraft_requested();
+        // IE_G5_MTP / IE_G5_MTP_STAGE are read only while the stages load: put back what the process had on EVERY
+        // exit from this load, a refusal included, so a later load in the process decides afresh. IE_G5_QSTAR_A stays:
+        // Glm5NextModel reads it into a function static at its first MoE call, after load, so q* is process-wide.
+        struct MtpEnvRestore {
+            std::optional<std::string> mtp, stage;
+            static std::optional<std::string> get(const char* k) {
+                const char* v=std::getenv(k); return v?std::optional<std::string>(v):std::nullopt;
+            }
+            static void put(const char* k, const std::optional<std::string>& v) {
+                if (v) setenv(k,v->c_str(),1); else unsetenv(k);
+            }
+            ~MtpEnvRestore() { put("IE_G5_MTP",mtp); put("IE_G5_MTP_STAGE",stage); }
+        };
+        std::optional<MtpEnvRestore> mtp_env;
+        if(pipedraft) {
+            mtp_env.emplace(MtpEnvRestore{MtpEnvRestore::get("IE_G5_MTP"),MtpEnvRestore::get("IE_G5_MTP_STAGE")});
+            setenv("IE_G5_MTP","1",1);
+            setenv("IE_G5_MTP_STAGE","head",1);
+            if(!std::getenv("IE_G5_QSTAR") && !std::getenv("IE_G5_QSTAR_A")) setenv("IE_G5_QSTAR_A","0.5",0);
+        }
         const uint32_t n_tf=b->cfg.n_transformer_layers();
         uint32_t split=(n_tf+1)/2;
         if (const char* v=std::getenv("IE_G5_SPLIT")) {
@@ -1697,9 +1893,13 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                 if (al.device().has(sycl::aspect::ext_intel_free_memory))
                     usable=std::min(usable,uint64_t(al.device().get_info<sycl::ext::intel::info::device::free_memory>()*0.90));
             } catch (...) {} // some Level Zero drivers cannot report free memory
-            const uint64_t reserve=glm5_runtime_reserve(b->cfg,opts.max_ctx,std::max(chunk,8u),lo,hi);
+            const uint64_t reserve=glm5_runtime_reserve(b->cfg,opts.max_ctx,std::max(chunk,8u),lo,hi)+
+                (pipedraft && stage==0 ? glm5_mtp_reserve(b->cfg,opts.max_ctx) : 0);
             uint64_t weights=0, experts=0, max_slot=0, moe_layers=0;
-            for(uint32_t l=lo;l<hi;++l) {
+            // (the MTP block, blk.n_tf, is one more MoE layer on the stage that hosts the kit: stage A here)
+            const uint32_t l_end=(pipedraft && stage==0)?hi+1:hi;
+            for(uint32_t l0=lo;l0<l_end;++l0) {
+                const uint32_t l=l0<hi?l0:n_tf;
                 uint64_t layer_bytes=0;
                 for(const char* name:{"ffn_gate_exps.weight","ffn_up_exps.weight","ffn_down_exps.weight"})
                     if(const auto* t=e->gguf_.find_tensor("blk."+std::to_string(l)+"."+name))layer_bytes+=t->nbytes;
@@ -1749,8 +1949,23 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             if(b->split) if(auto m=b->B.warm_cache(profile);!m.empty()){err=m;return nullptr;}
         }
         vocab=e->glm5_vocab_=b->cfg.vocab;
-        e->prompt_cache_on_=false;
-        if(opts.prompt_cache) std::fprintf(stderr,"[glm5next] prefix cache unavailable; requests reset and prefill independently\n");
+        if(pipedraft) {
+            b->dr.on=b->A.mtp_loaded();
+            for(auto* m:{&b->A,&b->B}) m->set_cpu_partition(b->dr.on);   // the stages run concurrently at decode
+            std::fprintf(stderr,b->dr.on
+                ?"[glm5next] MTP pipelined draft ON: card 0 drafts the next token and runs stage A on it while card 1 runs the "
+                 "current one; a sampled token that is not the draft redoes stage A (IE_G5_PIPEDRAFT=0 = off)\n"
+                :"[glm5next] the MTP kit did not load on stage A: plain decode (no MTP pipelined draft)\n");
+        }
+        e->prompt_cache_on_=opts.prompt_cache;
+        std::fprintf(stderr,e->prompt_cache_on_
+            ?"[glm5next] prompt cache ON: one conversation -- each stage's KDA + open-pool state at the stable conversation depth in pinned "
+             "system RAM, restored when the next prompt extends it (--no-prompt-cache = off)\n"
+            :"[glm5next] prompt cache off: requests reset and prefill independently\n");
+        if(b->split) std::fprintf(stderr,std::getenv("IE_G5_NO_PIPELINE")
+            ?"[glm5next] prefill serial across the two cards (IE_G5_NO_PIPELINE)\n"
+            :"[glm5next] prefill over %u tokens pipelined across the two cards in %u-token chunks (IE_G5_NO_PIPELINE=1 = serial)\n",
+            b->chunk,b->chunk);
     } else if (e->arch_ == ModelArch::kQwen4Exp) {
         // Qwen3.8-Flash-Next: HC wide-residual DeltaNet/QSA hybrid, host-
         // streamed routed experts behind per-card VRAM LRU caches. 1 GPU runs
@@ -2267,7 +2482,7 @@ sycl::event Engine::ds4_forward(sycl::queue& q, const int32_t* ids, uint32_t T,
     // sampler, and the per-layer caches are cleared HERE at pos==0 — the runtime
     // has no reset_kv flag, it has reset_context().
     if (tp_ids_host_.size() < T) tp_ids_host_.resize(T);
-    q.memcpy(tp_ids_host_.data(), ids, T * sizeof(int32_t)).wait();
+    alloc_.d2h(tp_ids_host_.data(), ids, T * sizeof(int32_t));   // pinned stage (issue #2)
     if (pos == 0) {
         if (ds4_->tp) { ds4_->tp->reset_context(); ds4_->tp->clear_vision(); }
         else          { ds4_->rt->reset_context(); ds4_->rt->clear_vision(); }
@@ -2521,11 +2736,26 @@ sycl::event Engine::glm5_forward(sycl::queue& q,const int32_t* ids,uint32_t T,ui
     if(!glm5_err_.empty()) return {};
     tp_ids_host_.resize(T);
     q.memcpy(tp_ids_host_.data(),ids,uint64_t(T)*sizeof(int32_t)).wait();
-    if(pos==0) { glm5_->A.reset_state(); if(glm5_->split) glm5_->B.reset_state(); }
+    // a new sequence rewrites the rows the prompt cache's copy stands on
+    if(pos==0) { glm5_->A.reset_state(); if(glm5_->split) glm5_->B.reset_state(); glm5_->drop(); }
+    if(T==1 && glm5_->dr.live) {   // a decode step through the MTP pipelined draft
+        tp_logits_host_.resize(glm5_vocab_);
+        if(auto m=glm5_->draft_step(tp_ids_host_[0],pos,tp_logits_host_.data());!m.empty()) { glm5_err_=m;return {}; }
+        return glm5_host_logits(q);
+    }
     if(auto m=glm5_->fwd(tp_ids_host_.data(),T,pos);!m.empty()) { glm5_err_=m;return {}; }
+    return glm5_logits(q);
+}
+
+// The tail stage's last-row logits -> d_logits_ (the engine's sampler), refusing non-finite ones.
+sycl::event Engine::glm5_logits(sycl::queue& q) {
     auto& tail=glm5_->split?glm5_->B:glm5_->A;
     tp_logits_host_.resize(glm5_vocab_);
     tail.queue().memcpy(tp_logits_host_.data(),tail.logits(),uint64_t(glm5_vocab_)*2).wait();
+    return glm5_host_logits(q);
+}
+
+sycl::event Engine::glm5_host_logits(sycl::queue& q) {
     for(auto v:tp_logits_host_) if(!std::isfinite(float(v))) {glm5_err_="non-finite logits";return {};}
     return q.memcpy(d_logits_,tp_logits_host_.data(),uint64_t(glm5_vocab_)*2);
 }
@@ -2535,7 +2765,7 @@ sycl::event Engine::q4e_forward(sycl::queue& q, const int32_t* ids, uint32_t T,
     // Host-bounce like ds4_forward: device ids in, model-owned state, fp16
     // logits bounced from the tail card into the engine's sampler buffer.
     if (tp_ids_host_.size() < T) tp_ids_host_.resize(T);
-    q.memcpy(tp_ids_host_.data(), ids, T * sizeof(int32_t)).wait();
+    alloc_.d2h(tp_ids_host_.data(), ids, T * sizeof(int32_t));   // pinned stage (issue #2)
     if (pos == 0) {
         q4e_->A.reset_state();
         if (q4e_->split) q4e_->B.reset_state();
@@ -2678,7 +2908,7 @@ void Engine::stepper_loop_() {
                 const RowCtx& rc = rows[r];
                 sycl::half* row = lg + r * uint64_t(V);
                 if (rc.nw > 0) {
-                    hq.memcpy(stepper_.d_recent, rc.win, rc.nw * sizeof(int32_t));
+                    model.fleet()->dev(model.head_dev()).h2d_async(stepper_.d_recent, rc.win, rc.nw * sizeof(int32_t));
                     sampling_penalties(hq, row, V, stepper_.d_recent, rc.nw,
                                        rc.sp.repeat_penalty, rc.sp.presence_penalty, rc.sp.frequency_penalty);
                 }
@@ -2687,8 +2917,7 @@ void Engine::stepper_loop_() {
                                          rc.sp.top_p, rc.sp.min_p,
                                          rc.rng + rc.step);
             }
-            hq.memcpy(picks.data(), stepper_.d_pick,
-                      idx.size() * sizeof(int32_t)).wait();
+            model.fleet()->dev(model.head_dev()).d2h(picks.data(), stepper_.d_pick, idx.size() * sizeof(int32_t));
         }
         gate_.release();
 
@@ -2804,9 +3033,9 @@ struct HostSlotStash {
                 c.v.resize(nsl * slice);
                 const sycl::half* ks = m.kv_cache(dev).k_ptr();
                 const sycl::half* vs = m.kv_cache(dev).v_ptr();
-                for (uint64_t s = 0; s < nsl; ++s) {
-                    q.memcpy(c.k.data() + s * slice, ks + s * stride, slice);
-                    q.memcpy(c.v.data() + s * slice, vs + s * stride, slice);
+                for (uint64_t s = 0; s < nsl; ++s) {   // through the card's pinned stage (blocking; issue #2)
+                    fleet->dev(dev).d2h(c.k.data() + s * slice, ks + s * stride, slice);
+                    fleet->dev(dev).d2h(c.v.data() + s * slice, vs + s * stride, slice);
                 }
             }
             if (m.dev_has_dn(dev)) {
@@ -2817,8 +3046,8 @@ struct HostSlotStash {
                                     d.config().n_layers_linear * sizeof(sycl::half);
                 c.dns.resize(sb);
                 c.dnc.resize(cb);
-                q.memcpy(c.dns.data(), d.state_ptr(), sb);
-                q.memcpy(c.dnc.data(), d.conv_state_ptr(), cb);
+                fleet->dev(dev).d2h(c.dns.data(), d.state_ptr(), sb);
+                fleet->dev(dev).d2h(c.dnc.data(), d.conv_state_ptr(), cb);
             }
             q.wait();   // d2h copies must land before the gate is released
         }
@@ -2866,16 +3095,16 @@ struct HostSlotStash {
                 const uint64_t slice  = uint64_t(depth) * kc.head_dim * sizeof(sycl::half);
                 const uint64_t stride = uint64_t(kc.max_ctx) * kc.head_dim;
                 const uint64_t nsl    = uint64_t(kc.n_layers_full) * kc.n_kv_heads;
-                for (uint64_t s = 0; s < nsl; ++s) {
-                    q.memcpy(live.k_ptr() + s * stride, c.k.data() + s * slice, slice);
-                    q.memcpy(live.v_ptr() + s * stride, c.v.data() + s * slice, slice);
+                for (uint64_t s = 0; s < nsl; ++s) {   // through the card's pinned stage (blocking; issue #2)
+                    fleet->dev(dev).h2d(live.k_ptr() + s * stride, c.k.data() + s * slice, slice);
+                    fleet->dev(dev).h2d(live.v_ptr() + s * stride, c.v.data() + s * slice, slice);
                 }
                 for (uint32_t l = 0; l < kc.n_layers_full; ++l) live.set_length(l, depth);
             }
             if (m.dev_has_dn(dev)) {
                 DeltaNetState& d = m.dn_state(dev);
-                q.memcpy(d.state_ptr(), c.dns.data(), c.dns.size());
-                q.memcpy(d.conv_state_ptr(), c.dnc.data(), c.dnc.size());
+                fleet->dev(dev).h2d(d.state_ptr(), c.dns.data(), c.dns.size());
+                fleet->dev(dev).h2d(d.conv_state_ptr(), c.dnc.data(), c.dnc.size());
             }
             q.wait();   // h2d must land before the holder's next forward
         }
@@ -3180,12 +3409,12 @@ public:
         int32_t pick = 0;
         try {
             if (!window.empty()) {
-                q.memcpy(recent_[lane], window.data(), window.size() * sizeof(int32_t));
+                m_.fleet()->dev(m_.head_dev()).h2d_async(recent_[lane], window.data(), window.size() * sizeof(int32_t));
                 sampling_penalties(q, lg, V_, recent_[lane], uint32_t(window.size()), sp.repeat_penalty, sp.presence_penalty,
                                    sp.frequency_penalty);
             }
             sample_softmax_topk_topp(q, lg, pick_[lane], V_, sp.temperature, sp.top_k, sp.top_p, sp.min_p, seed);
-            q.memcpy(&pick, pick_[lane], sizeof(pick)).wait();
+            m_.fleet()->dev(m_.head_dev()).d2h(&pick, pick_[lane], sizeof(pick));   // pinned stage (issue #2)
         } catch (const sycl::exception& x) { err = x.what(); }
         return pick;
     }
@@ -3206,7 +3435,7 @@ public:
                 const LanesSampling& s = *sp[r];
                 sycl::half* lg = lg_[lane];
                 if (!windows[r].empty()) {
-                    q.memcpy(recent_[lane], windows[r].data(), windows[r].size() * sizeof(int32_t));
+                    m_.fleet()->dev(m_.head_dev()).h2d_async(recent_[lane], windows[r].data(), windows[r].size() * sizeof(int32_t));
                     sampling_penalties(q, lg, V_, recent_[lane], uint32_t(windows[r].size()), s.repeat_penalty, s.presence_penalty,
                                        s.frequency_penalty);
                 }
@@ -3256,7 +3485,7 @@ public:
             for (uint32_t r = 0; r < rows; ++r) {   // (the queue runs these in order: recent_[lane] is row r's while its kernels run)
                 sycl::half* lg = m_.look_logits() + uint64_t(r) * V_;
                 if (!windows[r].empty()) {
-                    q.memcpy(recent_[lane], windows[r].data(), windows[r].size() * sizeof(int32_t));
+                    m_.fleet()->dev(m_.head_dev()).h2d_async(recent_[lane], windows[r].data(), windows[r].size() * sizeof(int32_t));
                     sampling_penalties(q, lg, V_, recent_[lane], uint32_t(windows[r].size()), sp.repeat_penalty, sp.presence_penalty,
                                        sp.frequency_penalty);
                 }
@@ -3948,12 +4177,12 @@ public:
         int32_t pick = 0;
         try {
             if (!window.empty()) {
-                q.memcpy(recent_[lane], window.data(), window.size() * sizeof(int32_t));
+                m_.fleet()->dev(m_.head_dev()).h2d_async(recent_[lane], window.data(), window.size() * sizeof(int32_t));
                 sampling_penalties(q, lg, V_, recent_[lane], uint32_t(window.size()), sp.repeat_penalty, sp.presence_penalty,
                                    sp.frequency_penalty);
             }
             sample_softmax_topk_topp(q, lg, pick_[lane], V_, sp.temperature, sp.top_k, sp.top_p, sp.min_p, seed);
-            q.memcpy(&pick, pick_[lane], sizeof(pick)).wait();
+            m_.fleet()->dev(m_.head_dev()).d2h(&pick, pick_[lane], sizeof(pick));   // pinned stage (issue #2)
         } catch (const sycl::exception& x) { err = x.what(); }
         return pick;
     }
@@ -3973,7 +4202,7 @@ public:
                 const LanesSampling& s = *sp[r];
                 sycl::half* lg = lg_[lane];
                 if (!windows[r].empty()) {
-                    q.memcpy(recent_[lane], windows[r].data(), windows[r].size() * sizeof(int32_t));
+                    m_.fleet()->dev(m_.head_dev()).h2d_async(recent_[lane], windows[r].data(), windows[r].size() * sizeof(int32_t));
                     sampling_penalties(q, lg, V_, recent_[lane], uint32_t(windows[r].size()), s.repeat_penalty, s.presence_penalty,
                                        s.frequency_penalty);
                 }
@@ -4197,6 +4426,10 @@ GenerateResult Engine::generate(const std::string& prompt,
     } gate_guard_{&gate_};
 
     glm5_err_.clear(); // request-local reset under the generation gate
+    // A request that left its decode without draft_end (an exception) must not take this prompt's 1-row pieces
+    // through draft_step: stage A back on the committed stream, the draft off until this request's decode
+    if (glm5_ && glm5_->dr.live)
+        if (auto m = glm5_->draft_end(); !m.empty()) std::fprintf(stderr, "[glm5-draft] reset: %s\n", m.c_str());
     // The other two forward-failure latches are cleared here too, UNDER the
     // gate: cleared before it, a queued request (--parallel > 1) could wipe a
     // running one's latched error between its forward and its check.
@@ -4233,7 +4466,8 @@ GenerateResult Engine::generate(const std::string& prompt,
     }
 
     // --- dspark separate-draft GREEDY spec decode (single-GPU kQwen35Dense,
-    //     --spec-draft). Lossless (greedy only); temperature>0 falls through to
+    //     --spec-draft). Greedy only, near-lossless: the split's --spec, whose T=V verify works the same way,
+    //     flips a rare near-tie token vs plain greedy (2026-10-15); temperature>0 falls through to
     //     plain decode. Takes precedence over --spec (MTP) when both are set. ---
     if (spec_draft_ && dspark_drafter_ && dspark_drafter_->loaded &&
         arch_ == ModelArch::kQwen35Dense && !qwen35_split_ && !qwen35_tp_ &&
@@ -4772,6 +5006,23 @@ GenerateResult Engine::generate(const std::string& prompt,
                 else std::fprintf(stderr, "[q4e-cache] restore: %s\n", rm.c_str());
             }
         }
+    } else if (prompt_cache_on_ && glm5_) {
+        // GLM-5.3-Flash: one live conversation, all-or-nothing as Flash-Next above (the KDA state cannot be
+        // truncated): the copy restores when its tokens are a STRICT prefix of the new prompt. The latent KV and the
+        // pool keys below it are the rows still on the cards (a sequence that started again at 0 dropped the copy).
+        const std::vector<int32_t>& st = glm5_->snap_tokens;
+        const uint32_t D = glm5_->snap_depth();
+        if (D > 0 && st.size() == size_t(D) && size_t(D) < ids.size() && std::equal(st.begin(), st.end(), ids.begin())) {
+            const auto t_r = std::chrono::steady_clock::now();
+            if (std::string rm = glm5_->rest(); rm.empty()) {
+                restored = D;
+                std::fprintf(stderr, "[glm5-cache] restored %u of %zu prompt tokens (%.1f ms)\n", D, ids.size(),
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_r).count());
+            } else {
+                std::fprintf(stderr, "[glm5-cache] restore: %s; full prefill\n", rm.c_str());
+                glm5_->drop();
+            }
+        }
     } else if (prompt_cache_on_ && arch_ == ModelArch::kDeepSeek4) {
         // DeepSeek-V4 single-endpoint snapshot (runtime-owned device state, tokens
         // here). MUST precede the single-GPU branch below for the same reason
@@ -5053,6 +5304,20 @@ GenerateResult Engine::generate(const std::string& prompt,
                 std::fprintf(stderr, "[q4e-pipeline] serial fallback: %s\n", m.c_str());
             }
         }
+        // glm5next split: the chunk-pipelined range (Glm5Bundle::fwd_pipelined), in the load's chunk. No serial
+        // fallback: a failed range leaves the stages at different depths, so the request ends with its error.
+        // IE_G5_NO_PIPELINE=1 = the serial chunk loop below.
+        static const bool g5_pipeline = std::getenv("IE_G5_NO_PIPELINE") == nullptr && !glm5_serial_diagnostics();
+        if (g5_pipeline && glm5_ && glm5_->split && glm5_err_.empty() && end > pos && end - pos > glm5_->chunk) {
+            if (pos == 0) { glm5_->A.reset_state(); glm5_->B.reset_state(); glm5_->drop(); }
+            if (auto m = glm5_->fwd_pipelined(ids.data() + pos, end - pos, pos); !m.empty()) {
+                glm5_err_ = m; slot_err = "glm5next: " + m; return;
+            }
+            pos = end;
+            glm5_logits(q).wait();
+            if (!glm5_err_.empty()) slot_err = "glm5next: " + glm5_err_;
+            return;
+        }
         while (pos < end && slot_err.empty() && !pf_abort) {
             uint32_t n = std::min<uint32_t>(pf_chunk, end - pos);
             if (ds4_vis_active_) {
@@ -5223,6 +5488,14 @@ GenerateResult Engine::generate(const std::string& prompt,
                 else           sl.tokens.clear();
             }
         }
+        else if (glm5_) {
+            // only a state that IS the prompt's first snap_at tokens (a failed forward leaves the stages elsewhere)
+            if (glm5_err_.empty() && glm5_->A.depth() == snap_at && (!glm5_->split || glm5_->B.depth() == snap_at)) {
+                tag = "glm5-cache";
+                m = glm5_->snap();
+                if (m.empty()) glm5_->snap_tokens = pref;
+            }
+        }
         else if (!tp_)               { m = prefix_cache_.insert(q, pref, kv_, dn_);           tag = "prompt-cache"; }
         if (!m.empty() && tag) std::fprintf(stderr, "[%s] insert: %s\n", tag, m.c_str());
     }
@@ -5279,7 +5552,7 @@ GenerateResult Engine::generate(const std::string& prompt,
             if (nw > 0) {
                 int32_t win[kMaxRepeatWindow];
                 for (uint32_t k = 0; k < nw; ++k) win[k] = ids[P - nw + k];
-                q.memcpy(d_recent_, win, nw * sizeof(int32_t)).wait();
+                alloc_.h2d(d_recent_, win, nw * sizeof(int32_t));   // pinned stage (issue #2)
                 sampling_penalties(q, d_logits_, vocab(), d_recent_, nw,
                                    sp.repeat_penalty, sp.presence_penalty, sp.frequency_penalty);
             }
@@ -5287,7 +5560,7 @@ GenerateResult Engine::generate(const std::string& prompt,
         sample_softmax_topk_topp(q, d_logits_, d_pick_, vocab(), sp.temperature,
                                  sp.top_k, sp.top_p, sp.min_p, rng).wait();
         int32_t pick = 0;
-        q.memcpy(&pick, d_pick_, sizeof(pick)).wait();
+        alloc_.d2h(&pick, d_pick_, sizeof(pick));
         if (!sp.ignore_eos &&
             (pick == tok_.eos_token_id() || pick == stop_ids_[0] || pick == stop_ids_[1])) {
             res.finish_reason = "stop";
@@ -5439,6 +5712,9 @@ GenerateResult Engine::generate(const std::string& prompt,
             q35m_look_step_ = true;
         }
     }
+    // GLM-5.3-Flash with the MTP pipelined draft on: this request's decode steps through it
+    if (glm5_ && glm5_->dr.on && glm5_err_.empty())
+        if (auto m = glm5_->draft_begin(pos); !m.empty()) std::fprintf(stderr, "[glm5-draft] %s -- plain decode\n", m.c_str());
     for (uint32_t step = 0; step < max_new; ++step) {
         if (sp.repeat_penalty != 1.0f || sp.presence_penalty != 0.f || sp.frequency_penalty != 0.f) {
             // llama.cpp-style penalty_last_n: the window is the last N tokens of
@@ -5456,7 +5732,7 @@ GenerateResult Engine::generate(const std::string& prompt,
                     const uint32_t i = start + k;       // index into ids++generated
                     win[k] = (i < P) ? ids[i] : generated[i - P];
                 }
-                q.memcpy(d_recent_, win, nw * sizeof(int32_t)).wait();
+                alloc_.h2d(d_recent_, win, nw * sizeof(int32_t));   // pinned stage (issue #2)
                 sampling_penalties(q, d_logits_, vocab(), d_recent_, nw, sp.repeat_penalty, sp.presence_penalty, sp.frequency_penalty);
             }
         }
@@ -5493,7 +5769,7 @@ GenerateResult Engine::generate(const std::string& prompt,
                                  sp.temperature, sp.top_k, sp.top_p, sp.min_p,
                                  rng + step);
         int32_t pick = 0;
-        q.memcpy(&pick, d_pick_, sizeof(pick)).wait();
+        alloc_.d2h(&pick, d_pick_, sizeof(pick));
         {   // IE_DEBUG_PICKS=1 (P4 B49): every picked token id and its text, one line a step (stderr).
             static const bool dbg_picks = std::getenv("IE_DEBUG_PICKS") != nullptr;
             if (dbg_picks) {
@@ -5546,7 +5822,7 @@ GenerateResult Engine::generate(const std::string& prompt,
             if (se.empty()) se = slot_stash.stash(qwen35_split_model_, pos);
             if (se.empty() && test_yield) {
                 const int32_t wrong = (pick + 1 < int32_t(vocab())) ? pick + 1 : 0;
-                q.memcpy(d_ids_ + pos, &wrong, sizeof(wrong)).wait();
+                alloc_.h2d(d_ids_ + pos, &wrong, sizeof(wrong));
                 forward_step(q, d_ids_ + pos, /*T=*/1, pos).wait();
                 se = slot_stash.unstash(qwen35_split_model_); ladder_.clear(); ++ladder_epoch_;   // (P4 B57)
                 if (se.empty() && std::getenv("IE_TEST_STASH_VERIFY")) {
@@ -5578,7 +5854,7 @@ GenerateResult Engine::generate(const std::string& prompt,
                 // Corrupt-then-restore probe (engine-level restore check):
                 // advance the live state with a WRONG token, then unstash.
                 const int32_t wrong = (pick + 1 < int32_t(vocab())) ? pick + 1 : 0;
-                q.memcpy(d_ids_ + pos, &wrong, sizeof(wrong)).wait();
+                alloc_.h2d(d_ids_ + pos, &wrong, sizeof(wrong));
                 forward_step(q, d_ids_ + pos, /*T=*/1, pos).wait();
                 se = q4e_unstash(); ladder_.clear(); ++ladder_epoch_; q4e_->mtp_ok = false;   // (P4 B62 / B63)
             } else if (se.empty()) {
@@ -5599,7 +5875,7 @@ GenerateResult Engine::generate(const std::string& prompt,
         // there — one token later, same exception. The host-runtime arches
         // (deepseek4/glm5next/qwen4exp) run their forward synchronously inside
         // forward_step and latch errors before it returns, unchanged.
-        if (yielded) q.memcpy(d_ids_ + pos, &pick, sizeof(pick)).wait();   // gate was released: see above
+        if (yielded) alloc_.h2d(d_ids_ + pos, &pick, sizeof(pick));   // gate was released: see above
         else         q.memcpy(d_ids_ + pos, d_pick_, sizeof(int32_t));
         if (q27_spec_step_) {   // P4 B48: the sampler and the seed of the NEXT token, for the step's drafts
             // Off by default: measured 2026-10-04 (ie serve, temperature 0.7, seed 7, three requests) the sampled drafts
@@ -5633,6 +5909,11 @@ GenerateResult Engine::generate(const std::string& prompt,
         if (!glm5_err_.empty()) { res.finish_reason="error: glm5next: "+glm5_err_; break; }
         if (!q4e_err_.empty()) { res.finish_reason = "error: qwen4exp: " + q4e_err_; break; }
     }
+    if (glm5_ && glm5_->dr.live)   // stage A back on the committed stream
+        if (auto m = glm5_->draft_end(); !m.empty()) {
+            std::fprintf(stderr, "[glm5-draft] end: %s\n", m.c_str());
+            if (glm5_err_.empty()) glm5_err_ = m;
+        }
     if (q4e_look_step_) {   // P4 B56: likewise for Flash-Next's lookup rows
         if (auto m = q4e_->look_flush(); !m.empty()) {
             std::fprintf(stderr, "[look-step] flush: %s\n", m.c_str());
@@ -6012,7 +6293,12 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
         std::string error;
         const std::string prompt=build_glm5_prompt(turns,enable_thinking,tools_json,error,reasoning_effort);
         if(!error.empty()) { GenerateResult r;r.finish_reason="error: "+error;return r; }
-        auto r=generate(prompt,sp,on_token);
+        // the prompt cache's copy goes at the stable conversation boundary (the render without its generation suffix)
+        uint32_t cache_prefix_len=0;
+        if(prompt_cache_on_)
+            if(const auto stable=glm5_stable_prefix(prompt,enable_thinking);!stable.empty())
+                cache_prefix_len=uint32_t(tok_.encode(stable,/*allow_special=*/true).size());
+        auto r=generate(prompt,sp,on_token,cache_prefix_len);
         auto parsed=parse_glm5_completion(r.text,enable_thinking,tools_json);
         r.text=std::move(parsed.content);r.reasoning_content=std::move(parsed.reasoning);
         r.tool_calls_json=std::move(parsed.tool_calls);

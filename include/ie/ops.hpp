@@ -328,6 +328,17 @@ sycl::event gemm_fp16(sycl::queue& q,
                       uint32_t M, uint32_t N, uint32_t K,
                       const std::vector<sycl::event>& deps = {});
 
+// gemm_fp16's contract (A [M,K] fp16, B [K,N] fp16, C [M,N] fp32, all row-major) with K split four ways inside a
+// work-group and the partials summed in a fixed order: for the few-row GEMMs of a prefill MoE, where gemm_fp16 runs
+// ~32 work-groups and is latency bound. Deterministic; not bit-identical to gemm_fp16 (K summation order). Stores
+// rows < M only (no tail-tile spill). Needs gemm_fp16_splitk_ok(M, N, K): N % 64 == 0, K % 64 == 0, K >= 256.
+bool gemm_fp16_splitk_ok(uint32_t M, uint32_t N, uint32_t K);
+sycl::event gemm_fp16_splitk(sycl::queue& q,
+                             const sycl::half* A, const sycl::half* B,
+                             float* C,
+                             uint32_t M, uint32_t N, uint32_t K,
+                             const std::vector<sycl::event>& deps = {});
+
 // P2: dense-weight fp16 GEMV for F16 GGUF tensors (e.g. qwen3 attn_v).
 //   A    : [K] FP16 activation
 //   W_kn : [K, N] FP16 row-major (GGUF stores [N, K] row-major; loader transposes before upload)

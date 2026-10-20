@@ -19,6 +19,7 @@
 
 **Latest**
 
+- **v0.2.26, October 20 — GLM-5.3-Flash served fast, and issue #2:** in `ie serve`, [GLM-5.3-Flash](#new-in-v0226) reads a 9.6K-token agent prompt in **32.4 s** (was 243 s), answers later turns from the prompt cache in **9.5–9.7 s** (was 273–311 s) and decodes **13.5–14.3 tok/s** (was 10.8–11.5); the re-published `glm5-next` GGUF loads. Host↔device copies on the Qwen3.8-27B and 35B-A3B two-card splits and in `--spec`'s draft head go through pinned memory, at most 64 MiB a copy, for [issue #2](https://github.com/Red-Weasel/machx-inference-engine/issues/2) (a B70 wedged under the 27B). [Details](#new-in-v0226)
 - **v0.2.25, October 20 — two new models:** [Laguna S 2.1](#new-in-v0225) (118B-A8B) and Inkling-Small (276B-A12B) run in `ie serve` on one card or two; Laguna writes **33.7–35.1 tok/s** on two cards. DeepSeek-V4.1-Flash decodes **10.6 % faster** with byte-identical output. Host↔device copies on the new models and in the VRAM self-test go through pinned memory, and the 27B's `ie serve` no longer crashes on exit. [Details](#new-in-v0225)
 - **Video, October 5–6:** [LTX-2.5](docs/ltx25/LTX25_ON_ARC.md) makes 5 seconds of 1280×704 video with sound in about 21 s on two Arc Pro B70 cards (stock PyTorch: 79 s).
 - **v0.2.23, October 12 — MiMo faster:** MiMo-V2.6-Flash writes **23–26 % faster** with the same tokens (27.8–28.3 tok/s with its drafter, 21.8–23.3 before) and reads long prompts up to **43 % faster** in `ie serve` (37,810 tokens: 92.5 → 53.4 s). DeepSeek-V4.1-Flash decodes about 7 % faster. [Details](#new-in-v0223)
@@ -110,15 +111,15 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 </tr>
 <tr>
 <td width="48" align="center" valign="middle"><img src="docs/images/logo-glm.png" width="36" height="36" alt="Z.ai GLM"></td>
-<td align="left" valign="middle" nowrap><b>GLM-5.3-Flash</b><br><sub>MoE · measured Sep 27<br>MTP draft · pipelined prefill</sub></td>
+<td align="left" valign="middle" nowrap><b>GLM-5.3-Flash</b><br><sub>MoE · measured Oct 20<br>MTP draft · prompt cache</sub></td>
 <td align="left" valign="middle" nowrap>UD-Q4_K_XL GGUF<br><sub>host-resident experts</sub></td>
-<td align="left" valign="middle" nowrap><b>156.4</b> <sub>at 16K</sub></td>
-<td align="left" valign="middle" nowrap><b>14.0–14.4</b> <sub>at 16K</sub><br><b>12.6–12.8</b> <sub>as served</sub></td>
+<td align="left" valign="middle" nowrap><b>300</b> <sub>at 9.6K, served</sub></td>
+<td align="left" valign="middle" nowrap><b>13.5–14.3</b> <sub>as served</sub><br><b>14.0–14.4</b> <sub>runner, at 16K</sub></td>
 </tr>
 </tbody>
 </table>
 
-<sub>Prefill is prompt reading and decode is writing, in tokens per second; 2.4K and 10.7K are prompt lengths in tokens (`ie-prompt-bench`, prompt cache off, greedy). "Plain" is without speculative decoding; `--spec` is speculative decoding: the 27B's own MTP draft head, and on Flash-Next lookup drafts, which pay only on replies that copy text already in the conversation. Qwen figures were measured on community fine-tunes of the models: the 35B-A3B on the Qwen3.8-35B-A3B Distill (the September 26 – October 1 rows of [Benchmarks](#benchmarks) used a Qwen3.6-35B-A3B fine-tune). GLM's 14.0–14.4 is the standalone runner with its MTP draft and 12.6–12.8 the served configuration; Flash-Next's decode with its MTP head in the standalone runner is 37.1–38.2 chat and 44.4–44.6 code (September 27), and `ie serve` does not load that head. Every figure, with its date and conditions, is listed below.</sub>
+<sub>Prefill is prompt reading and decode is writing, in tokens per second; 2.4K and 10.7K are prompt lengths in tokens (`ie-prompt-bench`, prompt cache off, greedy). "Plain" is without speculative decoding; `--spec` is speculative decoding: the 27B's own MTP draft head, and on Flash-Next lookup drafts, which pay only on replies that copy text already in the conversation. Qwen figures were measured on community fine-tunes of the models: the 35B-A3B on the Qwen3.8-35B-A3B Distill (the September 26 – October 1 rows of [Benchmarks](#benchmarks) used a Qwen3.6-35B-A3B fine-tune). GLM's 300 and 13.5–14.3 are `ie serve` with its defaults on a 9.6K-token agent prompt (October 20), and 14.0–14.4 the standalone runner with its MTP draft at 16K; Flash-Next's decode with its MTP head in the standalone runner is 37.1–38.2 chat and 44.4–44.6 code (September 27), and `ie serve` does not load that head. Every figure, with its date and conditions, is listed below.</sub>
 
 <details>
 <summary><b>Every figure, with its date and conditions</b></summary>
@@ -153,9 +154,9 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 - **Prefill** 571 tok/s at 4K; **decode** 26.1 tok/s at 4K, 32.7 on a short prompt; tool calls, prompt cache. Measured on the previous driver stack (September 11).
 
 **GLM-5.3-Flash** · UD-Q4_K_XL GGUF, host-resident experts
-- **Prefill:** 156.4 tok/s at 16K (September 27).
-- **Decode:** 14.0–14.4 tok/s at 16K in the standalone runner (`ie-glm5next-run`, MTP draft); 12.64 / 12.76 for one request in the served configuration. `ie serve` refuses speculative decoding for GLM and runs it one request at a time.
-- **Also:** MTP draft, two-GPU pipelined prefill, request lanes in a test tool (two lanes ×1.68 against one request).
+- **Served (`ie serve`, October 20):** a 9.6K-token agent prompt is read at 300 tok/s (first token in 32.4 s, was 243 s); each later turn restores the conversation from the prompt cache and answers in 9.5–9.7 s (was 273–311 s); decode 13.5–14.3 tok/s with the MTP draft, which is on by default (was 10.8–11.5). Prefill runs expert batches of 32+ rows (split-K GEMMs), dense projections and MLA absorbs on XMX, in 2048-token chunks. [Measurements](docs/glm53/SERVE_SPEED_2026-10-19.md).
+- **Standalone runner:** prefill 156.4 tok/s at 16K (September 27); decode 14.0–14.4 tok/s at 16K (`ie-glm5next-run`, MTP draft).
+- **Also:** two-GPU pipelined prefill, request lanes in a test tool (two lanes ×1.68 against one request). `ie serve` runs GLM one request at a time.
 
 </details>
 
@@ -173,6 +174,76 @@ class ([New in v0.2.6](#new-in-v026)).
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
 
 ---
+
+<a id="new-in-v0226"></a>
+## 🆕 New in v0.2.26
+
+Everything since [v0.2.25](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.25). Measured
+October 19–20, 2026, on two Arc Pro B70 cards.
+
+### GLM-5.3-Flash in `ie serve`: first token 7.5× sooner, later turns 28–33× sooner
+
+On an agent conversation (a 9.6K-token system prompt with three tools, then ~1.4K-token tool results), with the
+server's defaults and the model card's sampling:
+
+| | v0.2.25 | v0.2.26 |
+|---|---|---|
+| first turn, 9.6K tokens cold | 243.2 s (39 tok/s) | **32.4 s (300 tok/s)** |
+| later turns | 273–311 s (the whole conversation read again) | **9.5–9.7 s** |
+| decode | 10.8–11.5 tok/s | **13.5–14.3 tok/s** |
+
+- **Prompt cache:** a turn that extends the conversation restores both cards' state from system RAM and reads only the
+  new tokens. Re-sending a turn restored 10,989 of 10,991 tokens and answered in 0.57 s with the same reply.
+- **Pipelined prefill:** card 1 reads the next prompt chunk while card 2 finishes the current one, in 2048-token chunks
+  (was 256; `--prefill-chunk` up to 2048 sets it, and 1024 gives back about 4 % of decode).
+- **MTP draft on by default** (`IE_G5_PIPEDRAFT=0` turns it off).
+- **Prefill on XMX:** routed experts with 32 or more rows in a chunk, the dense Q8_0 projections and the MLA absorbs
+  run as XMX GEMMs; experts below 256 rows split K four ways (`gemm_fp16_splitk`), and Q4_K/Q5_K dequant is tiled
+  through shared local memory (bit-identical). Switches: `IE_G5_XMX_ROWS`, `IE_G5_Q8_GEMM_ROWS`,
+  `IE_G5_ABSORB_XMX_ROWS`, `IE_G5_SPLITK` (0 = off each).
+- **Checks:** greedy with the CPU expert leg off (`IE_G5_CPU_MISS=0`), the restored turn, pipelined prefill against
+  serial prefill and the MTP draft against plain decode each give byte-identical replies. The XMX prefill changes the
+  summation order, and benign arithmetic changes move this model's PPL by about 0.002; split-K is no worse (wikitext
+  at 16K context: 1.9461 with it, 1.9469 without).
+- **The re-published GGUF loads.** Unsloth's GLM-5.3-Flash files were rewritten on October 5 with the architecture
+  named `glm5-next`; v0.2.25 refused them ("unsupported architecture"). Both names load now.
+- Prefill chunks above 2048 are refused: at 4096 a kernel's 32-bit range overflowed.
+
+[Measurements](docs/glm53/SERVE_SPEED_2026-10-19.md).
+
+### Host↔device copies through pinned memory ([issue #2](https://github.com/Red-Weasel/machx-inference-engine/issues/2))
+
+A B70 wedged after about two hours of `ie serve --gpus 2 --spec` on the Qwen3.8-27B (a copy-engine fault, then a
+failed GPU reset). It matches an open driver issue ([intel/compute-runtime#948](https://github.com/intel/compute-runtime/issues/948),
+drm/xe#8390) that sustained load exposes on B70 and B580, in other engines too. In #948 the copy engine faults on
+single copies of 512 MiB or more from pageable memory, so the engine now copies through pinned memory, at most 64 MiB
+a copy:
+
+- Every host↔device copy of the Qwen3.8-27B and 35B-A3B two-card splits, including the card-to-card hand-off, the
+  samplers' per-token copies and the dense loaders, goes through a 64 MiB pinned buffer per card. No single copy is
+  larger than 64 MiB.
+- `--spec`'s MTP draft head loaded `token_embd` and the packed `output.weight` (about 1 GB each) in single pageable
+  copies, in exactly the issue's configuration. Both go through the pinned buffer now.
+- Small device-to-host reads (up to 1 MiB) run as a kernel on the compute queue: as copy-engine copies they waited
+  for the compute → copy-engine hand-off after every step and cost the 27B's two-lane decode 0.55 %.
+- **Checks:** the 27B in the issue's configuration (`--ctx 262144 --parallel 1 --spec --spec-k 3`), on one card with
+  `--spec`, and with two lanes; the 35B-A3B with one request and with lanes; with and without repetition penalties:
+  byte-identical replies to v0.2.25 at the same speed or slightly faster. The prompt-cache slot stash restores
+  bit-exactly. No kernel GPU fault in any run.
+- **Not shown:** a multi-hour soak. A soak can show the fault; it cannot prove it is gone.
+- Switches: `IE_NO_PINNED_STAGE=1` restores the direct copies, `IE_NO_D2H_KERNEL=1` the copy-engine reads,
+  `IE_COPY_STATS=1` prints calls and time per copy path at exit.
+
+### What is still slow, and not checked
+
+- **DeepSeek-V4.1-Flash runs on two cards only.** On a machine with more Arc cards it takes all of them, and past two
+  cards prompts over 2,048 tokens fail and attention past 16K tokens of context is wrong. Run it with `--cards 0,1`
+  (`ie cards` lists the numbers). Four-card support is planned.
+- GLM-5.3-Flash prefill is bound by streaming the host expert bank over PCIe 5.0 x8 and by per-expert compute;
+  dequantizing inside the split-K GEMM is the next step. `ie serve` runs GLM one request at a time.
+- The other models (Flash-Next, the DeepSeeks, MiMo, GLM, Gemma and more) still copy host memory directly, mostly
+  whole tensors at load. Laguna and Inkling have used the pinned buffer since v0.2.25. Each conversion needs its own
+  old-against-new gate.
 
 <a id="new-in-v0225"></a>
 ## 🆕 New in v0.2.25

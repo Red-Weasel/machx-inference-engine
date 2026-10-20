@@ -45,7 +45,10 @@ ModelArch detect_arch(const GgufReader& g) {
     // per-layer head_count_kv MAP, Sinkhorn hyper-connections, 288-expert
     // sigmoid MoE + shared, NextN/MTP block IN the GGUF. RECOGNIZED so tools
     // report honestly; runtime port in progress — docs/glm53/PORT_PLAN.md.
-    if (a == "glm5next")  return ModelArch::kGlm5Next;
+    // `glm5-next` is the same model under llama.cpp's name: Unsloth's 2026-10-05
+    // metadata rewrite of GLM-5.3-Flash-GGUF renamed the arch and its key prefix
+    // (read_glm5next_config follows the file's own prefix).
+    if (a == "glm5next" || a == "glm5-next") return ModelArch::kGlm5Next;
     if (a == "hyv4")      return ModelArch::kHyv4;      // Tencent Hy4-preview: MLA(roped 64)+sinks+gated attn, iHC, DSA indexer, 256-expert MoE
 
     if (a == "qwen35")    return ModelArch::kQwen35Dense;
@@ -563,28 +566,31 @@ std::string read_glm5next_config(const GgufReader& g, Glm5NextConfig& out) {
     // 46-entry per-layer array — any scalar binding would misread the whole
     // hybrid layout. Helper idiom as read_glmdsa_config; f32 returns presence
     // because two of the floats (gate_lower_bound, weights_scale) change the
-    // math silently if a missing key fell through to a default.
+    // math silently if a missing key fell through to a default. Keys hang off
+    // the file's own arch name: `glm5next.` or (Unsloth 2026-10-05) `glm5-next.`.
+    const auto* arch_kv = g.find_kv("general.architecture");
+    const std::string P = (arch_kv ? std::string(arch_kv->as_string()) : std::string("glm5next")) + ".";
     auto u32 = [&](const char* suffix, uint32_t& dst) -> bool {
-        const auto* kv = g.find_kv(std::string("glm5next.") + suffix);
+        const auto* kv = g.find_kv(P + suffix);
         if (!kv) return false;
         dst = uint32_t(kv->as_uint());
         return true;
     };
     auto f32 = [&](const char* suffix, float& dst) -> bool {
-        const auto* kv = g.find_kv(std::string("glm5next.") + suffix);
+        const auto* kv = g.find_kv(P + suffix);
         if (!kv) return false;
         dst = float(kv->as_float());
         return true;
     };
     auto arr_i32 = [&](const char* suffix, std::vector<int32_t>& dst) -> bool {
-        const auto* kv = g.find_kv(std::string("glm5next.") + suffix);
+        const auto* kv = g.find_kv(P + suffix);
         if (!kv || kv->type != GgufValueType::kArray) return false;
         const auto a = kv->as_pod_array<int32_t>();
         dst.assign(a.begin(), a.end());
         return true;
     };
     auto arr_f32 = [&](const char* suffix, std::vector<float>& dst) -> bool {
-        const auto* kv = g.find_kv(std::string("glm5next.") + suffix);
+        const auto* kv = g.find_kv(P + suffix);
         if (!kv || kv->type != GgufValueType::kArray) return false;
         const auto a = kv->as_pod_array<float>();
         dst.assign(a.begin(), a.end());
@@ -649,7 +655,7 @@ std::string read_glm5next_config(const GgufReader& g, Glm5NextConfig& out) {
     u32("expert_gating_func", out.expert_gating_func);
     if (!f32("expert_weights_scale", out.expert_weights_scale))
         return "missing glm5next.expert_weights_scale";
-    if (const auto* kv = g.find_kv("glm5next.expert_weights_norm"))
+    if (const auto* kv = g.find_kv(P + "expert_weights_norm"))
         out.expert_weights_norm = kv->as_bool();
     // Grouped routing is NOT implemented; the file ships group_count 1 (a
     // no-op). Refuse anything else instead of silently ignoring it.
@@ -699,7 +705,7 @@ std::string read_glm5next_config(const GgufReader& g, Glm5NextConfig& out) {
     // and the [d,d] recurrence state both hang off this product.
     if (out.kda_head_dim == 0 || out.n_q_heads == 0)
         return "glm5next: zero kda.head_dim/attention.head_count";
-    if (const auto* kv = g.find_kv("glm5next.vocab_size");
+    if (const auto* kv = g.find_kv(P + "vocab_size");
         kv && uint32_t(kv->as_uint()) != out.vocab)
         return "glm5next: vocab_size != tokenizer.ggml.tokens length";
     return {};

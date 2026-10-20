@@ -122,7 +122,7 @@ inline LaunchOptions parse_launch_options(const std::vector<std::string>& args) 
             if(!known_reasoning_effort(v))throw std::runtime_error("--reasoning-effort requires a supported model effort level");
             out.defaults.reasoning_effort=v;
         }
-        else if (flag == "--prefill-chunk") e.prefill_chunk = uint32_t(integer(1, INT32_MAX));
+        else if (flag == "--prefill-chunk") { e.prefill_chunk = uint32_t(integer(1, INT32_MAX)); e.prefill_chunk_set = true; }
         else if (flag == "--vram-reserve-gib") out.vram_reserve_gib = double(number(0, 24));
         else if (flag == "--parallel") {   // P4 B30: "auto" = the default
             if (i + 1 < args.size() && args[i + 1] == "auto") { ++i; e.parallel = kLanesAuto; }
