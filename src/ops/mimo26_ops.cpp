@@ -10,6 +10,7 @@
 #include <cstdlib>
 #include <limits>
 #include <stdexcept>
+#include <type_traits>
 
 namespace ie {
 
@@ -168,67 +169,95 @@ sycl::event mimo26_attention_decode(sycl::queue& q, const sycl::half* Q, const s
     const uint32_t NS = std::min({mimo26_decode_max_splits(), want, (span + kMinKeys - 1) / kMinKeys});
     const uint32_t gqa = n_q / n_kv, PW = hdv + 2;
     constexpr uint32_t Bc = 32;
-    auto part = ie::ps(q, "mimo26_attn_decode_part", [&](sycl::handler& h) {
+    // B68: HPS query heads per sub-group, so each K / V element is loaded once for HPS heads, and FT: the tile is widened
+    // to float once, when it is staged (exact), instead of by every sub-group at every key (the unpacking and widening
+    // were ~40 of ~115 instructions per key); tiles of BC = 8 keys (a small SLM tile lets more work-groups run at once).
+    // Every head's own operations and their order are unchanged: the same bits (ie-mimo26-fp8-bench --checksums). Full
+    // layers 2 heads per sub-group, the SWA layers 1. Full layer, 8 rows, 30k keys: 3.74 -> 2.03 ms.
+    // IE_MIMO26_ATTN_B68=0 = v0.2.23's kernel (one head per sub-group, fp16 tiles of 32 keys).
+    static const bool b68 = [] { const char* v = std::getenv("IE_MIMO26_ATTN_B68"); return !(v && *v == '0'); }();
+    auto submit = [&]<uint32_t HPS, bool FT, uint32_t BC>() {
+    using TT = std::conditional_t<FT, float, sycl::half>;
+    return ie::ps(q, "mimo26_attn_decode_part", [&](sycl::handler& h) {
         h.depends_on(append);
         constexpr uint32_t HD = 192, HDV = 128, dk = HD / kSg, dv = HDV / kSg;
-        sycl::local_accessor<sycl::half, 1> Ks(sycl::range<1>(Bc * HD), h), Vs(sycl::range<1>(Bc * HDV), h);
-        const uint32_t vs = v_stride, R = ring;
+        sycl::local_accessor<TT, 1> Ks(sycl::range<1>(BC * HD), h), Vs(sycl::range<1>(BC * HDV), h);
+        const uint32_t vs = v_stride, R = ring, nsg = gqa / HPS;
         const float scale = 1.0f / sycl::sqrt(float(HD));
-        h.parallel_for(sycl::nd_range<3>({T, size_t(n_kv) * NS, size_t(gqa) * kSg}, {1, 1, size_t(gqa) * kSg}),
+        h.parallel_for(sycl::nd_range<3>({T, size_t(n_kv) * NS, size_t(nsg) * kSg}, {1, 1, size_t(nsg) * kSg}),
                        [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(kSg)]] {
             const uint32_t t = uint32_t(it.get_group(0)), g1 = uint32_t(it.get_group(1));
             const uint32_t kvh = g1 / NS, s = g1 % NS;
-            const uint32_t lid = uint32_t(it.get_local_id(2)), sgi = lid / kSg, lane = lid % kSg, hq = kvh * gqa + sgi;
+            const uint32_t lid = uint32_t(it.get_local_id(2)), sgi = lid / kSg, lane = lid % kSg, hq0 = kvh * gqa + sgi * HPS;
             const uint32_t p = pos0 + t, n_keys = p + 1, k0 = (window && n_keys > window) ? n_keys - window : 0u;
             const uint32_t range = n_keys - k0, per = (range + NS - 1) / NS;
             const uint32_t a = k0 + std::min(range, s * per), b = k0 + std::min(range, (s + 1) * per);
             auto sg = it.get_sub_group();
-            float qv[dk];
+            float qv[HPS][dk];
             #pragma unroll
-            for (uint32_t d = 0; d < dk; ++d) qv[d] = float(Q[(size_t(t) * n_q + hq) * HD + lane * dk + d]);
-            float m = -std::numeric_limits<float>::infinity(), l = 0.f, acc[dv];
+            for (uint32_t hh = 0; hh < HPS; ++hh)
+                #pragma unroll
+                for (uint32_t d = 0; d < dk; ++d) qv[hh][d] = float(Q[(size_t(t) * n_q + hq0 + hh) * HD + lane * dk + d]);
+            float m[HPS], l[HPS], acc[HPS][dv];
             #pragma unroll
-            for (uint32_t d = 0; d < dv; ++d) acc[d] = 0.f;
-            const uint32_t nthr = gqa * kSg;
-            for (uint32_t base = a; base < b; base += Bc) {
-                const uint32_t nb = std::min(Bc, b - base);
+            for (uint32_t hh = 0; hh < HPS; ++hh) {
+                m[hh] = -std::numeric_limits<float>::infinity(); l[hh] = 0.f;
+                #pragma unroll
+                for (uint32_t d = 0; d < dv; ++d) acc[hh][d] = 0.f;
+            }
+            const uint32_t nthr = nsg * kSg;
+            for (uint32_t base = a; base < b; base += BC) {
+                const uint32_t nb = std::min(BC, b - base);
                 sycl::group_barrier(it.get_group());
                 // the tile's K and V rows into SLM, 16 bytes per load (the rows are 384 / 256 bytes, 16-byte aligned)
                 for (uint32_t i = lid; i < nb * (HD / 8); i += nthr) {
                     const uint32_t r = i / (HD / 8), c8 = i % (HD / 8), key = base + r, si = R ? key % R : key;
                     sycl::vec<sycl::half, 8> v;
                     v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(k_cache + (size_t(kvh) * slots + si) * HD + c8 * 8));
-                    v.store(0, Ks.template get_multi_ptr<sycl::access::decorated::no>() + r * HD + c8 * 8);
+                    v.template convert<TT>().store(0, Ks.template get_multi_ptr<sycl::access::decorated::no>() + r * HD + c8 * 8);
                 }
                 for (uint32_t i = lid; i < nb * (HDV / 8); i += nthr) {
                     const uint32_t r = i / (HDV / 8), c8 = i % (HDV / 8), key = base + r, si = R ? key % R : key;
                     sycl::vec<sycl::half, 8> v;
                     v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space, sycl::access::decorated::no>(v_cache + (size_t(kvh) * slots + si) * vs + c8 * 8));
-                    v.store(0, Vs.template get_multi_ptr<sycl::access::decorated::no>() + r * HDV + c8 * 8);
+                    v.template convert<TT>().store(0, Vs.template get_multi_ptr<sycl::access::decorated::no>() + r * HDV + c8 * 8);
                 }
                 sycl::group_barrier(it.get_group());
                 for (uint32_t j = 0; j < nb; ++j) {
-                    sycl::vec<sycl::half, 4> k4[dk / 4];   // this lane's 12 K dims: 24 bytes, 8-byte aligned
+                    sycl::vec<TT, 4> k4[dk / 4];   // this lane's 12 K dims
                     #pragma unroll
                     for (uint32_t u = 0; u < dk / 4; ++u) k4[u].load(u, Ks.template get_multi_ptr<sycl::access::decorated::no>() + j * HD + lane * dk);
-                    float pdot = 0.f;
+                    float sc[HPS];
                     #pragma unroll
-                    for (uint32_t d = 0; d < dk; ++d) pdot += qv[d] * float(k4[d / 4][d % 4]);
-                    const float sc = sycl::reduce_over_group(sg, pdot, sycl::plus<float>()) * scale;
-                    const float m_new = sycl::fmax(m, sc), al = sycl::native::exp(m - m_new), e = sycl::native::exp(sc - m_new);
-                    sycl::vec<sycl::half, dv> v8;          // this lane's 8 V dims: 16 bytes
+                    for (uint32_t hh = 0; hh < HPS; ++hh) {
+                        float pdot = 0.f;
+                        #pragma unroll
+                        for (uint32_t d = 0; d < dk; ++d) pdot += qv[hh][d] * float(k4[d / 4][d % 4]);
+                        sc[hh] = sycl::reduce_over_group(sg, pdot, sycl::plus<float>()) * scale;
+                    }
+                    sycl::vec<TT, dv> v8;          // this lane's 8 V dims
                     v8.load(0, Vs.template get_multi_ptr<sycl::access::decorated::no>() + j * HDV + lane * dv);
                     #pragma unroll
-                    for (uint32_t d = 0; d < dv; ++d) acc[d] = acc[d] * al + e * float(v8[d]);
-                    l = l * al + e; m = m_new;
+                    for (uint32_t hh = 0; hh < HPS; ++hh) {
+                        const float m_new = sycl::fmax(m[hh], sc[hh]), al = sycl::native::exp(m[hh] - m_new), e = sycl::native::exp(sc[hh] - m_new);
+                        #pragma unroll
+                        for (uint32_t d = 0; d < dv; ++d) acc[hh][d] = acc[hh][d] * al + e * float(v8[d]);
+                        l[hh] = l[hh] * al + e; m[hh] = m_new;
+                    }
                 }
             }
-            float* out = partials + ((size_t(t) * n_q + hq) * NS + s) * PW;
             #pragma unroll
-            for (uint32_t d = 0; d < dv; ++d) out[lane * dv + d] = acc[d];
-            if (lane == 0) { out[HDV] = m; out[HDV + 1] = l; }
+            for (uint32_t hh = 0; hh < HPS; ++hh) {
+                float* out = partials + ((size_t(t) * n_q + hq0 + hh) * NS + s) * PW;
+                #pragma unroll
+                for (uint32_t d = 0; d < dv; ++d) out[lane * dv + d] = acc[hh][d];
+                if (lane == 0) { out[HDV] = m[hh]; out[HDV + 1] = l[hh]; }
+            }
         });
     });
+    };
+    auto part = !b68 ? submit.template operator()<1, false, Bc>()
+              : window == 0 && gqa % 2 == 0 ? submit.template operator()<2, true, 8>() : submit.template operator()<1, true, 8>();
     // 2. merge the splits per (row, head), sink folded into the denominator
     return ie::ps(q, "mimo26_attn_decode_merge", [&](sycl::handler& h) {
         h.depends_on(part);

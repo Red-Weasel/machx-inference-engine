@@ -1366,7 +1366,8 @@ uint64_t Ds4HostArena::max_segment_bytes() const noexcept {
 // ---------------------------------------------------------------------------
 std::string Ds4ExpertCache::init(sycl::queue& compute, const Ds4HostArena& arena,
                                  uint32_t slots_per_layer, uint64_t vram_budget_bytes,
-                                 uint32_t static_slots, uint32_t bank_slots) {
+                                 uint32_t static_slots, uint32_t bank_slots,
+                                 uint32_t n_elastic, uint64_t elastic_block_bytes) {
     free_storage();
     if (arena.n_layers() == 0) return "Ds4ExpertCache: arena not initialised";
     if (slots_per_layer == 0)  return "Ds4ExpertCache: slots_per_layer == 0";
@@ -1432,6 +1433,24 @@ std::string Ds4ExpertCache::init(sycl::queue& compute, const Ds4HostArena& arena
             return e;
         }
         device_bytes_ += need;
+    }
+
+    // Elastic region (docs/deepseek41/105): n_elastic ADDITIONAL slots per layer, backed by ONE separate
+    // block (not dev_[l]), so the forward can lend the whole block as prefill scratch. dev_[l] above was
+    // sized by the pre-bump slots_ (the dev count); elastic_base_ marks the boundary and slots_ grows to
+    // cover the elastic slots, so the bookkeeping .assign below sizes for them. Off (n_elastic==0): slots_
+    // unchanged, elastic_base_ == slots_, every elastic branch dead -> byte-identical.
+    elastic_base_ = slots_;
+    n_elastic_    = n_elastic;
+    if (n_elastic_) {
+        elastic_off_.assign(n_layers_, 0);
+        uint64_t off = 0;
+        for (uint32_t l = 0; l < n_layers_; ++l) { elastic_off_[l] = off; off += arena.slot_bytes(l) * n_elastic_; }
+        elastic_blk_bytes_ = std::max<uint64_t>(elastic_block_bytes, off);   // >= slot capacity AND the lent-scratch size
+        elastic_blk_ = static_cast<uint8_t*>(sycl::malloc_device(size_t(elastic_blk_bytes_), compute));
+        if (!elastic_blk_) { const std::string e = "Ds4ExpertCache: elastic block alloc of " + bytes_str(elastic_blk_bytes_) + " failed"; free_storage(); return e; }
+        device_bytes_ += elastic_blk_bytes_;
+        slots_ += n_elastic_;
     }
 
     for (int b = 0; b < 2 && bank_slots_; ++b) {
@@ -1509,6 +1528,9 @@ void Ds4ExpertCache::free_storage() noexcept {
     if (cq_) for (uint8_t* p : dev_) if (p) sycl::free(p, *cq_);
     if (cq_) for (uint8_t*& p : bank_) if (p) { sycl::free(p, *cq_); p = nullptr; }
     bank_slots_ = 0; bank_stride_ = 0;
+    if (cq_ && elastic_blk_) sycl::free(elastic_blk_, *cq_);
+    elastic_blk_ = nullptr; elastic_blk_bytes_ = 0; n_elastic_ = 0; elastic_base_ = 0; elastic_lent_ = false;
+    elastic_off_.clear();
     dev_.clear();
     slot_of_.clear(); tag_of_.clear(); fifo_.clear(); fill_cursor_.clear();
     inuse_.clear(); inuse_prev_.clear(); from_spec_.clear();
@@ -1558,7 +1580,7 @@ bool Ds4ExpertCache::is_resident(uint32_t L, uint32_t e) const noexcept {
 
 uint32_t Ds4ExpertCache::pick_victim(uint32_t L, const uint8_t* iu,
                                      const uint8_t* iu_prev) noexcept {
-    const uint32_t stream = slots_ - static_;
+    const uint32_t stream = avail_slots_() - static_;   // elastic slots excluded while lent
     if (stream == 0) return kDs4NoSlot;
     if (lru_) {
         // Least recently touched streaming slot outside both live generations.
@@ -1566,14 +1588,14 @@ uint32_t Ds4ExpertCache::pick_victim(uint32_t L, const uint8_t* iu,
         const uint64_t* st = stamp_.data() + uint64_t(L) * slots_;
         uint32_t best = kDs4NoSlot;
         uint64_t best_stamp = ~uint64_t(0);
-        for (uint32_t s = static_; s < slots_; ++s) {
+        for (uint32_t s = static_; s < avail_slots_(); ++s) {
             if (iu[s] || (iu_prev && iu_prev[s])) continue;
             if (st[s] < best_stamp) { best_stamp = st[s]; best = s; }
         }
         return best;
     }
     uint32_t v = fifo_[L];
-    if (v < static_ || v >= slots_) v = static_;
+    if (v < static_ || v >= avail_slots_()) v = static_;   // (a lent elastic block is outside the FIFO's range)
     for (uint32_t tries = 0; tries < stream; ++tries) {
         const uint32_t next = static_ + (v - static_ + 1) % stream;
         if (!iu[v] && !(iu_prev && iu_prev[v])) { fifo_[L] = next; return v; }
@@ -1590,6 +1612,8 @@ void* Ds4ExpertCache::slot_ptr(uint32_t L, uint32_t slot) noexcept {
         return bank_[v / bank_slots_] + uint64_t(v % bank_slots_) * bank_stride_;
     }
     if (slot >= slots_) return nullptr;
+    if (n_elastic_ && slot >= elastic_base_)   // elastic slot: backed by the separate block, not dev_[L]
+        return elastic_blk_ + elastic_off_[L] + uint64_t(slot - elastic_base_) * arena_->slot_bytes(L);
     return dev_[L] + uint64_t(slot) * arena_->slot_bytes(L);
 }
 
@@ -1601,7 +1625,41 @@ const void* Ds4ExpertCache::slot_ptr(uint32_t L, uint32_t slot) const noexcept {
         return bank_[v / bank_slots_] + uint64_t(v % bank_slots_) * bank_stride_;
     }
     if (slot >= slots_) return nullptr;
+    if (n_elastic_ && slot >= elastic_base_)   // elastic slot: backed by the separate block, not dev_[L]
+        return elastic_blk_ + elastic_off_[L] + uint64_t(slot - elastic_base_) * arena_->slot_bytes(L);
     return dev_[L] + uint64_t(slot) * arena_->slot_bytes(L);
+}
+
+void* Ds4ExpertCache::lend_elastic(sycl::queue& q) noexcept {
+    if (!n_elastic_ || !elastic_blk_) return nullptr;
+    if (!elastic_lent_) {
+        // Drain both queues so no in-flight GEMM or fill still reads an elastic slot before the block
+        // becomes the forward's scratch. A prefill chunk is large, so one sync here is negligible.
+        try { q.wait(); } catch (...) {}
+        if (xq_) { try { xq_->wait(); } catch (...) {} }
+        for (uint32_t L = 0; L < n_layers_; ++L) {
+            // Both queues are drained, so no claim is live: clear BOTH in-use generations over every slot. The decode steps that ran
+            // with the block returned grouped by the larger cap (stream/2 of the full partition); their stale claims, kept as the
+            // "previous generation", would otherwise protect more than half of the smaller lent partition and starve the first
+            // group of the chunk ("no VRAM slot after acquire", seen after a long prefill + a few decode tokens).
+            std::memset(inuse_.data() + uint64_t(L) * slots_, 0, slots_);
+            std::memset(inuse_prev_.data() + uint64_t(L) * slots_, 0, slots_);
+            for (uint32_t s = elastic_base_; s < slots_; ++s) {
+                const uint64_t i = uint64_t(L) * slots_ + s;
+                if (tag_of_[i] >= 0) { slot_of_[uint64_t(L) * n_experts_ + uint32_t(tag_of_[i])] = -1; tag_of_[i] = -1; }
+                stamp_[i] = 0; inuse_[i] = 0; inuse_prev_[i] = 0; from_spec_[i] = 0; slot_seq_[i] = 0;
+                slot_ev_[i] = sycl::event{};
+            }
+            if (fill_cursor_[L] >= elastic_base_) fill_cursor_[L] = static_;
+            if (fifo_[L]        >= elastic_base_) fifo_[L]        = static_;
+        }
+        elastic_lent_ = true;
+    }
+    return elastic_blk_;
+}
+
+void Ds4ExpertCache::reclaim_elastic() noexcept {
+    elastic_lent_ = false;   // the elastic slots were invalidated at lend: empty and available again for decode
 }
 
 sycl::event Ds4ExpertCache::acquire_prefill(uint32_t L, const int32_t* ids, uint32_t n,
@@ -1641,15 +1699,15 @@ sycl::event Ds4ExpertCache::acquire_prefill(uint32_t L, const int32_t* ids, uint
         // so the cursor scan is a one-time cost per layer.
         {
             uint32_t s = fill_cursor_[L], found = kDs4NoSlot;
-            for (uint32_t tries = 0; tries < slots_ - static_ && s < slots_; ++tries, ++s)
+            for (uint32_t tries = 0; tries < avail_slots_() - static_ && s < avail_slots_(); ++tries, ++s)
                 if (tag_of(L, s) < 0) { found = s; break; }
-            fill_cursor_[L] = (found == kDs4NoSlot) ? slots_ : found + 1;
+            fill_cursor_[L] = (found == kDs4NoSlot) ? avail_slots_() : found + 1;
             if (found != kDs4NoSlot) {
                 tag_of(L, found) = e;
                 slot_of(L, uint32_t(e)) = int32_t(found);
                 touch(L, found);
                 from_spec_[uint64_t(L) * slots_ + found] = 0;
-                const sycl::event fe = xq_->memcpy(dev_[L] + uint64_t(found) * sb, src, size_t(sb));
+                const sycl::event fe = xq_->memcpy(static_cast<uint8_t*>(slot_ptr(L, found)), src, size_t(sb));
                 slot_ev_[uint64_t(L) * slots_ + found]  = fe;
                 slot_seq_[uint64_t(L) * slots_ + found] = ++seq_;
                 note_fill(fe);
@@ -1756,7 +1814,7 @@ sycl::event Ds4ExpertCache::acquire_impl(uint32_t L, const int32_t* ids, uint32_
         touch(L, v);
         from_spec_[uint64_t(L) * slots_ + v] = 0;
 
-        const sycl::event fe = xq_->memcpy(dev_[L] + uint64_t(v) * sb, src, size_t(sb));
+        const sycl::event fe = xq_->memcpy(static_cast<uint8_t*>(slot_ptr(L, v)), src, size_t(sb));
         slot_ev_[uint64_t(L) * slots_ + v]  = fe;
         slot_seq_[uint64_t(L) * slots_ + v] = ++seq_;
         note_fill(fe);
@@ -1800,7 +1858,7 @@ uint32_t Ds4ExpertCache::speculate(uint32_t L, const int32_t* ids, uint32_t n) {
         slot_of(L, uint32_t(e)) = int32_t(v);
         touch(L, v);
         from_spec_[uint64_t(L) * slots_ + v] = 1;
-        const sycl::event fe = xq_->memcpy(dev_[L] + uint64_t(v) * sb, src, size_t(sb));
+        const sycl::event fe = xq_->memcpy(static_cast<uint8_t*>(slot_ptr(L, v)), src, size_t(sb));
         // Recorded exactly as a demand fetch is, so that a later acquire which
         // HITS this slot before the copy lands returns an event that covers it.
         slot_ev_[uint64_t(L) * slots_ + v]  = fe;

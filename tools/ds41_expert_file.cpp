@@ -29,7 +29,7 @@
 int main(int argc, char** argv) {
     if (argc < 3) { std::fprintf(stderr, "usage: ie-ds41-expert-file <model> <ranking> [--cutoff N] [--out PATH] [--threads T] --confirm\n"); return 2; }
     const std::string dir = argv[1], ranking = argv[2];
-    uint32_t cutoff = 297, end = 0, nthreads = 8; std::string out = dir + "/" + "ie_experts_tail.ieslot"; bool confirm = false;
+    uint32_t cutoff = 297, end = 0, nthreads = 8; std::string out = dir + "/" + "ie_experts_tail.ieslot"; bool confirm = false, verify = false;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--cutoff" && i + 1 < argc) cutoff = uint32_t(std::atoi(argv[++i]));
@@ -37,6 +37,7 @@ int main(int argc, char** argv) {
         else if (a == "--out" && i + 1 < argc) out = argv[++i];
         else if (a == "--threads" && i + 1 < argc) nthreads = uint32_t(std::atoi(argv[++i]));
         else if (a == "--confirm") confirm = true;
+        else if (a == "--verify") verify = true;
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
     ie::DeepSeek41Model m; if (auto e = m.load(dir); !e.empty()) { std::fprintf(stderr, "load: %s\n", e.c_str()); return 1; }
@@ -45,6 +46,40 @@ int main(int argc, char** argv) {
     if (cutoff >= end) { std::fprintf(stderr, "the window [%u, %u) is empty (expert count %u)\n", cutoff, end, E); return 2; }
     ie::Ds4SlotLayout lay; if (auto e = ie::ds41_slot_layout(c.dim, c.moe_inter_dim, lay); !e.empty()) { std::fprintf(stderr, "layout: %s\n", e.c_str()); return 1; }
     if (lay.bytes % 4096) { std::fprintf(stderr, "the slot (%llu bytes) is not a 4 KiB multiple; O_DIRECT reads of it would need padding -- not written\n", (unsigned long long)lay.bytes); return 1; }
+    if (verify) {   // read-only: every slot the file's table holds against the live shards' pack path, byte for byte (the ranking argument is unused)
+        const int vfd = open(out.c_str(), O_RDONLY), vdfd = open(out.c_str(), O_RDONLY | O_DIRECT);
+        if (vfd < 0 || vdfd < 0) { std::perror("open file to verify"); return 1; }
+        ie::Ds41ExpertFileHeader vh{};
+        if (pread(vfd, &vh, sizeof vh, 0) != ssize_t(sizeof vh) || std::memcmp(vh.magic, ie::kDs41ExpertFileMagic, 8) != 0) { std::fprintf(stderr, "%s is not an IESLOT01 file\n", out.c_str()); return 1; }
+        if (vh.H != c.dim || vh.EF != c.moe_inter_dim || vh.n_layers != NL || vh.n_experts != E || vh.slot_bytes != lay.bytes) { std::fprintf(stderr, "layout mismatch between %s and the model\n", out.c_str()); return 1; }
+        std::vector<uint64_t> vt(size_t(NL) * E);
+        if (pread(vfd, vt.data(), vt.size() * 8, off_t(vh.table_off)) != ssize_t(vt.size() * 8)) { std::fprintf(stderr, "table read failed\n"); return 1; }
+        std::vector<std::pair<uint32_t, uint32_t>> work;
+        for (uint32_t l = 0; l < NL; ++l) for (uint32_t e = 0; e < E; ++e) if (vt[size_t(l) * E + e]) work.push_back({l, e});
+        std::printf("verifying %zu slots of %s against the shards under %s (%u threads)\n", work.size(), out.c_str(), dir.c_str(), nthreads);
+        std::atomic<uint64_t> next{0}, done{0}, bad{0}; std::vector<std::atomic<uint32_t>> bad_by_layer(NL); std::mutex em; std::vector<std::pair<uint32_t, uint32_t>> firsts; std::string first_err;
+        const auto t0 = std::chrono::steady_clock::now(); std::vector<std::thread> ts;
+        for (uint32_t t = 0; t < nthreads; ++t) ts.emplace_back([&] {
+            void *a = nullptr, *b = nullptr, *bounce = nullptr;
+            if (posix_memalign(&a, 4096, size_t(lay.bytes)) != 0 || posix_memalign(&b, 4096, size_t(lay.bytes)) != 0 || posix_memalign(&bounce, 4096, size_t(ie::ds41_pack_bounce_bytes(lay))) != 0) return;
+            for (;;) {
+                const uint64_t k = next.fetch_add(1); if (k >= work.size()) break;
+                const auto [l, e] = work[k]; const auto& Lw = m.layers()[l];
+                std::string er = ie::ds41_slot_pack_pread(lay, m.store(), Lw.exp_w1[e], Lw.exp_w3[e], Lw.exp_w2[e], a, bounce);
+                if (er.empty()) er = ie::ds41_slot_pread_file(vdfd, vt[size_t(l) * E + e], b, lay.bytes, 0, 1, nullptr);
+                if (!er.empty()) { std::lock_guard<std::mutex> g(em); if (first_err.empty()) first_err = "layer " + std::to_string(l) + " expert " + std::to_string(e) + ": " + er; ++bad; continue; }
+                if (std::memcmp(a, b, size_t(lay.bytes)) != 0) { ++bad; ++bad_by_layer[l]; std::lock_guard<std::mutex> g(em); if (firsts.size() < 8) firsts.push_back({l, e}); }
+                const uint64_t d = ++done; if (d % 250 == 0) { std::printf("  %llu / %zu slots, %llu differ, %.0f s\n", (unsigned long long)d, work.size(), (unsigned long long)bad.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count()); std::fflush(stdout); }
+            }
+            std::free(a); std::free(b); std::free(bounce);
+        });
+        for (auto& t : ts) t.join();
+        std::printf("\nverified %llu of %zu slots: %llu DIFFER from the live shards%s\n", (unsigned long long)done.load(), work.size(), (unsigned long long)bad.load(), bad ? " -- the file is STALE" : " -- the file matches");
+        if (!first_err.empty()) std::printf("first read error: %s\n", first_err.c_str());
+        for (auto [l, e] : firsts) std::printf("  differs: layer %u expert %u\n", l, e);
+        if (bad) { std::printf("differing slots by layer:"); for (uint32_t l = 0; l < NL; ++l) if (bad_by_layer[l]) std::printf(" L%u=%u", l, bad_by_layer[l].load()); std::printf("\n"); }
+        return bad ? 5 : 0;
+    }
     std::vector<std::vector<uint32_t>> rank;
     if (auto e = ie::ds4_expert_priority_read_layers(ranking, E, NL, rank); !e.empty()) { std::fprintf(stderr, "ranking: %s\n", e.c_str()); return 1; }
     const uint64_t per_layer = end - cutoff, n_slots = uint64_t(NL) * per_layer;

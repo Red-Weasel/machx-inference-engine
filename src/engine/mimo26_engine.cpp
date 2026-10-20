@@ -674,6 +674,23 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
     uint32_t n_pass = 0, n_rows = 0, n_acc = 0, n_plain = 0, df_pass = 0, df_acc = 0;
     const uint32_t V = b.model.config().vocab_size;
     std::vector<int32_t> rows; std::vector<float> vlg;
+    // B68: where a decode step's wall time goes (the log line below): the target forward, the draft, the drafter's
+    // context, the sampling (incl. the finite scan and the token's emission) -- the rest is the loop's own
+    using clk = std::chrono::steady_clock;
+    double tm_fwd = 0, tm_draft = 0, tm_ctx = 0, tm_samp = 0, tm_plain = 0, tm_nodraft = 0;
+    // and the verify forwards' expert tier (Mimo26LayerStats summed over the layers): its wall, the CPU miss leg, the GPU groups
+    double vt_moe = 0, vt_cpu = 0, vt_groups = 0, vt_pcie = 0, vt_rows = 0, vt_cpu_exp = 0, vt_static = 0, vt_pinned = 0;
+    auto tally = [&] { for (const auto& st : b.fwd.stats()) { vt_moe += st.moe_ms; vt_cpu += st.cpu_ms; vt_groups += st.groups_ms; vt_pcie += double(st.pcie_bytes); vt_cpu_exp += st.experts_cpu;
+                                                               vt_static += st.experts_static; vt_pinned += st.experts_pinned + st.experts_mmap; } };
+    auto since = [](clk::time_point a) { return std::chrono::duration<double, std::milli>(clk::now() - a).count(); };
+    const auto t_loop = clk::now();
+    // B68: speculative sampling (IE_MIMO26_SPEC_SAMPLE=1, temperature > 0): each DFlash draft is SAMPLED from the drafter's
+    // softmax q and accepted with probability min(1, p / q), a rejection replaced by a draw from max(0, p - q) normalised
+    // (Leviathan et al. 2023) -- the output follows the sampler's distribution p exactly, and a draft is accepted with
+    // probability sum_x min(p(x), q(x)) instead of the greedy draft's p(argmax q). Off: v0.2.23's sample-and-compare.
+    static const bool spec_sample_env = [] { const char* v = std::getenv("IE_MIMO26_SPEC_SAMPLE"); return v && *v == '1'; }();
+    const bool ss = spec_sample_env && p.temperature > 0.f;
+    std::vector<double> ss_u, ss_p, ss_q, ss_w; std::vector<int32_t> ss_ids; uint32_t ss_rej = 0;
     int32_t id = Ds41Generator::sample(logits, recent, p, rng, svp);
     for (uint32_t k_done = 0;;) {
         if (!emit(id)) break;
@@ -689,34 +706,65 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
             static const long fault_at = [] { const char* v = std::getenv("IE_MIMO26_DFLASH_FAULT"); return v && *v ? std::atol(v) : 0L; }();
             static long n_drafts = 0;
             std::string e;
-            try { e = ++n_drafts == fault_at ? std::string("dflash: injected fault (IE_MIMO26_DFLASH_FAULT)") : b.dflash->draft(id, b.dflash_k, d, b.dflash_minp); }
+            const auto t0 = clk::now();
+            if (ss) { ss_u.resize(b.dflash_k); for (auto& x : ss_u) x = Ds41Generator::uniform(rng); }
+            try { e = ++n_drafts == fault_at ? std::string("dflash: injected fault (IE_MIMO26_DFLASH_FAULT)") : b.dflash->draft(id, b.dflash_k, d, b.dflash_minp, ss ? ss_u.data() : nullptr); }
             catch (const std::exception& x) { e = std::string("dflash: ") + x.what(); }
+            tm_draft += since(t0);
+            if (d.empty()) tm_nodraft += since(t0);
             if (e.empty()) from_df = true;
             else { d.clear(); df_fail(e); }   // (a failed draft may hold the rows before the bad one: none is used)
         }
         if (d.size() > max_new - k_done) d.resize(max_new - k_done);
         const uint32_t pos = b.fwd.n_pos();
         if (d.empty()) {
+            auto t0 = clk::now();
             if (auto e = b.fwd.forward(&id, 1, pos, logits, false); !e.empty()) {
                 b.live.clear(); b.fwd.reset(); b.cache.live_lost();
                 r.finish_reason = "error: mimo_v2 decode: " + e; return r;
             }
+            tm_fwd += since(t0); tm_plain += since(t0);
             b.live.push_back(id); ++n_plain;
-            add_ctx(1, pos, 1);
+            t0 = clk::now(); add_ctx(1, pos, 1); tm_ctx += since(t0);
+            t0 = clk::now();
             inject_fault(logits.data(), logits.size());
             if (!sampled_ok(logits.data(), logits.size(), pos, "decode")) return r;
             id = Ds41Generator::sample(logits, recent, p, rng, svp);
+            tm_samp += since(t0);
             continue;
         }
         rows.assign(1, id); rows.insert(rows.end(), d.begin(), d.end());
+        auto t0 = clk::now();
         if (auto e = b.fwd.forward(rows.data(), uint32_t(rows.size()), pos, vlg, true); !e.empty()) {
             b.live.clear(); b.fwd.reset(); b.cache.live_lost();
             r.finish_reason = "error: mimo_v2 lookup verify: " + e; return r;
         }
+        tm_fwd += since(t0); tally(); vt_rows += double(rows.size()); t0 = clk::now();
         uint32_t acc = 0; int32_t next = -1; bool ended = false, drop_last = false;
         for (uint32_t rr = 0; rr <= d.size(); ++rr) {
             inject_fault(vlg.data() + size_t(rr) * V, V);
             if (!sampled_ok(vlg.data() + size_t(rr) * V, V, pos + rr, "verify")) return r;
+            if (ss && from_df && rr < d.size()) {   // B68: speculative sampling of a sampled draft (above)
+                Ds41Generator::distribution(vlg.data() + size_t(rr) * V, V, recent, p, ss_ids, ss_p, svp);
+                double pd = 0;
+                for (size_t i = 0; i < ss_ids.size(); ++i) if (ss_ids[i] == d[rr]) { pd = ss_p[i]; break; }
+                if (Ds41Generator::uniform(rng) * b.dflash->sampled_q(rr) < pd) {   // accepted with probability min(1, p / q)
+                    const int32_t a = d[rr];
+                    ++acc;
+                    if (!emit(a)) { ended = true; drop_last = true; break; }
+                    idx.push(a);
+                    if (++k_done == max_new) { ended = true; break; }
+                    continue;
+                }
+                ++ss_rej;   // rejected: the next token from max(0, p - q) over p's candidates (q's mass elsewhere has p = 0)
+                const std::string qe = b.dflash->row_q(rr, ss_ids, ss_q);
+                ss_w.resize(ss_ids.size()); double tot = 0;
+                for (size_t i = 0; i < ss_ids.size(); ++i) { ss_w[i] = qe.empty() ? std::max(0.0, ss_p[i] - ss_q[i]) : ss_p[i]; tot += ss_w[i]; }
+                if (tot <= 0) { ss_w = ss_p; tot = 1.0; }   // p <= q everywhere cannot reject; rounding: draw from p
+                const double u = Ds41Generator::uniform(rng) * tot; double c = 0; next = ss_ids.back();
+                for (size_t i = 0; i < ss_ids.size(); ++i) { c += ss_w[i]; if (u < c) { next = ss_ids[i]; break; } }
+                break;
+            }
             const int32_t a = Ds41Generator::sample_row(vlg.data() + size_t(rr) * V, V, recent, p, rng, svp);
             if (rr == d.size() || a != d[rr]) { next = a; break; }
             ++acc;
@@ -725,16 +773,28 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
             if (++k_done == max_new) { ended = true; break; }
         }
         const uint32_t keep = 1 + acc - (drop_last ? 1u : 0u);         // the rows of id and the accepted drafts
+        tm_samp += since(t0);
         b.fwd.rewind(pos + keep);
-        if (keep) add_ctx(keep, pos, uint32_t(rows.size()));
+        t0 = clk::now(); if (keep) add_ctx(keep, pos, uint32_t(rows.size())); tm_ctx += since(t0);
         if (from_df) { ++df_pass; df_acc += acc; if (vit) vit->add_draft(uint32_t(d.size()), acc); }
         b.live.insert(b.live.end(), rows.begin(), rows.begin() + keep);
         ++n_pass; n_rows += uint32_t(rows.size()); n_acc += acc;
         if (ended) break;
         id = next;
     }
-    if (b.dflash) std::fprintf(stderr, "[mimo26 dflash] %u passes, %u drafts accepted (%.2f per pass)%s\n", df_pass, df_acc, df_pass ? double(df_acc) / df_pass : 0.0,
-                               df_on ? "" : ("; OFF after a drafter fault at token " + std::to_string(df_fault_at)).c_str());
+    if (b.dflash) std::fprintf(stderr, "[mimo26 dflash] %u passes, %u drafts accepted (%.2f per pass)%s%s\n", df_pass, df_acc, df_pass ? double(df_acc) / df_pass : 0.0,
+                               df_on ? "" : ("; OFF after a drafter fault at token " + std::to_string(df_fault_at)).c_str(),
+                               ss ? ("; speculative sampling, " + std::to_string(ss_rej) + " rejections").c_str() : "");
+    if (const uint32_t nf = n_pass + n_plain)
+        std::fprintf(stderr, "[mimo26 decode] %u steps (%u verify, %u plain), ms per step: %.1f = forward %.1f, draft %.1f, drafter context %.1f, "
+                     "sampling %.1f, other %.1f; forward per plain step %.1f, per verify %.1f; empty drafts %.1f ms per plain step\n", nf, n_pass, n_plain,
+                     since(t_loop) / nf, tm_fwd / nf, tm_draft / nf, tm_ctx / nf, tm_samp / nf, (since(t_loop) - tm_fwd - tm_draft - tm_ctx - tm_samp) / nf,
+                     n_plain ? tm_plain / n_plain : 0.0, n_pass ? (tm_fwd - tm_plain) / n_pass : 0.0, n_plain ? tm_nodraft / n_plain : 0.0);
+    if (n_pass)
+        std::fprintf(stderr, "[mimo26 decode] per verify (%.1f rows): expert tiers %.1f ms, CPU leg %.1f (%.0f experts), GPU groups %.1f, PCIe %.2f GB; "
+                     "experts used %.0f, static (VRAM) %.0f = %.1f %%\n",
+                     vt_rows / n_pass, vt_moe / n_pass, vt_cpu / n_pass, vt_cpu_exp / n_pass, vt_groups / n_pass, vt_pcie / n_pass / 1e9,
+                     (vt_static + vt_pinned) / n_pass, vt_static / n_pass, 100.0 * vt_static / std::max(1.0, vt_static + vt_pinned));
     if (b.lookup) std::fprintf(stderr, "[mimo26 lookup] %u tokens: %u verify passes (%u rows, %u drafts accepted), %u plain steps\n",
                                r.completion_tokens, n_pass, n_rows, n_acc, n_plain);
     if (!pending.empty()) { text += pending; if (on_token) on_token(pending); }

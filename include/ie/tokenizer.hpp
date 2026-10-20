@@ -150,6 +150,8 @@ private:
     // that deliberately omits it. P2 gate 2026-09-01: 15/62 '~'+punct pairs
     // split differently through the joyai table.
     bool        hyv4_          = false;
+    bool        laguna_        = false;   // Laguna-S-2.1: [^\n]+|[\n]+ first, then the qwen2 regex (Unicode classes) per piece
+    bool        inkling_       = false;   // Inkling-Small: the o200k-family regex with \p{M} letters (pretokenize_inkling)
     // The qwen2 regex over REAL Unicode categories (pretokenize_qwen2_unicode): set only by load_from_hf_json for a
     // tokenizer.json whose one Split is the Qwen2 pattern (MiMo-V2.6, docs/mimo26 P1 gate finding 1). The GGUF path
     // keeps the byte-level approximation of pretokenize_simple, byte for byte.

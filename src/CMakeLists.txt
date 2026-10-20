@@ -103,6 +103,8 @@ add_library(ie_core
   model/dspark_drafter.cpp
   model/qwen35_split.cpp
   model/qwen4exp.cpp
+  model/laguna.cpp
+  model/inkling.cpp
   model/qwen4_vision.cpp
   model/qwen4_image.cpp
   model/ds4_vision.cpp
@@ -147,6 +149,8 @@ add_library(ie_core
   engine/engine.cpp
   engine/ds41_engine.cpp
   engine/mimo26_engine.cpp
+  engine/laguna_engine.cpp
+  engine/inkling_engine.cpp
   engine/glm5_server.cpp
   engine/lanes_serve.cpp
   server/openai_proto.cpp

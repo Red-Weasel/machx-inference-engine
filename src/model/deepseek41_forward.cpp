@@ -174,6 +174,7 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
         }
 
         uint32_t n_static = opt.n_static, n_pinned = opt.n_pinned;
+        uint32_t n_elastic = 0; uint64_t elastic_blk = 0;   // docs/105: extra stream slots lent as prefill scratch
         if (n_static + n_pinned == 0) {
             const auto& dev = q.get_device();
             const uint64_t free_now = dev.has(sycl::aspect::ext_intel_free_memory)
@@ -207,6 +208,12 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
             const uint64_t per_slot_all_layers = uint64_t(tnL) * lay.bytes;     // one slot in every layer of THIS tier
             const uint32_t experts_here = ep_ == 1 ? (c.n_routed_experts - ci + n_cards - 1) / n_cards : c.n_routed_experts;
             const uint32_t slots = ds41_static_slots(for_experts, per_slot_all_layers, experts_here);
+            // docs/105 elastic region: devote opt.elastic_bytes of the reserve headroom to ADDITIONAL stream
+            // slots (block sized to also hold the lent prefill scratch). Capped so total slots <= experts_here.
+            if (opt.elastic_bytes && per_slot_all_layers && slots < experts_here) {
+                n_elastic   = uint32_t(std::min<uint64_t>(opt.elastic_bytes / per_slot_all_layers, experts_here - slots));
+                elastic_blk = std::max<uint64_t>(opt.elastic_bytes, scratch + nc_scratch);
+            }
             const uint32_t extra = uint32_t(lanes_.size() - 1);
             if (auto e = ds41_static_refusal(slots, stream, for_experts, extra, lane_bytes_[ci], lane_ctx_); !e.empty()) return e;
             if (extra)   // P4 B14: what the lanes cost this card's static tier, never silent
@@ -233,7 +240,7 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
             for (uint32_t give_back = 0; give_back <= 8 && n_static > give_back; ++give_back) {
                 const uint32_t ns = n_static - give_back;
                 try {
-                    te = card.tier.init(q, m, tL0, tnL, ranking, ns, n_pinned, stream, fwd_cap_, ep_ == 1 ? uint32_t(ci) : 0u, ep_ == 1 ? n_cards : 1u);
+                    te = card.tier.init(q, m, tL0, tnL, ranking, ns, n_pinned, stream, fwd_cap_, ep_ == 1 ? uint32_t(ci) : 0u, ep_ == 1 ? n_cards : 1u, n_elastic, elastic_blk);
                 } catch (const sycl::exception& ex) { te = std::string("threw: ") + ex.what(); }
                 if (te.empty()) {
                     if (give_back) std::fprintf(stderr, "[ds41 forward] card %zu: the VRAM claim overshot; %u static slots per layer instead of %u (the rest stream from the pinned tier)\n", ci, ns, n_static);
@@ -701,7 +708,22 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
     const bool dec_keep = dec_cache && T <= kDs41MaxDecodeRows;
     if (dec_keep && card.dec_scratch.size() <= T) { card.dec_scratch.resize(T + 1); card.dec_cursor.resize(T + 1, 0); }   // one list per step length (P2)
     if (dec_keep) card.dec_cursor[T] = 0;
+    // docs/105 elastic region: on a big-scratch chunk (T > kDs41MaxDecodeRows) borrow the cache's elastic
+    // block as THIS forward's scratch -- the elastic slots vanish, leaving exactly today's slot count for the
+    // chunk (byte-identical prefill), and the block's VRAM (former reserve headroom) is reused instead of a
+    // fresh malloc. The guard reclaims on every run_card exit so decode gets its extra slots back.
+    uint8_t* eblk = nullptr; uint64_t ecur = 0, ecap = 0;
+    struct ElasticGuard { Ds41ExpertTier* t = nullptr; ~ElasticGuard() { if (t) t->reclaim_elastic(); } } eguard;
+    if (T > kDs41MaxDecodeRows && card.tier.has_elastic()) {
+        eblk = static_cast<uint8_t*>(card.tier.lend_elastic(q));
+        if (eblk) { ecap = card.tier.elastic_block_bytes(); eguard.t = &card.tier; }
+    }
     auto take = [&](size_t bytes) -> void* {
+        if (eblk) {   // bump from the lent block; an overflow falls through to a per-call malloc below
+            const size_t a = (bytes + 255) & ~size_t(255);
+            if (ecur + a <= ecap) { void* p = eblk + ecur; ecur += a; return p; }
+            return nullptr;
+        }
         if (!dec_keep) return nullptr;
         auto& ds = card.dec_scratch[T]; size_t& cur = card.dec_cursor[T];
         if (cur < ds.size()) return ds[cur].second == bytes ? ds[cur++].first : nullptr;

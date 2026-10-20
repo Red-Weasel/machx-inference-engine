@@ -188,6 +188,55 @@ int32_t Ds41Generator::sample_row(float* lg, size_t V, const std::vector<int32_t
     return idx[n - 1];
 }
 
+double Ds41Generator::uniform(uint64_t& rng) { return uniform01(rng); }
+
+void Ds41Generator::distribution(float* lg, size_t V, const std::vector<int32_t>& recent, const Ds41SampleParams& sp,
+                                 std::vector<int32_t>& ids, std::vector<double>& probs, Ds41SampleStats* stats) {
+    // sample_row's steps, in its order and arithmetic, up to its draw (which picks from p[0, n) with weights p / zz)
+    if (sp.repeat_penalty != 1.f && sp.repeat_window)
+        for (size_t i = recent.size() > sp.repeat_window ? recent.size() - sp.repeat_window : 0; i < recent.size(); ++i) {
+            const int32_t id = recent[i];
+            if (id < 0 || size_t(id) >= V) continue;
+            lg[size_t(id)] = lg[size_t(id)] > 0 ? lg[size_t(id)] / sp.repeat_penalty : lg[size_t(id)] * sp.repeat_penalty;
+        }
+    if (sp.temperature <= 0.f) {
+        if (stats) stats->has_H = false;
+        ids.assign(1, int32_t(std::max_element(lg, lg + V) - lg)); probs.assign(1, 1.0); return;
+    }
+    std::vector<int32_t> idx(V); std::iota(idx.begin(), idx.end(), 0);
+    auto by_logit = [&](int32_t a, int32_t b) { return lg[size_t(a)] > lg[size_t(b)] || (lg[size_t(a)] == lg[size_t(b)] && a < b); };
+    size_t keep = V;
+    if (sp.top_k && sp.top_k < V) { std::nth_element(idx.begin(), idx.begin() + std::ptrdiff_t(sp.top_k), idx.end(), by_logit); keep = sp.top_k; }
+    const double mx = double(*std::max_element(lg, lg + V)) / sp.temperature;
+    double z = 0;
+    for (size_t i = 0; i < keep; ++i) z += std::exp(double(lg[size_t(idx[i])]) / sp.temperature - mx);
+    const double target = sp.top_p < 1.f ? double(sp.top_p) : 2.0;
+    std::vector<double> p;
+    size_t n = 0;
+    for (size_t K = std::min<size_t>(keep, 64);; K = std::min(keep, K * 4)) {
+        if (K < keep) std::nth_element(idx.begin(), idx.begin() + std::ptrdiff_t(K), idx.begin() + std::ptrdiff_t(keep), by_logit);
+        std::sort(idx.begin(), idx.begin() + std::ptrdiff_t(K), by_logit);
+        p.resize(K);
+        for (size_t i = 0; i < K; ++i) p[i] = std::exp(double(lg[size_t(idx[i])]) / sp.temperature - mx) / z;
+        double c = 0; bool fits = false;
+        for (n = 0; n < K;) { c += p[n]; ++n; if (c >= target) { fits = true; break; } }
+        if (fits || K == keep) break;
+    }
+    if (stats) {
+        double s = 0;
+        if (keep == V) for (size_t i = 0; i < V; ++i) { const double a = double(lg[i]) / sp.temperature - mx; s += std::exp(a) * a; }
+        else for (size_t i = 0; i < keep; ++i) { const double a = double(lg[size_t(idx[i])]) / sp.temperature - mx; s += std::exp(a) * a; }
+        stats->has_H = true;
+        stats->H = std::log(z) - s / z;
+        stats->margin = p[0] - (p.size() > 1 ? p[1] : 0.0);
+    }
+    if (sp.min_p > 0.f) { const double floor = sp.min_p * p[0]; size_t m = 0; while (m < n && p[m] >= floor) ++m; n = std::max<size_t>(1, m); }
+    double zz = 0; for (size_t i = 0; i < n; ++i) zz += p[i];
+    ids.assign(idx.begin(), idx.begin() + std::ptrdiff_t(n));
+    probs.resize(n);
+    for (size_t i = 0; i < n; ++i) probs[i] = p[i] / zz;
+}
+
 namespace {
 // The plain loop's per-token emission -- eos, the ids, the UTF-8 hold-back, the stop strings -- one token at a time in
 // order; the speculative loop (docs/deepseek41/58) feeds it the committed tokens the same way.

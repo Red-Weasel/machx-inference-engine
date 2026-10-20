@@ -19,6 +19,7 @@
 
 **Latest**
 
+- **v0.2.25, October 20 — two new models:** [Laguna S 2.1](#new-in-v0225) (118B-A8B) and Inkling-Small (276B-A12B) run in `ie serve` on one card or two; Laguna writes **33.7–35.1 tok/s** on two cards. DeepSeek-V4.1-Flash decodes **10.6 % faster** with byte-identical output. Host↔device copies on the new models and in the VRAM self-test go through pinned memory, and the 27B's `ie serve` no longer crashes on exit. [Details](#new-in-v0225)
 - **Video, October 5–6:** [LTX-2.5](docs/ltx25/LTX25_ON_ARC.md) makes 5 seconds of 1280×704 video with sound in about 21 s on two Arc Pro B70 cards (stock PyTorch: 79 s).
 - **v0.2.23, October 12 — MiMo faster:** MiMo-V2.6-Flash writes **23–26 % faster** with the same tokens (27.8–28.3 tok/s with its drafter, 21.8–23.3 before) and reads long prompts up to **43 % faster** in `ie serve` (37,810 tokens: 92.5 → 53.4 s). DeepSeek-V4.1-Flash decodes about 7 % faster. [Details](#new-in-v0223)
 - **v0.2.21, October 7 — Flash-Next sees long images:** Flash-Next answered image prompts of more than 2,048 tokens as if there were no image (v0.2.10 through v0.2.20); fixed. A conversation edited in the middle restarts from a saved point on Flash-Next too (28.5 → 18.4 s on a 15.7K-token prompt), and image conversations keep their restart points (second turn on Flash-Next 24.8 → 3.0 s). `--spec` is now offered for the 35B-A3B class and Flash-Next. [Details](#new-in-v0221)
@@ -172,6 +173,49 @@ class ([New in v0.2.6](#new-in-v026)).
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
 
 ---
+
+<a id="new-in-v0225"></a>
+## 🆕 New in v0.2.25
+
+Everything since [v0.2.23](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.23) (v0.2.24 was not
+published). Measured October 13–18, 2026, on Arc Pro B70 cards; greedy unless a line says otherwise.
+
+### Laguna S 2.1 and Inkling-Small run
+
+- **Laguna S 2.1** (poolside, 118B-A8B, UD-Q4_K_M): `ie serve` with its chat template, thinking, tool calls and prefix reuse.
+  Its 24-token greedy text matches llama.cpp. On two cards each card runs half the layers and caches its own layers'
+  experts. After a 548-token prompt, decode goes from 20.8 tok/s on one card to 32.9 on two, with identical tokens. The
+  full `ie serve` test on two cards (chat, a tool call, the tool result, a streamed tool call) decoded 33.7–35.1 tok/s.
+  On two cards, card 1 reads the next prompt chunk while card 2 finishes the current one: prefill on a 2,192-token
+  prompt goes from 119.1 to 178.4 tok/s, with the same tokens.
+- **Inkling-Small** (Thinking Machines Lab, 276B-A12B, UD-Q4_K_XL): `ie serve` with its chat template (8/8
+  byte-identical to the GGUF's own), thinking and tool calls. Its greedy text matches llama.cpp (the reference graph in
+  llama.cpp PR #25731). On two cards: 22.45 tok/s decode with a cold expert cache; prefill on a 2,200-token prompt goes
+  from 146.0 to 211.6 tok/s with the cards overlapped.
+
+### DeepSeek-V4.1-Flash decodes 10.6 % faster
+
+The expert stream cache gets extra slots from a 3 GiB block that prefill borrows as scratch and decode gets back, so
+they cost no VRAM at the prefill peak. Decode goes from 8.42 to 9.31 tok/s on the gate prompt; the output is
+byte-identical with the block on and off. `IE_DS41_ELASTIC_GIB=0` turns it off.
+
+The DeepSeek V4 and V4.1 tool-call parsers are hardened: a stray `>` or quote left on a tool name is cleaned, markup in
+a name is refused, and one-reading JSON slips are repaired (raw control characters, invalid escapes, trailing commas).
+A malformed call still executes nothing.
+
+### MiMo-V2.6-Flash decode attention
+
+Two heads per sub-group with float tiles of 8 keys. A full layer at 30K positions × 8 rows takes 2.03 ms instead of
+3.74, bit-identical; `ie serve` at 38K tokens is about 6 % faster.
+
+### Reliability
+
+- Pageable host memory: on fresh contexts, copies from it faulted the card (`-EFAULT`, then DEVICE_LOST). Laguna's and
+  Inkling's host↔device copies now go through a 64 MiB pinned buffer per card. The VRAM page-alias self-test, which runs
+  on every device allocation of 64 MiB or more, does its copy-engine writes and read-back through pinned memory too.
+- The Qwen3.8-27B's `ie serve` segfaulted on every exit (restart points freed after their allocators); fixed.
+- `--spec` is documented as near-lossless, not lossless: on rare near-ties the verify pass can pick a different token
+  than plain greedy decoding. Run without `--spec` for bit-exact output.
 
 <a id="new-in-v0223"></a>
 ## 🆕 New in v0.2.23
@@ -1329,13 +1373,12 @@ the benchmarked models. Prebuilt container images may lag these source updates.
 | **Qwen dense** · `qwen2`, `qwen3` | Qwen2/2.5/3, compatible Qwen distills | `ie serve`; shared dense transformer path with architecture-specific attention handling |
 | **Llama-compatible dense** · `llama`, `phi3`, `granite` | Llama-3.x, compatible Mistral, Phi and Granite GGUFs | `ie serve`; shared dense path; compatibility depends on GGUF architecture and tensor layout |
 | **GLM-5.2** · `glm-dsa` | GLM-5.2 | Experimental `ie-glm52-run`; standalone MLA + MoE forward path |
+| **Laguna S 2.1** · `laguna` | Laguna-S-2.1 (118B-A8B MoE) | `ie serve` on one or two cards; sliding-window + full attention, GLM-style thinking and tool calls |
+| **Inkling-Small** · `inkling` | Inkling-Small (276B-A12B MoE) | `ie serve` on one or two cards; shortconv + relative-bias attention |
 | **Tencent Hy4-preview** · `hyv4` | Hy4-preview | Experimental `ie-hyv4-run`; standalone generation/PPL, two-GPU stage split and STQ1/IQ1 quantization support; no general server qualification claimed |
 
 Every model `ie serve` runs can also be one server of an `ie supervise` layout, on the cards the layout gives it
 ([layouts](docs/serve_config.md)).
-
-**Recognized without an inference runtime:** Inkling-Small (`inkling`) and
-Laguna S 2.1 (`laguna`). Loader recognition is not runnable model support.
 
 **Weight import:** `ie import` converts supported AWQ, GPTQ and EXL3 safetensors
 to native GGUF. Import format support does not add an unsupported architecture.

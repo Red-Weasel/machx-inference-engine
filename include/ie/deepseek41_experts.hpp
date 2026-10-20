@@ -151,13 +151,22 @@ public:
     std::string init(sycl::queue& q, const DeepSeek41Model& m, uint32_t first_layer, uint32_t n_layers,
                      const std::vector<std::vector<uint32_t>>& ranking,
                      uint32_t n_static, uint32_t n_pinned, uint32_t stream_slots, uint32_t max_tokens,
-                     uint32_t part = 0, uint32_t n_parts = 1);
+                     uint32_t part = 0, uint32_t n_parts = 1,
+                     uint32_t n_elastic = 0, uint64_t elastic_block_bytes = 0);
     // The same over any model's expert planes (MiMo-V2.6: docs/mimo26).
     std::string init(sycl::queue& q, const Ds41ExpertSource& s, uint32_t first_layer, uint32_t n_layers,
                      const std::vector<std::vector<uint32_t>>& ranking,
                      uint32_t n_static, uint32_t n_pinned, uint32_t stream_slots, uint32_t max_tokens,
-                     uint32_t part = 0, uint32_t n_parts = 1);
+                     uint32_t part = 0, uint32_t n_parts = 1,
+                     uint32_t n_elastic = 0, uint64_t elastic_block_bytes = 0);
     void free_storage(sycl::queue& q);
+
+    // Elastic region (docs/deepseek41/105): pass-throughs to the stream cache. The forward lends the block
+    // as its prefill-chunk scratch and reclaims it for decode. No-ops when the cache has no elastic slots.
+    void*    lend_elastic(sycl::queue& q) { return cache_.lend_elastic(q); }
+    void     reclaim_elastic() { cache_.reclaim_elastic(); }
+    bool     has_elastic() const { return cache_.elastic_slots() > 0; }
+    uint64_t elastic_block_bytes() const { return cache_.elastic_block_bytes(); }
 
     // y[T, H] = routed MoE for model layer L (must be in this tier's range); y is zeroed here.
     // x is the post-ffn_norm stream [T, H] fp32; ridx/rw are HOST [T*top_k] from the router.

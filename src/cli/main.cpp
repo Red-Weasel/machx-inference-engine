@@ -37,14 +37,16 @@ const char* USAGE =
   "                                 1024 measured pp512 72 -> 105 tok/s BUT needs a lowered\n"
   "                                 expert-slot count, which is still bench-only, or it OOMs.)\n"
   "                                (--spec = MTP self-speculative GREEDY decode for the\n"
-  "                                 Qwen3.6-27B (kQwen35Dense, single-GPU); always LOSSLESS.\n"
+  "                                 Qwen3.6-27B (kQwen35Dense, single-GPU); near-lossless\n"
+  "                                 (greedy; rare near-tie token flips vs plain decode).\n"
   "                                 Faster only when the verify forward is cheap: ~1.1-1.2x on\n"
   "                                 Q8_0-quant MTP heads, but it REGRESSES on Q4_K_M (the Q4_K\n"
   "                                 verify is dequant-bound; see docs/authority/qwen35-27b.md).\n"
   "                                 Optional --spec-k K (default 4))\n"
   "                                (--spec-draft <dspark.gguf> = separate-draft spec decode\n"
   "                                 for the Qwen3.6-27B (kQwen35Dense, single-GPU) using a\n"
-  "                                 target-conditioned dspark drafter; always LOSSLESS greedy)\n"
+  "                                 target-conditioned dspark drafter; near-lossless greedy\n"
+  "                                 -- rare near-tie flips vs plain, as --spec)\n"
   "                                (--gpus N>1 = split across N GPUs: tensor-parallel\n"
   "                                 for dense archs, layer-split for Qwen3-Next-80B —\n"
   "                                 runs models too big for one card, e.g. Qwen2.5-72B\n"
@@ -401,7 +403,7 @@ int main(int argc, char** argv) {
         if (line.empty()) continue;
         turns.push_back({"user", line});
         ie::SamplingParams sp = launch.defaults.sampling;
-        // --spec is GREEDY-only (the lossless guarantee holds for argmax decode);
+        // --spec is GREEDY-only (near-lossless: equals argmax decode except rare near-tie flips);
         // force temperature 0 so the spec path actually engages instead of silently
         // falling back to sampled decode.
         if (opts.spec || !opts.spec_draft.empty()) sp.temperature = 0.0f;

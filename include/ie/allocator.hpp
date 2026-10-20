@@ -61,6 +61,11 @@ std::string dev_alloc_owner(const void* p);
 // overwrite=0. Idempotent; also run from a static initializer in allocator.cpp.
 void apply_runtime_defaults();
 
+// sycl::malloc_device with the VRAM 2 MiB page-alias self-test (allocator.cpp, P4 B50) on allocations of
+// IE_ALLOC_ALIAS_MIN_MIB or more: what DeviceAllocator::malloc does, for runtimes that hold a bare queue.
+// Null when the allocation fails or no sound allocation was found.
+void* malloc_device_checked(sycl::queue& q, size_t nbytes);
+
 class DeviceAllocator {
 public:
     // Picks the `ordinal`-th GPU device whose name contains `name_filter`

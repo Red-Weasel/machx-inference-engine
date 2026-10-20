@@ -63,8 +63,13 @@ public:
     // The drafts after `anchor` (the token at position p = ctx_end(), not yet in the target's caches): up to block - 1
     // greedy tokens, `k` of them returned -- cut before the first draft whose softmax probability under the drafter is
     // below `min_p` (0 keeps all k: a verify row costs ~25 ms, so a likely rejection is cheaper not drafted).
-    std::string draft(int32_t anchor, uint32_t k, std::vector<int32_t>& out, float min_p = 0.f);
+    // B68: with `u` (k uniforms in [0, 1)), each draft is SAMPLED from its row's softmax (inverse CDF at u[r]) instead of
+    // taken greedily, for speculative sampling (accept with min(1, p / q)); the cut still reads the row's top-1 probability.
+    std::string draft(int32_t anchor, uint32_t k, std::vector<int32_t>& out, float min_p = 0.f, const double* u = nullptr);
     const std::vector<float>& last_probs() const { return probs_; }   // the last draft's top-1 probabilities, all k rows
+    // B68, after a sampled draft: q(draft r) under the drafter, and q of `ids` at row r (its logits row read back)
+    double sampled_q(uint32_t r) const { return r < qsel_.size() ? double(qsel_[r]) : 0.0; }
+    std::string row_q(uint32_t r, const std::vector<int32_t>& ids, std::vector<double>& q);
     // P5 gate (d): dflash.py's forward as shipped -- no attention sinks, value scale 1 -- for the reference comparison
     void set_reference_form(bool on) { ref_form_ = on; }
     uint64_t vram_bytes() const { return bytes_; }
@@ -101,6 +106,8 @@ private:
     int32_t* pos_ = nullptr;
     int32_t* top_id_ = nullptr; float* top_p_ = nullptr;   // [block]: the head rows' argmax and its softmax probability
     std::vector<float> probs_;
+    float* qs_ = nullptr;                        // B68 [4][block]: the uniforms, then per row q(sampled), the max logit, the sum
+    std::vector<float> qsel_, gmax_, gsum_, row_;
     bool ref_form_ = false;
     std::vector<void*> owned_;
     uint64_t bytes_ = 0;

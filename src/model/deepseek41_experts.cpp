@@ -290,14 +290,16 @@ Ds41ExpertSource Ds41ExpertSource::from(const DeepSeek41Model& m, uint32_t first
 std::string Ds41ExpertTier::init(sycl::queue& q, const DeepSeek41Model& m, uint32_t first_layer, uint32_t n_layers,
                                  const std::vector<std::vector<uint32_t>>& ranking,
                                  uint32_t n_static, uint32_t n_pinned, uint32_t stream_slots, uint32_t max_tokens,
-                                 uint32_t part, uint32_t n_parts) {
-    return init(q, Ds41ExpertSource::from(m, first_layer), first_layer, n_layers, ranking, n_static, n_pinned, stream_slots, max_tokens, part, n_parts);
+                                 uint32_t part, uint32_t n_parts,
+                                 uint32_t n_elastic, uint64_t elastic_block_bytes) {
+    return init(q, Ds41ExpertSource::from(m, first_layer), first_layer, n_layers, ranking, n_static, n_pinned, stream_slots, max_tokens, part, n_parts, n_elastic, elastic_block_bytes);
 }
 
 std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint32_t first_layer, uint32_t n_layers,
                                  const std::vector<std::vector<uint32_t>>& ranking,
                                  uint32_t n_static, uint32_t n_pinned, uint32_t stream_slots, uint32_t max_tokens,
-                                 uint32_t part, uint32_t n_parts) {
+                                 uint32_t part, uint32_t n_parts,
+                                 uint32_t n_elastic, uint64_t elastic_block_bytes) {
     // The OpenMP block time is 0 on every thread of this tier that forks a team (this one, the
     // mmap reader thread of each moe() call, the CPU worker): libiomp5's default lets a team spin
     // 200 ms after every region, and the reader team's spin on the P-cores displaces the host
@@ -387,7 +389,7 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint
     }
     // VRAM: static + stream slots per layer. Static installs go through the pinned staging
     // slots, a batch of readers at a time, then one DMA each.
-    if (auto e = cache_.init(q, arena_, n_static + stream_slots, 0, n_static, 0); !e.empty()) return "tier cache: " + e;
+    if (auto e = cache_.init(q, arena_, n_static + stream_slots, 0, n_static, 0, n_elastic, elastic_block_bytes); !e.empty()) return "tier cache: " + e;
     // Phase 15 C2: the expert file -- validated, coverage counted, one slot checked byte for byte
     if (!file_path.empty()) {
         const int fd = open(file_path.c_str(), O_RDONLY), dfd = open(file_path.c_str(), O_RDONLY | O_DIRECT);

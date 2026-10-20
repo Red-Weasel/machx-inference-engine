@@ -109,6 +109,12 @@ public:
                           Ds41SampleStats* stats = nullptr);
     static int32_t sample_row(float* logits, size_t V, const std::vector<int32_t>& recent, const Ds41SampleParams& sp, uint64_t& rng_state,
                               Ds41SampleStats* stats = nullptr);
+    // B68 (MiMo speculative sampling): the distribution sample_row draws from -- the repeat penalty applied to `logits` as
+    // sample_row applies it, then the temperature, top-k, top-p and min-p: the kept candidates, most likely first, and their
+    // probabilities (summing to 1). temperature <= 0: the argmax alone, probability 1. And the generator's uniform draw.
+    static void distribution(float* logits, size_t V, const std::vector<int32_t>& recent, const Ds41SampleParams& sp,
+                             std::vector<int32_t>& ids, std::vector<double>& probs, Ds41SampleStats* stats = nullptr);
+    static double uniform(uint64_t& rng_state);
     // DSpark P4 (docs/deepseek41/58): with a drafter attached, run() speculates at temperature <= 0 -- five drafts
     // verified in one T = 6 step, greedy acceptance with the plain sampler, rollback_to, the rings re-seeded;
     // token for token the plain loop's stream. At temperature > 0 the plain loop runs (said once on stderr).

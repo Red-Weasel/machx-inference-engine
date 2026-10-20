@@ -1,6 +1,7 @@
 // V4.1 native text/tool protocol, checked against the checkpoint encoding/encoding.py.
 // Internal task/reminder roles and image inference are intentionally unsupported.
 #include "ie/deepseek41_prompt.hpp"
+#include "ie/tool_call_repair.hpp"
 
 #include <cstdlib>
 #include <algorithm>
@@ -298,6 +299,7 @@ std::string ds41_cut_tool_name(std::string_view text) {
 
 Ds41Completion ds41_parse_completion(std::string_view text, bool thinking) {
     Ds41Completion out;
+    const std::string raw_for_log(text);          // for the ToolCallObserver (docs/deepseek41/107): repairs and refusals carry the raw text
     try {
         auto fail=[](const char* msg){throw std::runtime_error(msg);};
         if(thinking) {
@@ -317,7 +319,10 @@ Ds41Completion ds41_parse_completion(std::string_view text, bool thinking) {
             while(!text.starts_with(calls_close)) {
                 std::match_results<std::string_view::const_iterator> match;
                 if(!std::regex_search(text.begin(),text.end(),match,invoke)) fail("invalid invoke header");
-                const std::string name=tool_name(Json{{"name",match[1].str()}},Json::object());
+                std::string cleaned_name; bool name_trimmed=false;
+                if(!clean_tool_name(match[1].str(),cleaned_name,&name_trimmed,toolcall_repair_enabled())) fail("invalid tool name");   // markup in a name is never a call
+                if(name_trimmed) tool_call_notify("deepseek41","repaired","tool name '"+match[1].str()+"' read as '"+cleaned_name+"'",raw_for_log);
+                const std::string name=tool_name(Json{{"name",cleaned_name}},Json::object());
                 text.remove_prefix(match.length());
                 std::string args="{"; std::vector<std::string> keys;
                 // Reference emits a blank arguments line for a zero-argument invocation.
@@ -330,9 +335,17 @@ Ds41Completion ds41_parse_completion(std::string_view text, bool thinking) {
                     auto end=text.find(parameter_close);
                     if(end==std::string_view::npos) fail("missing parameter terminator");
                     auto value=text.substr(0,end);
-                    if(!is_string && Json::parse(value,nullptr,false).is_discarded()) fail("invalid JSON parameter");
+                    std::string value_text(value);            // verbatim, as the reference passes it, unless the repair was needed
+                    if(!is_string && Json::parse(value,nullptr,false).is_discarded()) {
+                        // only slips with exactly one reading are fixed (tool_call_repair.hpp); a bare word, an unterminated string
+                        // and the like stay "invalid JSON parameter", because a malformed call must execute nothing
+                        const Json fixed=toolcall_repair_enabled()?Json::parse(json_syntax_repair(value),nullptr,false):Json(Json::value_t::discarded);
+                        if(fixed.is_discarded()) fail("invalid JSON parameter");
+                        value_text=py_json(fixed);
+                        tool_call_notify("deepseek41","repaired","JSON of parameter '"+key+"' repaired",raw_for_log);
+                    }
                     if(keys.size()>1) args+=", ";
-                    args+=py_json(key)+": "+(is_string?py_json(std::string(value)):std::string(value));
+                    args+=py_json(key)+": "+(is_string?py_json(std::string(value)):value_text);
                     text.remove_prefix(end+parameter_close.size());
                 }
                 text.remove_prefix(invoke_close.size()); args+='}';
@@ -348,6 +361,7 @@ Ds41Completion ds41_parse_completion(std::string_view text, bool thinking) {
     } catch(const std::exception& e) {
         out.error=std::string("deepseek41 completion: ")+e.what(); out.tool_calls_json.clear();
         out.content=ds41_visible_content(out.content);
+        if(raw_for_log.find("｜DSML｜")!=std::string::npos) tool_call_notify("deepseek41","rejected",out.error,raw_for_log);
     }
     return out;
 }

@@ -115,6 +115,13 @@ public:
         // pass took 22 s with ~10 s of stages floating between passes; at 6 GiB it took 12.5 s and
         // the stages agree (docs/deepseek41/23, runs O-T2). Sized by measurement, not derived yet.
         uint64_t vram_reserve = 6ull << 30;
+        // Elastic region (docs/deepseek41/105, IE_DS41_ELASTIC_GIB): bytes that are EXTRA expert stream
+        // slots during decode (T <= kDs41MaxDecodeRows) and the forward's batch workspace during a prefill
+        // chunk -- lent, then reclaimed. 0 = off: the reserve stays free and batch_ws is malloc/freed per
+        // chunk (today's behaviour, byte-identical). A stream slot is a cache, so lending it costs an
+        // invalidation not a restore; the reserve floor drops by the same amount, so VRAM at the prefill
+        // peak is unchanged. Measured +8.6% lossless decode on V4.1-UNCENSORED at reserve 3.0 (2026-10-16).
+        uint64_t elastic_bytes = 0;
         // Phase 54 (docs/deepseek41/93): the FP8 LM head (lossy; off for the reference tests, on in ie serve / ie-ds41-run).
         // IE_DS41_HEAD_FP8=1/0 overrides whatever the caller set.
         bool head_fp8 = false;

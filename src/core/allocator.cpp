@@ -342,7 +342,11 @@ uint32_t alloc_alias_bad_words(sycl::queue& q, void* p, size_t nbytes) {
         w[i] = ((1 + i / WPP) << 24) | (i % WPP);
     });
     q.wait();
-    std::vector<uint64_t> ce(npages);
+    // the copy engine's tags and the read-back go through pinned memory: a fresh context's first copies from pageable
+    // memory read unmapped pages (the driver's mapping of the pageable source was not present yet; DEVICE_LOST at Laguna
+    // serve loads, 2026-10-16/18)
+    uint64_t* ce = sycl::malloc_host<uint64_t>(npages + 1, q);
+    if (!ce) { sycl::free(rep, q); return 0; }
     for (uint64_t k = 0; k < npages; ++k) {
         ce[k] = ((1 + k) << 24) | kCeMark;
         q.memcpy(static_cast<uint8_t*>(p) + k * PG, &ce[k], 8);
@@ -357,21 +361,21 @@ uint32_t alloc_alias_bad_words(sycl::queue& q, void* p, size_t nbytes) {
         c.fetch_add(1u);
     });
     q.wait();
-    uint32_t bad = 0;
-    q.memcpy(&bad, rep, sizeof(uint32_t)).wait();
+    q.memcpy(&ce[npages], rep, sizeof(uint32_t)).wait();
+    const uint32_t bad = uint32_t(ce[npages] & 0xFFFFFFFFu);   // little-endian: the uint32 count sits in the low half
+    sycl::free(ce, q);
     sycl::free(rep, q);
     q.memset(p, 0, nbytes).wait();
     return bad;
 }
 }   // namespace
 
-void* DeviceAllocator::malloc(size_t nbytes) {
-    if (!queue_) return nullptr;
-    void* p = sycl::malloc_device(nbytes, *queue_);
+void* malloc_device_checked(sycl::queue& q, size_t nbytes) {
+    void* p = sycl::malloc_device(nbytes, q);
     if (p && alloc_alias_test_on() && nbytes >= alloc_alias_min_bytes()) {
         for (uint32_t attempt = 0;; ++attempt) {
             const auto t0 = std::chrono::steady_clock::now();
-            const uint32_t bad = alloc_alias_bad_words(*queue_, p, nbytes);
+            const uint32_t bad = alloc_alias_bad_words(q, p, nbytes);
             const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             {
                 std::lock_guard<std::mutex> lk(g_alias_mu);
@@ -382,13 +386,19 @@ void* DeviceAllocator::malloc(size_t nbytes) {
             // `p` is kept (never freed): its address range must not come back.
             std::fprintf(stderr, "[alloc] VRAM PAGE ALIAS: %s: a %.1f MiB allocation at %p has %u words that read another "
                          "page's data -- kept aside, %s (IE_NO_ALLOC_ALIAS_TEST=1 skips this test)\n",
-                         queue_->get_device().get_info<sycl::info::device::name>().c_str(), double(nbytes) / 1048576.0, p,
+                         q.get_device().get_info<sycl::info::device::name>().c_str(), double(nbytes) / 1048576.0, p,
                          bad, attempt < kAliasRetries ? "allocating again" : "no sound allocation found: the allocation fails");
             if (attempt >= kAliasRetries) return nullptr;
-            p = sycl::malloc_device(nbytes, *queue_);
+            p = sycl::malloc_device(nbytes, q);
             if (!p) return nullptr;
         }
     }
+    return p;
+}
+
+void* DeviceAllocator::malloc(size_t nbytes) {
+    if (!queue_) return nullptr;
+    void* p = malloc_device_checked(*queue_, nbytes);
     if (p && dev_alloc_auditing()) dev_alloc_record(this, p, nbytes);
     return p;
 }

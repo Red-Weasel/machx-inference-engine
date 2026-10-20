@@ -6,7 +6,7 @@ add_executable(exl3_decode_test unit/exl3_decode_test.cpp)
 target_link_libraries(exl3_decode_test PRIVATE ie_core ie_sycl_flags)
 target_compile_definitions(exl3_decode_test PRIVATE
   EXL3_DATA_DIR="${CMAKE_SOURCE_DIR}/tests/data/exl3")
-add_test(NAME exl3_decode_test COMMAND exl3_decode_test)
+add_test(NAME exl3_decode_test COMMAND exl3_decode_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_executable(dequant_bt_test unit/dequant_bt_test.cpp)
 target_link_libraries(dequant_bt_test PRIVATE ie_core ie_sycl_flags)
@@ -423,6 +423,26 @@ target_include_directories(deepseek4_tokenizer_test PRIVATE
 target_compile_options(deepseek4_tokenizer_test PRIVATE -UNDEBUG)
 add_test(NAME deepseek4_tokenizer_test COMMAND deepseek4_tokenizer_test)
 
+# Tool-call repair helpers (docs/deepseek41/107): header-only, host-only (no GPU, no model).
+add_executable(tool_call_repair_test unit/tool_call_repair_test.cpp)
+target_link_libraries(tool_call_repair_test PRIVATE ie_sycl_flags)
+target_include_directories(tool_call_repair_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+  ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_options(tool_call_repair_test PRIVATE -UNDEBUG)
+add_test(NAME tool_call_repair_test COMMAND tool_call_repair_test)
+
+# DS4.1 completion parser, tool-call handling (docs/deepseek41/107): host-only, links the one parser source directly.
+add_executable(ds41_tool_parse_test
+  unit/ds41_tool_parse_test.cpp
+  ${CMAKE_SOURCE_DIR}/src/model/deepseek41_prompt.cpp)
+target_link_libraries(ds41_tool_parse_test PRIVATE ie_sycl_flags)
+target_include_directories(ds41_tool_parse_test PRIVATE
+  ${CMAKE_SOURCE_DIR}/include
+  ${CMAKE_SOURCE_DIR}/third_party)
+target_compile_options(ds41_tool_parse_test PRIVATE -UNDEBUG)
+add_test(NAME ds41_tool_parse_test COMMAND ds41_tool_parse_test)
+
 # Wave-1 Task 3/4: Mistral [INST] + DeepSeek-R1-Distill chat-template builders.
 # Host-only (NO GPU, NO model weights) — pure string builders. Compiles the
 # SYCL-free tokenizer + gguf_reader + dtype TUs directly (same precedent as
@@ -504,6 +524,11 @@ add_test(NAME chatml_xml_tools_test COMMAND chatml_xml_tools_test ${CMAKE_SOURCE
 add_executable(preflight_test unit/preflight_test.cpp)
 target_link_libraries(preflight_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME preflight_test COMMAND preflight_test)
+
+# Inkling-Small: the native chat template vs the GGUF's Jinja template (transformers-rendered goldens) and the reply parser.
+add_executable(inkling_template_test unit/inkling_template_test.cpp)
+target_link_libraries(inkling_template_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME inkling_template_test COMMAND inkling_template_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_executable(server_capabilities_test unit/server_capabilities_test.cpp)
 target_link_libraries(server_capabilities_test PRIVATE ie_core ie_sycl_flags)

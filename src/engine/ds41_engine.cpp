@@ -130,6 +130,10 @@ std::string Engine::ds41_load(const std::string& dir) {
     // IE_DS41_VRAM_RESERVE_GIB: the per-card headroom kept free after the dense set (default 6 GiB, ResidentOptions);
     // the A/B knob for the static-expert budget -- the same name ds41_resident_test reads.
     if (const char* r = std::getenv("IE_DS41_VRAM_RESERVE_GIB"); r && *r) ro.vram_reserve = uint64_t(std::max(0.0, std::atof(r)) * 1073741824.0);
+    // IE_DS41_ELASTIC_GIB (docs/deepseek41/105): the elastic region -- extra stream slots at decode, the
+    // batch workspace at prefill. Default 3 GiB = ON (gate-verified +10.6% lossless decode); set =0 to disable.
+    ro.elastic_bytes = uint64_t(3.0 * 1073741824.0);
+    if (const char* e = std::getenv("IE_DS41_ELASTIC_GIB"); e && *e) ro.elastic_bytes = uint64_t(std::max(0.0, std::atof(e)) * 1073741824.0);
     if (n_lanes > 1) { ro.lanes = n_lanes; ro.lane_ctx = lane_ctx; }   // P4 B6b (1 lane: the pre-lane forward, byte for byte)
     if (auto e = b->fwd.init_resident(b->qs, b->model, b->tables, ranking, ro); !e.empty()) return "deepseek41 resident: " + e;
     if (n_lanes > 1 && b->fwd.expert_parallel()) return "deepseek41: --parallel > 1 runs on the lane pipe, which refuses expert parallel (IE_DS41_EP)";

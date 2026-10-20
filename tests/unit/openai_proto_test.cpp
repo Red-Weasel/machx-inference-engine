@@ -503,6 +503,8 @@ int main() {
         ie::SamplingParams sp; sp.presence_penalty = 1.5f;
         assert(ie::dropped_penalty_warning(ModelArch::kMimo26, sp).find("IGNORED") != std::string::npos);
         assert(ie::dropped_penalty_warning(ModelArch::kDeepSeek41, sp).find("DeepSeek-V4.1") != std::string::npos);
+        assert(ie::dropped_penalty_warning(ModelArch::kLaguna, sp).find("Laguna") != std::string::npos);
+        assert(ie::dropped_penalty_warning(ModelArch::kInkling, sp).find("Inkling") != std::string::npos);
         assert(ie::dropped_penalty_warning(ModelArch::kQwen35Dense, sp).empty());
         sp.presence_penalty = 0; sp.frequency_penalty = 0.3f;
         assert(!ie::dropped_penalty_warning(ModelArch::kMimo26, sp).empty());

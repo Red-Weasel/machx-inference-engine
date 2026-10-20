@@ -67,6 +67,12 @@ struct Ds41Bundle;
 // MiMo-V2.6 (kMimo26): a model DIRECTORY (config.json model_type mimo_v2), the two-card forward, the tokenizer.json
 // tokenizer and the checkpoint's chat template. src/engine/mimo26_engine.cpp (docs/mimo26/00_PORT_PLAN.md P3b).
 struct Mimo26Bundle;
+// Laguna-S-2.1 (kLaguna): the GGUF, the one-card runtime (LagunaModel), the GGUF's tokenizer and chat template.
+// src/engine/laguna_engine.cpp (docs/laguna/00_PORT_PLAN.md P5).
+struct LagunaBundle;
+// Inkling-Small (kInkling): the GGUF, the one-card runtime (InklingModel), the GGUF's tokenizer and its chat format.
+// src/engine/inkling_engine.cpp (docs/inkling/00_PORT_PLAN.md P5).
+struct InklingBundle;
 
 // Pinned (USM host) staging buffer for the host-bounced logits row. Every
 // multi-card / host-runtime path (DenseModelTP, qwen3next, qwen35 TP/split,
@@ -176,11 +182,12 @@ struct EngineOptions {
     bool     spec          = false;  // MTP self-speculative decode (Qwen3.6-27B
                                      // kQwen35Dense, GREEDY only; single/split/TP). Loads
                                      // the native MTP/NextN head (~0.6 GB) and runs
-                                     // draft+verify; lossless vs plain greedy. CLI: --spec.
+                                     // draft+verify; near-lossless vs plain greedy (rare
+                                     // near-tie flips on the split, 2026-10-15). CLI: --spec.
     uint32_t spec_k        = 2;      // draft length. K=2 is the MEASURED optimum for the
                                      // 27B (verify cost grows ~linearly with K but accept
                                      // saturates): clean-box K=2 1.12× / K=3 1.06× / K=4
-                                     // 0.98× (a LOSS). Lossless at all K. Override --spec-k.
+                                     // 0.98× (a LOSS). Same verify at all K. Override --spec-k.
     std::string spec_head;           // gemma4 MTP draft head GGUF (separate file,
                                      // mtp-gemma-4-*-Q8_0.gguf). Empty → convention:
                                      // first mtp-*.gguf next to the target. CLI: --spec-head.
@@ -610,6 +617,16 @@ private:
     GenerateResult mimo26_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
                               bool enable_thinking, std::string_view tools_json, std::string_view reasoning_effort);
     GenerateResult mimo26_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token);
+    // laguna (src/engine/laguna_engine.cpp): the load (gguf_ already open) and the chat/generate routes
+    std::string    laguna_load();
+    GenerateResult laguna_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
+                               bool enable_thinking, std::string_view tools_json, std::string_view reasoning_effort);
+    GenerateResult laguna_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token);
+    // inkling (src/engine/inkling_engine.cpp): the load (gguf_ already open) and the chat/generate routes
+    std::string    inkling_load();
+    GenerateResult inkling_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
+                                bool enable_thinking, std::string_view tools_json, std::string_view reasoning_effort);
+    GenerateResult inkling_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token);
     // qwen4exp forward, defined in engine.cpp (Q4eBundle is incomplete here).
     sycl::event q4e_forward(sycl::queue& q, const int32_t* ids, uint32_t T, uint32_t pos);
     // P4 B8: Flash-Next at --parallel N > 1 on two cards -- the request on a lane of the shared lanes module (engine.cpp).
@@ -688,6 +705,10 @@ private:
     std::unique_ptr<Ds4Bundle> ds4_;
     std::unique_ptr<Ds41Bundle> ds41_;   // deepseek41 only; frees its runtime in its own destructor
     std::unique_ptr<Mimo26Bundle> mimo26_;   // mimo_v2 only; frees its runtime in its own destructor
+    std::unique_ptr<LagunaBundle> laguna_;   // laguna only; reads gguf_'s mapping, so it is declared after gguf_
+    std::mutex laguna_mu_;                   // one request at a time on the one runtime
+    std::unique_ptr<InklingBundle> inkling_; // inkling only; reads gguf_'s mapping, so it is declared after gguf_
+    std::mutex inkling_mu_;
     uint32_t        ds4_vocab_ = 0;       // cached: vocab() cannot see into Ds4Bundle
     // DeepSeek-V4-Flash-Vision-Exp (docs/deepseek4/70_VISION_EXP_PORT_PLAN.md P3/P4).
     // load() finds the vision sidecar beside the GGUF and uploads the tower on

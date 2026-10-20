@@ -5,6 +5,8 @@
 #include "ie/engine.hpp"
 #include "ie/ds41_engine.hpp"
 #include "ie/mimo26_engine.hpp"
+#include "ie/laguna_engine.hpp"
+#include "ie/inkling_engine.hpp"
 #include "ie/mimo26_host_rules.hpp"  // mimo26_vision_refusal (vision_status_json)
 #include "ie/ds41_vision.hpp"        // kDs41VisMaxTok (vision_status_json)
 #include "ie/prompt_cache_slots.hpp" // prompt_cache_slots_rule (/props "prompt_cache_slots", P4 B45 (3))
@@ -984,6 +986,16 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         err = "unsupported architecture: " +
               (a ? std::string(a->as_string()) : std::string("<missing>"));
         return nullptr;
+    }
+    if (e->arch_ == ModelArch::kLaguna) {            // Laguna-S-2.1: its own runtime, one card or two (src/engine/laguna_engine.cpp)
+        if (auto m = e->laguna_load(); !m.empty()) { err = m; return nullptr; }
+        e->prompt_cache_on_ = e->opts_.prompt_cache; // it keeps the live conversation's prefix
+        return e;
+    }
+    if (e->arch_ == ModelArch::kInkling) {           // Inkling-Small: its own runtime, one card or two (src/engine/inkling_engine.cpp)
+        if (auto m = e->inkling_load(); !m.empty()) { err = m; return nullptr; }
+        e->prompt_cache_on_ = e->opts_.prompt_cache;
+        return e;
     }
     // IE_P2P=1 + qwen4exp: both stage allocators join ONE shared context
     // with peer access — the A->B wide handoff then PUSHES device-to-device
@@ -2561,6 +2573,10 @@ Engine::~Engine() {
         stepper_.cv.notify_all();
         stepper_.th.join();
     }
+    // The DeltaNet ladder's copies come from fleet_'s per-card allocators, and ladder_ is declared before fleet_: left to
+    // the member order it outlives them (the 27B's exit segfaulted in sycl::free on a dead queue). Free them while the cards
+    // are alive.
+    ladder_.free_all();
     if (stepper_.d_pick || stepper_.d_recent) {
         sycl::queue& hq = qwen35_split_model_.fleet()
             ? qwen35_split_model_.fleet()->dev(qwen35_split_model_.head_dev()).queue()
@@ -4136,6 +4152,8 @@ GenerateResult Engine::generate(const std::string& prompt,
                                 bool anchor) {
     if (arch_ == ModelArch::kDeepSeek41) return ds41_generate(prompt, sp, on_token);
     if (arch_ == ModelArch::kMimo26) return mimo26_generate(prompt, sp, on_token);
+    if (arch_ == ModelArch::kLaguna) return laguna_generate(prompt, sp, on_token);
+    if (arch_ == ModelArch::kInkling) return inkling_generate(prompt, sp, on_token);
     if (q4e_ && q4e_->serve) return q4e_generate_lanes(prompt, sp, on_token, cache_prefix_len, shared_prefix_len);
     if (q35m_ && q35m_->serve) return q35m_generate_lanes(prompt, sp, on_token, cache_prefix_len, reply_cache, shared_prefix_len, anchor);
     if (q27_ && q27_->serve) return q35m_generate_lanes(prompt, sp, on_token, cache_prefix_len, reply_cache, shared_prefix_len);   // P4 B18
@@ -4820,6 +4838,22 @@ GenerateResult Engine::generate(const std::string& prompt,
         // inited under tp_) are left alone. dn_.reset is a no-op for dense.
         kv_.reset();
         dn_.reset(q);
+    }
+    // Diagnose the intermittent full re-prefill (0 cached) on the dn-ladder cache path (27B/crown):
+    // a 0-cached turn costs a whole-context re-read (~5 min at 160k+). Name WHY the restore found
+    // nothing, so a live stall self-explains instead of staying "cause UNKNOWN". stderr-only, no
+    // behaviour change; gated to the dn-ladder models and long prompts. (IE_NO_CACHE_MISS_DIAG=1 off.)
+    if (restored == 0 && ids.size() > 4096 && (qwen35_split_ || qwen35moe_split_) &&
+        !std::getenv("IE_NO_CACHE_MISS_DIAG")) {
+        const uint32_t trie_peek = prompt_cache_on_ ? fleet_cache_.peek_longest_match(ids) : 0u;
+        const unsigned long long trie_bytes = prompt_cache_on_ ? (unsigned long long)fleet_cache_.total_bytes() : 0ull;
+        const char* why =
+            (trie_peek > 0)       ? "the trie HELD a usable prefix but the restore was skipped -- restore-path bug" :
+            (trie_bytes == 0)     ? "the trie is empty (first turn after load, or every snapshot was evicted)" :
+            (lad_shared > 0)      ? "this prompt shares its head with the live sequence but NOT with any trie snapshot -- the conversation's early tokens changed between turns (the 'head constant, 0 cached' case) or its snapshot was evicted" :
+                                    "the trie holds other prefixes but this prompt shares none (a new or branched conversation)";
+        std::fprintf(stderr, "[cache-miss-diag] full prefill of %zu tok (0 cached): live-LCP=%u, trie best-match=%u, trie bytes=%llu -- %s\n",
+                     ids.size(), lad_shared, trie_peek, trie_bytes, why);
     }
     q.memcpy(d_ids_, ids.data(), ids.size() * sizeof(int32_t)).wait();
     // Prefill chunk. The global default is 256 (the §1 BMG DeltaNet-recurrence
@@ -5934,6 +5968,8 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
     }
     if (arch_ == ModelArch::kDeepSeek41) return ds41_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
     if (arch_ == ModelArch::kMimo26) return mimo26_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
+    if (arch_ == ModelArch::kLaguna) return laguna_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
+    if (arch_ == ModelArch::kInkling) return inkling_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
     // Vision guard: only the Qwen3.8 ChatML branch below (Flash-Next; P4 B45: the
     // 27B two-card split) consumes turn images; every other arch must refuse rather
     // than silently drop. Each refusal helper is the one /props "vision" reports.

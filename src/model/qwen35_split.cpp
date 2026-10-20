@@ -2277,7 +2277,7 @@ std::string Qwen35SplitModel::forward_pipelined(const int32_t* ids, uint32_t T_t
 }
 
 // ===========================================================================
-// MTP self-speculative decode on the split path (--spec, greedy/lossless).
+// MTP self-speculative decode on the split path (--spec, greedy; near-lossless -- rare near-tie flips vs plain, 2026-10-15).
 // Same draft→verify→accept→commit machinery as Qwen35DenseModel::spec_loop_,
 // with per-card KV/DeltaNet bookkeeping. The NextN head lives on head_dev.
 // ===========================================================================

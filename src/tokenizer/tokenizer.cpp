@@ -1,6 +1,7 @@
 // src/tokenizer/tokenizer.cpp — byte-level BPE for Qwen3.6.
 
 #include "ie/tokenizer.hpp"
+#include "ie/tool_call_repair.hpp"
 
 #include "nlohmann/json.hpp"
 
@@ -439,6 +440,12 @@ std::string Tokenizer::load_from_gguf(const GgufReader& g) {
     // and llama.cpp leaves ignore_merges false for LLAMA_VOCAB_PRE_TYPE_JOYAI_LLM.
     joyai_         = (pre_ == "joyai-llm");
     hyv4_          = (pre_ == "hyv4");   // joyai cascade with tilde-as-symbol
+    // Laguna-S-2.1 (llama.cpp LLAMA_VOCAB_PRE_TYPE_LAGUNA): two regexes in sequence -- "[^\n]+|[\n]+" splits the text
+    // into line and newline runs, then the qwen2 regex (single digits) runs over each piece. The first pass is not a
+    // no-op: without it "foo.\nbar" pretokenizes ".\n" as one piece (alt 4's [\r\n]* tail) instead of "." + "\n".
+    // The qwen2 pass uses real Unicode classes (pretokenize_qwen2_unicode). ignore_merges stays off, as upstream.
+    laguna_        = (pre_ == "laguna");
+    inkling_       = (pre_ == "inkling");   // the o200k-family split (pretokenize_inkling); ignore_merges off, as upstream
     // tekken splits digits singly (\p{N}); llama-bpe and dbrx group runs of 1-3.
     // dbrx (Phi-4, cl100k/gpt2 BPE) pretokenizes IDENTICALLY to llama-bpe — the
     // only split delta vs the qwen2 default is digit-runs-≤3 (which digits_1to3_
@@ -483,7 +490,8 @@ std::string Tokenizer::load_from_gguf(const GgufReader& g) {
     if (!is_spm && !gemma_) {
         const bool implemented = pre_.empty() || pre_ == "default" || pre_ == "qwen2" ||
                                  pre_ == "llama-bpe" || pre_ == "dbrx" || pre_ == "tekken" ||
-                                 pre_ == "joyai-llm" || pre_ == "glm4" || pre_ == "hyv4";
+                                 pre_ == "joyai-llm" || pre_ == "glm4" || pre_ == "hyv4" || pre_ == "laguna" ||
+                                 pre_ == "inkling";
         if (!implemented) {
             pre_warning_ = "tokenizer.ggml.pre=\"" + pre_ +
                            "\" has no dedicated pre-tokenizer in this engine; falling back to "
@@ -852,6 +860,78 @@ static std::vector<std::string_view> pretokenize_qwen2_unicode(std::string_view 
     return out;
 }
 
+// Inkling-Small (llama.cpp LLAMA_VOCAB_PRE_TYPE_INKLING, PR #25731): the o200k-family regex with \p{M} in the letter classes,
+//   [^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))*((?=[\p{L}\p{M}])([^A-Z]))+(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])?
+//   |[^\r\n\p{L}\p{N}]?((?=[\p{L}\p{M}])([^a-z]))+((?=[\p{L}\p{M}])([^A-Z]))*(?:...same...)?
+//   |\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+
+// over llama.cpp's collapsed alphabet (uni_class): a letter or mark is "upper" unless ASCII a-z and "lower" unless ASCII
+// A-Z, so a non-ASCII letter extends either run (the case split is ASCII-only, as the lookaheads spell it). The two word
+// alternatives collapse to tekken's two phases (upper run, then lower run; either may be empty, not both), then the
+// optional contraction; numbers group up to three codepoints; the punctuation run's tail takes '/' as well as CR/LF.
+static std::vector<std::string_view> pretokenize_inkling(std::string_view text) {
+    std::vector<std::string_view> out;
+    const size_t n = text.size();
+    auto at = [&](size_t p, size_t& next) -> UniCls { size_t q = p; const uint32_t cp = utf8_decode(text, q); next = q; return uni_class(cp); };
+    auto is_crlf = [&](size_t p) { return text[p] == '\r' || text[p] == '\n'; };
+    auto is_lm = [](UniCls k) { return k == kULet || k == kUMrk; };
+    auto contraction = [&](size_t p) -> size_t {             // (?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])
+        if (p + 1 >= n || text[p] != '\'') return 0;
+        const unsigned char a = uint8_t(text[p + 1]) | 0x20;
+        if (a == 's' || a == 't' || a == 'm' || a == 'd') return 2;
+        if (p + 2 < n) {
+            const unsigned char b = uint8_t(text[p + 2]) | 0x20;
+            if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) return 3;
+        }
+        return 0;
+    };
+    size_t i = 0;
+    while (i < n) {
+        size_t i1 = 0;
+        const UniCls k0 = at(i, i1);
+        // alts 1/2: the case-aware word, with an optional one-codepoint prefix
+        {
+            size_t j = i, nx = 0;
+            if (k0 != kULet && k0 != kUNum && !is_crlf(i) && i1 < n && is_lm(at(i1, nx))) j = i1;
+            size_t k = j, q = 0;
+            while (k < n) { const UniCls kk = at(k, q); if (!is_lm(kk) || (text[k] >= 'a' && text[k] <= 'z')) break; k = q; }
+            while (k < n) { const UniCls kk = at(k, q); if (!is_lm(kk) || (text[k] >= 'A' && text[k] <= 'Z')) break; k = q; }
+            if (k > j) { k += contraction(k); out.emplace_back(text.substr(i, k - i)); i = k; continue; }
+        }
+        // alt 3: \p{N}{1,3}
+        if (k0 == kUNum) {
+            size_t j = i1, q = 0;
+            for (int c = 1; c < 3 && j < n && at(j, q) == kUNum; ++c) j = q;
+            out.emplace_back(text.substr(i, j - i)); i = j; continue;
+        }
+        // alt 4:  ?[^\s\p{L}\p{N}]+[\r\n/]*
+        {
+            size_t j = i, q = 0;
+            if (text[j] == ' ') ++j;
+            if (j < n) {
+                const UniCls kj = at(j, q);
+                if (kj != kUWs && kj != kULet && kj != kUNum) {
+                    j = q;
+                    while (j < n) { const UniCls kk = at(j, q); if (kk == kUWs || kk == kULet || kk == kUNum) break; j = q; }
+                    while (j < n && (is_crlf(j) || text[j] == '/')) ++j;
+                    out.emplace_back(text.substr(i, j - i)); i = j; continue;
+                }
+            }
+        }
+        // alts 5/6/7: whitespace (as pretokenize_qwen2_unicode)
+        if (k0 == kUWs) {
+            size_t e = i, last_nl = std::string_view::npos, last_start = i;
+            while (e < n) { size_t q = 0; if (at(e, q) != kUWs) break; if (is_crlf(e)) last_nl = e; last_start = e; e = q; }
+            if (last_nl != std::string_view::npos) { out.emplace_back(text.substr(i, last_nl + 1 - i)); i = last_nl + 1; }
+            else if (e == n)                      { out.emplace_back(text.substr(i, e - i)); i = e; }
+            else if (last_start > i)              { out.emplace_back(text.substr(i, last_start - i)); i = last_start; }
+            else                                  { out.emplace_back(text.substr(i, e - i)); i = e; }
+            continue;
+        }
+        out.emplace_back(text.substr(i, i1 - i)); i = i1;   // unreachable for the classes above; guarantees progress
+    }
+    return out;
+}
+
 // Wave-1: tekken pre-tokenizer (Mistral Nemo / Small-24B / Devstral / Codestral).
 // Mirrors llama.cpp LLAMA_VOCAB_PRE_TYPE_TEKKEN (llama-vocab.cpp). Original
 // tokenizer.json regex (the authoritative spec), alternatives tried in order:
@@ -1167,10 +1247,22 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text, bool allow_special
         }
         // Split into pretokens. joyai-llm and tekken each use a distinct split;
         // all other pre-types (default/qwen2/llama-bpe) use the shared simple path.
-        const auto pretoks = (joyai_ || hyv4_) ? pretokenize_joyai(chunk, hyv4_)
-                           : tekken_ ? pretokenize_tekken(chunk)
-                           : qwen2_unicode_ ? pretokenize_qwen2_unicode(chunk)
-                                     : pretokenize_simple(chunk, digits_1to3_);
+        std::vector<std::string_view> pretoks;
+        if (laguna_) {
+            for (size_t a = 0; a < chunk.size();) {
+                const bool nl = chunk[a] == '\n';
+                size_t b = a;
+                while (b < chunk.size() && (chunk[b] == '\n') == nl) ++b;
+                const auto part = pretokenize_qwen2_unicode(chunk.substr(a, b - a));
+                pretoks.insert(pretoks.end(), part.begin(), part.end());
+                a = b;
+            }
+        } else
+            pretoks = inkling_ ? pretokenize_inkling(chunk)
+                    : (joyai_ || hyv4_) ? pretokenize_joyai(chunk, hyv4_)
+                    : tekken_ ? pretokenize_tekken(chunk)
+                    : qwen2_unicode_ ? pretokenize_qwen2_unicode(chunk)
+                              : pretokenize_simple(chunk, digits_1to3_);
         for (auto pt : pretoks) {
             // Byte-encode each byte of the pretoken.
             std::string enc;
@@ -2287,7 +2379,41 @@ bool ds4_parse_param(std::string_view seg, std::string& key, bool& is_str, std::
 
 }  // namespace
 
+namespace {
+DeepSeek4Completion parse_deepseek4_completion_impl(std::string_view text, bool thinking);
+}
+
+// Tool-call hardening (docs/deepseek41/107). The port below is bug-compatible with the reference parser, whose regexes are strict
+// about spelling; a model that drifts a little (the V4.1 spelling `<｜DSML｜ parameter` inside a V4 block, a stray `>` on the name)
+// used to lose the whole turn to `tool name format error`, or worse, hand the harness a call named after the markup. So:
+//   * the spaced spelling of a DSML tag is read as the unspaced one (a value holding that exact text is vanishingly rare, and the
+//     reference would already have thrown on the markup around it);
+//   * a tool name is trimmed of a stray `>` / quote tail, and a name that still holds markup is a parse ERROR, never a call;
+//   * a non-string parameter whose JSON is slightly off gets the conservative repair of tool_call_repair.hpp (the reference passes
+//     the text through unvalidated, so the harness got `arguments` it could not parse).
+// Every repair and every refusal is reported to the installed ToolCallObserver (the server logs it), so the next real failure is
+// captured with its raw text instead of being a mystery.
 DeepSeek4Completion parse_deepseek4_completion(std::string_view text, bool thinking) {
+    const std::string raw_for_log(text);
+    std::string normalized;
+    static const std::string kSpaced = std::string(kDsml) + " ";
+    if (toolcall_repair_enabled() && text.find(kSpaced) != std::string_view::npos) {
+        normalized.reserve(text.size());
+        for (size_t i = 0; i < text.size();) {
+            if (text.compare(i, kSpaced.size(), kSpaced) == 0) { normalized += kDsml; i += kSpaced.size(); }
+            else normalized += text[i++];
+        }
+        text = normalized;
+        tool_call_notify("deepseek4", "repaired", "DSML tag spelled with a space after the token", raw_for_log);
+    }
+    DeepSeek4Completion out = parse_deepseek4_completion_impl(text, thinking);
+    if (!out.error.empty() && raw_for_log.find(kDsml) != std::string::npos)
+        tool_call_notify("deepseek4", "rejected", out.error, raw_for_log);
+    return out;
+}
+
+namespace {
+DeepSeek4Completion parse_deepseek4_completion_impl(std::string_view text, bool thinking) {
     DeepSeek4Completion out;
     const std::string dsml           = kDsml;
     const std::string tc_start       = "\n\n<" + dsml + "tool_calls";
@@ -2330,10 +2456,15 @@ DeepSeek4Completion parse_deepseek4_completion(std::string_view text, bool think
 
             const std::string_view name_stops[] = {param_open, invoke_close};
             i = ds4_read_until(i, text, name_stops, seg, matched);
-            std::string tool_name;
-            if (!ds4_parse_invoke_name(seg, tool_name)) {
+            std::string tool_name, raw_name;
+            if (!ds4_parse_invoke_name(seg, raw_name)) {
                 out.error = "tool name format error"; return out;
             }
+            bool name_trimmed = false;
+            if (!clean_tool_name(raw_name, tool_name, &name_trimmed, toolcall_repair_enabled())) {   // markup in a name: an error, never a call named after it
+                out.error = "tool name format error: the name holds markup"; return out;
+            }
+            if (name_trimmed) tool_call_notify("deepseek4", "repaired", "tool name '" + raw_name + "' read as '" + tool_name + "'", text);
             // decode_dsml_to_arguments(): {"k": <json>, ...} with the raw value
             // verbatim for string="false" and JSON-quoted for string="true".
             std::string args = "{";
@@ -2355,8 +2486,17 @@ DeepSeek4Completion parse_deepseek4_completion(std::string_view text, bool think
                 first_arg = false;
                 args += nlohmann::ordered_json(key).dump(-1, ' ', /*ensure_ascii=*/false);
                 args += ": ";
+                std::string value_text = val;                // verbatim, as the reference passes it, unless it needs the repair
+                if (!is_str && toolcall_repair_enabled() && nlohmann::ordered_json::parse(val, nullptr, false).is_discarded()) {
+                    const auto fixed = nlohmann::ordered_json::parse(json_syntax_repair(val), nullptr, false);
+                    if (!fixed.is_discarded()) {
+                        value_text = fixed.dump(-1, ' ', /*ensure_ascii=*/false);
+                        tool_call_notify("deepseek4", "repaired", "JSON of parameter '" + key + "' repaired", text);
+                    } else
+                        tool_call_notify("deepseek4", "invalid", "parameter '" + key + "' is not JSON and could not be repaired; passed through as written", text);
+                }
                 args += is_str ? nlohmann::ordered_json(val).dump(-1, ' ', /*ensure_ascii=*/false)
-                               : val;
+                               : value_text;
 
                 const std::string_view nxt_stops[] = {param_open, invoke_close};
                 i = ds4_read_until(i, text, nxt_stops, seg, matched);
@@ -2393,6 +2533,7 @@ DeepSeek4Completion parse_deepseek4_completion(std::string_view text, bool think
     out.tool_calls_json = calls.dump();
     return out;
 }
+}  // namespace
 
 std::string build_granite_prompt(std::span<const ChatTurn> turns,
                                  bool add_generation_prompt) {

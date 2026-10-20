@@ -136,6 +136,18 @@ inline std::optional<Recommendation> recommended_sampling(ModelArch arch, std::s
         r.note = "card: top_p 0.95 or 1.0; 0.95 is what every card evaluation used (owner decision 2026-09-28)";
         return r;
     }
+    if (arch == ModelArch::kLaguna) {
+        Recommendation r;
+        r.model = "Laguna-S-2.1";
+        r.source = "https://huggingface.co/poolside/Laguna-S-2.1";
+        r.thinking = {1.0, 1.0, 20, 0.0, 0.0, 1.0, "the default (the card's chat template thinks unless told not to)"};
+        r.instruct = RecommendedMode{1.0, 1.0, 20, 0.0, 0.0, 1.0,
+                      "quick replies (general guidance; the card gives one sampling set for both modes)"};
+        r.max_output_note = "not specified by the card";
+        r.context = 1048576;
+        r.note = "generation_config: temperature 1.0, top_p 1.0, top_k 20, min_p 0";
+        return r;
+    }
     return std::nullopt;
 }
 
@@ -147,11 +159,12 @@ inline const RecommendedMode& recommended_mode(const Recommendation& r, bool thi
 // DeepSeek-V4.1 and MiMo-V2.6 sample on the host (deepseek41_generate.cpp), which has no presence or frequency penalty:
 // such a setting is served WITHOUT it (owner decision 2026-09-28: warn, do not refuse). "" = nothing is dropped.
 inline std::string dropped_penalty_warning(ModelArch arch, const SamplingParams& sp) {
-    if (arch != ModelArch::kDeepSeek41 && arch != ModelArch::kMimo26) return {};
+    if (arch != ModelArch::kDeepSeek41 && arch != ModelArch::kMimo26 && arch != ModelArch::kLaguna && arch != ModelArch::kInkling) return {};
     if (sp.presence_penalty == 0.f && sp.frequency_penalty == 0.f) return {};
     return std::string("presence_penalty ") + std::to_string(sp.presence_penalty) + " / frequency_penalty " +
            std::to_string(sp.frequency_penalty) + " IGNORED: the " +
-           (arch == ModelArch::kMimo26 ? "MiMo-V2.6" : "DeepSeek-V4.1") +
+           (arch == ModelArch::kMimo26 ? "MiMo-V2.6" : arch == ModelArch::kLaguna ? "Laguna" :
+            arch == ModelArch::kInkling ? "Inkling" : "DeepSeek-V4.1") +
            " sampler has no presence/frequency penalty (repeat_penalty works)";
 }
 

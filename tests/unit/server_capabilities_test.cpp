@@ -1,5 +1,6 @@
 #undef NDEBUG
 #include "ie/server_capabilities.hpp"
+#include "ie/reasoning.hpp"
 #include "ie/recommended_sampling.hpp"
 #include "nlohmann/json.hpp"
 #include <cassert>
@@ -16,8 +17,14 @@ int main() {
  assert(!ie::server_supports_arch(ModelArch::kGlmDsa));
  assert(!ie::server_supports_arch(ModelArch::kUnknown));
  assert(!ie::server_supports_arch(ModelArch::kHyv4));
+ assert(ie::server_supports_arch(ModelArch::kLaguna));
+ assert(ie::server_supports_arch(ModelArch::kInkling));
  assert(ie::server_streams_experts(ModelArch::kGlm5Next));
  assert(!ie::server_streams_experts(ModelArch::kLlama3));
+ assert(ie::server_streams_experts(ModelArch::kLaguna));
+ assert(ie::reasoning_capabilities(ModelArch::kLaguna).thinking);
+ assert(ie::server_streams_experts(ModelArch::kInkling));
+ assert(ie::reasoning_capabilities(ModelArch::kInkling).default_effort == "high");
  auto general=json::parse(ie::server_capabilities_json());
  assert(general.at("schema_version")==1);
  assert(general.at("features").at("context_shift")==false);

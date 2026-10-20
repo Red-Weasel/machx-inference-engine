@@ -10,6 +10,7 @@
 #include "../../third_party/nlohmann/json.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <fstream>
@@ -151,8 +152,8 @@ std::string Mimo26DFlash::init(sycl::queue& q, const uint8_t* embed_bf16, uint32
     kv32_ = dev<float>(std::max(M, B) * NKV); kh_ = dev<sycl::half>(std::max(M, B) * NKV); vh_ = dev<sycl::half>(std::max(M, B) * NKV);
     x32_ = dev<float>(B * H); t32_ = dev<float>(B * std::max(H, NQ)); x16_ = dev<sycl::half>(B * H); q32_ = dev<float>(B * NQ); qh_ = dev<sycl::half>(B * NQ);
     att_ = dev<sycl::half>(B * NQ); g32_ = dev<float>(B * cfg_.inter); u32_ = dev<float>(B * cfg_.inter); h16_ = dev<sycl::half>(B * cfg_.inter);
-    lg32_ = dev<float>(B * size_t(vocab)); pos_ = dev<int32_t>(std::max(M, B)); top_id_ = dev<int32_t>(B); top_p_ = dev<float>(B);
-    if (!feat32_ || !feat16_ || !ctx32_ || !ctx16_ || !kv32_ || !kh_ || !vh_ || !x32_ || !t32_ || !x16_ || !q32_ || !qh_ || !att_ || !g32_ || !u32_ || !h16_ || !lg32_ || !pos_ || !top_id_ || !top_p_)
+    lg32_ = dev<float>(B * size_t(vocab)); pos_ = dev<int32_t>(std::max(M, B)); top_id_ = dev<int32_t>(B); top_p_ = dev<float>(B); qs_ = dev<float>(4 * size_t(B));
+    if (!feat32_ || !feat16_ || !ctx32_ || !ctx16_ || !kv32_ || !kh_ || !vh_ || !x32_ || !t32_ || !x16_ || !q32_ || !qh_ || !att_ || !g32_ || !u32_ || !h16_ || !lg32_ || !pos_ || !top_id_ || !top_p_ || !qs_)
         return "dflash: workspace allocation failed";
     q.wait();
     reset();
@@ -270,7 +271,16 @@ std::string Mimo26DFlash::add_context(const float* feats, uint32_t T, uint32_t p
     return {};
 }
 
-std::string Mimo26DFlash::draft(int32_t anchor, uint32_t k, std::vector<int32_t>& out, float min_p) {
+std::string Mimo26DFlash::row_q(uint32_t r, const std::vector<int32_t>& ids, std::vector<double>& q) {
+    if (!q_ || r >= qsel_.size()) return "dflash: row_q without a sampled draft row " + std::to_string(r);
+    row_.resize(vocab_);
+    q_->memcpy(row_.data(), lg32_ + size_t(r) * vocab_, size_t(vocab_) * 4).wait();
+    q.resize(ids.size());
+    for (size_t i = 0; i < ids.size(); ++i) q[i] = ids[i] >= 0 && uint32_t(ids[i]) < vocab_ ? double(sycl::exp(row_[size_t(ids[i])] - gmax_[r]) / gsum_[r]) : 0.0;
+    return {};
+}
+
+std::string Mimo26DFlash::draft(int32_t anchor, uint32_t k, std::vector<int32_t>& out, float min_p, const double* u) {
     out.clear(); probs_.clear();
     if (!q_ || L_.empty()) return "dflash: not initialised";
     if (!head_) return "dflash: no lm_head attached (set_head)";
@@ -344,7 +354,41 @@ std::string Mimo26DFlash::draft(int32_t anchor, uint32_t k, std::vector<int32_t>
     mimo26_rms_norm(q, x32_, fnorm_, x16_, nullptr, B, H, cfg_.eps);
     gemm_nt_f16_onednn(q, x16_ + H, head_, lg32_, k, vocab_, H);   // rows 1..k: the drafts
     // per row on the device: the argmax (the first index of the maximum, as std::max_element) and its softmax probability
-    {
+    if (u) {   // B68: a sampled draft per row -- the inverse CDF of the row's softmax at u[r], over contiguous chunks
+        std::vector<float> uf(k); for (uint32_t r = 0; r < k; ++r) uf[r] = float(u[r]);
+        q.memcpy(qs_, uf.data(), k * 4);
+        constexpr uint32_t WG = 1024;
+        const float* lg = lg32_; int32_t* tid = top_id_; float* tp = top_p_; float* qs = qs_; const uint32_t V = vocab_, KB = B;
+        ie::ps(q, "mimo26_dflash_sample", [&](sycl::handler& h) {
+            sycl::local_accessor<float, 1> exs(sycl::range<1>(WG), h);
+            h.parallel_for(sycl::nd_range<1>(size_t(k) * WG, WG), [=](sycl::nd_item<1> it) {
+                const uint32_t r = uint32_t(it.get_group(0)), l = uint32_t(it.get_local_id(0));
+                const float* row = lg + size_t(r) * V;
+                float m = -std::numeric_limits<float>::infinity();
+                for (uint32_t i = l; i < V; i += WG) m = sycl::fmax(m, row[i]);
+                const float gm = sycl::reduce_over_group(it.get_group(), m, sycl::maximum<float>());
+                const uint32_t C = (V + WG - 1) / WG, a = std::min(V, l * C), b = std::min(V, a + C);
+                float s = 0.f;
+                for (uint32_t i = a; i < b; ++i) s += sycl::exp(row[i] - gm);
+                const float ex = sycl::exclusive_scan_over_group(it.get_group(), s, sycl::plus<float>());
+                const float tot = sycl::group_broadcast(it.get_group(), ex + s, WG - 1);
+                const float target = qs[r] * tot;
+                // chunk l owns [ex_l, ex_{l+1}) of the scan's own prefixes (non-decreasing: the terms are >= 0), so exactly one
+                // chunk claims the target; the last chunk that holds tokens also takes a target rounding left at the end
+                exs[l] = ex;
+                sycl::group_barrier(it.get_group());
+                const uint32_t lastnz = (V - 1) / C;
+                if (a < b && target >= ex && (l == lastnz || target < exs[l + 1])) {
+                    float c = ex; uint32_t sel = b - 1;
+                    for (uint32_t i = a; i < b; ++i) { c += sycl::exp(row[i] - gm); if (target < c) { sel = i; break; } }
+                    tid[r] = int32_t(sel); qs[KB + r] = sycl::exp(row[sel] - gm) / tot;
+                }
+                if (l == 0) { tp[r] = 1.f / tot; qs[2 * KB + r] = gm; qs[3 * KB + r] = tot; }
+            });
+        });
+        qsel_.resize(k); gmax_.resize(k); gsum_.resize(k);
+        q.memcpy(qsel_.data(), qs_ + B, k * 4); q.memcpy(gmax_.data(), qs_ + 2 * B, k * 4); q.memcpy(gsum_.data(), qs_ + 3 * B, k * 4);
+    } else {
         constexpr uint32_t WG = 1024;
         const float* lg = lg32_; int32_t* tid = top_id_; float* tp = top_p_; const uint32_t V = vocab_;
         ie::ps(q, "mimo26_dflash_argmax", [&](sycl::handler& h) {
@@ -365,9 +409,12 @@ std::string Mimo26DFlash::draft(int32_t anchor, uint32_t k, std::vector<int32_t>
     std::vector<int32_t> ids(k); probs_.resize(k);
     q.memcpy(ids.data(), top_id_, k * 4);
     q.memcpy(probs_.data(), top_p_, k * 4).wait();
+    // B68: the first draft's own cut (IE_MIMO26_DFLASH_FIRST_MINP; unset = min_p, v0.2.23): a step the cut leaves empty is
+    // a plain one-row forward that commits one token, so a lower first cut trades a slightly wider verify for its chance
+    static const float first_minp = [] { const char* v = std::getenv("IE_MIMO26_DFLASH_FIRST_MINP"); return v && *v ? float(std::atof(v)) : -1.f; }();
     for (uint32_t r = 0; r < k; ++r) {
         if (ids[r] < 0 || uint32_t(ids[r]) >= vocab_) return "dflash: draft row " + std::to_string(r) + " has no finite maximum";
-        if (probs_[r] < min_p) break;
+        if (probs_[r] < (r == 0 && first_minp >= 0.f ? first_minp : min_p)) break;
         out.push_back(ids[r]);
     }
     return {};

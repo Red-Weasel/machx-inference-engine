@@ -3,6 +3,7 @@
 #include "ie/openai_proto.hpp"
 #include "ie/server_admission.hpp"
 #include "ie/stop_sequences.hpp"
+#include "ie/toolcall_log.hpp"
 #include "httplib/httplib.h"
 #include "nlohmann/json.hpp"
 #include <algorithm>
@@ -333,6 +334,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
             // (P4 B35: and a Qwen thinking template's, whose text now shows the tag)
             const bool separate_thinking_ns =
                 (eng.arch() == ModelArch::kDeepSeek4 || eng.arch() == ModelArch::kGlm5Next || eng.arch() == ModelArch::kDeepSeek41 || eng.arch() == ModelArch::kMimo26 ||
+                 eng.arch() == ModelArch::kLaguna || eng.arch() == ModelArch::kInkling ||
                  eng.chatml_thinking())
                 && cr.enable_thinking;
             std::string acc_ns;
@@ -357,7 +359,9 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                     // a forming tool-call block is never cut by a stop sequence
                     // (the stream path holds it back the same way)
                     static const std::string kToolOpen = "<tool_call>";
-                    const std::string kDsmlOpen = eng.arch() == ModelArch::kDeepSeek41
+                    // the bare DSML token opens a forming call for both DeepSeek families: the parsers also read the spaced
+                    // spelling (`<｜DSML｜ tool_calls`, docs/deepseek41/107), which the longer V4 marker would not catch
+                    const std::string kDsmlOpen = (eng.arch() == ModelArch::kDeepSeek41 || eng.arch() == ModelArch::kDeepSeek4)
                         ? "<｜DSML｜" : "<｜DSML｜tool_calls";
                     const size_t tool_at = std::min(acc_ns.find(kToolOpen, cs),
                                                     acc_ns.find(kDsmlOpen, cs));
@@ -488,8 +492,10 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 const bool ds4 = (eng.arch() == ModelArch::kDeepSeek4);
                 const bool ds41 = (eng.arch() == ModelArch::kDeepSeek41);
                 const bool mimo = (eng.arch() == ModelArch::kMimo26);   // the engine parses MiMo's XML tool calls (docs/mimo26 P3b)
-                const bool structured = ds4 || eng.arch() == ModelArch::kGlm5Next || eng.arch() == ModelArch::kDeepSeek41 || mimo;
-                const std::string DSML_OPEN = ds41 ? "<｜DSML｜" : "<｜DSML｜tool_calls";
+                const bool structured = ds4 || eng.arch() == ModelArch::kGlm5Next || eng.arch() == ModelArch::kDeepSeek41 || mimo ||
+                                        eng.arch() == ModelArch::kLaguna ||   // GLM's tool-call format, parsed by the engine
+                                        eng.arch() == ModelArch::kInkling;    // its stream translated to </think> / <tool_call>
+                const std::string DSML_OPEN = (ds41 || ds4) ? "<｜DSML｜" : "<｜DSML｜tool_calls";   // bare token: see kDsmlOpen above
                 static const std::string THINK_CLOSE = "</think>";
                 // P4 B35: a Qwen thinking template with thinking on: the text before the model's first </think> (which
                 // the engine's text shows) goes out as delta.reasoning_content, then the content -- split_chatml_think's
@@ -744,6 +750,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
             host.c_str(), port, port);
         return 1;
     }
+    install_toolcall_log();   // repaired / refused tool calls: a stderr line + the raw call in ~/.cache/machx-ie/toolcall-events.jsonl (docs/deepseek41/107)
     std::printf("[ie] serving %s on http://%s:%d/v1 (ctx %u, parallel %u, max-queue %u)\n",
                 model_id.c_str(), host.c_str(), port, eng.max_ctx(), eng.parallel(), max_queue);
     std::fflush(stdout);

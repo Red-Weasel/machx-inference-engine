@@ -27,13 +27,15 @@ bool server_supports_arch(ModelArch arch) noexcept {
         case ModelArch::kQwen3Moe: case ModelArch::kQwen3Next:
         case ModelArch::kGemma4: case ModelArch::kGptOss:
         case ModelArch::kDeepSeek4: case ModelArch::kQwen4Exp:
-        case ModelArch::kGlm5Next: case ModelArch::kDeepSeek41: case ModelArch::kMimo26: return true;
+        case ModelArch::kGlm5Next: case ModelArch::kDeepSeek41: case ModelArch::kMimo26:
+        case ModelArch::kLaguna: case ModelArch::kInkling: return true;
         default: return false;
     }
 }
 bool server_streams_experts(ModelArch arch) noexcept {
     return arch == ModelArch::kDeepSeek4 || arch == ModelArch::kQwen4Exp ||
-           arch == ModelArch::kGlm5Next || arch == ModelArch::kDeepSeek41 || arch == ModelArch::kMimo26;
+           arch == ModelArch::kGlm5Next || arch == ModelArch::kDeepSeek41 || arch == ModelArch::kMimo26 ||
+           arch == ModelArch::kLaguna || arch == ModelArch::kInkling;
 }
 std::string server_capabilities_json(const std::string& model_path) {
     using nlohmann::json;
@@ -69,7 +71,8 @@ std::string server_capabilities_json(const std::string& model_path) {
     const bool cache = generic || arch == ModelArch::kQwen35Moe ||
         arch == ModelArch::kQwen35Dense || arch == ModelArch::kQwen3Next ||
         arch == ModelArch::kGemma4 || arch == ModelArch::kQwen4Exp ||
-        arch == ModelArch::kDeepSeek4 || arch == ModelArch::kDeepSeek41 || arch == ModelArch::kMimo26;
+        arch == ModelArch::kDeepSeek4 || arch == ModelArch::kDeepSeek41 || arch == ModelArch::kMimo26 ||
+        arch == ModelArch::kLaguna || arch == ModelArch::kInkling;
     // v0.2.21: the 35B-A3B class (lookup drafts on the request lanes, P4 B55) and Flash-Next (lookup drafts at one lane, B56; its
     // MTP head only with a --spec-head path, B63) take --spec too, so a client's load screen can offer it.
     const bool spec = generic || arch == ModelArch::kQwen35Dense || arch == ModelArch::kGemma4 ||

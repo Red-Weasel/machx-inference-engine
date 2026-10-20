@@ -168,47 +168,63 @@ sycl::event lag_moe_router(sycl::queue& q, const float* logits, const float* bia
                            uint32_t T, uint32_t n_experts, uint32_t k,
                            bool norm_topk_prob, float softcap,
                            const std::vector<sycl::event>& deps) {
+    // One work-group per row: every expert's score at once, then k rounds of a group-wide max over a 64-bit key --
+    // the selection score's order-preserving bits above ~index, so the larger score wins and the smaller index on
+    // ties (the strict total order above; a NaN score ranks last). Was one work-item per row walking every expert k
+    // times: 415 us per decode layer on Laguna-S-2.1 (256 experts, k 10), a quarter of a decode step.
+    constexpr uint32_t WG = 256, kMaxK = 32, kPer = 4;       // up to WG * kPer experts per row
     return ie::ps(q, "lag_moe_router", [&](sycl::handler& h) {
         h.depends_on(deps);
-        const uint32_t global = ((T + kWG - 1) / kWG) * kWG;
-        h.parallel_for(sycl::nd_range<1>(global, kWG), [=](sycl::nd_item<1> it) {
-            const uint32_t t = uint32_t(it.get_global_id(0));
-            if (t >= T) return;
-            const float* row = logits + uint64_t(t) * n_experts;
-            constexpr uint32_t kMaxK = 32;
-            uint32_t sel[kMaxK];
-            float    w[kMaxK];
-            float prev_s = 0.f;
-            uint32_t prev_i = 0;
-            for (uint32_t r = 0; r < k && r < kMaxK; ++r) {
-                float best_s = -1e30f, best_score = 0.f;
-                uint32_t best_i = 0;
-                bool found = false;
-                for (uint32_t e = 0; e < n_experts; ++e) {
-                    float lg = row[e];
-                    if (softcap > 0.f) lg = sycl::tanh(lg / softcap) * softcap;
-                    const float score = 1.f / (1.f + sycl::exp(-lg));   // sigmoid
-                    const float sc = score + bias[e];                   // SELECTION only
-                    const bool after = r == 0 ? true
-                                    : (sc < prev_s || (sc == prev_s && e > prev_i));
-                    if (!after) continue;
-                    if (!found || sc > best_s || (sc == best_s && e < best_i)) {
-                        best_s = sc; best_i = e; best_score = score; found = true;
-                    }
+        sycl::local_accessor<int32_t, 1> isel(sycl::range<1>(kMaxK), h);
+        sycl::local_accessor<float, 1>   wsel(sycl::range<1>(kMaxK), h);
+        h.parallel_for(sycl::nd_range<1>(uint64_t(T) * WG, WG), [=](sycl::nd_item<1> it) {
+            const uint64_t t = it.get_group(0);
+            const uint32_t lid = uint32_t(it.get_local_id(0));
+            const float* row = logits + t * n_experts;
+            uint64_t key[kPer];
+            float    score[kPer];
+            for (uint32_t j = 0; j < kPer; ++j) {
+                const uint32_t e = lid + j * WG;
+                key[j] = 0; score[j] = 0.f;                        // 0 = no expert (never a real key)
+                if (e >= n_experts) continue;
+                float lg = row[e];
+                if (softcap > 0.f) lg = sycl::tanh(lg / softcap) * softcap;
+                const float sg = 1.f / (1.f + sycl::exp(-lg));   // sigmoid
+                float sc = sg + bias[e];                          // SELECTION only
+                uint32_t u;
+                if (!(sc == sc)) u = 0u;                          // NaN: below every number
+                else {
+                    if (sc == 0.f) sc = 0.f;                      // -0 orders as +0
+                    u = sycl::bit_cast<uint32_t>(sc);
+                    u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
                 }
-                sel[r] = best_i;
-                w[r]   = best_score;     // UNBIASED score is the weight
-                prev_s = best_s; prev_i = best_i;
+                key[j] = (uint64_t(u) << 32) | uint64_t(0xFFFFFFFFu - e);
+                score[j] = sg;                                    // UNBIASED score is the weight
             }
-            if (norm_topk_prob) {
-                float sum = 0.f;
-                for (uint32_t r = 0; r < k; ++r) sum += w[r];
-                const float inv = (sum > 0.f) ? (1.f / sum) : 0.f;
-                for (uint32_t r = 0; r < k; ++r) w[r] *= inv;
+            const uint32_t kk = k < kMaxK ? k : kMaxK;
+            for (uint32_t r = 0; r < kk; ++r) {
+                uint64_t best = 0;
+                for (uint32_t j = 0; j < kPer; ++j) best = key[j] > best ? key[j] : best;
+                best = sycl::reduce_over_group(it.get_group(), best, sycl::maximum<uint64_t>());
+                for (uint32_t j = 0; j < kPer; ++j)
+                    if (best != 0 && key[j] == best) {
+                        isel[r] = int32_t(0xFFFFFFFFu - uint32_t(best & 0xFFFFFFFFu));
+                        wsel[r] = score[j];
+                        key[j] = 0;
+                    }
             }
-            for (uint32_t r = 0; r < k; ++r) {
-                out_idx[uint64_t(t) * k + r] = int32_t(sel[r]);
-                out_w[uint64_t(t) * k + r]   = w[r];
+            sycl::group_barrier(it.get_group());
+            if (lid == 0) {
+                float inv = 1.f;
+                if (norm_topk_prob) {
+                    float sum = 0.f;
+                    for (uint32_t r = 0; r < kk; ++r) sum += wsel[r];
+                    inv = (sum > 0.f) ? (1.f / sum) : 0.f;
+                }
+                for (uint32_t r = 0; r < kk; ++r) {
+                    out_idx[t * k + r] = isel[r];
+                    out_w[t * k + r]   = norm_topk_prob ? wsel[r] * inv : wsel[r];
+                }
             }
         });
     });

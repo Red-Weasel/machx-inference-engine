@@ -504,6 +504,45 @@ int main() {
               "c", "r",
               R"([{"type":"function","function":{"name":"f",)"
               R"("arguments":"{\"code\": \"line1\\nline2\"}"}}])" },
+            // Tool-call hardening (docs/deepseek41/107): a model that opens its parameters in the V4.1 spelling
+            // (`<｜DSML｜ parameter`, a space after the token) inside a V4 `tool_calls` block. The invoke-name regex
+            // port is non-greedy to the END of the segment it was handed, so the missing `<｜DSML｜parameter` stop
+            // used to swallow the whole call into the NAME and return a "valid" call with that name and no
+            // arguments -- the agent then got `unknown tool '<markup>'` and lost the turn. It must parse as the call
+            // it is: name `grep`, the one parameter, no markup in the name.
+            { "c\n\n<" + dsml + "tool_calls>\n<" + dsml + "invoke name=\"grep\">\n<" + dsml +
+              " parameter name=\"arguments\" string=\"false\">{\"p\": 1}</" + dsml + " parameter>\n</" + dsml +
+              "invoke>\n</" + dsml + "tool_calls>" + eos, false, true,
+              "c", "",
+              R"([{"type":"function","function":{"name":"grep","arguments":"{\"arguments\": {\"p\": 1}}"}}])" },
+            // ... and the spaced spelling of the whole block (open, close and invoke), same call.
+            { "c\n\n<" + dsml + " tool_calls>\n<" + dsml + " invoke name=\"ls\">\n<" + dsml +
+              " parameter name=\"path\" string=\"true\">/tmp</" + dsml + " parameter>\n</" + dsml +
+              " invoke>\n</" + dsml + " tool_calls>" + eos, false, true,
+              "c", "",
+              R"([{"type":"function","function":{"name":"ls","arguments":"{\"path\": \"/tmp\"}"}}])" },
+            // A stray `>` stuck to the name (`name="run_bash>">`): the name is the identifier before it.
+            { "c\n\n<" + dsml + "tool_calls>\n<" + dsml + "invoke name=\"run_bash>\">\n<" + dsml +
+              "parameter name=\"command\" string=\"true\">ls</" + dsml + "parameter>\n</" + dsml +
+              "invoke>\n</" + dsml + "tool_calls>" + eos, false, true,
+              "c", "",
+              R"([{"type":"function","function":{"name":"run_bash","arguments":"{\"command\": \"ls\"}"}}])" },
+            // Markup in a name that cannot be an identifier is a parse ERROR, never a call.
+            { "c\n\n<" + dsml + "tool_calls>\n<" + dsml + "invoke name=\"a\"><b>\">\n</" + dsml + "invoke>\n</" +
+              dsml + "tool_calls>" + eos, false, false, "", "", "" },
+            // A JSON blob with a LITERAL newline inside a string (multi-line code written straight into the value): repaired, re-serialized.
+            { "c\n\n<" + dsml + "tool_calls>\n<" + dsml + "invoke name=\"run_bash\">\n<" + dsml +
+              "parameter name=\"arguments\" string=\"false\">{\"command\": \"a\nb\"}</" + dsml + "parameter>\n</" + dsml +
+              "invoke>\n</" + dsml + "tool_calls>" + eos, false, true,
+              "c", "",
+              R"([{"type":"function","function":{"name":"run_bash","arguments":"{\"arguments\": {\"command\":\"a\\nb\"}}"}}])" },
+            // A bare word where JSON was promised is NOT guessed at: the DS4 port has always passed such a value through as written, and
+            // that is unchanged (the client then rejects the arguments; the V4.1 parser refuses the call outright).
+            { "c\n\n<" + dsml + "tool_calls>\n<" + dsml + "invoke name=\"read_file\">\n<" + dsml +
+              "parameter name=\"path\" string=\"false\">README.md</" + dsml + "parameter>\n</" + dsml +
+              "invoke>\n</" + dsml + "tool_calls>" + eos, false, true,
+              "c", "",
+              R"([{"type":"function","function":{"name":"read_file","arguments":"{\"path\": README.md}"}}])" },
             // Malformed: upstream RAISES on each of these, so the port must report an
             // error rather than invent a plausible parse.
             { "no think marker" + eos, true, false, "", "", "" },
@@ -530,6 +569,19 @@ int main() {
                 std::printf("  §5 PARSE #%zu accepted a MALFORMED completion\n", i);
             }
         }
+    }
+
+    // ---- §5b IE_TOOLCALL_REPAIR=0 makes the DS4 parser strict again (no rebuild), and the markup-in-name refusal stays ----
+    {
+        const std::string dsml = "\xef\xbd\x9c" "DSML" "\xef\xbd\x9c";
+        const std::string spaced = "c\n\n<" + dsml + "tool_calls>\n<" + dsml + "invoke name=\"grep\">\n<" + dsml +
+            " parameter name=\"a\" string=\"false\">1</" + dsml + " parameter>\n</" + dsml + "invoke>\n</" + dsml + "tool_calls>";
+        const std::string markup_name = "c\n\n<" + dsml + "tool_calls>\n<" + dsml + "invoke name=\"a\"><b>\">\n</" + dsml + "invoke>\n</" + dsml + "tool_calls>";
+        setenv("IE_TOOLCALL_REPAIR", "0", 1);
+        if (ie::parse_deepseek4_completion(spaced, false).error.empty()) { ++failures; std::printf("  §5b spaced call accepted with the switch OFF\n"); }
+        if (ie::parse_deepseek4_completion(markup_name, false).error.empty()) { ++failures; std::printf("  §5b markup name accepted with the switch OFF\n"); }
+        unsetenv("IE_TOOLCALL_REPAIR");
+        if (!ie::parse_deepseek4_completion(spaced, false).error.empty()) { ++failures; std::printf("  §5b spaced call refused with the switch ON\n"); }
     }
 
     if (have_tok) {

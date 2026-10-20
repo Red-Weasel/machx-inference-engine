@@ -913,10 +913,25 @@ public:
     // caller sizes them out of ITS VRAM budget before deriving slots_per_layer
     // (DeepSeek4Runtime::load_prepare); init only allocates, and if a bank's
     // allocation fails it drops the banks and keeps going (old grouped path).
+    // `n_elastic` (docs/deepseek41/105) = ADDITIONAL streaming slots per layer, beyond slots_per_layer,
+    // backed by ONE separate contiguous block of `elastic_block_bytes` (sized by the caller to also hold a
+    // prefill chunk's scratch). They are the top slots [slots_per_layer, slots_per_layer+n_elastic); during a
+    // prefill chunk the forward calls lend_elastic() to borrow the block as scratch and the slots go away
+    // (back to exactly slots_per_layer, i.e. today's behaviour). 0 = off, byte-identical to before.
     std::string init(sycl::queue& compute, const Ds4HostArena& arena,
                      uint32_t slots_per_layer, uint64_t vram_budget_bytes = 0,
-                     uint32_t static_slots = 0, uint32_t bank_slots = 0);
+                     uint32_t static_slots = 0, uint32_t bank_slots = 0,
+                     uint32_t n_elastic = 0, uint64_t elastic_block_bytes = 0);
     void free_storage() noexcept;
+
+    // Elastic region. lend_elastic: invalidate the elastic slots and return the block for the forward to use
+    // as its prefill-chunk scratch (q is drained first so no in-flight read touches them). reclaim_elastic:
+    // the slots become available (empty) again for decode. No-ops when n_elastic == 0.
+    void*    lend_elastic(sycl::queue& q) noexcept;
+    void     reclaim_elastic() noexcept;
+    uint64_t elastic_block_bytes() const noexcept { return elastic_blk_bytes_; }
+    bool     elastic_lent() const noexcept { return elastic_lent_; }
+    uint32_t elastic_slots() const noexcept { return n_elastic_; }
 
     // Uploads one slot's worth of bytes for layer `L` into static slot `s` and
     // records it as expert `e`, permanently.  Blocking: the caller's staging
@@ -927,7 +942,7 @@ public:
     sycl::queue& transfer_queue() noexcept { return *xq_; }
     uint32_t     slots_per_layer() const noexcept { return slots_; }
     uint32_t     static_slots() const noexcept { return static_; }
-    uint32_t     stream_slots() const noexcept { return slots_ - static_; }
+    uint32_t     stream_slots() const noexcept { return avail_slots_() - static_; }
     uint64_t     device_bytes() const noexcept { return device_bytes_; }
 
     // Can expert `e` of layer `L` be served at all — i.e. is it resident now, or
@@ -1222,6 +1237,18 @@ private:
     void note_fill(const sycl::event& e) { if (!xq_prof_) pending_.clear(); pending_.push_back(e); }
     uint32_t                   n_layers_ = 0, n_experts_ = 0, slots_ = 0, static_ = 0;
     uint64_t                   device_bytes_ = 0;
+
+    // Elastic region (docs/deepseek41/105). The top n_elastic_ slots [elastic_base_, slots_) are backed by
+    // elastic_blk_ (not dev_[L]); elastic_off_[L] is layer L's byte offset into it. When elastic_lent_, those
+    // slots are unavailable (the block is on loan as prefill scratch) so avail_slots_() falls back to the base
+    // count and every slot-assignment path skips them. n_elastic_ == 0 -> elastic_base_ == slots_ -> all off.
+    uint32_t                   n_elastic_   = 0;
+    uint32_t                   elastic_base_ = 0;
+    uint8_t*                   elastic_blk_ = nullptr;
+    uint64_t                   elastic_blk_bytes_ = 0;
+    std::vector<uint64_t>      elastic_off_;
+    bool                       elastic_lent_ = false;
+    uint32_t                   avail_slots_() const noexcept { return elastic_lent_ ? elastic_base_ : slots_; }
     Stats                      st_{};
 };
 

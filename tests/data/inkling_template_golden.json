@@ -1,0 +1,260 @@
+[
+ {
+  "name": "user only, thinking default",
+  "thinking": true,
+  "effort": null,
+  "messages": [
+   {
+    "role": "user",
+    "content": "What is the capital of France?"
+   }
+  ],
+  "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|><|message_user|><|content_text|>What is the capital of France?<|end_message|><|message_model|>"
+ },
+ {
+  "name": "system + user, thinking off",
+  "thinking": false,
+  "effort": null,
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "prompt": "<|message_system|><|content_text|>You are terse.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>Hi<|end_message|><|message_model|>"
+ },
+ {
+  "name": "history with reasoning, effort low",
+  "thinking": true,
+  "effort": "low",
+  "messages": [
+   {
+    "role": "user",
+    "content": "2+2?"
+   },
+   {
+    "role": "assistant",
+    "content": "4",
+    "reasoning_content": "Add them."
+   },
+   {
+    "role": "user",
+    "content": "times 3?"
+   }
+  ],
+  "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.2<|end_message|><|message_user|><|content_text|>2+2?<|end_message|><|message_model|><|content_thinking|>Add them.<|end_message|><|message_model|><|content_text|>4<|end_message|><|content_model_end_sampling|><|message_user|><|content_text|>times 3?<|end_message|><|message_model|>"
+ },
+ {
+  "name": "tools, a call, its result, effort max",
+  "thinking": true,
+  "effort": "max",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Use tools when needed."
+   },
+   {
+    "role": "user",
+    "content": "Weather in Zürich?"
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Z\\u00fcrich\", \"days\": 3, \"nested\": {\"b\": [1, 2.5, \"x\"], \"a\": null}}"
+      }
+     }
+    ],
+    "reasoning_content": "Call the tool."
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "{\"temp\": 18}"
+   },
+   {
+    "role": "user",
+    "content": "Thanks"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather for a city — °C or °F",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "default": 1
+       },
+       "ratio": {
+        "type": "number",
+        "default": 1.0
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "noop"
+    }
+   }
+  ],
+  "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city — °C or °F\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"default\":1,\"type\":\"integer\"},\"ratio\":{\"default\":1.0,\"type\":\"number\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"noop\",\"parameters\":{},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Use tools when needed.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.99<|end_message|><|message_user|><|content_text|>Weather in Zürich?<|end_message|><|message_model|><|content_thinking|>Call the tool.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Zürich\",\"days\":3,\"nested\":{\"a\":null,\"b\":[1,2.5,\"x\"]}}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>{\"temp\": 18}<|end_message|><|message_user|><|content_text|>Thanks<|end_message|><|message_model|>"
+ },
+ {
+  "name": "developer + mid system, numeric effort",
+  "thinking": true,
+  "effort": "0.35",
+  "messages": [
+   {
+    "role": "developer",
+    "content": "Dev note."
+   },
+   {
+    "role": "user",
+    "content": "a"
+   },
+   {
+    "role": "system",
+    "content": "Mid system."
+   },
+   {
+    "role": "user",
+    "content": "b"
+   }
+  ],
+  "prompt": "<|message_system|><|content_text|>Dev note.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.35<|end_message|><|message_user|><|content_text|>a<|end_message|><|message_system|><|content_text|>Mid system.<|end_message|><|message_user|><|content_text|>b<|end_message|><|message_model|>"
+ },
+ {
+  "name": "assistant text + call, thinking off",
+  "thinking": false,
+  "effort": null,
+  "messages": [
+   {
+    "role": "user",
+    "content": "x"
+   },
+   {
+    "role": "assistant",
+    "content": "Checking.",
+    "tool_calls": [
+     {
+      "id": "call_1",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Z\\u00fcrich\", \"days\": 3, \"nested\": {\"b\": [1, 2.5, \"x\"], \"a\": null}}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_1",
+    "content": "ok"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Get the weather for a city — °C or °F",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "unit": {
+        "type": "string",
+        "enum": [
+         "c",
+         "f"
+        ]
+       },
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "default": 1
+       },
+       "ratio": {
+        "type": "number",
+        "default": 1.0
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "noop"
+    }
+   }
+  ],
+  "prompt": "<|message_system|>tool_declare<|content_xml|>[{\"description\":\"Get the weather for a city — °C or °F\",\"name\":\"get_weather\",\"parameters\":{\"properties\":{\"city\":{\"type\":\"string\"},\"days\":{\"default\":1,\"type\":\"integer\"},\"ratio\":{\"default\":1.0,\"type\":\"number\"},\"unit\":{\"enum\":[\"c\",\"f\"],\"type\":\"string\"}},\"required\":[\"city\"],\"type\":\"object\"},\"type\":\"function\"},{\"description\":\"\",\"name\":\"noop\",\"parameters\":{},\"type\":\"function\"}]<|end_message|><|message_system|><|content_text|>Thinking effort level: 0<|end_message|><|message_user|><|content_text|>x<|end_message|><|message_model|><|content_text|>Checking.<|end_message|><|message_model|>get_weather<|content_invoke_tool_json|>{\"name\":\"get_weather\",\"args\":{\"city\":\"Zürich\",\"days\":3,\"nested\":{\"a\":null,\"b\":[1,2.5,\"x\"]}}}<|end_message|><|content_model_end_sampling|><|message_tool|>get_weather<|content_text|>ok<|end_message|><|message_model|>"
+ },
+ {
+  "name": "empty assistant turn, effort medium",
+  "thinking": true,
+  "effort": "medium",
+  "messages": [
+   {
+    "role": "user",
+    "content": "q"
+   },
+   {
+    "role": "assistant",
+    "content": ""
+   },
+   {
+    "role": "user",
+    "content": "again"
+   }
+  ],
+  "prompt": "<|message_system|><|content_text|>Thinking effort level: 0.7<|end_message|><|message_user|><|content_text|>q<|end_message|><|message_user|><|content_text|>again<|end_message|><|message_model|>"
+ },
+ {
+  "name": "system only, effort 0.5",
+  "thinking": true,
+  "effort": "0.5",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Only a system message."
+   }
+  ],
+  "prompt": "<|message_system|><|content_text|>Only a system message.<|end_message|><|message_system|><|content_text|>Thinking effort level: 0.5<|end_message|><|message_model|>"
+ }
+]

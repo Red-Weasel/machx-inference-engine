@@ -164,8 +164,10 @@ public:
                         std::vector<Qwen35SpecCheckpoint>* ckpts = nullptr);
 
     // ---- MTP self-speculative GREEDY decode (--spec) on the split path ----
-    // Same lossless draft→verify→accept→commit machinery as the single-GPU
+    // Same draft→verify→accept→commit machinery as the single-GPU
     // Qwen35DenseModel::spec_generate, with per-card KV/DeltaNet bookkeeping.
+    // Near-lossless, not bit-exact: the verify forward's rounding can flip a
+    // rare near-tie token vs plain greedy (measured 2026-10-15).
     // The NextN head lives on plan.head_dev (+~0.6 GB there, spec-only).
     using SpecEmit = std::function<bool(int32_t)>;
     std::string load_mtp_head(const GgufReader& g, uint32_t max_ctx);

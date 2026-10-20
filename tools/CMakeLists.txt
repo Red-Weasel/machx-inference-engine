@@ -638,6 +638,19 @@ target_link_libraries(ie_ds41_dma_pair_bench PRIVATE ie_sycl_flags)
 set_target_properties(ie_ds41_dma_pair_bench PROPERTIES OUTPUT_NAME "ie-ds41-dma-pair-bench")
 
 # Phase 15 C2: the mmap tier's experts in slot layout on disk (docs/deepseek41/40)
+# Laguna-S-2.1 v0 bring-up (docs/laguna/00_PORT_PLAN.md P4): one card, oracle comparison + greedy decode.
+add_executable(ie_tok_dump tok_dump.cpp)
+target_link_libraries(ie_tok_dump PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_tok_dump PROPERTIES OUTPUT_NAME "ie-tok-dump")
+
+add_executable(ie_laguna_run laguna_run.cpp)
+target_link_libraries(ie_laguna_run PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_laguna_run PROPERTIES OUTPUT_NAME "ie-laguna-run")
+
+add_executable(ie_inkling_run inkling_run.cpp)
+target_link_libraries(ie_inkling_run PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_inkling_run PROPERTIES OUTPUT_NAME "ie-inkling-run")
+
 add_executable(ie_ds41_expert_file ds41_expert_file.cpp)
 target_link_libraries(ie_ds41_expert_file PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_ds41_expert_file PROPERTIES OUTPUT_NAME "ie-ds41-expert-file")
