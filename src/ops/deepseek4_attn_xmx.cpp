@@ -114,7 +114,7 @@ bool ds4_attention_xmx_eligible(const sycl::device& dev, uint32_t T, uint32_t n_
         return !(e && *e && std::string(e) == "0");
     }();
     if (!on) return false;
-    if (T <= 16 || head_dim != uint32_t(ds4ax::D) || n_heads == 0 || n_heads % ds4ax::HT) return false;
+    if (T <= 16 || head_dim != uint32_t(ds4ax::D) || n_heads == 0 || n_heads % 16) return false;   // a 32- or a 16-head tile
     static const bool fits = [&dev] {
         const uint64_t slm = dev.get_info<sycl::info::device::local_mem_size>();
         const size_t   wg  = dev.get_info<sycl::info::device::max_work_group_size>();
@@ -162,8 +162,12 @@ sycl::event ds4_attention_xmx_segs(sycl::queue& q,
     using namespace ds4ax;
     if (kv_rows && (kv.b || kv.n_b || kv.n_a % KB))
         throw std::invalid_argument("ds4_attention_xmx: per-row keys take one segment of whole 64-key blocks");
-    if (head_dim != uint32_t(D) || n_heads % HT)
-        throw std::invalid_argument("ds4_attention_xmx: head_dim must be 512 and n_heads a multiple of 32");
+    if (head_dim != uint32_t(D) || n_heads == 0 || n_heads % 16)
+        throw std::invalid_argument("ds4_attention_xmx: head_dim must be 512 and n_heads a multiple of 16");
+    // the head tile: 32 where the heads divide (every caller before 2026-10-20), else 16 (V4.1 tensor parallel over 4
+    // cards: 16 heads per card). IE_DS41_ATTN_XMX_HT=16 forces the 16-head tile (a check of it on 32-head cards).
+    static const bool force16 = [] { const char* e = std::getenv("IE_DS41_ATTN_XMX_HT"); return e && std::string(e) == "16"; }();
+    const bool tile16 = n_heads % 32 != 0 || force16;
     const uint32_t n_kv     = kv.n_a + kv.n_b;
     const uint32_t n_kv_pad = (n_kv + KB - 1) / KB * KB;
     // Rows STAGED in fp16.  With a b segment: segment a padded out to a whole
@@ -245,8 +249,15 @@ sycl::event ds4_attention_xmx_segs(sycl::queue& q,
     const uint32_t    n_stage_c = n_stage;
     const sycl::half* kvr       = kv_rows;
 
+    auto submit_attention = [&]<bool DirectQ, bool Rows, int HT>() {
+    static_assert(HT == 32 || HT == 16, "a 32- or a 16-head tile");
+    // HT changes which lanes do what, not a head's arithmetic: S, P, the running m and O per head are the same; l's
+    // block sum runs over LPH partial sums instead of 8 (fp32 rounding of that sum's order only)
+    constexpr int MR  = HT / TM;      // row tiles (heads) of the P . V step
+    constexpr int CT  = HT / TN;      // head column tiles of the S step
+    constexpr int LPH = WG / HT;      // softmax lanes per head
+    constexpr int KPL = KB / LPH;     // keys per softmax lane
     const uint32_t n_ht = n_heads / HT;
-    auto submit_attention = [&]<bool DirectQ, bool Rows>() {
     return ie::ps(q, "ds4_attention_xmx", [&](sycl::handler& h) {
         if constexpr (DirectQ) h.depends_on(deps);
         else h.depends_on(eq);
@@ -291,8 +302,8 @@ sycl::event ds4_attention_xmx_segs(sycl::queue& q,
                 for (int nc = 0; nc < NC; ++nc) mat::joint_matrix_fill(sg, acc[mr][nc], 0.0f);
 
             const float* mrow = mask ? mask + uint64_t(t) * n_kv : nullptr;
-            const uint32_t hh = lid & (HT - 1);      // this lane's head for the softmax
-            const uint32_t jj = lid >> 5;            // 0..7: rows [8 jj, 8 jj + 8) of the block
+            const uint32_t hh = lid % HT;            // this lane's head for the softmax
+            const uint32_t jj = lid / HT;            // 0..LPH-1: rows [KPL jj, KPL jj + KPL) of the block
             sycl::group_barrier(grp);
 
             for (uint32_t n0 = 0; n0 < n_kv; n0 += KB) {
@@ -310,10 +321,10 @@ sycl::event ds4_attention_xmx_segs(sycl::queue& q,
                                        : (n0 < n_stage_c) ? kv16 + uint64_t(n0) * D
                                                           : kvb + uint64_t(n0 - n_a) * D;
 
-                // ---- S^T [KB][HT] = Kblk [KB][D] . Q^T [D][HT]: 8 row tiles x 2 head
-                //      column tiles = 16 tiles, one per sub-group (rt = s >> 1, ct = s & 1) ----
-                {
-                    const uint32_t rt = s >> 1, ct = s & 1;
+                // ---- S^T [KB][HT] = Kblk [KB][D] . Q^T [D][HT]: 8 row tiles x CT head
+                //      column tiles, one per sub-group (a 16-head tile: 8 tiles, 8 sub-groups idle here) ----
+                if (s < uint32_t(8 * CT)) {
+                    const uint32_t rt = s / CT, ct = s % CT;
                     mat::joint_matrix<sycl::sub_group, float, mat::use::accumulator, TM, TN> sacc;
                     mat::joint_matrix_fill(sg, sacc, 0.0f);
                     const sycl::half* kbase = kblk + uint64_t(rt * TM) * D;
@@ -338,12 +349,12 @@ sycl::event ds4_attention_xmx_segs(sycl::queue& q,
                 }
                 sycl::group_barrier(grp);
 
-                // ---- online softmax per head; 8 lanes per head, 8 keys each ----
-                float sc[8];
+                // ---- online softmax per head; LPH lanes per head, KPL keys each ----
+                float sc[KPL];
                 float bm = kNegInf;
                 #pragma unroll
-                for (int r = 0; r < 8; ++r) {
-                    const uint32_t row = jj * 8 + r;
+                for (int r = 0; r < KPL; ++r) {
+                    const uint32_t row = jj * KPL + r;
                     const float mv = mk[row];
                     sc[r] = (mv > kMaskedCut) ? St[row * HT + hh] * scaling + mv : kNegInf;
                     bm = sycl::fmax(bm, sc[r]);
@@ -353,7 +364,7 @@ sycl::event ds4_attention_xmx_segs(sycl::queue& q,
                 if (lid < HT) {
                     float m8 = kNegInf;
                     #pragma unroll
-                    for (int j = 0; j < 8; ++j) m8 = sycl::fmax(m8, red[j * HT + lid]);
+                    for (int j = 0; j < LPH; ++j) m8 = sycl::fmax(m8, red[j * HT + lid]);
                     const float m_old = mrun[lid];
                     const float m_n   = sycl::fmax(m_old, m8);
                     mnew[lid]  = m_n;
@@ -364,8 +375,8 @@ sycl::event ds4_attention_xmx_segs(sycl::queue& q,
                     const float m_n = mnew[hh];
                     float ps = 0.f;
                     #pragma unroll
-                    for (int r = 0; r < 8; ++r) {
-                        const uint32_t row = jj * 8 + r;
+                    for (int r = 0; r < KPL; ++r) {
+                        const uint32_t row = jj * KPL + r;
                         const float e = (sc[r] > kNegInf) ? sycl::exp(sc[r] - m_n) : 0.f;
                         P[hh * KB + row] = sycl::half(e);
                         ps += e;
@@ -376,7 +387,7 @@ sycl::event ds4_attention_xmx_segs(sycl::queue& q,
                 if (lid < HT) {
                     float l8 = 0.f;
                     #pragma unroll
-                    for (int j = 0; j < 8; ++j) l8 += red[j * HT + lid];
+                    for (int j = 0; j < LPH; ++j) l8 += red[j * HT + lid];
                     lrun[lid] = lrun[lid] * alpha[lid] + l8;
                     mrun[lid] = mnew[lid];
                 }
@@ -445,10 +456,16 @@ sycl::event ds4_attention_xmx_segs(sycl::queue& q,
         });
     });
     };
-    if (kv_rows) return direct_q ? submit_attention.template operator()<true, true>()
-                                 : submit_attention.template operator()<false, true>();
-    return direct_q ? submit_attention.template operator()<true, false>()
-                    : submit_attention.template operator()<false, false>();
+    if (tile16) {
+        if (kv_rows) return direct_q ? submit_attention.template operator()<true, true, 16>()
+                                     : submit_attention.template operator()<false, true, 16>();
+        return direct_q ? submit_attention.template operator()<true, false, 16>()
+                        : submit_attention.template operator()<false, false, 16>();
+    }
+    if (kv_rows) return direct_q ? submit_attention.template operator()<true, true, 32>()
+                                 : submit_attention.template operator()<false, true, 32>();
+    return direct_q ? submit_attention.template operator()<true, false, 32>()
+                    : submit_attention.template operator()<false, false, 32>();
 }
 
 }  // namespace ie

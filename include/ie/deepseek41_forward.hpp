@@ -27,6 +27,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include <atomic>
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
@@ -68,6 +69,11 @@ struct Ds41LayerStats {
     // attention (hc mixes + collapse + norm + projections + attention + o), ffn_pre (hc mixes + collapse
     // + norm + router), shared (shared expert + hc mix). ms - moe_ms - these = the layer's untimed rest.
     double   engram_ms = 0, attn_ms = 0, ffn_pre_ms = 0, shared_ms = 0, moe_call_ms = 0;   // moe_call: the tier call's wall from here
+    // tensor parallel (2026-10-20): this card's two all-reduces in the layer -- the whole call, the partial's copy-and-wait
+    // (the card's own work up to there), the barriers (the other cards'), the sum
+    double   tp_ar_ms = 0, tp_copy_ms = 0, tp_bar_ms = 0, tp_sum_ms = 0;
+    // ... by site: [0] attention's, [1] the experts'; copy-and-wait and the first barrier's wait (the arrival skew)
+    double   tp_site_copy_ms[2] = {0, 0}, tp_site_bar1_ms[2] = {0, 0};
     // the attention kernel's GPU timestamps, when the queue has profiling: queue = start - submit, exec = end - start (ms)
     double   attn_kernel_queue_ms = -1, attn_kernel_exec_ms = -1;
     float    flip_gap_max     = 0;    // the golden's 6th-vs-7th score margin, max over flipped tokens
@@ -141,6 +147,12 @@ public:
         // 2 = the control arm (the same machinery, the other cards' tiers empty). 0 = off; the env
         // IE_DS41_EP=1|control sets it when the option is 0. Needs two cards; refused with the CPU split.
         uint32_t expert_parallel = 0;
+        // Tensor parallel (2026-10-20): 1 = every card runs EVERY layer of every token on its part of the work -- its
+        // n_heads / n query heads (and the o_groups they form), its EF / n units of every routed expert and of the shared
+        // expert -- and the cards add their partial sums through the host twice a layer (after the attention's output
+        // projection, after the experts). The env IE_DS41_TP=1 sets it when the option is 0. Needs two cards or more; not
+        // with expert parallel, the lane pipe, the pipelined prefill or the drafter capture (yet).
+        uint32_t tensor_parallel = 0;
         // P4 B6a (docs/deepseek41/P4_B6A_LANES.md): LANES -- sequences with their own decode state (every layer's window
         // ring, the kv sources' latents and index keys, the ratio-2 halves and their counts, the rollback snapshots, the
         // positions, the engram look-back, the vision spans, the prefix cache's live checkpoints), one active at a time on
@@ -163,6 +175,7 @@ public:
     };
     uint32_t n_cards() const { return uint32_t(cards_.size()); }
     uint32_t expert_parallel() const { return ep_; }   // 0 off, 1 on, 2 the control arm (docs/deepseek41/38)
+    uint32_t tensor_parallel() const { return tp_; }   // 0 off, else the number of parts (= cards)
     CardInfo card_info(uint32_t c) const;
     Ds41DenseCache& dense_cache(uint32_t c) { return cards_.at(c)->cache; }   // the card's resident dense set (the drafter uploads its stages through it)
     // Where expert e of model layer L lives: 0 static VRAM, 1 pinned host, 2 mmap (2 when not resident).
@@ -214,7 +227,7 @@ public:
     // been given only them.
     std::string forward_pipelined(const int32_t* ids, const std::vector<std::pair<uint32_t, uint32_t>>& chunks, std::vector<float>& logits,
                                   const std::function<bool()>& stop = {}, size_t* n_done = nullptr);
-    bool pipelined_admissible() const { return cards_.size() >= 2 && !ep_ && !capture_main_hidden_ && resident_ && !piping(); }
+    bool pipelined_admissible() const { return cards_.size() >= 2 && !ep_ && !tp_ && !capture_main_hidden_ && resident_ && !piping(); }
 
     // P4 B6a (docs/deepseek41/P4_B6A_LANES.md) -- LANES, the serial API: the lane every later call reads and writes -- forward,
     // reset_state, rollback_to, n_pos, capacity, all_ids, the vision spans and provider, the prefix cache's live state -- until
@@ -353,6 +366,8 @@ public:
     bool bounded_replay() const { return bounded_replay_; }
 
     const std::vector<Ds41LayerStats>& stats() const { return stats_; }
+    // tensor parallel: card ci's per-layer stats (card 0's are stats()); empty off tensor parallel
+    const std::vector<Ds41LayerStats>& tp_card_stats(size_t ci) const { static const std::vector<Ds41LayerStats> none; return ci == 0 ? stats_ : ci < tp_stats_.size() ? tp_stats_[ci] : none; }
     // DSpark P1 (docs/deepseek41/57): the last forward's `main_hidden` -- per row, the mean over the hc copies of the
     // stream ENTERING each dspark target layer (37, 38, 39), concatenated: [T, n_targets * dim] on the host. Empty
     // when the model has no drafter. The drafter reads it (its seed and its draft).
@@ -412,9 +427,13 @@ private:
         sycl::half* ep_ypc = nullptr; sycl::half* ep_hyc = nullptr; int32_t* ep_rows = nullptr;
         double ep_ms = 0;                         // the last remote moe wall on this card
         std::vector<std::vector<LayerState>> state;   // [lane][n_layers], only [L0, L1) allocated (P4 B6a: one set per lane)
-        // the caches a consumer layer at the top of this card reads when the source sits on an
-        // earlier card: the previous card's source state, imported through the host
-        float* imp_ckv = nullptr; float* imp_ik = nullptr;
+        // the caches a consumer layer at the top of this card reads when the source sits on an earlier card (2026-10-20):
+        // per lane, a MIRROR of that source's latents / index keys, rows [0, mir_have) valid -- each forward sends only the
+        // rows the source appended since the last one. Allocated only where the incoming boundary is live (mir_src >= 0:
+        // a kv source sits before L0 and L0 is not itself a kv + index source); mir_sent is the SENDER's count of the rows
+        // it has handed over (the previous card's stage writes it), mir_have the rows this card has landed
+        int32_t mir_src = -1;
+        std::vector<float*> mir_ckv, mir_ik; std::vector<uint32_t> mir_cap, mir_sent, mir_have;
         bool   state_ready = false;
         // Phase 18 (docs/deepseek41/46 term 2): the decode step's persistent pieces -- the T = 1
         // scratch, taken in the same order every step and freed with the state; the two RoPE
@@ -432,9 +451,13 @@ private:
     // Phase 43: what a card hands the next at its boundary (forward()'s host carry), and the card range one pipeline
     // stage runs. A stage that does not start at card 0 skips the host prep (the engram layers must sit before it) and
     // takes the stream from `in`; a stage that does not end at the last card exports it into `out` and commits no n_pos.
+    // 2026-10-20 (more than 2 cards): also the engram rows (the first stage's host prep makes them for every engram layer),
+    // the index picks' width, the candidate blocks the candidate source layer kept (its consumers can sit a card later),
+    // and the source caches as a DELTA: imp_ckv / imp_ik hold rows [bounce_off, bounce_nc) of the source's cache.
     struct StageCarry {
         std::vector<float> hh, hpm, imp_ckv, imp_ik; std::vector<int32_t> sh_topk;
-        uint32_t T_carry = 0, off_carry = 0, bounce_nc = 0; bool bounce_topk = false;
+        uint32_t T_carry = 0, off_carry = 0, bounce_nc = 0, bounce_off = 0, sh_topk_w = 0; bool bounce_topk = false;
+        std::vector<std::vector<sycl::half>> engram; std::vector<uint8_t> cand_keep;
     };
     // P4 B6a: a stage names the LANE it runs (-1 = the active lane: forward_pipelined's chunks) and whether every row's
     // logits are wanted (-1 = !logits_last_only_; the pipe carries it per step, since two lanes' steps may differ)
@@ -453,9 +476,35 @@ private:
     void        reset_lane(uint32_t lane);                                       // reset_state for one lane
     std::string rollback_lane_to(uint32_t lane, uint32_t n_pos, bool wait);     // rollback_to for one lane (the pipe: no queue wait)
     void        stage_loop(size_t s);                                            // the pipe's per-card thread
+    // 2026-10-20: the boundary mirrors' counts after a change to a lane's caches other than an append -- reset (every row
+    // rewritten: a new sequence, a host slot or a disk entry loaded) or truncated (a rollback, a live checkpoint restored)
+    void        mirror_sync(uint32_t lane, bool reset);
 
     std::vector<std::unique_ptr<Card>> cards_;
     uint32_t                  ep_ = 0;             // ResidentOptions::expert_parallel as resolved at init
+    // ---- tensor parallel (2026-10-20) ----
+    // The all-reduce of the cards' partial sums: each card's partial lands in its pinned `part` (its own context), a barrier,
+    // each card sums its share of the elements over the cards IN CARD ORDER and writes the total into every card's `sum`
+    // (so every card uploads the same bits and the replicated work stays identical across cards), a barrier, the upload.
+    // The barrier spins (a decode step meets it 80 times); a card that fails sets `failed` and the others return.
+    struct TpReduce {
+        uint32_t n = 0; size_t cap = 0;                  // cards; floats per buffer (max_forward_tokens x dim)
+        std::vector<float*> part, sum; std::vector<sycl::queue*> q;
+        // decode's one-barrier path: every card sums every element itself (n floats, a few microseconds), so the second
+        // barrier goes; the partials alternate between two small buffers, so a card one all-reduce ahead never writes the
+        // buffer a slower card is still reading (it cannot get two ahead: the next barrier needs the slower card)
+        size_t small_cap = 0; std::vector<float*> small[2]; std::vector<uint32_t> parity;
+        bool one_barrier = true;
+        std::atomic<uint64_t> gen{0}; std::atomic<uint32_t> count{0}; std::atomic<bool> failed{false};
+        bool barrier();
+        void fail() { failed.store(true, std::memory_order_release); }
+    };
+    uint32_t                  tp_ = 0;             // ResidentOptions::tensor_parallel as resolved at init: the parts (= cards), 0 off
+    std::unique_ptr<TpReduce> tpr_;
+    std::vector<std::vector<Ds41LayerStats>> tp_stats_;   // cards 1..n-1's per-layer stats (card 0's are stats_)
+    std::vector<std::vector<uint64_t>> tp_no_profile_;    // empty: only card 0 counts the routing
+    struct TpArTimes { double copy = 0, bar = 0, bar1 = 0, sum = 0, all = 0; };
+    std::string tp_allreduce(size_t ci, sycl::queue& q, float* dev, size_t n, TpArTimes* t = nullptr);
     const DeepSeek41Model*    m_ = nullptr;
     const Ds41EngramTables*   tb_ = nullptr;
     std::vector<Ds41LayerStats> stats_;

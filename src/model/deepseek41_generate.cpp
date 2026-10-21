@@ -412,14 +412,24 @@ std::string Ds41Generator::run(const std::vector<int32_t>& prompt_ids, uint32_t 
         Ds41NgramIndex idx; idx.reset(prompt_ids);
         fwd_.set_multi_row_decode(true);
         // where a step's time goes, summed over the layers: [0] the one-row steps, [1] the verify steps (docs/97)
-        struct Acc { double wall = 0, attn = 0, moe = 0, pre = 0, shd = 0; double bp = 0, bm = 0, sta = 0, pin = 0, mmx = 0, cpu = 0, hit = 0; uint32_t steps = 0, rows = 0; } acc[2];
+        struct Acc { double wall = 0, attn = 0, moe = 0, pre = 0, shd = 0; double bp = 0, bm = 0, sta = 0, pin = 0, mmx = 0, cpu = 0, hit = 0;
+                     double tprep = 0, tgrp = 0, tcpu = 0, tcpuw = 0, tjoin = 0, ttail = 0, ttier = 0, tspawn = 0;
+                     double tpar = 0, tpcopy = 0, tpbar = 0, tpsum = 0; double tps[8][4] = {}; double mmw = 0, mmr = 0, mmp = 0; uint32_t steps = 0, rows = 0; } acc[2];
         auto account = [&](int k, uint32_t rows_, double wall) {
             Acc& a = acc[k]; ++a.steps; a.rows += rows_; a.wall += wall;
             for (const auto& L : fwd_.stats()) {
                 a.attn += L.attn_ms; a.moe += L.moe_call_ms; a.pre += L.ffn_pre_ms; a.shd += L.shared_ms;
                 a.bp += double(L.bytes_pinned); a.bm += double(L.bytes_mmap); a.sta += L.experts_static; a.pin += L.experts_pinned;
                 a.mmx += L.experts_mmap; a.cpu += L.experts_cpu; a.hit += L.experts_stream_hit;
+                a.tprep += L.moe_prep_ms; a.tgrp += L.moe_groups_ms; a.tcpu += L.moe_cpu_ms; a.tcpuw += L.moe_cpu_work_ms;
+                a.tjoin += L.moe_join_ms; a.ttail += L.moe_tail_ms; a.ttier += L.moe_ms; a.tspawn += L.moe_spawn_ms;
+                a.tpar += L.tp_ar_ms; a.tpcopy += L.tp_copy_ms; a.tpbar += L.tp_bar_ms; a.tpsum += L.tp_sum_ms;
+                a.mmw += L.moe_mmap_ms; a.mmr += L.moe_mmap_read_ms; a.mmp += L.moe_mmap_permute_ms;
             }
+            for (uint32_t ci = 0; ci < std::min(fwd_.tensor_parallel(), 8u); ++ci)
+                for (const auto& L : fwd_.tp_card_stats(ci)) {
+                    a.tps[ci][0] += L.tp_site_copy_ms[0]; a.tps[ci][1] += L.tp_site_bar1_ms[0]; a.tps[ci][2] += L.tp_site_copy_ms[1]; a.tps[ci][3] += L.tp_site_bar1_ms[1];
+                }
         };
         const uint32_t V = uint32_t(logits.size());
         uint32_t pos = T, k_done = 0;
@@ -469,6 +479,22 @@ std::string Ds41Generator::run(const std::vector<int32_t>& prompt_ids, uint32_t 
                                  "experts static %.1f pinned %.1f (stream hits %.1f, CPU %.1f) mmap %.1f; link %.0f MiB pinned + %.0f MiB mmap\n",
                          k ? "verify  " : "one-row ", a.rows / n, a.wall / n, a.attn / n, a.pre / n, a.shd / n, a.moe / n,
                          a.sta / n, a.pin / n, a.hit / n, a.cpu / n, a.mmx / n, a.bp / n / 1048576.0, a.bm / n / 1048576.0);
+            // 2026-10-20: IE_DS41_STEP_DETAIL=1 -- the MoE call's own terms (card 0's tier), summed over the layers per step
+            static const bool detail = [] { const char* v = std::getenv("IE_DS41_STEP_DETAIL"); return v && *v && *v != '0'; }();
+            if (detail)
+                std::fprintf(stderr, "[ds41 lookup]   %s  MoE detail per step: tier %.1f = prep %.1f + spawn %.1f + groups %.1f + join %.1f + tail %.1f; CPU leg wall %.1f (work %.1f)\n",
+                             k ? "verify  " : "one-row ", a.ttier / n, a.tprep / n, a.tspawn / n, a.tgrp / n, a.tjoin / n, a.ttail / n, a.tcpu / n, a.tcpuw / n);
+            if (detail)
+                std::fprintf(stderr, "[ds41 lookup]   %s  disk tier per step (card 0): fill wall %.1f ms, per reader thread read %.1f + permute %.1f\n",
+                             k ? "verify  " : "one-row ", a.mmw / n, a.mmr / n, a.mmp / n);
+            if (detail && a.tpar > 0) {
+                std::fprintf(stderr, "[ds41 lookup]   %s  tensor-parallel all-reduces per step (card 0): %.1f ms = copy-and-wait %.1f + barriers %.1f + sum %.1f\n",
+                             k ? "verify  " : "one-row ", a.tpar / n, a.tpcopy / n, a.tpbar / n, a.tpsum / n);
+                for (uint32_t ci = 0; ci < std::min(fwd_.tensor_parallel(), 8u); ++ci)
+                    std::fprintf(stderr, "[ds41 lookup]   %s    card %u per step: attention all-reduce copy-and-wait %.1f + waiting for the others %.1f; "
+                                         "experts all-reduce copy-and-wait %.1f + waiting for the others %.1f\n",
+                                 k ? "verify  " : "one-row ", ci, a.tps[ci][0] / n, a.tps[ci][1] / n, a.tps[ci][2] / n, a.tps[ci][3] / n);
+            }
         }
     } else if (!spec) {
         uint32_t pos = T;

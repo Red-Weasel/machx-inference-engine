@@ -5,6 +5,7 @@
 // (Phase 9) carries the per-layer state a single-token step needs across calls.
 #include "ie/deepseek41_forward.hpp"
 #include "ie/deepseek41_candidate.hpp"
+#include "ie/deepseek41_cards.hpp"
 #include "ie/deepseek41_attn_xmx.hpp"
 
 #include "ie/deepseek4.hpp"
@@ -22,6 +23,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstring>
+#include <immintrin.h>
+#include <sched.h>
+#include <cerrno>
 #include <omp.h>
 #include <sys/mman.h>
 #include <thread>
@@ -67,6 +71,12 @@ struct EpHelpersDone {
 };
 // Phase 19 (docs/deepseek41/50): IE_DS41_EP_THREAD=0 restores a std::thread per layer per remote card (the kill switch)
 static bool ds41_ep_thread_on() { static const bool on = [] { const char* v = std::getenv("IE_DS41_EP_THREAD"); return !(v && *v && std::string(v) == "0"); }(); return on; }
+// Phase 18 (docs/deepseek41/46 term 2): the decode step's persistent scratch, the one-copy RoPE tables and the dead-bounce
+// rule; IE_DS41_SETUP_FAST=0 is the kill switch (read once: init_resident and forward_impl judge by the same value)
+static bool ds41_setup_fast_on() { static const bool on = [] { const char* v = std::getenv("IE_DS41_SETUP_FAST"); return !(v && *v && std::string(v) == "0"); }(); return on; }
+// 2026-10-20: a boundary sends only the latent rows appended since the last forward; IE_DS41_MIRROR=0 sends every row each
+// time (the A/B arm: the same rows land either way)
+static bool ds41_mirror_on() { static const bool on = [] { const char* v = std::getenv("IE_DS41_MIRROR"); return !(v && *v && std::string(v) == "0"); }(); return on; }
 }  // namespace
 
 std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, const DeepSeek41Model& m, const Ds41EngramTables& tables,
@@ -75,7 +85,14 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
     if (auto e = init(*qs[0], m, tables); !e.empty()) return e;
     const auto& c = m.config();
     if (qs.size() > c.n_layers) return "init_resident: more cards than layers";
+    // the prefix cache's per-card checkpoint masks are 32-bit, and a stage of one layer gains nothing (review 2026-10-20 #2)
+    if (qs.size() > c.n_layers / 2) return "init_resident: " + std::to_string(qs.size()) + " cards: at most " + std::to_string(c.n_layers / 2) + " (two layers each)";
     cap_pos_ = opt.max_tokens;
+    // tensor parallel (2026-10-20): the option, else the env; every card a part. Resolved before the cards' layer ranges.
+    tp_ = opt.tensor_parallel;
+    if (!tp_) if (const char* v = std::getenv("IE_DS41_TP"); v && *v && std::string(v) != "0") tp_ = 1;
+    if (tp_ && qs.size() < 2) tp_ = 0;
+    if (tp_) tp_ = uint32_t(qs.size());
     // Phase 24 (docs/deepseek41/64): the single-call bound for every per-call scratch buffer; the KV keeps max_tokens.
     fwd_cap_ = opt.max_forward_tokens ? opt.max_forward_tokens : opt.max_tokens;
     if (const char* v = std::getenv("IE_DS41_MAX_FWD")) if (const uint32_t n = uint32_t(std::atoi(v))) fwd_cap_ = n;
@@ -94,8 +111,19 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
     for (size_t i = 0; i < qs.size(); ++i) {
         cards_.push_back(std::make_unique<Card>());
         cards_[i]->q = qs[i];
-        cards_[i]->L0 = uint32_t(c.n_layers * i / qs.size());
-        cards_[i]->L1 = uint32_t(c.n_layers * (i + 1) / qs.size());
+        cards_[i]->L0 = tp_ ? 0u : uint32_t(c.n_layers * i / qs.size());          // tensor parallel: every card runs every layer
+        cards_[i]->L1 = tp_ ? c.n_layers : uint32_t(c.n_layers * (i + 1) / qs.size());
+    }
+    // 2026-10-20: which boundaries carry the source caches. The cache a card's first layers read is the last kv source's
+    // before its L0; the boundary is DEAD when L0 is itself a kv source and an index source -- it overwrites `cur` and
+    // `sh_topk` before any consumer reads them (Phase 18 judged it at decode; a prefill chunk runs the same order: the
+    // compressor, the latent append, the indexer, then the attention). On two cards (L0 = 20) nothing crosses; on four,
+    // 10 (layer 8's) and 30 (layer 20's) do, 20 not. IE_DS41_SETUP_FAST=0 keeps every boundary live.
+    for (size_t i = 1; i < cards_.size(); ++i) {
+        Card& cd = *cards_[i]; const auto& k0 = m.layers()[cd.L0].kind;
+        int32_t src = -1;
+        for (uint32_t L = 0; L < cd.L0; ++L) if (m.layers()[L].kind.is_kv_source) src = int32_t(L);
+        cd.mir_src = (tp_ || (ds41_setup_fast_on() && k0.is_kv_source && k0.is_index_source)) ? -1 : src;   // tensor parallel: no boundary
     }
 
     std::vector<std::vector<uint32_t>> ranking = ranking_in;
@@ -109,11 +137,15 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
     ep_ = opt.expert_parallel;
     if (!ep_) if (const char* v = std::getenv("IE_DS41_EP")) { const std::string s(v); ep_ = s == "control" ? 2u : (!s.empty() && s != "0") ? 1u : 0u; }
     if (ep_ && qs.size() < 2) ep_ = 0;                                          // one card: the ordinary path
-    // expert parallel + the CPU miss split (docs/deepseek41/42 step 3): the two tiers' workers each
-    // take half of the E-cores (8-13 / 14-19 on this box: the 12 E-cores split in two), unless
+    if (tp_ && ep_) return "init_resident: tensor parallel (IE_DS41_TP) and expert parallel (IE_DS41_EP) are exclusive";
+    Ds4SlotLayout lay_tp = lay;                                                  // one card's part of an expert
+    if (tp_) if (auto e = ds41_slot_layout_tp(c.dim, c.moe_inter_dim, 0, tp_, lay_tp); !e.empty()) return "init_resident: tensor parallel: " + e;
+    // expert parallel + the CPU miss split (docs/deepseek41/42 step 3): each tier's worker takes its part of the
+    // leg's cores (8-13 / 14-19 on this box: the 12 E-cores split in two; ds41_cpu_leg_default_cores elsewhere), unless
     // IE_DS41_CPU_CORES names the set explicitly, in which case both tiers share it as given
     const bool cpu_split = [] { const char* v = std::getenv("IE_DS41_CPU_MISS"); return !(v && *v && std::string(v) == "0"); }();   // ON since gate 20 (docs/52); =0 the kill switch
-    const bool split_cores = ep_ == 1 && cpu_split && !std::getenv("IE_DS41_CPU_CORES");
+    const bool split_cores = (ep_ == 1 || tp_) && cpu_split && !std::getenv("IE_DS41_CPU_CORES");   // tensor parallel: a tier per card too
+    const std::string leg_cores = split_cores ? ds41_cpu_leg_default_cores() : std::string();   // split in n_cards parts below
     const uint32_t n_cards = uint32_t(qs.size());
     uint64_t pin_cap = opt.host_pin_cap;
     if (!pin_cap) if (const char* v = std::getenv("IE_DS41_PIN_CAP_GIB")) pin_cap = uint64_t(std::atof(v) * 1073741824.0);   // the A/B knob against the live rule (docs/40)
@@ -142,6 +174,39 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
         }
         std::fprintf(stderr, "[ds41 forward] pinned host cap %.1f GiB from the live rule: %s\n", double(pin_cap) / 1073741824.0, why.c_str());
     }
+    // 2026-10-20 (a 4-card box may have its cards on x4 risers): each card's host->card rate from pinned memory, the path
+    // a pinned miss takes over PCIe, in a line; each card's tier scales the CPU leg's shares by it (ds41_qstar_factor). Before
+    // the budgets below read the free VRAM, so the probe's buffer costs nothing. IE_DS41_LINK_PROBE=0 skips it (the shares
+    // stay as swept); IE_DS41_LINK_GBS=x (a test switch) stands in for every card's measurement.
+    std::vector<double> link_gbs(cards_.size(), 0.0);
+    if (const char* v = std::getenv("IE_DS41_LINK_GBS"); v && *v) {
+        std::fill(link_gbs.begin(), link_gbs.end(), std::max(0.0, std::atof(v)));
+        std::fprintf(stderr, "[ds41 forward] IE_DS41_LINK_GBS=%s (a test switch): every card's link taken as %.1f GB/s, not measured\n", v, link_gbs[0]);
+    } else if (const char* v = std::getenv("IE_DS41_LINK_PROBE"); !(v && *v == '0'))
+        for (size_t ci = 0; ci < cards_.size(); ++ci) {
+            sycl::queue& q = *cards_[ci]->q;
+            constexpr size_t kProbe = 64ull << 20;
+            void* h = nullptr; void* d = nullptr; double best = 1e30;
+            try {
+                h = sycl::malloc_host(kProbe, q); d = sycl::malloc_device(kProbe, q);
+                if (h && d) {
+                    std::memset(h, 0, kProbe);
+                    for (int r = 0; r < 4; ++r) {   // the first copy warms the path; the best of the other three
+                        const auto t0 = std::chrono::steady_clock::now();
+                        q.memcpy(d, h, kProbe).wait();
+                        if (r) best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                    }
+                }
+            } catch (const sycl::exception&) { best = 1e30; }
+            if (h) sycl::free(h, q);
+            if (d) sycl::free(d, q);
+            if (best < 1e30) {
+                link_gbs[ci] = double(kProbe) / (best * 1e6);
+                std::fprintf(stderr, "[ds41 forward] card %zu link: %.1f GB/s host->card from pinned memory = %.2f experts/ms\n", ci,
+                             link_gbs[ci], double(kProbe) / best / double(lay.bytes));
+            }
+            else std::fprintf(stderr, "[ds41 forward] card %zu link: not measured (the probe's buffers)\n", ci);
+        }
 
     for (size_t ci = 0; ci < cards_.size(); ++ci) {
         Card& card = *cards_[ci]; sycl::queue& q = *card.q;
@@ -156,9 +221,10 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
         if (const char* v = std::getenv("IE_DS41_STREAM_SLOTS"); v && *v && std::atoi(v) >= 2) stream = uint32_t(std::atoi(v));   // Phase 51: the A/B knob
         if (ep_ == 1) if (const char* v = std::getenv("IE_DS41_EP_STREAM")) stream = std::max(1u, uint32_t(std::atoi(v)));
         // dense path first, so the expert budget is measured against what is actually left
+        if (tp_) card.cache.set_tp(uint32_t(ci), tp_);
         for (uint32_t L = card.L0; L < card.L1; ++L)
             if (auto e = card.cache.upload_layer(q, m, L); !e.empty()) return "dense cache: " + e;
-        if (card.L1 == c.n_layers)
+        if (card.L1 == c.n_layers && (!tp_ || ci == 0))   // tensor parallel: card 0 runs the head
             if (auto e = card.cache.upload_head(q, m, [&] { const char* v = std::getenv("IE_DS41_HEAD_FP8"); return v && *v ? std::string(v) == "1" : opt.head_fp8; }()); !e.empty()) return "dense cache: " + e;
         if (auto e = ensure_state(card); !e.empty()) return e;      // before the budget: it is part of the reserve's job
         // expert parallel: the staging buffers and the control arm's empty tier come out of the
@@ -204,8 +270,18 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
                 std::fprintf(stderr, "[ds41 forward] card %zu: keeping %.2f GiB free for one %u-token forward (batch workspace %.2f + scratch %.2f + context-scaled %.2f at strip %llu)\n",
                              ci, double(reserve) / 1073741824.0, fwd_cap_, double(batch_ws) / 1073741824.0, double(scratch) / 1073741824.0,
                              double(nc_scratch) / 1073741824.0, (unsigned long long)strip);
-            const uint64_t for_experts = free_now > reserve ? free_now - reserve : 0;
-            const uint64_t per_slot_all_layers = uint64_t(tnL) * lay.bytes;     // one slot in every layer of THIS tier
+            // Queues that share a device (IE_DS41_LOGICAL_CARDS, deepseek41_cards.hpp) split its free VRAM: each keeps its own
+            // reserve, the earlier ones' reserves are not free for a later one, and the rest is shared out among this queue
+            // and the later ones on the device. One queue per device: (free_now - reserve) / 1, as before.
+            uint32_t dev_before = 0, dev_share = 0;
+            for (size_t cj = 0; cj < cards_.size(); ++cj)
+                if (cards_[cj]->q->get_device() == q.get_device()) ++(cj < ci ? dev_before : dev_share);
+            const uint64_t keep_all = reserve * (dev_before + dev_share);
+            const uint64_t for_experts = free_now > keep_all ? (free_now - keep_all) / dev_share : 0;
+            if (dev_before + dev_share > 1)
+                std::fprintf(stderr, "[ds41 forward] card %zu shares its device with %u other queue(s): %.2f GiB free, %.2f GiB for its experts\n",
+                             ci, dev_before + dev_share - 1, double(free_now) / 1073741824.0, double(for_experts) / 1073741824.0);
+            const uint64_t per_slot_all_layers = uint64_t(tnL) * (tp_ ? lay_tp.bytes : lay.bytes);     // one slot in every layer of THIS tier (tensor parallel: its part of an expert)
             const uint32_t experts_here = ep_ == 1 ? (c.n_routed_experts - ci + n_cards - 1) / n_cards : c.n_routed_experts;
             const uint32_t slots = ds41_static_slots(for_experts, per_slot_all_layers, experts_here);
             // docs/105 elastic region: devote opt.elastic_bytes of the reserve headroom to ADDITIONAL stream
@@ -222,10 +298,27 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
                              ds41_static_slots(for_experts + lane_bytes_[ci] * extra, per_slot_all_layers, experts_here) - slots,
                              ds41_static_slots(for_experts + lane_bytes_[ci] * extra, per_slot_all_layers, experts_here) - stream, slots - stream);
             n_static = slots - stream;
-            const uint64_t host_cap = ep_ == 1 ? pin_cap / n_cards : pin_cap * nL / c.n_layers;   // this card's share of the pinned tier
+            const uint64_t host_cap = (ep_ == 1 || tp_) ? pin_cap / n_cards : pin_cap * nL / c.n_layers;   // this card's share of the pinned tier
             n_pinned = uint32_t(std::min<uint64_t>(experts_here - n_static, host_cap / per_slot_all_layers));
+            // TEST knobs (2026-10-20): every layer's tiers fixed, so a run on 2 cards and one on 4 place each layer's experts
+            // alike (the budgets above follow the free VRAM and RAM, which differ). The static count is capped at what fits;
+            // the pinned count is taken as given (bounded by the experts left), whatever the pinned rule would allow.
+            if (const char* v = std::getenv("IE_DS41_STATIC_SLOTS"); v && *v) {
+                const uint32_t want = uint32_t(std::max(0, std::atoi(v)));
+                if (want > n_static) std::fprintf(stderr, "[ds41 forward] card %zu: IE_DS41_STATIC_SLOTS=%u does not fit: %u static slots per layer\n", ci, want, n_static);
+                n_static = std::min(n_static, want);
+            }
+            if (const char* v = std::getenv("IE_DS41_PINNED_SLOTS"); v && *v) {
+                const uint32_t want = std::min<uint32_t>(experts_here - n_static, uint32_t(std::max(0, std::atoi(v))));
+                if (uint64_t(want) * per_slot_all_layers > host_cap)
+                    std::fprintf(stderr, "[ds41 forward] card %zu: IE_DS41_PINNED_SLOTS=%u pins %.1f GiB, past this card's %.1f GiB share of the pinned rule\n",
+                                 ci, want, double(uint64_t(want) * per_slot_all_layers) / 1073741824.0, double(host_cap) / 1073741824.0);
+                n_pinned = want;
+            }
         }
-        if (split_cores) card.tier.set_cpu_cores(ci == 0 ? "8-13" : "14-19");
+        if (split_cores) card.tier.set_cpu_cores(ds41_cpu_cores_part(leg_cores, uint32_t(ci), n_cards));
+        card.tier.set_link_gbs(link_gbs[ci]);
+        if (tp_) card.tier.set_tp(uint32_t(ci), tp_);
         // The static claim is derived from the free VRAM this card reports, and that estimate can
         // overshoot what the driver will actually hand out -- by the allocator's own padding, or because
         // something else took a few hundred MB since the query. When it does, the allocation used to
@@ -284,6 +377,45 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
         }
     g_ds4_attn_split_fixed64 = true;   // DSpark P2: the T-row step's attention combine is the one-row step's (bit-identical)
     if (ep_) std::fprintf(stderr, "[ds41 forward] expert parallel %s on %u cards\n", ep_ == 2 ? "CONTROL ARM (the machinery, no parallelism)" : "ON (parity share of every layer's experts per card)", n_cards);
+    if (tp_) {
+        // the all-reduce's pinned buffers: each card's in its own context (its copies run pinned), max_forward_tokens rows
+        tpr_ = std::make_unique<TpReduce>();
+        tpr_->n = tp_; tpr_->cap = size_t(fwd_cap_) * c.dim;
+        for (size_t ci = 0; ci < cards_.size(); ++ci) {
+            sycl::queue& q = *cards_[ci]->q;
+            float* p = sycl::malloc_host<float>(tpr_->cap, q); float* t = sycl::malloc_host<float>(tpr_->cap, q);
+            if (!p || !t) { if (p) sycl::free(p, q); if (t) sycl::free(t, q); return "init_resident: tensor-parallel reduce buffers: pinned alloc failed"; }
+            tpr_->part.push_back(p); tpr_->sum.push_back(t); tpr_->q.push_back(&q);
+        }
+        tpr_->small_cap = std::min(tpr_->cap, size_t(kDs41MaxDecodeRows) * c.dim);
+        for (size_t ci = 0; ci < cards_.size(); ++ci)
+            for (auto& b : tpr_->small) {
+                float* p = sycl::malloc_host<float>(tpr_->small_cap, *cards_[ci]->q);
+                if (!p) return "init_resident: tensor-parallel decode buffers: pinned alloc failed";
+                b.push_back(p);
+            }
+        tpr_->parity.assign(cards_.size(), 0);
+        if (const char* v = std::getenv("IE_DS41_TP_1BAR")) tpr_->one_barrier = !(*v == '0');
+        // the cards' host threads (this thread and the ones forward spawns from it) off EVERY card's CPU-leg cores: each
+        // tier's start moved this thread off its own leg's cores only, which left it -- and the card threads it spawns --
+        // free to land on the other cards' legs, slowing both that leg and the card's own launches
+        {
+            std::vector<bool> leg(CPU_SETSIZE, false); bool any = false;
+            for (const auto& cp : cards_) for (int k : cp->tier.cpu_cores()) if (k >= 0 && k < CPU_SETSIZE) { leg[size_t(k)] = true; any = true; }
+            const char* v = std::getenv("IE_DS41_TP_AFFINITY");
+            cpu_set_t set; CPU_ZERO(&set); int nfree = 0; const long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+            for (long k = 0; k < ncpu && k < CPU_SETSIZE; ++k) if (!leg[size_t(k)]) { CPU_SET(int(k), &set); ++nfree; }
+            if (any && nfree > 0 && !(v && *v == '0')) {
+                if (sched_setaffinity(0, sizeof set, &set) == 0) std::fprintf(stderr, "[ds41 forward] tensor parallel: the cards' host threads on the %d cores no CPU leg uses\n", nfree);
+                else std::fprintf(stderr, "[ds41 forward] tensor parallel: could not move the host threads off the CPU legs' cores (errno %d)\n", errno);
+            }
+        }
+        tp_stats_.assign(cards_.size(), {}); tp_no_profile_.clear();
+        std::fprintf(stderr, "[ds41 forward] tensor parallel ON on %u cards: each card runs all %u layers with %u of the %u query heads, %u of the %u units of every "
+                             "expert (%.1f MiB of each %.1f MiB expert) and of the shared expert; two host all-reduces per layer (%.1f MiB pinned per card)\n",
+                     tp_, c.n_layers, c.n_heads / tp_, c.n_heads, c.moe_inter_dim / tp_, c.moe_inter_dim, double(lay_tp.bytes) / 1048576.0, double(lay.bytes) / 1048576.0,
+                     double(tpr_->cap) * 8.0 / 1048576.0);
+    }
     if (lanes_.size() > 1) {
         std::fprintf(stderr, "[ds41 forward] lanes: %zu (lane 0 at ctx %u, lanes 1-%zu at ctx %u); one extra lane's device state per card:", lanes_.size(), cap_pos_, lanes_.size() - 1, lane_ctx_);
         for (size_t ci = 0; ci < cards_.size(); ++ci) std::fprintf(stderr, " %.1f MiB", double(lane_bytes_[ci]) / 1048576.0);
@@ -309,6 +441,10 @@ std::string Ds41Forward::ensure_state(Card& card) {
     // set are what one extra lane costs this card (lane_bytes_)
     card.state.assign(lanes_.size(), std::vector<LayerState>(c.n_layers));
     card.snaps_ready.assign(lanes_.size(), 0);
+    // 2026-10-20: the boundary mirror per lane, where the incoming boundary is live; a ratio-R source holds at most cap / R rows
+    const uint32_t mR = card.mir_src >= 0 ? std::max(1u, m_->layers()[uint32_t(card.mir_src)].kind.compress_ratio) : 1u;
+    card.mir_ckv.assign(lanes_.size(), nullptr); card.mir_ik.assign(lanes_.size(), nullptr);
+    card.mir_cap.assign(lanes_.size(), 0); card.mir_sent.assign(lanes_.size(), 0); card.mir_have.assign(lanes_.size(), 0);
     uint64_t bytes = 0;
     auto alloc = [&](size_t n) -> float* { float* p = sycl::malloc_device<float>(n, q); if (p) { q.memset(p, 0, n * 4); bytes += n * 4; } return p; };
     for (uint32_t l = 0; l < lanes_.size(); ++l) {
@@ -325,9 +461,13 @@ std::string Ds41Forward::ensure_state(Card& card) {
                 }
             }
         }
+        if (card.mir_src >= 0) {
+            const uint32_t rows = (cap + mR - 1) / mR;
+            if (!(card.mir_ckv[l] = alloc(size_t(rows) * HD)) || !(card.mir_ik[l] = alloc(size_t(rows) * IHD))) return "state: boundary mirror alloc failed";
+            card.mir_cap[l] = rows;
+        }
         if (l == 1) for (size_t ci = 0; ci < cards_.size(); ++ci) if (cards_[ci].get() == &card && ci < lane_bytes_.size()) lane_bytes_[ci] = bytes;
     }
-    if (!(card.imp_ckv = alloc(size_t(cap_pos_) * HD)) || !(card.imp_ik = alloc(size_t(cap_pos_) * IHD))) return "state: import alloc failed";
     // Phase 18 (docs/deepseek41/46 term 2): the two RoPE inv_freq tables resident (the host's
     // ds4_rope_inv_freq, uploaded once), the step's positions (pinned host + device) and their cos / sin
     {
@@ -375,8 +515,8 @@ void Ds41Forward::free_state(Card& card) {
         for (float* p : {st.win_kv, st.comp_kv, st.idx_k, st.part_kv, st.part_gate, st.snap_ring, st.snap_ckv, st.snap_cg, st.snap_part_kv, st.snap_part_gate}) if (p) sycl::free(p, q);
         st = LayerState{};
     }
-    if (card.imp_ckv) sycl::free(card.imp_ckv, q); if (card.imp_ik) sycl::free(card.imp_ik, q);
-    card.imp_ckv = nullptr; card.imp_ik = nullptr; card.snaps_ready.clear();
+    for (auto* v : {&card.mir_ckv, &card.mir_ik}) { for (float* p : *v) if (p) sycl::free(p, q); v->clear(); }
+    card.mir_cap.clear(); card.mir_sent.clear(); card.mir_have.clear(); card.snaps_ready.clear();
     for (auto& lst : card.dec_scratch) for (auto& [p, n] : lst) sycl::free(p, q);
     card.dec_scratch.clear(); card.dec_cursor.clear();
     for (void* p : {static_cast<void*>(card.rope_inv), static_cast<void*>(card.rope_pos), static_cast<void*>(card.rope_hpos),
@@ -394,7 +534,24 @@ void Ds41Forward::reset_lane(uint32_t lane) {
     for (auto& cp : cards_) if (lane < cp->state.size()) for (auto& st : cp->state[lane]) { st.nc = 0; st.part_valid = false; }
     Lane& S = lanes_[lane];
     S.n_pos = 0; S.all_ids.clear(); S.snap_valid = false;
+    mirror_sync(lane, true);
     pc_clear_live(lane);   // Phase 46: every live checkpoint's latents are about to be rewritten
+}
+
+// 2026-10-20: a mirror is the source's rows [0, mir_have) as of the last forward. A reset or a load rewrites rows below that
+// count, so nothing is kept; a truncation (a rollback, a live checkpoint) keeps the rows below the source's new count, which
+// the source never rewrites (append-only), and the rows above are sent again by the next forward. Called on a quiescent lane.
+void Ds41Forward::mirror_sync(uint32_t lane, bool reset) {
+    for (auto& cp : cards_) {
+        Card& cd = *cp;
+        if (cd.mir_src < 0 || lane >= cd.mir_sent.size()) continue;
+        uint32_t nc = 0;
+        if (!reset)
+            for (const auto& op : cards_)
+                if (uint32_t(cd.mir_src) >= op->L0 && uint32_t(cd.mir_src) < op->L1 && lane < op->state.size()) nc = op->state[lane][uint32_t(cd.mir_src)].nc;
+        // one count for both sides: an aborted step can leave the sender ahead of what landed (review 2026-10-20 #1)
+        cd.mir_sent[lane] = cd.mir_have[lane] = std::min({cd.mir_sent[lane], cd.mir_have[lane], nc});
+    }
 }
 
 std::string Ds41Forward::read_state(uint32_t L, std::vector<float>& win, std::vector<float>& comp, std::vector<float>& idxk, uint32_t& nc) const {
@@ -444,8 +601,69 @@ void Ds41Forward::free_resident() {
         for (void** b : {reinterpret_cast<void**>(&cp->ep_x), reinterpret_cast<void**>(&cp->ep_hx), reinterpret_cast<void**>(&cp->ep_ypc),
                          reinterpret_cast<void**>(&cp->ep_hyc), reinterpret_cast<void**>(&cp->ep_rows)}) if (*b) { sycl::free(*b, *cp->q); *b = nullptr; }
     }
-    ep_ = 0;
+    if (tpr_) for (size_t i = 0; i < tpr_->q.size(); ++i) {
+        sycl::free(tpr_->part[i], *tpr_->q[i]); sycl::free(tpr_->sum[i], *tpr_->q[i]);
+        for (auto& b : tpr_->small) if (i < b.size()) sycl::free(b[i], *tpr_->q[i]);
+    }
+    tpr_.reset(); tp_stats_.clear();
+    ep_ = 0; tp_ = 0;
     resident_ = false;
+}
+
+// ---- tensor parallel (2026-10-20): the all-reduce ------------------------------------------------------------------------
+bool Ds41Forward::TpReduce::barrier() {
+    // a central barrier: the last arrival resets the count and moves the generation on; the others spin until it moves (a
+    // decode step meets 80 of these, so a futex wake would cost more than the spin), yielding after a while
+    const uint64_t g = gen.load(std::memory_order_acquire);
+    if (count.fetch_add(1, std::memory_order_acq_rel) + 1 == n) {
+        count.store(0, std::memory_order_relaxed);
+        gen.store(g + 1, std::memory_order_release);
+        return !failed.load(std::memory_order_acquire);
+    }
+    for (uint32_t spins = 0; gen.load(std::memory_order_acquire) == g; ++spins) {
+        if (failed.load(std::memory_order_acquire)) return false;
+        if (spins < 20000) _mm_pause(); else std::this_thread::yield();
+    }
+    return !failed.load(std::memory_order_acquire);
+}
+
+std::string Ds41Forward::tp_allreduce(size_t ci, sycl::queue& q, float* dev, size_t n, TpArTimes* tt) {
+    TpReduce& R = *tpr_;
+    if (n > R.cap) return "tensor-parallel all-reduce of " + std::to_string(n) + " floats past the buffers' " + std::to_string(R.cap);
+    using clk = std::chrono::steady_clock;
+    auto ms = [](clk::time_point a, clk::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    const auto t0 = clk::now();
+    if (R.one_barrier && n <= R.small_cap) {
+        // decode: one barrier, then every card sums every element in card order -- the same bits as the two-barrier path
+        const uint32_t par = R.parity[ci]; R.parity[ci] ^= 1u;
+        q.memcpy(R.small[par][ci], dev, n * 4).wait();
+        const auto t1 = clk::now();
+        if (!R.barrier()) return "tensor parallel: another card failed";
+        const auto t2 = clk::now();
+        float* t = R.sum[ci];
+        std::memcpy(t, R.small[par][0], n * 4);
+        for (uint32_t r = 1; r < R.n; ++r) { const float* p = R.small[par][r]; for (size_t j = 0; j < n; ++j) t[j] += p[j]; }
+        const auto t3 = clk::now();
+        q.memcpy(dev, t, n * 4);
+        if (tt) { tt->copy += ms(t0, t1); tt->bar += ms(t1, t2); tt->bar1 += ms(t1, t2); tt->sum += ms(t2, t3); tt->all += ms(t0, clk::now()); }
+        return {};
+    }
+    q.memcpy(R.part[ci], dev, n * 4).wait();              // waits for this card's work up to here
+    const auto t1 = clk::now();
+    if (!R.barrier()) return "tensor parallel: another card failed";
+    const auto t2 = clk::now();
+    // this card's share of the elements, summed over the cards in card order -- the same bits whichever card sums them
+    const size_t a = n * ci / R.n, b = n * (ci + 1) / R.n;
+    float* t = R.sum[ci];
+    std::memcpy(t + a, R.part[0] + a, (b - a) * 4);
+    for (uint32_t r = 1; r < R.n; ++r) { const float* p = R.part[r]; for (size_t j = a; j < b; ++j) t[j] += p[j]; }
+    for (uint32_t r = 0; r < R.n; ++r) if (r != ci) std::memcpy(R.sum[r] + a, t + a, (b - a) * 4);
+    const auto t3 = clk::now();
+    if (!R.barrier()) return "tensor parallel: another card failed";
+    const auto t4 = clk::now();
+    q.memcpy(dev, R.sum[ci], n * 4);                       // ordered before the card's next kernels; the buffer is reused only
+    if (tt) { tt->copy += ms(t0, t1); tt->bar += ms(t1, t2) + ms(t3, t4); tt->bar1 += ms(t1, t2); tt->sum += ms(t2, t3); tt->all += ms(t0, clk::now()); }
+    return {};                                             // after this card's next partial is in, i.e. after this copy ran
 }
 
 uint64_t Ds41Forward::dense_bytes() const { uint64_t b = 0; for (const auto& cp : cards_) b += cp->cache.bytes(); return b; }
@@ -526,6 +744,9 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
     const size_t card_first = stage ? stage->card_first : 0, card_last = stage ? stage->card_last : cards_.size();
     const bool first_stage = card_first == 0, last_stage = card_last == cards_.size();
     if (stage && (probe || expected || force_routing)) return "forward: a pipeline stage takes no probe or expected routing";
+    if (tp_ && (stage || probe || expected || force_routing || capture_main_hidden_ || !resident_))
+        return "forward: tensor parallel runs the resident whole-model call only (no pipeline stage, probe, expected routing or drafter capture yet)";
+    if (tp_) for (const auto& cp : cards_) if (cp->L0 != 0 || cp->L1 != m_->config().n_layers) return "forward: tensor parallel needs every card on every layer";
     if (stage && (card_first >= card_last || card_last > cards_.size() || !first_stage != bool(stage->in) || !last_stage != bool(stage->out)))
         return "forward: malformed pipeline stage";
     // P4 B6a: the LANE this call runs -- the stage's (the pipe), else the active one -- and whether every row's logits are wanted
@@ -545,6 +766,7 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
     const uint32_t V = c.vocab_size;
     const float LOWEST = std::numeric_limits<float>::lowest();
     if (!stage) stats_.assign(c.n_layers, {});
+    if (tp_) for (size_t ci = 1; ci < tp_stats_.size(); ++ci) tp_stats_[ci].assign(c.n_layers, {});
     else for (size_t ci = card_first; ci < card_last; ++ci) for (uint32_t L = cards_[ci]->L0; L < cards_[ci]->L1; ++L) stats_[L] = {};   // its own layers only: the other stages write theirs meanwhile
 
     // ---- the two admitted regimes --------------------------------------------------------------
@@ -612,8 +834,6 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
     const size_t ids_before = first_stage ? S.all_ids.size() : 0;
     if (first_stage) S.all_ids.insert(S.all_ids.end(), ids, ids + T);
     struct RollBack { std::vector<int32_t>& v; size_t n; bool ok = false; ~RollBack() { if (!ok) v.resize(n); } } ids_guard{S.all_ids, ids_before, !first_stage};
-    if (!first_stage)
-        for (uint32_t Le : tb_->layer_ids) if (Le >= cards_[card_first]->L0) return "forward: a later pipeline stage holds an engram layer (" + std::to_string(Le) + "); its host prep is the first stage's";
 
     // ---- host-side preparation, shared by every card ---------------------------------------
     const auto t_prep = std::chrono::steady_clock::now();
@@ -672,20 +892,39 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
     };
     std::vector<float> hpm(size_t(T) * HC, 0.f);
     for (uint32_t t = 0; t < T; ++t) hpm[size_t(t) * HC] = 1.f;
-    std::vector<float> h_imp_ckv, h_imp_ik;                      // the current source's caches, at a card boundary
+    // at a card boundary: the source caches' new rows [bounce_off, bounce_nc), the index picks and their width, and the
+    // candidate blocks (h_cand, empty when none were kept) -- 2026-10-20, see StageCarry
+    std::vector<float> h_imp_ckv, h_imp_ik;
     std::vector<int32_t> h_sh_topk(size_t(T) * c.index_topk);
-    uint32_t bounce_nc = 0, sh_topk_w = 0; bool bounce_topk = false;
-    std::vector<int32_t> h_idx(size_t(T) * TK); std::vector<float> h_w(size_t(T) * TK);
+    std::vector<uint8_t> h_cand;
+    uint32_t bounce_nc = 0, bounce_off = 0, sh_topk_w = 0; bool bounce_topk = false;
     if (!first_stage) {   // Phase 43: the stream and the boundary caches, exactly as the previous card left them
         StageCarry& in = *stage->in;
         hh = std::move(in.hh); hpm = std::move(in.hpm); h_imp_ckv = std::move(in.imp_ckv); h_imp_ik = std::move(in.imp_ik); h_sh_topk = std::move(in.sh_topk);
-        T_carry = in.T_carry; off_carry = in.off_carry; bounce_nc = in.bounce_nc; bounce_topk = in.bounce_topk;
+        T_carry = in.T_carry; off_carry = in.off_carry; bounce_nc = in.bounce_nc; bounce_off = in.bounce_off; bounce_topk = in.bounce_topk;
+        sh_topk_w = in.sh_topk_w; engram_in16 = std::move(in.engram); h_cand = std::move(in.cand_keep);
     }
     if (first_stage) prep_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_prep).count();
+    // tensor parallel: the index picks' width is each card's own (they run the same layers at once); otherwise the carry's
+    uint32_t* const sh_topk_w_carry = &sh_topk_w;
+    std::vector<uint32_t> tp_sh_topk_w(tp_ ? cards_.size() : 0, 0u);
 
     // ---- one card's layer range -------------------------------------------------------------
     auto run_card = [&](Card& card, const size_t ci) -> std::string {
     sycl::queue& q = *card.q;
+    // Tensor parallel (2026-10-20): the layer body below runs on this card's PART -- its NH / n query heads (QH / n rows of
+    // q, the o_groups those heads form, OR / n of o_a's outputs = wo_b's inputs) and the shared expert's EF / n units, the
+    // dense cache holding exactly those slices -- under the names the body already uses; the whole model's otherwise. The
+    // body's two partial sums (wo_b's output, the experts' plus the shared expert's) meet in tp_allreduce. What a card
+    // shares with the others is read-only here, except what is shadowed per card: its stats, the routing profile (card 0
+    // counts), the index picks' width and the routing readback.
+    const uint32_t tpn = tp_ ? tp_ : 1u;
+    const uint32_t NH = c.n_heads / tpn, QH = NH * HD, G = c.o_groups / tpn, OR = G * OPG;
+    const uint32_t EF = c.moe_inter_dim / tpn;
+    auto& stats_ = (tp_ && ci) ? tp_stats_[ci] : this->stats_;
+    auto& profile_ = (tp_ && ci) ? tp_no_profile_ : this->profile_;
+    uint32_t& sh_topk_w = tp_ ? tp_sh_topk_w[ci] : *sh_topk_w_carry;
+    std::vector<int32_t> h_idx(size_t(T) * TK); std::vector<float> h_w(size_t(T) * TK);
     // the oneDNN projections named for the kernel profiler (oneDNN submits internally, so ie::ps
     // cannot wrap them; the event is pushed instead -- inert unless a tool set ie::g_profiler)
     auto pe = [](const char* name, sycl::event e) { if (ie::g_profiler) [[unlikely]] ie::g_profiler->push(name, e); return e; };
@@ -700,7 +939,7 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
     // capacity); a size that does not match falls back to a fresh allocation, freed as before.
     // ON by default (docs/47: bit-identical by the dumps, -2.9 ms/token measured); `IE_DS41_SETUP_FAST=0` restores
     // the per-step allocations, the five RoPE round trips and the source-cache bounce (the kill switch).
-    static const bool setup_fast = [] { const char* v = std::getenv("IE_DS41_SETUP_FAST"); return !(v && *v && std::string(v) == "0"); }();
+    const bool setup_fast = ds41_setup_fast_on();
     const bool dec_cache = decode && setup_fast;
     // Phase 43: the persistent lists serve DECODE-sized steps only. A continuation chunk's scratch (~0.9 MB per token
     // plus its context-scaled strips) used to stay allocated after the prefill -- one set per distinct chunk length,
@@ -889,6 +1128,9 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
                            NCMAX > size_t(c.candidate_topk_blocks) * cand_bs;
     const size_t cand_nbmax = cand_live ? (NCMAX + cand_bs - 1) / cand_bs : 0;
     uint8_t* cand_keep = cand_live ? reinterpret_cast<uint8_t*>(S32((size_t(T) * cand_nbmax + 3) / 4)) : nullptr;
+    // 2026-10-20: cand_keep's bytes in use (rows x blocks), once the source layer wrote them on this card or they came
+    // from the previous one; 0 = nothing kept. A consumer a card later (layers 32 / 36 on four cards) reads the carried copy.
+    size_t cand_n = 0;
     float* cand_bscore = cand_live ? S32(size_t(STRIP) * cand_nbmax) : nullptr;
     // the index-source's picks, shared with its consumers (one slot, as in SharedAttentionRuntime);
     // a card that starts mid-model inherits the previous card's, with the source caches it read
@@ -900,12 +1142,23 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
     int32_t* topk_nv  = SI(size_t(T));                 // Phase 33: each row's valid-pick count, from the sort
     bool asc_stale = true;
     struct Src { const float* ckv = nullptr; const float* ik = nullptr; uint32_t nc = 0; } cur;
-    if (bounce_nc) {
-        q.memcpy(card.imp_ckv, h_imp_ckv.data(), size_t(bounce_nc) * HD * 4);
-        q.memcpy(card.imp_ik, h_imp_ik.data(), size_t(bounce_nc) * IHD * 4);
-        cur = {card.imp_ckv, card.imp_ik, bounce_nc};
+    if (bounce_nc) {   // 2026-10-20: the new rows land in this lane's mirror after the rows it already holds
+        if (card.mir_src < 0 || lane >= card.mir_cap.size()) return "forward: card " + std::to_string(ci) + " received source caches but has no boundary mirror";
+        if (bounce_nc > card.mir_cap[lane]) return "forward: card " + std::to_string(ci) + ": " + std::to_string(bounce_nc) + " latents exceed the boundary mirror's " + std::to_string(card.mir_cap[lane]);
+        if (bounce_off > card.mir_have[lane] || bounce_off > bounce_nc || h_imp_ckv.size() != size_t(bounce_nc - bounce_off) * HD || h_imp_ik.size() != size_t(bounce_nc - bounce_off) * IHD)
+            return "forward: card " + std::to_string(ci) + ": the boundary sent rows from " + std::to_string(bounce_off) + " to a mirror holding " + std::to_string(card.mir_have[lane]) + " (out of step)";
+        if (const uint32_t n = bounce_nc - bounce_off) {
+            q.memcpy(card.mir_ckv[lane] + size_t(bounce_off) * HD, h_imp_ckv.data(), size_t(n) * HD * 4);
+            q.memcpy(card.mir_ik[lane] + size_t(bounce_off) * IHD, h_imp_ik.data(), size_t(n) * IHD * 4);
+        }
+        card.mir_have[lane] = bounce_nc;
+        cur = {card.mir_ckv[lane], card.mir_ik[lane], bounce_nc};
     }
     if (bounce_topk) { q.memcpy(sh_topk, h_sh_topk.data(), h_sh_topk.size() * 4); asc_stale = true; }
+    if (!h_cand.empty()) {
+        if (!cand_keep || h_cand.size() > size_t(T) * cand_nbmax) return "forward: card " + std::to_string(ci) + " received candidate blocks it has no room for";
+        q.memcpy(cand_keep, h_cand.data(), h_cand.size()); cand_n = h_cand.size();
+    }
     q.wait();
     DS4ExpertWorkspace ws;
     if (!resident_) if (auto e = ds4_expert_ws_alloc(q, H, EF, ws); !e.empty()) return e;
@@ -981,6 +1234,7 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
             const size_t li = size_t(it - tb_->layer_ids.begin());
             const Ds41LayerDense* rde = resident_ ? card.cache.layer(L) : nullptr;
             sycl::half* w_e = rde ? rde->engram_wkv : (sycl::half*)keep(dense(Lw.engram_wkv));
+            if (li >= engram_in16.size() || engram_in16[li].size() != size_t(T) * EIN) return "layer " + std::to_string(L) + ": no engram rows (the first stage makes them; a later one takes them from the carry)";
             q.memcpy(t16, engram_in16[li].data() + size_t(T - Tl) * EIN, size_t(Tl) * EIN * 2).wait();   // the last Tl rows of T
             ((rde && rde->f8_engram_wkv.w) ? (Tl == 1 ? gemv_fp8_e4m3_f16_tagged(q, t16, rde->f8_engram_wkv.w, rde->f8_engram_wkv.s, ekv, EIN, EOUT, "engram_wkv")
                                               : (decode && Tl <= kDs41MaxDecodeRows) ? gemv_fp8_rows(q, t16, EIN, rde->f8_engram_wkv.w, rde->f8_engram_wkv.s, ekv, Tl, EIN, EOUT)
@@ -1211,6 +1465,7 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
                             cand_noop_ = false;
                             ds41_candidate_block_scores(q, scores, d_pos_t + so, cand_bscore, sT, NC, cand_bs, R);
                             ds41_candidate_select(q, cand_bscore, cand_keep + size_t(so) * cnb, sT, NC, cand_bs, c.candidate_topk_blocks).wait();
+                            cand_n = size_t(Tl) * cnb;
                         } else if (int32_t(L) > c.candidate_source_layer && !cand_skip) {
                             ds41_candidate_apply(q, cand_keep + size_t(so) * cnb, scores, sT, NC, cand_bs).wait();
                         }
@@ -1341,6 +1596,12 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
         }
         to16(oa, t16, size_t(Tl) * OR);
         W(dense_proj("ds41.onednn.o_b", t16, w_ob, rd ? &rd->f8_wo_b : nullptr, ao, Tl, H, OR));
+        if (tp_) {
+            TpArTimes at;
+            if (auto e = tp_allreduce(ci, q, ao, size_t(Tl) * H, &at); !e.empty()) return "layer " + std::to_string(L) + " (attention all-reduce): " + e;
+            stats_[L].tp_ar_ms += at.all; stats_[L].tp_copy_ms += at.copy; stats_[L].tp_bar_ms += at.bar; stats_[L].tp_sum_ms += at.sum;
+            stats_[L].tp_site_copy_ms[0] += at.copy; stats_[L].tp_site_bar1_ms[0] += at.bar1;
+        }
 
         W(ds4_hc_mix(q, h, a_post, a_comb, ao, h_next, Tl, H, HC));
         std::swap(h, h_next);
@@ -1360,6 +1621,7 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
         W(ds4_rms_norm(q, xf, n_ff, xfn, Tl, H, c.norm_eps));
 
         W(ds4_router_topk(q, xfn, g_w, g_b, r_logits, r_w, r_i, Tl, H, E, TK, c.route_scale));   // the readback below waits
+        if (resident_) card.tier.stage_x(q, xfn, Tl);   // 2026-10-20: the CPU leg's copy of xfn rides the readback's wait
         q.memcpy(h_idx.data(), r_i, size_t(Tl) * TK * 4); q.memcpy(h_w.data(), r_w, size_t(Tl) * TK * 4).wait();   // Tl rows: the rest of h_idx is stale
         if (const auto runs = image_runs(Tl); !runs.empty()) {
             // image-span tokens select by their own bias (training's noaux_tc_for_vl); the weights stay the unbiased
@@ -1587,6 +1849,12 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
         const auto tsh = std::chrono::steady_clock::now();
         if (!shared_early) shared_expert();
         ie::ps(q, "ds41_shared_add", [&](sycl::handler& hh_) { hh_.parallel_for(sycl::range<1>(size_t(Tl) * H), [=](sycl::id<1> i) { moe[i] += shh[i]; }); });
+        if (tp_) {
+            TpArTimes at;
+            if (auto e = tp_allreduce(ci, q, moe, size_t(Tl) * H, &at); !e.empty()) return "layer " + std::to_string(L) + " (experts all-reduce): " + e;
+            stats_[L].tp_ar_ms += at.all; stats_[L].tp_copy_ms += at.copy; stats_[L].tp_bar_ms += at.bar; stats_[L].tp_sum_ms += at.sum;
+            stats_[L].tp_site_copy_ms[1] += at.copy; stats_[L].tp_site_bar1_ms[1] += at.bar1;
+        }
         W(ds4_hc_mix(q, h, f_post, f_comb, moe, h_next, Tl, H, HC));
         std::swap(h, h_next);
         stats_[L].shared_ms = ms_from(tsh);
@@ -1601,7 +1869,7 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
     }
     // =========================================================================================
 
-    if (card.L1 == c.n_layers) {
+    if (card.L1 == c.n_layers && (!tp_ || ci == 0)) {   // tensor parallel: card 0's head; the others are done
         // ---- collapse with the last ffn_pre, norm, head ----------------------------------------
         const auto t_head = std::chrono::steady_clock::now();
         ds41_hc_collapse(q, h, pre_mix, xa, Tl, H, HC);
@@ -1630,37 +1898,66 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
         head_bytes_ = layer_dense_bytes;
         head_ms_ = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_head).count();
         if (!resident_) sycl::free(const_cast<float*>(n_out), q);
-    } else {
+    } else if (!tp_) {
         // ---- hand the state to the next card through the host --------------------------------
         q.memcpy(hh.data(), h, size_t(Tl) * FLAT * 4); q.memcpy(hpm.data(), pre_mix, size_t(Tl) * HC * 4); T_carry = Tl; off_carry = seg_off;
-        // Phase 18 (docs/deepseek41/46 term 2): the bounce is dead when the next card's first layer is a kv
-        // source AND an index source -- it overwrites `cur` and `sh_topk` before any consumer reads them
-        // (this split: layer 20; the dumps at 0.0 with the copy gone are the proof). Decode only.
-        const auto& nk = m.layers()[card.L1].kind;
-        const bool dead_bounce = dec_cache && nk.is_kv_source && nk.is_index_source;
-        bounce_nc = dead_bounce ? 0u : cur.nc; bounce_topk = false;
-        if (cur.ckv && cur.nc && !dead_bounce) {
-            h_imp_ckv.resize(size_t(cur.nc) * HD); h_imp_ik.resize(size_t(cur.nc) * IHD);
-            q.memcpy(h_imp_ckv.data(), cur.ckv, h_imp_ckv.size() * 4); q.memcpy(h_imp_ik.data(), cur.ik, h_imp_ik.size() * 4);
+        // Phase 18 (docs/deepseek41/46 term 2): the bounce is dead when the next card's first layer is a kv source AND an
+        // index source -- it overwrites `cur` and `sh_topk` before any consumer reads them (two cards: layer 20; the dumps
+        // at 0.0 with the copy gone were the proof). 2026-10-20: judged once at init for prefill and decode alike
+        // (Card::mir_src < 0), and a live boundary sends only the rows the next card's mirror of this lane lacks.
+        Card& nx = *cards_[ci + 1];
+        bounce_nc = 0; bounce_off = 0; bounce_topk = false; h_imp_ckv.clear(); h_imp_ik.clear();
+        if (nx.mir_src >= 0 && cur.ckv && cur.nc) {
+            uint32_t& sent = nx.mir_sent[lane];
+            if (!ds41_mirror_on() || sent > cur.nc) sent = 0;
+            const uint32_t n = cur.nc - sent;
+            h_imp_ckv.resize(size_t(n) * HD); h_imp_ik.resize(size_t(n) * IHD);
+            if (n) {
+                q.memcpy(h_imp_ckv.data(), cur.ckv + size_t(sent) * HD, h_imp_ckv.size() * 4);
+                q.memcpy(h_imp_ik.data(), cur.ik + size_t(sent) * IHD, h_imp_ik.size() * 4);
+            }
             q.memcpy(h_sh_topk.data(), sh_topk, h_sh_topk.size() * 4); bounce_topk = true;
+            bounce_off = sent; bounce_nc = cur.nc;
         }
+        if (cand_n) { h_cand.resize(cand_n); q.memcpy(h_cand.data(), cand_keep, cand_n); } else h_cand.clear();
         q.wait_and_throw();
+        if (bounce_nc) nx.mir_sent[lane] = bounce_nc;   // only once the rows are on the host
     }
     if (!resident_) ds4_expert_ws_free(q, ws);
     for (void* p : scratch) sycl::free(p, q);
     if (decode && T <= kDs41MaxDecodeRows) { LaneTierStats& lt = lane_tier_[lane][ci]; ++lt.steps; lt.rows += T; }
     // Phase 46: a prefill chunk's end is a prefix-cache checkpoint of this lane for this card (its rings copied after its launches)
-    if (pc_on_ && T > kDs41MaxDecodeRows) pc_capture(lane, ci, pos0 + T);
+    if (pc_on_ && T > kDs41MaxDecodeRows && !tp_) pc_capture(lane, ci, pos0 + T);   // tensor parallel: after every card is done
     return {};
     };   // run_card
 
+    if (tp_) {
+        // tensor parallel: every card runs run_card at once, card 0 on this thread; they meet in tp_allreduce. A card that fails
+        // releases the others (their next all-reduce returns), so the join never hangs; the first real error is reported.
+        tpr_->failed.store(false); tpr_->count.store(0); std::fill(tpr_->parity.begin(), tpr_->parity.end(), 0u);
+        std::vector<std::string> errs(cards_.size());
+        auto one = [&](size_t ci) {
+            try { errs[ci] = run_card(*cards_[ci], ci); }
+            catch (const std::exception& ex) { errs[ci] = std::string("threw: ") + ex.what(); }
+            if (!errs[ci].empty()) tpr_->fail();
+        };
+        std::vector<std::thread> th;
+        for (size_t ci = 1; ci < cards_.size(); ++ci) th.emplace_back(one, ci);
+        one(0);
+        for (auto& t : th) t.join();
+        for (int pass = 0; pass < 2; ++pass)
+            for (size_t ci = 0; ci < errs.size(); ++ci)
+                if (!errs[ci].empty() && (pass || errs[ci].find("another card failed") == std::string::npos)) return "card " + std::to_string(ci) + ": " + errs[ci];
+        if (pc_on_ && T > kDs41MaxDecodeRows) for (size_t ci = 0; ci < cards_.size(); ++ci) pc_capture(lane, ci, pos0 + T);
+    } else
     for (size_t ci = card_first; ci < card_last; ++ci)
         if (auto e = run_card(*cards_[ci], ci); !e.empty()) return e;
     ids_guard.ok = true;
     if (!last_stage) {    // Phase 43: hand the boundary to the next stage; the positions are committed by the last one
         StageCarry& out = *stage->out;
         out.hh = std::move(hh); out.hpm = std::move(hpm); out.imp_ckv = std::move(h_imp_ckv); out.imp_ik = std::move(h_imp_ik); out.sh_topk = std::move(h_sh_topk);
-        out.T_carry = T_carry; out.off_carry = off_carry; out.bounce_nc = bounce_nc; out.bounce_topk = bounce_topk;
+        out.T_carry = T_carry; out.off_carry = off_carry; out.bounce_nc = bounce_nc; out.bounce_off = bounce_off; out.bounce_topk = bounce_topk;
+        out.sh_topk_w = sh_topk_w; out.engram = std::move(engram_in16); out.cand_keep = std::move(h_cand);
         return {};
     }
     S.n_pos = pos0 + T;
@@ -1786,6 +2083,7 @@ std::string Ds41Forward::rollback_lane_to(uint32_t lane, uint32_t n_pos, bool wa
         if (wait) q.wait_and_throw();
     }
     S.all_ids.resize(n_pos); S.n_pos = n_pos; S.snap_valid = false;
+    mirror_sync(lane, false);   // 2026-10-20: the rows past the sources' new counts are sent again
     return {};
 }
 
@@ -1798,6 +2096,7 @@ std::string Ds41Forward::rollback_lane_to(uint32_t lane, uint32_t n_pos, bool wa
 std::string Ds41Forward::pipe_start(PipeDone done) {
     if (!resident_ || cards_.size() < 2) return "pipe_start: needs resident mode on 2+ cards";
     if (ep_) return "pipe_start: refused with expert parallel";
+    if (tp_) return "pipe_start: refused with tensor parallel (the lane pipe runs the layer split)";
     if (capture_main_hidden_) return "pipe_start: refused with the drafter capture";
     if (!stage_th_.empty()) return ppaused_ ? "pipe_start: the pipe is paused (pipe_resume)" : "pipe_start: already running";
     if (const char* v = std::getenv("IE_DS41_DUMP_ROUTING"); v && *v) return "pipe_start: IE_DS41_DUMP_ROUTING is serial-only";

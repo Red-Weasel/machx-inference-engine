@@ -33,6 +33,11 @@ namespace ie {
 // One expert's slot: gate (w1), up (w3), down (w2) as MXFP4 planes in V4's convention --
 // nibble plane at off0, E8M0 plane at off1, each 64 B aligned. K/N are contraction/output.
 std::string ds41_slot_layout(uint32_t H, uint32_t EF, Ds4SlotLayout& out);
+// Tensor parallel (2026-10-20): part `part` of n_parts of every expert -- gate / up rows [ef0, ef0 + EF/n) (their intermediate
+// units, N = EF/n) and down's columns over the same units (K = EF/n, a partial sum over them), ef0 = part * EF/n. The
+// planes record the checkpoint's shape in src_K / src_N and the slice's origin in k0 / n0; n_parts = 1 is ds41_slot_layout.
+// EF's 32-blocks must split evenly (2304 = 72 blocks: 2, 3, 4, 6, 8 parts).
+std::string ds41_slot_layout_tp(uint32_t H, uint32_t EF, uint32_t part, uint32_t n_parts, Ds4SlotLayout& out);
 
 // The permute-free on-disk tail (docs/deepseek41/40, C2): the mmap tier's experts written once in
 // the engine's slot layout, so a fill is one O_DIRECT pread straight into the staging slot. The
@@ -184,13 +189,25 @@ public:
     // the one scatter then accumulates the six products in the same order as the whole tier.
     void set_ep_export(bool on) { ep_export_ = on; }
     // The CPU miss split's cores for THIS tier, set before init (docs/deepseek41/42 step 3: under
-    // expert parallel each card's tier gets its own half of the E-cores); empty = the env / default.
+    // expert parallel each card's tier gets its own part of the leg's cores); empty = the env / default.
     void set_cpu_cores(std::string cores) { cpu_cores_override_ = std::move(cores); }
+    // 2026-10-20: this card's host->card rate (init_resident's probe), set before init. With it the CPU leg's start measures
+    // its own rate and scales the shares' defaults to the box (ds41_qstar_factor); 0 (MiMo, the tools) = the defaults as swept.
+    void set_link_gbs(double gbs) { link_gbs_ = gbs; }
+    // Tensor parallel (2026-10-20), set before init: this tier holds part `part` of n_parts of EVERY expert (ds41_slot_layout_tp)
+    // in each of its tiers, so its moe() output is a partial sum the cards add up. 1 part = the whole expert, as before.
+    void set_tp(uint32_t part, uint32_t n_parts) { tp_part_ = part; tp_n_ = n_parts ? n_parts : 1u; }
+    // 2026-10-20: the CPU leg's activations copied to the host AHEAD of the call -- enqueued on `q` before a host wait the
+    // caller makes anyway (the routing readback), so the next moe() on the same x and T finds them there and skips its own
+    // copy-and-wait. The bytes are the same; only a GPU round trip per layer goes. Without the caller's wait in between the
+    // call would read a copy in flight, so the forward stages right before its readback and nowhere else.
+    void stage_x(sycl::queue& q, const float* x, uint32_t T);
     // B66: the leg's team size for the next calls (1..its cores; the team's first n threads, each pinned to its core in the
     // core list's order); only between calls. Bits do not depend on it (rows are independent).
     void set_cpu_threads(int n) { if (!cpu_.cores.empty()) cpu_.nthreads = std::max(1, std::min(n, int(cpu_.cores.size()))); }
     int  cpu_threads() const { return cpu_.nthreads; }
     int  cpu_core_count() const { return int(cpu_.cores.size()); }
+    const std::vector<int>& cpu_cores() const { return cpu_.cores; }   // the leg's cores (empty: no leg)
     // The CPU leg's PCIe share of the pinned misses at 2..kMaxRows rows (CpuMiss::qstar_multi; IE_DS41_QSTAR_MULTI at init). A
     // caller whose rows come from SEVERAL sequences (MiMo-V2.6 P4 B3 groups: the rows share almost no experts, so an expert
     // carries ~1 row and the split is closer to the one-row q*) sets its own share before moe() and restores this one after.
@@ -264,7 +281,7 @@ private:
     // lands as ITS PACKED fp16 ROW (the routing weight stays real; the one scatter applies it), so an
     // exporting tier's CPU rows travel like its GPU rows and the split works under expert parallel.
     // IE_DS41_CPU_MISS=1 enables; IE_DS41_QSTAR = the PCIe share of the misses (default 0.30 =
-    // 1.2 / (1.2 + 2.75) experts per ms, measured); IE_DS41_CPU_CORES (default 8-19, the E-cores).
+    // 1.2 / (1.2 + 2.75) experts per ms, measured); IE_DS41_CPU_CORES (default ds41_cpu_leg_default_cores: 8-19 here, the E-cores).
     struct CpuMiss {
         bool on = false; float qstar = 0.30f; std::vector<int> cores; int nthreads = 0;
         // Phase 59 (docs/deepseek41/98): the leg also serves 2..kMaxRows-row decode steps (a speculative verify); its
@@ -286,6 +303,7 @@ private:
         // pinned host: the activations [max_rows, H]. Pinned, not a std::vector: NEO 26.35 serves a small device-to-host copy
         // into pageable memory by CPU reads through the BAR (~0.35 ms for one 16 KiB row, 30x the pinned copy; P4 B13, 2026-09-27)
         float* x = nullptr;
+        const float* x_staged = nullptr; uint32_t x_staged_rows = 0;   // stage_x: x's source and rows, until the next moe()
         uint64_t x_bytes = 0;                                 // its size (pinned_bytes counts it)
         std::optional<sycl::context> x_ctx;                   // its context: the destructor frees it when free_storage never ran
         std::vector<float> scratch, out;                      // host: per row of a run, EF*2 and H
@@ -298,6 +316,9 @@ private:
     };
     CpuMiss cpu_;
     std::string cpu_cores_override_;
+    double link_gbs_ = 0;                      // set_link_gbs
+    uint32_t tp_part_ = 0, tp_n_ = 1;          // set_tp
+    double cpu_probe_gbs();                    // the leg's rate on pinned experts, GB/s of weights; 0 = not measured
     // The mmap fill's reader: a PERSISTENT thread per affinity mode ([0] the calling thread's partition -- decode --, [1]
     // every core -- prefill with the CPU leg on), so its OpenMP team is created once. It used to be a fresh std::thread
     // per moe() call, and libiomp5 never reclaimed the teams those threads opened: a served process reached 94,178

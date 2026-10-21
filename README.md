@@ -175,6 +175,15 @@ class ([New in v0.2.6](#new-in-v026)).
 
 ---
 
+<a id="test-v0227rc1"></a>
+## 🧪 Test build v0.2.27-rc1: DeepSeek-V4.1-Flash on four cards, and tensor parallel
+
+A test build, not a release ([notes](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.27-rc1)).
+DeepSeek-V4.1-Flash runs on more than two Arc cards (checked by emulating four on two; real four-card speed not
+measured yet), and `IE_DS41_TP=1` turns on tensor parallel: on two B70s it decodes 17.2 tok/s against the layer split's
+14.6, and reads long prompts slower (301 against 513 tok/s at 23.6K tokens). Without the switch, two-card V4.1 gives
+the same tokens as v0.2.26.
+
 <a id="new-in-v0226"></a>
 ## 🆕 New in v0.2.26
 
@@ -236,9 +245,9 @@ a copy:
 
 ### What is still slow, and not checked
 
-- **DeepSeek-V4.1-Flash runs on two cards only.** On a machine with more Arc cards it takes all of them, and past two
-  cards prompts over 2,048 tokens fail and attention past 16K tokens of context is wrong. Run it with `--cards 0,1`
-  (`ie cards` lists the numbers). Four-card support is planned.
+- **DeepSeek-V4.1-Flash runs on two cards only in v0.2.26.** On a machine with more Arc cards it takes all of them, and
+  past two cards prompts over 2,048 tokens fail and attention past 16K tokens of context is wrong. Run it with
+  `--cards 0,1` (`ie cards` lists the numbers). Fixed in the [v0.2.27-rc1 test build](#test-v0227rc1).
 - GLM-5.3-Flash prefill is bound by streaming the host expert bank over PCIe 5.0 x8 and by per-expert compute;
   dequantizing inside the split-K GEMM is the next step. `ie serve` runs GLM one request at a time.
 - The other models (Flash-Next, the DeepSeeks, MiMo, GLM, Gemma and more) still copy host memory directly, mostly

@@ -8,6 +8,7 @@
 //   reuse across turns yet). The engram tables and the held-out ranking default to files beside
 //   the model (engram_tables.json, engram_token_map.i32, ie_ranking_heldout.txt). Ctrl-C ends the
 //   current answer and unloads. Tool calls, images and DSpark are not supported: refused, not faked.
+#include "ie/deepseek41_cards.hpp"
 #include "ie/deepseek41_dspark.hpp"
 #include "ie/deepseek41_generate.hpp"
 #include "ie/deepseek41_prompt.hpp"
@@ -76,13 +77,9 @@ int main(int argc, char** argv) {
     if (auto e = tb.load(tables); !e.empty()) { std::fprintf(stderr, "engram tables (%s): %s\n", tables.c_str(), e.c_str()); return 1; }
     ie::Tokenizer tok;
     if (auto e = tok.load_from_hf_json(model + "/tokenizer.json", model + "/tokenizer_config.json"); !e.empty()) { std::fprintf(stderr, "tokenizer: %s\n", e.c_str()); return 1; }
-    std::vector<sycl::device> devs;
-    for (const auto& p : sycl::platform::get_platforms()) {
-        if (p.get_backend() != sycl::backend::ext_oneapi_level_zero) continue;
-        for (const auto& d : p.get_devices(sycl::info::device_type::gpu))
-            if (d.get_info<sycl::info::device::name>().find("Arc") != std::string::npos) devs.push_back(d);
-    }
-    if (devs.empty()) { std::fprintf(stderr, "no Arc GPU\n"); return 1; }
+    const ie::Ds41Cards cards = ie::ds41_cards();   // ie serve's cards (IE_DS41_LOGICAL_CARDS included)
+    if (!cards.error.empty()) { std::fprintf(stderr, "%s\n", cards.error.c_str()); return 1; }
+    const std::vector<sycl::device>& devs = cards.devs;
     std::vector<std::unique_ptr<sycl::queue>> queues; std::vector<sycl::queue*> qs;
     for (const auto& d : devs) { queues.push_back(std::make_unique<sycl::queue>(sycl::context(d), d, sycl::property_list{sycl::property::queue::in_order{}})); qs.push_back(queues.back().get()); }
     std::vector<std::vector<uint32_t>> rank;

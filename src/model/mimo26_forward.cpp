@@ -1,5 +1,6 @@
 // src/model/mimo26_forward.cpp — MiMo-V2.6 forward (P2 bring-up). See include/ie/mimo26_forward.hpp.
 #include "ie/mimo26_forward.hpp"
+#include "ie/deepseek41_cards.hpp"
 
 #include "ie/kernel_profiler.hpp"
 #include "ie/mimo26_host_rules.hpp"
@@ -271,10 +272,14 @@ std::string Mimo26Forward::upload_card(Card& c) {
                              (unsigned long long)(lane_bytes_[ci] * (lanes_.size() - 1) / (uint64_t(n_moe) * lay.bytes)), n_static);
         }
         // P4 B2: pipelined lanes run both cards' CPU legs at once -- each on its own half of the E-cores (V4.1's split)
-        if (opt_.split_cpu_cores && cards_.size() == 2 && !std::getenv("IE_DS41_CPU_CORES")) c.tier.set_cpu_cores(ci == 0 ? "8-13" : "14-19");
+        //   (the leg's cores: ds41_cpu_leg_default_cores, 8-19 here; its halves 8-13 / 14-19)
+        if (opt_.split_cpu_cores && cards_.size() == 2 && !std::getenv("IE_DS41_CPU_CORES")) c.tier.set_cpu_cores(ds41_cpu_cores_part(ds41_cpu_leg_default_cores(), uint32_t(ci), 2));
         // B66: card 1's team on the same E-cores in rotated order, so a half team of each card (forward_pipelined's two legs at
         // once) lands on disjoint cores: card 0's first 6 threads on 8-13, card 1's on 14-19; a whole team is unchanged
-        else if (cards_.size() == 2 && ci == 1 && !std::getenv("IE_DS41_CPU_CORES")) c.tier.set_cpu_cores("14-19,8-13");
+        else if (cards_.size() == 2 && ci == 1 && !std::getenv("IE_DS41_CPU_CORES")) {
+            const std::string all = ds41_cpu_leg_default_cores();
+            c.tier.set_cpu_cores(ds41_cpu_cores_part(all, 1, 2) + "," + ds41_cpu_cores_part(all, 0, 2));
+        }
         // the claim can overshoot what the driver hands out (allocator padding): an AUTO count gives back a slot per layer
         // at a time -- those experts fall to the pinned tier, a speed cost, not a correctness one
         std::string te;
@@ -863,14 +868,7 @@ std::string Mimo26Forward::pipe_start(PipeDone done, uint32_t group_lanes, uint3
     std::vector<int> off;
     if (opt_.split_cpu_cores) {
         const char* ev = std::getenv("IE_DS41_CPU_CORES");
-        const std::string cores = ev && *ev ? ev : "8-19";
-        for (size_t i = 0; i < cores.size();) {
-            size_t j = cores.find(',', i); if (j == std::string::npos) j = cores.size();
-            const std::string tok = cores.substr(i, j - i); const size_t d = tok.find('-');
-            if (d == std::string::npos) off.push_back(std::atoi(tok.c_str()));
-            else for (int c = std::atoi(tok.substr(0, d).c_str()); c <= std::atoi(tok.substr(d + 1).c_str()); ++c) off.push_back(c);
-            i = j + 1;
-        }
+        off = ds41_parse_cores(ev && *ev ? std::string(ev) : ds41_cpu_leg_default_cores());
     }
     for (size_t s = 0; s < cards_.size(); ++s)
         stage_th_.emplace_back([this, s, off] {

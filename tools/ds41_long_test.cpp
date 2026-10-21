@@ -2,6 +2,7 @@
 // chunks, and what does decode cost afterwards. It walks the prompt up in stages and reports the length at which
 // something refuses, with the refusal's own words -- so a wall is identified rather than inferred.
 //   usage: ie-ds41-long-test <model> <golden_dir> [ranking] [target_tokens] [chunk] [decode_tokens]
+#include "ie/deepseek41_cards.hpp"
 #include "ie/deepseek41_forward.hpp"
 #include "ie/expert_stream.hpp"
 #include "ie/kernel_profiler.hpp"
@@ -49,9 +50,9 @@ int main(int argc, char** argv) {
     std::vector<int32_t> ids; ids.reserve(size_t(target) + 64);
     while (ids.size() < size_t(target) + 64) ids.insert(ids.end(), pp.begin(), pp.end());
 
-    std::vector<sycl::device> devs;
-    for (const auto& p : sycl::platform::get_platforms()) { if (p.get_backend() != sycl::backend::ext_oneapi_level_zero) continue; for (const auto& d : p.get_devices(sycl::info::device_type::gpu)) if (d.get_info<sycl::info::device::name>().find("Arc") != std::string::npos) devs.push_back(d); }
-    if (devs.empty()) { std::fprintf(stderr, "no Arc GPU\n"); return 1; }
+    const ie::Ds41Cards cards = ie::ds41_cards();   // ie serve's cards (IE_DS41_LOGICAL_CARDS included)
+    if (!cards.error.empty()) { std::fprintf(stderr, "%s\n", cards.error.c_str()); return 1; }
+    const std::vector<sycl::device>& devs = cards.devs;
     // IE_QUEUE_PROFILING=1: queues with event profiling, so a chunk's per-kernel device time can be
     // harvested. Each submit costs ~0.4 us, so profiled rates are for SHAPE comparisons, never headlines.
     const bool qprof = std::getenv("IE_QUEUE_PROFILING") != nullptr;

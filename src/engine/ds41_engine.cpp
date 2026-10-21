@@ -11,6 +11,7 @@
 
 #include "ie/ds41_engine.hpp"
 #include "ie/ds41_serve_rules.hpp"
+#include "ie/deepseek41_cards.hpp"
 #include "ie/deepseek41_generate.hpp"
 #include "ie/deepseek41_prompt.hpp"
 #include "ie/expert_stream.hpp"
@@ -44,14 +45,18 @@ std::string Engine::ds41_load(const std::string& dir) {
     if (auto e = b->model.load(dir); !e.empty()) return "deepseek41: " + e;
     if (auto e = b->tables.load(dir); !e.empty()) return "deepseek41 engram tables (engram_tables.json + engram_token_map.i32 beside the model): " + e;
     if (auto e = b->tok.load_from_hf_json(dir + "/tokenizer.json", dir + "/tokenizer_config.json"); !e.empty()) return "deepseek41 tokenizer: " + e;
-    std::vector<sycl::device> devs;
-    for (const auto& p : sycl::platform::get_platforms()) {
-        if (p.get_backend() != sycl::backend::ext_oneapi_level_zero) continue;
-        for (const auto& d : p.get_devices(sycl::info::device_type::gpu))
-            if (d.get_info<sycl::info::device::name>().find("Arc") != std::string::npos) devs.push_back(d);
-    }
-    if (devs.empty()) return "deepseek41: no Arc GPU";
-    for (const auto& d : devs) { b->queues.push_back(std::make_unique<sycl::queue>(sycl::context(d), d, sycl::property_list{sycl::property::queue::in_order{}})); b->qs.push_back(b->queues.back().get()); }
+    // The cards (deepseek41_cards.hpp): every discrete Arc GPU, the integrated one skipped; --gpus N takes the first N
+    // (0 = all of them). Each card owns a contiguous layer range; what crosses a boundary -- the stream, the engram rows,
+    // the shared caches' new rows, the index picks and the candidate blocks -- is carried through the host, so any
+    // count runs the same arithmetic (2026-10-20, known_bugs §5.9 fixed).
+    const Ds41Cards cards = ds41_cards(opts_.n_gpus);
+    if (!cards.error.empty()) return "deepseek41: " + cards.error;
+    if (cards.devs.size() > 1 || cards.n_integrated)
+        std::fprintf(stderr, "[deepseek41] %zu card(s)%s%s\n", cards.devs.size(),
+                     cards.n_integrated ? " (integrated graphics skipped)" : "",
+                     cards.devs.size() < cards.n_physical * cards.logical ? " of those visible, by --gpus" : "");
+    b->queues = ds41_card_queues(cards.devs);
+    for (auto& q : b->queues) b->qs.push_back(q.get());
     // Phase 57: the vision tower, staged in pinned host memory BEFORE the runtime sizes its pinned expert pool (the
     // live rule then sees it). Nothing of it stays on a card: encode_gpu() leases its block per image. IE_DS41_VISION=0
     // leaves it out; a failure here is reported on every image request instead of failing the load.
@@ -93,9 +98,11 @@ std::string Engine::ds41_load(const std::string& dir) {
     if (auto_n) {
         auto set = [](const char* k) { const char* v = std::getenv(k); return v && *v; };
         const char* ep = std::getenv("IE_DS41_EP");
+        const char* tp = std::getenv("IE_DS41_TP");
         one_why = b->qs.size() < 2 ? "the lanes need two cards" : spec ? "IE_DS41_SPEC=1"
                 : set("IE_DS41_PROFILE_OUT") ? "IE_DS41_PROFILE_OUT is set" : set("IE_DS41_DUMP_ROUTING") ? "IE_DS41_DUMP_ROUTING is set"
-                : (ep && *ep && std::string(ep) != "0") ? "IE_DS41_EP" : "";
+                : (ep && *ep && std::string(ep) != "0") ? "IE_DS41_EP"
+                : (tp && *tp && std::string(tp) != "0") ? "IE_DS41_TP (tensor parallel serves one lane: the lane pipe is the layer split's)" : "";
     }
     const LanesAutoPlan lp = auto_n ? lanes_auto_plan(LanesArch::kDeepSeek41, uint32_t(b->qs.size()), one_why.empty(), opts_.slot_ctx)
                                     : LanesAutoPlan{std::max<uint32_t>(1, opts_.parallel), opts_.slot_ctx, false};
@@ -111,7 +118,7 @@ std::string Engine::ds41_load(const std::string& dir) {
         if (spec) return "deepseek41: --parallel " + std::to_string(n_lanes) + " serves without DSpark speculation (IE_DS41_SPEC=1 is --parallel 1 only)";
         if (const char* po = std::getenv("IE_DS41_PROFILE_OUT"); po && *po) return "deepseek41: IE_DS41_PROFILE_OUT profiles --parallel 1 only (a request's reset of the routing counts would wipe the other lanes')";
         if (const char* v = std::getenv("IE_DS41_DUMP_ROUTING"); v && *v) return "deepseek41: IE_DS41_DUMP_ROUTING is --parallel 1 only (the lane pipe refuses it)";
-        if (b->qs.size() < 2) return "deepseek41: --parallel > 1 needs the two-card lane pipe (" + std::to_string(b->qs.size()) + " card found)";
+        if (b->qs.size() < 2) return "deepseek41: --parallel > 1 needs the card lane pipe, two cards or more (" + std::to_string(b->qs.size()) + " card found)";
     }
     if (spec) {
         setenv("IE_DS41_DECODE_MULTI", "1", 0);
@@ -137,6 +144,7 @@ std::string Engine::ds41_load(const std::string& dir) {
     if (n_lanes > 1) { ro.lanes = n_lanes; ro.lane_ctx = lane_ctx; }   // P4 B6b (1 lane: the pre-lane forward, byte for byte)
     if (auto e = b->fwd.init_resident(b->qs, b->model, b->tables, ranking, ro); !e.empty()) return "deepseek41 resident: " + e;
     if (n_lanes > 1 && b->fwd.expert_parallel()) return "deepseek41: --parallel > 1 runs on the lane pipe, which refuses expert parallel (IE_DS41_EP)";
+    if (n_lanes > 1 && b->fwd.tensor_parallel()) return "deepseek41: --parallel > 1 runs on the lane pipe, the layer split's; tensor parallel (IE_DS41_TP) serves --parallel 1";
     b->fwd.set_logits_last_only(true);
     // Phase 46 (docs/deepseek41/86): the prefix cache, on unless the load disables it (--no-prompt-cache /
     // IE_NO_PROMPT_CACHE) or IE_DS41_PROMPT_CACHE=0; speculation keeps it off (the generator does too)
@@ -158,14 +166,14 @@ std::string Engine::ds41_load(const std::string& dir) {
                      double(b->drafter.dense_bytes()) / 1073741824.0, b->drafter.tier().n_static(), b->drafter.tier().n_pinned());
     }
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    std::string res = "{\"arch\":\"deepseek_v41\",\"cards\":" + std::to_string(devs.size()) + ",\"capacity\":" + std::to_string(opts_.max_ctx) + ",\"load_s\":" + std::to_string(int(s)) + ",\"placement\":[";
-    for (size_t c = 0; c < devs.size(); ++c) {
+    std::string res = "{\"arch\":\"deepseek_v41\",\"cards\":" + std::to_string(b->qs.size()) + ",\"capacity\":" + std::to_string(opts_.max_ctx) + ",\"load_s\":" + std::to_string(int(s)) + ",\"placement\":[";
+    for (size_t c = 0; c < b->qs.size(); ++c) {
         const auto ci = b->fwd.card_info(uint32_t(c));
         res += std::string(c ? "," : "") + "{\"layers\":[" + std::to_string(ci.first_layer) + "," + std::to_string(ci.first_layer + ci.n_layers - 1) + "],\"static\":" + std::to_string(ci.n_static) + ",\"stream\":" + std::to_string(ci.n_stream) + ",\"pinned\":" + std::to_string(ci.n_pinned) + "}";
     }
     res += "]}";
     memory_residency_json_ = res;
-    std::fprintf(stderr, "[deepseek41] resident in %.0f s on %zu card(s), capacity %u tokens\n", s, devs.size(), opts_.max_ctx);
+    std::fprintf(stderr, "[deepseek41] resident in %.0f s on %zu card(s), capacity %u tokens\n", s, b->qs.size(), opts_.max_ctx);
     arch_ = ModelArch::kDeepSeek41;
     opts_.parallel = n_lanes;   // 1 = the serial path, as before P4 B6b
     if (const char* lv = std::getenv("IE_DS41_LOOKUP"); lv && std::string(lv) == "0") b->lookup = false;
@@ -180,10 +188,10 @@ std::string Engine::ds41_load(const std::string& dir) {
         const uint32_t cap = std::max<uint32_t>(2u, b->fwd.forward_capacity() & ~1u);
         s.mix_chunk = cap;
         if (const char* v = std::getenv("IE_DS41_MIX_CHUNK"); v && *v) s.mix_chunk = std::min<uint32_t>(cap, std::max<uint32_t>(64u, uint32_t(std::max(0L, std::atol(v)))) & ~1u);
-        std::fprintf(stderr, "[deepseek41] lanes: %u (lane 0 %u positions, lanes 1..%u %u each; --slot-ctx); requests decode together through the two-card lane pipe, "
+        std::fprintf(stderr, "[deepseek41] lanes: %u (lane 0 %u positions, lanes 1..%u %u each; --slot-ctx); requests decode together through the %zu-card lane pipe, "
                              "prompt-lookup %s per lane; a prefill chunk is %u rows while another lane is busy (IE_DS41_MIX_CHUNK) and %u alone; a prompt arriving while "
                              "every other lane is idle prefills in its serial turn with the cards pipelined over its chunks (docs/deepseek41/P4_B6B_SERVE.md)\n",
-                     n_lanes, s.lanes[0].cap, n_lanes - 1, lane_ctx, s.lookup ? "on" : "off", s.mix_chunk, cap);
+                     n_lanes, s.lanes[0].cap, n_lanes - 1, lane_ctx, b->qs.size(), s.lookup ? "on" : "off", s.mix_chunk, cap);
     }
     if (const char* po = std::getenv("IE_DS41_PROFILE_OUT"); po && *po) {
         b->profile_out = po;

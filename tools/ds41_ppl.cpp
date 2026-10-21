@@ -7,6 +7,7 @@
 // --out writes (nll float32, argmax int32) per position, so two runs on the same tokens compare PAIRWISE: --compare
 // reads another run's file and prints the mean NLL difference with its standard error over chunk-level blocks (the
 // positions are not independent) and the top-1 agreement -- a route change's quality delta, not two noisy PPLs.
+#include "ie/deepseek41_cards.hpp"
 #include "ie/deepseek41_forward.hpp"
 #include "ie/expert_stream.hpp"
 #include "ie/tokenizer.hpp"
@@ -56,13 +57,10 @@ int main(int argc, char** argv) {
     if (N < C) { std::fprintf(stderr, "the text has %zu tokens, fewer than one chunk of %u\n", ids.size(), C); return 2; }
     ids.resize(N);
 
-    std::vector<sycl::device> devs;
-    for (const auto& p : sycl::platform::get_platforms()) {
-        if (p.get_backend() != sycl::backend::ext_oneapi_level_zero) continue;
-        for (const auto& d : p.get_devices(sycl::info::device_type::gpu))
-            if (d.get_info<sycl::info::device::name>().find("Arc") != std::string::npos) devs.push_back(d);
-    }
-    if (devs.empty()) { std::fprintf(stderr, "no Arc GPU\n"); return 1; }
+    // ie serve's cards (2026-10-20: IE_DS41_LOGICAL_CARDS included, so the 4-card tensor-parallel gate runs on two cards)
+    const ie::Ds41Cards cards = ie::ds41_cards();
+    if (!cards.error.empty()) { std::fprintf(stderr, "%s\n", cards.error.c_str()); return 1; }
+    const std::vector<sycl::device>& devs = cards.devs;
     std::vector<std::unique_ptr<sycl::queue>> queues; std::vector<sycl::queue*> qs;
     for (const auto& d : devs) { queues.push_back(std::make_unique<sycl::queue>(sycl::context(d), d, sycl::property_list{sycl::property::queue::in_order{}})); qs.push_back(queues.back().get()); }
     std::vector<std::vector<uint32_t>> rank;

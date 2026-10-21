@@ -48,6 +48,20 @@ add_executable(cpu_moe_gemv_test unit/cpu_moe_gemv_test.cpp)
 target_link_libraries(cpu_moe_gemv_test PRIVATE ie_core)
 add_test(NAME cpu_moe_gemv_test COMMAND cpu_moe_gemv_test)
 
+# The V4.1 CPU expert leg's default cores: this box keeps 8-19, a homogeneous CPU gets its physical cores (no GPU).
+add_executable(ds41_cpu_cores_test unit/ds41_cpu_cores_test.cpp)
+target_link_libraries(ds41_cpu_cores_test PRIVATE ie_core)
+add_test(NAME ds41_cpu_cores_test COMMAND ds41_cpu_cores_test)
+add_executable(ds41_tp_slice_test unit/ds41_tp_slice_test.cpp)
+target_link_libraries(ds41_tp_slice_test PRIVATE ie_core)
+add_test(NAME ds41_tp_slice_test COMMAND ds41_tp_slice_test)
+add_executable(ds41_attn_xmx_ht16_test unit/ds41_attn_xmx_ht16_test.cpp)
+target_link_libraries(ds41_attn_xmx_ht16_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME ds41_attn_xmx_ht16_test COMMAND ds41_attn_xmx_ht16_test)
+add_executable(ds41_xmx_ntail_test unit/ds41_xmx_ntail_test.cpp)
+target_link_libraries(ds41_xmx_ntail_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME ds41_xmx_ntail_test COMMAND ds41_xmx_ntail_test)
+
 # Dual W8A16 GEMV bit-identity vs two singles (GPU1).
 add_executable(gemv_q8_soa_dual_test unit/gemv_q8_soa_dual_test.cpp)
 target_link_libraries(gemv_q8_soa_dual_test PRIVATE ie_core ie_sycl_flags)

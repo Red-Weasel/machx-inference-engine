@@ -128,6 +128,7 @@ add_library(ie_core
   model/deepseek4.cpp
   model/deepseek41.cpp
   model/deepseek41_engram.cpp
+  model/deepseek41_cards.cpp
   model/deepseek41_forward.cpp
   model/deepseek41_dspark.cpp
   model/deepseek41_prompt.cpp

@@ -49,6 +49,12 @@ class Ds41DenseCache {
 public:
     // Upload layer L's dense set to `q`'s device if not already there. Idempotent. "" on success.
     std::string upload_layer(sycl::queue& q, const DeepSeek41Model& m, uint32_t L);
+    // Tensor parallel (2026-10-20), set before the first upload: this card holds part `part` of n_parts of the head-split and
+    // unit-split matrices -- wq_b's rows and the sinks of its query heads, wo_a's rows of the o_groups those heads form, wo_b's
+    // columns over them, the shared expert's sh_w1 / sh_w3 rows and sh_w2 columns over its intermediate units -- each as its
+    // own FP8 pair (N / K the slice's). Everything else is whole on every card. Needs the FP8-resident mode.
+    void set_tp(uint32_t part, uint32_t n_parts) { tp_part_ = part; tp_n_ = n_parts ? n_parts : 1u; }
+    uint32_t tp_parts() const { return tp_n_; }
     // Upload embed (kept host-side: it is a gather), final norm, and the head to `q`'s device.
     // fp8_head (Phase 54, docs/deepseek41/93, founder-approved LOSSY): the BF16 head quantised at load to E4M3 with one E8M0
     // exponent per 32x32 block -- the checkpoint's own dense FP8 layout, read by the FP8 GEMVs -- instead of an fp16 copy:
@@ -73,6 +79,7 @@ private:
     Ds41Fp8Mat  head8_;
     uint64_t    head_bytes_ = 0;
     bool        fp8_ = false;
+    uint32_t    tp_part_ = 0, tp_n_ = 1;
     sycl::half* scratch_ = nullptr; size_t scratch_halves_ = 0; sycl::queue* scratch_q_ = nullptr;
 };
 
