@@ -221,6 +221,7 @@ struct FakeCrown final : ie::LanesModel {
         for (int m = max_active.load(); a > m && !max_active.compare_exchange_weak(m, a);) {}
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         if (!x.empty()) dec_sleep(x[0].lane, x[0].pos0);
+        last_sleep(s);
         --active;
         if (s == 0) for (const auto& step : x) rec0(step.lane, step.pos0, 1);
         if (s == 1) ++group_steps;
@@ -265,6 +266,9 @@ struct FakeCrown final : ie::LanesModel {
     }
     // (P4 B36 (C)) a decode row's step takes dec_ms more a stage (stalled decoders); plen = each lane's prompt length
     std::atomic<int> dec_ms{0};
+    // (2026-10-21, the 27B's lanes) a decode step's last stage takes last_ms more: the slower card 1 (the head) of the 27B split
+    std::atomic<int> last_ms{0};
+    void last_sleep(uint32_t s) { if (const int lm = last_ms.load(); lm && s == 1) std::this_thread::sleep_for(std::chrono::milliseconds(lm)); }
     std::vector<uint32_t> plen = std::vector<uint32_t>(64, UINT32_MAX);
     void dec_sleep(uint32_t lane, uint32_t pos0) {
         if (const int dm = dec_ms.load(); dm && lane < plen.size() && pos0 >= plen[lane]) std::this_thread::sleep_for(std::chrono::milliseconds(dm));
@@ -305,7 +309,7 @@ struct FakeCrown final : ie::LanesModel {
         const int a = ++active;
         for (int m = max_active.load(); a > m && !max_active.compare_exchange_weak(m, a);) {}
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        if (x.T == 1) dec_sleep(x.lane, x.pos0);
+        if (x.T == 1) { dec_sleep(x.lane, x.pos0); if (x.pos0) last_sleep(s); }
         --active;
         for (int i = 0, n = deep_cost(x.T, x.pos0); i < n; ++i) {
             if (aborted) return "stopped at a layer boundary";
@@ -1953,9 +1957,10 @@ void test_front_submit() {
 // formed (by size, in order) after every decoder ran for `settle_ms`, the regroup's stats, and whether every reply was a prefix of
 // --parallel 1's.
 struct RegroupRun { std::vector<uint32_t> groups; ie::Glm5LanePipe::RegroupStats rg; bool same = true; double step_ms = 0; };
-RegroupRun run_decoders(int D, int settle_ms, int window_ms, bool with_lead = false) {
+RegroupRun run_decoders(int D, int settle_ms, int window_ms, bool with_lead = false, int last_ms = 0) {
     std::vector<uint32_t> caps(size_t(D) + 2, 4000);
     FakeCrown m(caps, true);
+    m.last_ms = last_ms;
     ie::LanesServe::Options o;
     o.prefill_fifo = true; o.short_first = true; o.short_rows = 20; o.decode_quota = 4; o.quota_max_ms = 60000;
     if (with_lead) { o.mix_chunk = 2; o.recut = true; m.deep_from = 0; m.deep_row_ms = 2; }
@@ -2041,6 +2046,22 @@ void test_regroup() {
               "regroup beside a deep prefilling lead (lane pipeline, re-cut, quota): 4 decoders' groups stay merged (mean " +
                   std::to_string(mean).substr(0, 4) + " rows, sizes " + hist_of(r.groups) + "; waits " + std::to_string(r.rg.waits) +
                   ", merged " + std::to_string(r.rg.merges) + "); replies prefixes of --parallel 1's, the lead == --parallel 1");
+    }
+    // 2026-10-21 (known_bugs 20): the 27B split's shape -- four decoders, card 1 (the head) the slower stage, so each landing
+    // hands stage 0 one lane. A release-candidate run stayed in one-lane groups (1:1015 2:255). With the regroup they pair.
+    {
+        const RegroupRun r = run_decoders(4, 150, 300, false, /*last_ms=*/2);
+        uint32_t mn = UINT32_MAX;
+        for (uint32_t g : r.groups) mn = std::min(mn, g);
+        check(r.same && !r.groups.empty() && mn >= 2,
+              "regroup, the 27B's shape (4 decoders, the last stage 3 ms against 1): they settle in pairs (every group >= 2 rows: sizes " +
+                  hist_of(r.groups) + "); waits " + std::to_string(r.rg.waits) + " merged " + std::to_string(r.rg.merges) + " timed out " +
+                  std::to_string(r.rg.timeouts) + "; replies prefixes of --parallel 1's");
+        const uint32_t saved = g_regroup_us;
+        g_regroup_us = 0;
+        const RegroupRun o = run_decoders(4, 150, 300, false, 2);
+        g_regroup_us = saved;
+        check(o.same && o.rg.waits == 0, "regroup OFF, the 27B's shape: no wait; groups as the alignment left them (sizes " + hist_of(o.groups) + ")");
     }
     {
         const uint32_t saved = g_regroup_us;

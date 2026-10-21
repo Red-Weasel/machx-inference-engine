@@ -130,7 +130,7 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 - **Prefill:** 2,962 / 3,001 tok/s at 2.4K / 10.7K tokens (`ie-prompt-bench`, prompt cache off, greedy; October 4, v0.2.13; it was 1,037 / 820 before). Q6_K: 1,378 / 1,549. An earlier version of this table said 945 tok/s at 2K, measured in August.
 - **Decode:** 17.1 tok/s plain; 24.3 with `--spec` (`ie serve`, temperature 0.7, short prompt) and 29.7 as the median of five short prompts (bench, greedy). Q6_K 21.5 / 19.8 plain, 26.9 / 21.6 with `--spec`; Q5_K 23.3 / 21.4 and 26.3 / 22.9 (2.4K / 10.7K-token prompts, October 4–5). An August figure of 24.5 tok/s used the opt-in tensor-parallel path (`IE_QWEN35_TP`) with speculative decoding.
 - **Serving:** prompt cache (layer-split); 16 requests at once at 153.5 tok/s together, 17.2–17.3 alone (`--ctx 8192 --parallel 16`, October 1); a reply that returns a file with one identifier renamed (1,800 tokens, temperature 0.7) takes 108.5 s plain and 28.4 s with `--spec`. With `--spec --parallel N` the lanes draft with the MTP head (v0.2.27, October 21, greedy): one request 17.4 → 27.4 tok/s, four at once 64.8 / 63.9 together.
-- **Q4_K_M** (October 21, v0.2.27, a Q4_K_M re-quantized from the Q8_0): decode 27.5 tok/s on two cards and 27.8 on one; a 3,382-token prompt read at 1,393 / 1,045 tok/s; one request with `--spec` 37.1–39.6, at `--parallel N` 36.0–40.2 alone and 63.1 for two together.
+- **Q4_K_M** (October 21, v0.2.27, a Q4_K_M re-quantized from the Q8_0): decode 27.5 tok/s on two cards and 27.8 on one; a 3,382-token prompt read at 1,393 / 1,045 tok/s; one request with `--spec` 37.1–39.6, at `--parallel N` 36.0–40.2 alone and 63.1 for two together. v0.2.29 (3 rows a round, the integer-dot kernel): one request 41.9 tok/s on the lanes and 38.9 at `--parallel 1`, two together 67.8; huihui-ai's Q4_K made from BF16 43.4 / 42.5 / 74.0.
 - **One card** (Q6_K, October 5): prefill 823 / 830, decode 22.0 / 20.4, 32.6 / 19.8 with `--spec`.
 
 **Qwen3.8-35B-A3B** · Q8_0 GGUF, split over both cards; measured on community fine-tunes (October 4–5: the Qwen3.8-35B-A3B Distill; earlier rows: a Qwen3.6-35B-A3B fine-tune, where this README says "35B-A3B class")
@@ -177,6 +177,57 @@ class ([New in v0.2.6](#new-in-v026)).
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
 
 ---
+
+<a id="new-in-v0229"></a>
+## 🆕 New in v0.2.29
+
+Everything since [v0.2.28](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.28). Measured
+October 21, 2026, on two Arc Pro B70 cards. All of it is the Qwen3.8-27B (and the 35B-A3B class's Q6_K / Q5_K
+experts); every other model gives v0.2.28's tokens.
+
+### Qwen3.8-27B: MTP checks cost less on the K-quants, and every file drafts 2 tokens a round
+
+The decode kernel for Q4_K, Q5_K and Q6_K weights now takes its integer dot products from the GPU's own integer dot
+instruction instead of building them byte by byte. The integers are the same, so the results are the same bit for bit,
+and each extra row of an MTP check costs much less: Q4_K `ffn_down` at 1 / 3 / 4 rows went from 95 / 148 / 179 µs to
+88 / 119 / 135. With that, every file now checks 3 rows a round (2 drafted tokens) by default, on the request lanes and
+at `--parallel 1`; `--spec-k` still sets it.
+
+| Qwen3.8-27B, `--spec`, two cards, 256 tokens a reply | v0.2.28 | v0.2.29 |
+|---|---|---|
+| Q4_K_M, one request (`--parallel 2`) | 37.2 tok/s | **41.9** |
+| Q4_K_M, two at once, together | 63.2 | **67.8** |
+| Q6_K, one request / two together | 31.8 / 52.5 | **37.4 / 61.8** |
+| `--parallel 1`, one request: Q4_K_M / Q6_K / Q8_0 | 36.0 / 29.9 / 26.8 | **38.9 / 34.7 / 29.4** |
+
+- Plain decoding is unchanged or a little faster (Q4_K_M two lanes 27.2 / 51.8 → 27.7 / 53.5); the 35B-A3B class's
+  Q6_K experts take the same kernel change (two lanes 94.6 / 173.9 → 95.8 / 176.6 tok/s, the same text).
+- **A better Q4 file for `--spec`:** huihui-ai's own `Huihui-Qwen3.8-27B-abliterated-Q4_K.gguf`, quantized from BF16,
+  accepts more drafts than a Q4_K_M we re-quantized from the Q8_0 (2.00 against 1.92 tokens a round): **43.4 / 74.0**
+  tok/s on two lanes, **42.5** at `--parallel 1`, plain the same 27.7. Its perplexity is within 0.2 % of the
+  re-quantized file's (16,127 wikitext tokens: 4.784 against 4.775; Q8_0 4.728).
+- **Checks:** every `--spec` reply has the same text and token count as plain decoding (lanes and `--parallel 1`,
+  Q4_K_M, Q6_K and Q8_0, both Q4 files); the kernel unit test checks Q4_K, Q5_K and Q6_K rows against one row bit for
+  bit. Four Q8_0 lanes with `--spec`: 8 of 8 replies the same as plain and as v0.2.28 (63.8 tok/s together). Every
+  other model gives v0.2.28's tokens (Flash-Next, the 35B-A3B class, the 27B at Q8_0, MiMo, Laguna, and V4.1 with its CPU
+  expert leg off); no GPU fault in any run.
+
+### Qwen3.8-27B: four request lanes keep sharing steps
+
+In v0.2.28, one of seven four-lane runs fell to 44.3 tok/s together: the lanes fell out of step and stayed in one-lane
+steps. Card 1 holds the output head, so every finished token hands card 0 one lane at a time, and nothing gathered
+them again. Card 0 now waits up to 50 ms for the next lane to land before starting a step that would leave three or
+more lanes rotating alone, as the 35B-A3B class has done since v0.2.8 (`IE_QWEN35_GROUP_WAIT_US`; `IE_QWEN35_REGROUP=0`
+turns it off). Sixteen requests of mixed lengths, four at a time, Q8_0 `--spec`: 53.9–57.9 tok/s together without the
+wait, 59.0–59.1 with it, the same replies.
+
+### What is still slow, and not checked
+
+- For one request, `--parallel 1 --spec` is still slower than one lane of `--parallel 2` (Q4_K_M 38.9 against 41.9).
+- The MTP checks still cost about 20 µs a row on `ffn_down`. An XMX (DPAS) kernel for the rows was built and measured:
+  correct, but slower than this release's kernel on one row and faster only on `ffn_down`, so it is not shipped.
+- Q5_K 27B files are covered by the kernel test only, not run end to end.
+- The V4.1 expert ranking is still the one profiled on the September weights (see v0.2.28).
 
 <a id="new-in-v0228"></a>
 ## 🆕 New in v0.2.28

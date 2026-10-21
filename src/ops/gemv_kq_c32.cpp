@@ -35,6 +35,7 @@
 
 #include <sycl/sycl.hpp>
 #include "ie/dp4a.hpp"
+#include "ie/dp4a_native.hpp"
 #include "ie/kernel_profiler.hpp"
 
 #include <algorithm>
@@ -197,6 +198,15 @@ namespace {
 
 constexpr int kC32Sg = 16;        // lanes per column
 
+// 2026-10-21: the chunk fold's integer dots on the hardware dot (C32Chunk::fold<true>; the same exact integers, so the same
+// results). The 27B's MTP verify rows measured (gemv_kq_c32_test --bench, Q4_K, card 0) ffn_gate/up T = 1 / 3 / 4 93 / 119 / 132
+// -> 90 / 96 / 100 us, ffn_down 95 / 148 / 179 -> 88 / 119 / 135, the Q6_K head at T = 4 2001 -> 1769: the byte-arithmetic dot
+// made every extra row cost 10-45 % of a whole T = 1 call. IE_C32_NATIVE_DOT=0 = the byte arithmetic (ie::dp4a_ss). Read once.
+inline bool c32_native_dot() {
+    static const bool v = [] { const char* e = std::getenv("IE_C32_NATIVE_DOT"); return !(e && *e == '0'); }();
+    return v;
+}
+
 // One lane's decoded chunk c of weight column n (kind 6: lo uint4 + hi uint2 + sc int8 x2 + d fp16/256; kind 5: lo uint4 +
 // hi uint32 + sm uint16 + dm uint32/256; kind 4: kind 5 without hi). Shared by the dense GEMV and the MoE kernels below, so
 // every path folds a chunk with the SAME operations.
@@ -236,16 +246,22 @@ template <int KIND> struct C32Chunk {
         }
     }
     // acc + this chunk . activation block (xw = its 8 qs words, d8 / s8 its scale and d8*sum). Explicit fma: a contractable
-    // a*b+c is fused or not at the backend's choice per instance.
+    // a*b+c is fused or not at the backend's choice per instance. NAT = the hardware integer dot (dp4a_native.hpp: the same
+    // exact integer as ie::dp4a_ss, without IGC's per-byte operand rebuild), so NAT does not change a result.
+    template <bool NAT = false>
     float fold(const uint32_t* xw, float d8, float s8, float acc) const {
+        auto dot = [](uint32_t a, uint32_t b, int32_t c) {
+            if constexpr (NAT) return ie::dp4a_ss_native(a, b, c);
+            else return ie::dp4a_ss(int32_t(a), int32_t(b), c);
+        };
         if constexpr (KIND == 6) {
             int32_t i0 = 0, s0 = 0, i1 = 0, s1 = 0;
             #pragma unroll
             for (int w = 0; w < 4; ++w) {
-                i0 = ie::dp4a_ss(int32_t(P[w]), int32_t(xw[w]), i0);
-                s0 = ie::dp4a_ss(0x01010101, int32_t(xw[w]), s0);
-                i1 = ie::dp4a_ss(int32_t(P[w + 4]), int32_t(xw[w + 4]), i1);
-                s1 = ie::dp4a_ss(0x01010101, int32_t(xw[w + 4]), s1);
+                i0 = dot(P[w], xw[w], i0);
+                s0 = dot(0x01010101u, xw[w], s0);
+                i1 = dot(P[w + 4], xw[w + 4], i1);
+                s1 = dot(0x01010101u, xw[w + 4], s1);
             }
             const int32_t iv = sc0 * (i0 - 32 * s0) + sc1 * (i1 - 32 * s1);
             return sycl::fma(f0 * d8, float(iv), acc);
@@ -254,8 +270,8 @@ template <int KIND> struct C32Chunk {
             int32_t id0 = 0, id1 = 0;
             #pragma unroll
             for (int w = 0; w < 4; ++w) {
-                id0 = ie::dp4a_ss(int32_t(P[w]), int32_t(xw[w]), id0);
-                id1 = ie::dp4a_ss(int32_t(P[w + 4]), int32_t(xw[w + 4]), id1);
+                id0 = dot(P[w], xw[w], id0);
+                id1 = dot(P[w + 4], xw[w + 4], id1);
             }
             return sycl::fma(-f1, s8, sycl::fma(f0 * d8, float(id0 + id1), acc));
         }
@@ -272,7 +288,11 @@ inline void c32_xwords(const block_q8_1x& xb, uint32_t* xw) {
 // activation is re-read from L2 per column otherwise, ~1.8x the weight bytes at K = 5120), and keeps CPS columns' weight
 // loads in flight. A column's chunks still fold in ascending c on its lane, so CPS does not change a result.
 // The activation is read from L2 (block_q8_1x per chunk): staging it in SLM measured slower here (the barrier; B21 bench).
-template <int KIND, int T_MAX, int CPS, int COLS = 16>
+// 2026-10-21, the rows (T 2..4, native dot, both bit-identical, then removed): staging the T rows in SLM a 64-chunk tile at a
+// time was slower on every 27B shape (Q4 ffn_down T = 3 128 -> 156 us, ffn_gate/up 96 -> 113), and loading the next chunk's
+// weights before folding the current one was slower too (ffn_down T = 3 126 -> 134). Extra rows stay nearly free where the
+// grid is wide (ffn_gate/up: N = 17408) and cost ~20 us each on ffn_down (N = 5120, 160 work-groups, 34 chunks a lane).
+template <int KIND, int T_MAX, int CPS, bool NAT, int COLS = 16>
 sycl::event c32_gemv_impl(sycl::queue& q, const void* x_q8, const uint8_t* lo, const void* hi, const void* sc,
                           const void* d, sycl::half* y, uint32_t K, uint32_t N, uint32_t T,
                           const std::vector<sycl::event>& deps) {
@@ -309,7 +329,7 @@ sycl::event c32_gemv_impl(sycl::queue& q, const void* x_q8, const uint8_t* lo, c
                     uint32_t xw[8];
                     c32_xwords(xb, xw);
                     #pragma unroll
-                    for (int j = 0; j < CPS; ++j) acc[j][t] = wc[j].fold(xw, xb.d, xb.s, acc[j][t]);
+                    for (int j = 0; j < CPS; ++j) acc[j][t] = wc[j].template fold<NAT>(xw, xb.d, xb.s, acc[j][t]);
                 }
             }
             #pragma unroll
@@ -340,7 +360,9 @@ sycl::event c32_gemv(sycl::queue& q, const void* x_q8, const uint8_t* lo, const 
     // columns a subgroup (measured, gemv_kq_c32_test --bench on the 27B shapes): T = 1 two at K <= 8192, four at the 27B's
     // K = 17408; rows T <= 8 two; T 9..16 one (the 16 rows' accumulators fill the registers).
     const int cps = T == 1 ? (K <= 8192 ? 2 : 4) : T <= 8 ? 2 : 1;
-#define IE_C32_GO(TM, CP) return c32_gemv_impl<KIND, TM, CP>(q, x_q8, lo, hi, sc, d, y, K, N, T, deps)
+    const bool nat = c32_native_dot();
+#define IE_C32_GO(TM, CP) return nat ? c32_gemv_impl<KIND, TM, CP, true>(q, x_q8, lo, hi, sc, d, y, K, N, T, deps) \
+                                     : c32_gemv_impl<KIND, TM, CP, false>(q, x_q8, lo, hi, sc, d, y, K, N, T, deps)
     if (T == 1) { if (cps == 4) IE_C32_GO(1, 4); IE_C32_GO(1, 2); }
     if (T == 2) IE_C32_GO(2, 2);
     if (T == 3) IE_C32_GO(3, 2);
@@ -546,7 +568,7 @@ sycl::event dequant_q4k_c32_to_Bt(sycl::queue& q, const uint8_t* lo, const uint1
 // ============================================================================================================================
 namespace {
 
-template <int KIND>
+template <int KIND, bool NAT>
 sycl::event c32_moe_gate_up(sycl::queue& q, const void* x_q8, const C32Bank& g, const C32Bank& u, const int32_t* topk_idx,
                             sycl::half* h_out, uint32_t T, uint32_t Kt, uint32_t H, uint32_t EFF) {
     constexpr int COLS = 16, WG = kC32Sg * COLS;
@@ -568,8 +590,8 @@ sycl::event c32_moe_gate_up(sycl::queue& q, const void* x_q8, const C32Bank& g, 
                 uc.load(u.lo, u.hi, u.sc, u.d, col, H, c);
                 uint32_t xw[8];
                 c32_xwords(xr[c], xw);
-                ga = gc.fold(xw, xr[c].d, xr[c].s, ga);
-                ua = uc.fold(xw, xr[c].d, xr[c].s, ua);
+                ga = gc.template fold<NAT>(xw, xr[c].d, xr[c].s, ga);
+                ua = uc.template fold<NAT>(xw, xr[c].d, xr[c].s, ua);
             }
             ga = sycl::reduce_over_group(it.get_sub_group(), ga, sycl::plus<float>());
             ua = sycl::reduce_over_group(it.get_sub_group(), ua, sycl::plus<float>());
@@ -578,7 +600,7 @@ sycl::event c32_moe_gate_up(sycl::queue& q, const void* x_q8, const C32Bank& g, 
     });
 }
 
-template <int KIND>
+template <int KIND, bool NAT>
 sycl::event c32_moe_down(sycl::queue& q, const void* h_q8, const C32Bank& dw, const int32_t* topk_idx,
                          const sycl::half* topk_w, sycl::half* y_packed, uint32_t T, uint32_t Kt, uint32_t EFF, uint32_t H) {
     constexpr int COLS = 16, WG = kC32Sg * COLS;
@@ -599,7 +621,7 @@ sycl::event c32_moe_down(sycl::queue& q, const void* h_q8, const C32Bank& dw, co
                 wc.load(dw.lo, dw.hi, dw.sc, dw.d, col, EFF, c);
                 uint32_t xw[8];
                 c32_xwords(xr[c], xw);
-                acc = wc.fold(xw, xr[c].d, xr[c].s, acc);
+                acc = wc.template fold<NAT>(xw, xr[c].d, xr[c].s, acc);
             }
             acc = sycl::reduce_over_group(it.get_sub_group(), acc, sycl::plus<float>());
             if (lane == 0) y_packed[uint64_t(tk) * H + n] = sycl::half(float(topk_w[tk]) * acc);
@@ -612,7 +634,7 @@ sycl::event c32_moe_down(sycl::queue& q, const void* h_q8, const C32Bank& dw, co
 // once per routed row. Outputs by sorted row, like moe_prefill_{gate_up_silu,down}_q8 (moe_prefill_reduce_sum after).
 constexpr uint32_t kC32PfTile = 8;
 
-template <int KIND>
+template <int KIND, bool NAT>
 sycl::event c32_moe_prefill_gate_up(sycl::queue& q, const void* xp_q8, const C32Bank& g, const C32Bank& u,
                                     const uint32_t* eoff, sycl::half* hp, uint32_t E, uint32_t H, uint32_t EFF) {
     constexpr int COLS = 16, WG = kC32Sg * COLS;
@@ -642,8 +664,8 @@ sycl::event c32_moe_prefill_gate_up(sycl::queue& q, const void* xp_q8, const C32
                         const block_q8_1x& xb = X8[uint64_t(r0 + m) * nb + c];
                         uint32_t xw[8];
                         c32_xwords(xb, xw);
-                        ga[m] = gc.fold(xw, xb.d, xb.s, ga[m]);
-                        ua[m] = uc.fold(xw, xb.d, xb.s, ua[m]);
+                        ga[m] = gc.template fold<NAT>(xw, xb.d, xb.s, ga[m]);
+                        ua[m] = uc.template fold<NAT>(xw, xb.d, xb.s, ua[m]);
                     }
                 }
                 #pragma unroll
@@ -658,7 +680,7 @@ sycl::event c32_moe_prefill_gate_up(sycl::queue& q, const void* xp_q8, const C32
     });
 }
 
-template <int KIND>
+template <int KIND, bool NAT>
 sycl::event c32_moe_prefill_down(sycl::queue& q, const void* hq8, const C32Bank& dw, const uint32_t* eoff,
                                  const sycl::half* sorted_w, sycl::half* out_packed, uint32_t E, uint32_t H, uint32_t EFF) {
     constexpr int COLS = 16, WG = kC32Sg * COLS;
@@ -687,7 +709,7 @@ sycl::event c32_moe_prefill_down(sycl::queue& q, const void* hq8, const C32Bank&
                         const block_q8_1x& xb = X8[uint64_t(r0 + m) * nb + c];
                         uint32_t xw[8];
                         c32_xwords(xb, xw);
-                        acc[m] = wc.fold(xw, xb.d, xb.s, acc[m]);
+                        acc[m] = wc.template fold<NAT>(xw, xb.d, xb.s, acc[m]);
                     }
                 }
                 #pragma unroll
@@ -706,23 +728,35 @@ sycl::event c32_moe_prefill_down(sycl::queue& q, const void* hq8, const C32Bank&
 sycl::event moe_gate_up_silu_c32(sycl::queue& q, const void* x_q8, const C32Bank& g, const C32Bank& u,
                                  const int32_t* topk_idx, sycl::half* h_out, uint32_t T, uint32_t Kt, uint32_t H,
                                  uint32_t EFF) {
-    return g.kind == 6 ? c32_moe_gate_up<6>(q, x_q8, g, u, topk_idx, h_out, T, Kt, H, EFF)
-                       : c32_moe_gate_up<5>(q, x_q8, g, u, topk_idx, h_out, T, Kt, H, EFF);
+    if (c32_native_dot())
+        return g.kind == 6 ? c32_moe_gate_up<6, true>(q, x_q8, g, u, topk_idx, h_out, T, Kt, H, EFF)
+                           : c32_moe_gate_up<5, true>(q, x_q8, g, u, topk_idx, h_out, T, Kt, H, EFF);
+    return g.kind == 6 ? c32_moe_gate_up<6, false>(q, x_q8, g, u, topk_idx, h_out, T, Kt, H, EFF)
+                       : c32_moe_gate_up<5, false>(q, x_q8, g, u, topk_idx, h_out, T, Kt, H, EFF);
 }
 sycl::event moe_down_c32(sycl::queue& q, const void* h_q8, const C32Bank& dw, const int32_t* topk_idx,
                          const sycl::half* topk_w, sycl::half* y_packed, uint32_t T, uint32_t Kt, uint32_t EFF, uint32_t H) {
-    return dw.kind == 6 ? c32_moe_down<6>(q, h_q8, dw, topk_idx, topk_w, y_packed, T, Kt, EFF, H)
-                        : c32_moe_down<5>(q, h_q8, dw, topk_idx, topk_w, y_packed, T, Kt, EFF, H);
+    if (c32_native_dot())
+        return dw.kind == 6 ? c32_moe_down<6, true>(q, h_q8, dw, topk_idx, topk_w, y_packed, T, Kt, EFF, H)
+                            : c32_moe_down<5, true>(q, h_q8, dw, topk_idx, topk_w, y_packed, T, Kt, EFF, H);
+    return dw.kind == 6 ? c32_moe_down<6, false>(q, h_q8, dw, topk_idx, topk_w, y_packed, T, Kt, EFF, H)
+                        : c32_moe_down<5, false>(q, h_q8, dw, topk_idx, topk_w, y_packed, T, Kt, EFF, H);
 }
 sycl::event moe_prefill_gate_up_silu_c32(sycl::queue& q, const void* xp_q8, const C32Bank& g, const C32Bank& u,
                                          const uint32_t* eoff, sycl::half* hp, uint32_t E, uint32_t H, uint32_t EFF) {
-    return g.kind == 6 ? c32_moe_prefill_gate_up<6>(q, xp_q8, g, u, eoff, hp, E, H, EFF)
-                       : c32_moe_prefill_gate_up<5>(q, xp_q8, g, u, eoff, hp, E, H, EFF);
+    if (c32_native_dot())
+        return g.kind == 6 ? c32_moe_prefill_gate_up<6, true>(q, xp_q8, g, u, eoff, hp, E, H, EFF)
+                           : c32_moe_prefill_gate_up<5, true>(q, xp_q8, g, u, eoff, hp, E, H, EFF);
+    return g.kind == 6 ? c32_moe_prefill_gate_up<6, false>(q, xp_q8, g, u, eoff, hp, E, H, EFF)
+                       : c32_moe_prefill_gate_up<5, false>(q, xp_q8, g, u, eoff, hp, E, H, EFF);
 }
 sycl::event moe_prefill_down_c32(sycl::queue& q, const void* hq8, const C32Bank& dw, const uint32_t* eoff,
                                  const sycl::half* sorted_w, sycl::half* out_packed, uint32_t E, uint32_t H, uint32_t EFF) {
-    return dw.kind == 6 ? c32_moe_prefill_down<6>(q, hq8, dw, eoff, sorted_w, out_packed, E, H, EFF)
-                        : c32_moe_prefill_down<5>(q, hq8, dw, eoff, sorted_w, out_packed, E, H, EFF);
+    if (c32_native_dot())
+        return dw.kind == 6 ? c32_moe_prefill_down<6, true>(q, hq8, dw, eoff, sorted_w, out_packed, E, H, EFF)
+                            : c32_moe_prefill_down<5, true>(q, hq8, dw, eoff, sorted_w, out_packed, E, H, EFF);
+    return dw.kind == 6 ? c32_moe_prefill_down<6, false>(q, hq8, dw, eoff, sorted_w, out_packed, E, H, EFF)
+                        : c32_moe_prefill_down<5, false>(q, hq8, dw, eoff, sorted_w, out_packed, E, H, EFF);
 }
 
 }  // namespace ie

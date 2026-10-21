@@ -16,6 +16,7 @@
 // image carries the B70 backend options, which the CPU compiler rejects).
 #include "ie/dequant.hpp"
 #include "ie/dequant_ref.hpp"
+#include "ie/gemv_q8_soa_v2.hpp"
 #include "ie/ops.hpp"
 #include "ie/quant_blocks.hpp"
 
@@ -526,11 +527,12 @@ void bench(sycl::queue& q) {
             const double bytes = double(st.lo.size() + st.hi.size() + st.sc.size() + st.d.size());
             const double t1 = time_it([&] { dv.gemv(kind, dq8, y, K, N, 1); });
             const double t2 = time_it([&] { dv.gemv(kind, dq8, y, K, N, 2); });
+            const double t3 = time_it([&] { dv.gemv(kind, dq8, y, K, N, 3); });
             const double t4 = time_it([&] { dv.gemv(kind, dq8, y, K, N, 4); });
             const double t8 = time_it([&] { dv.gemv(kind, dq8, y, K, N, 8); });
             const double t16 = time_it([&] { dv.gemv(kind, dq8, y, K, N, 16); });
-            std::snprintf(buf, sizeof buf, " Q%d c32 %.0f (%.0f) T2 %.0f T4 %.0f T8 %.0f T16 %.0f |", kind,
-                          bytes / t1 / 1e9, t1 * 1e6, t2 * 1e6, t4 * 1e6, t8 * 1e6, t16 * 1e6);
+            std::snprintf(buf, sizeof buf, " Q%d c32 %.0f (%.0f) T2 %.0f T3 %.0f T4 %.0f T8 %.0f T16 %.0f |", kind,
+                          bytes / t1 / 1e9, t1 * 1e6, t2 * 1e6, t3 * 1e6, t4 * 1e6, t8 * 1e6, t16 * 1e6);
             line += buf;
             if (kind == 4) {   // the AoS Q4_K kernel the split ran before (dense::gemv_q_T's T = 1 route) on the same blocks
                 void* aw = sycl::malloc_device(raw.size(), q);
@@ -575,13 +577,15 @@ void bench(sycl::queue& q) {
             auto* dd = sycl::malloc_device<uint16_t>(uint64_t(N) * K / 32, q);
             q.memset(qs, 3, uint64_t(N) * K); q.fill(dd, uint16_t(0x1400), uint64_t(N) * K / 32).wait();
             const double bytes = double(N) * K * (1 + 2.0 / 32);
-            const double t1 = time_it([&] { gemv_q8_0_soa_q8(q, dq8, qs, dd, y, K, N); });
-            const double t2 = time_it([&] { gemv_q8_0_soa_q8_batched(q, dq8, qs, dd, y, K, N, 2); });
-            const double t4 = time_it([&] { gemv_q8_0_soa_q8_batched(q, dq8, qs, dd, y, K, N, 4); });
-            const double t8 = time_it([&] { gemv_q8_0_soa_q8_batched(q, dq8, qs, dd, y, K, N, 8); });
-            const double t16 = time_it([&] { gemv_q8_0_soa_q8_batched(q, dq8, qs, dd, y, K, N, 16); });
-            std::snprintf(buf, sizeof buf, " Q8 soa %.0f (%.0f) T2 %.0f T4 %.0f T8 %.0f T16 %.0f", bytes / t1 / 1e9, t1 * 1e6,
-                          t2 * 1e6, t4 * 1e6, t8 * 1e6, t16 * 1e6);
+            // the selectors the split runs (gemv_q8_soa_v2.hpp: the native-dot v2 kernels unless their env says 0)
+            const double t1 = time_it([&] { gemv_q8_0_soa_q8_sel(q, dq8, qs, dd, y, K, N); });
+            const double t2 = time_it([&] { gemv_q8_0_soa_q8_batched_sel(q, dq8, qs, dd, y, K, N, 2); });
+            const double t3 = time_it([&] { gemv_q8_0_soa_q8_batched_sel(q, dq8, qs, dd, y, K, N, 3); });
+            const double t4 = time_it([&] { gemv_q8_0_soa_q8_batched_sel(q, dq8, qs, dd, y, K, N, 4); });
+            const double t8 = time_it([&] { gemv_q8_0_soa_q8_batched_sel(q, dq8, qs, dd, y, K, N, 8); });
+            const double t16 = time_it([&] { gemv_q8_0_soa_q8_batched_sel(q, dq8, qs, dd, y, K, N, 16); });
+            std::snprintf(buf, sizeof buf, " Q8 soa %.0f (%.0f) T2 %.0f T3 %.0f T4 %.0f T8 %.0f T16 %.0f", bytes / t1 / 1e9,
+                          t1 * 1e6, t2 * 1e6, t3 * 1e6, t4 * 1e6, t8 * 1e6, t16 * 1e6);
             line += buf;
             sycl::free(qs, q); sycl::free(dd, q);
         }

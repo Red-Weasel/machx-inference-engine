@@ -4107,7 +4107,10 @@ public:
             std::string line;
             for (size_t g = 1; g < gs.size(); ++g)
                 if (gs[g]) line += " " + std::to_string(g) + ":" + std::to_string(gs[g]);
-            std::fprintf(stderr, "[qwen35split] lane rows: groups by size (rows:count)%s\n", line.empty() ? " none" : line.c_str());
+            const Glm5LanePipe::RegroupStats rg = pipe_.regroup_stats();
+            std::fprintf(stderr, "[qwen35split] lane rows: groups by size (rows:count)%s; regroup waits %llu, merges %llu, timeouts %llu "
+                                 "(%.0f ms waited)\n", line.empty() ? " none" : line.c_str(), (unsigned long long)rg.waits,
+                         (unsigned long long)rg.merges, (unsigned long long)rg.timeouts, rg.wait_ms);
         }
         sycl::queue& q = hq();
         try { q.wait(); } catch (...) {}
@@ -4136,6 +4139,20 @@ public:
         return {};
     }
     uint64_t host_bytes() const { return pipe_.host_bytes() + 2 * uint64_t(pf_chunk_) * H_ * sizeof(sycl::half); }
+    // 2026-10-21: the crown's rows-mode regroup wait (P4 B42; 0 = off), and its counts with the decode groups by size for
+    // /health "pipe"
+    void set_regroup(uint32_t wait_us) { pipe_.set_regroup(wait_us); }
+    std::string pipe_stats() const override {
+        if (!rows_) return {};
+        const std::vector<uint64_t> gs = pipe_.group_sizes();
+        const Glm5LanePipe::RegroupStats rg = pipe_.regroup_stats();
+        std::string js = "{\"groups\":[";
+        for (size_t g = 1; g < gs.size(); ++g) js += (g > 1 ? "," : "") + std::to_string(gs[g]);
+        char b[160];
+        std::snprintf(b, sizeof b, "],\"regroup_waits\":%llu,\"regroup_merges\":%llu,\"regroup_timeouts\":%llu,\"regroup_wait_ms\":%.0f}",
+                      (unsigned long long)rg.waits, (unsigned long long)rg.merges, (unsigned long long)rg.timeouts, rg.wait_ms);
+        return js + b;
+    }
 
     const char* tag() const override { return "q27 lanes"; }
     uint32_t n_lanes() const override { return m_.n_lanes(); }
@@ -4501,6 +4518,24 @@ std::string Engine::q27_lanes_init() {
                            gcap ? std::to_string(gcap).c_str() : "AUTO (one group per card)");
     else std::fprintf(stderr, "[qwen35split] lane rows OFF (%s): one lane a card step\n",
                       rows_why.empty() ? "IE_QWEN35_ROWS=0" : rows_why.c_str());
+    // 2026-10-21 (known_bugs 20): the crown's decode regroup (P4 B42), on by default with rows. Card 1 (the head) is the slower
+    // stage, so a landing hands stage 0 one lane at a time: four lanes that fell out of step (a release-candidate run: groups
+    // 1:1015 2:255, 44.3 tok/s together against 63.9-65.0 in pairs) kept forming one-lane groups for the rest of the batch.
+    // Stage 0 now waits -- at most IE_QWEN35_GROUP_WAIT_US (default 50,000: four Q8_0 lanes in pairs write 64.8 tok/s, one
+    // card-1 step ~31 ms, longer at depth) -- for the decode group landing on card 1 before forming a group that would leave
+    // 3+ groups rotating; one or two decoders and an MTP round (a multi-row step, which runs alone) never wait. IE_QWEN35_REGROUP=0 = off.
+    if (rows) {
+        const char* rgv = std::getenv("IE_QWEN35_REGROUP");
+        uint32_t regroup_us = (rgv && std::string(rgv) == "0") ? 0u : 50000u;
+        if (const char* v = std::getenv("IE_QWEN35_GROUP_WAIT_US"); v && regroup_us)
+            regroup_us = uint32_t(std::clamp(std::atoi(v), 1, 1000000));
+        lm->set_regroup(regroup_us);
+        if (regroup_us)
+            std::fprintf(stderr, "[qwen35split] decode regroup ON: stage 0 waits up to %u us for the decode group landing on card 1 before "
+                                 "forming a group that would leave 3+ groups rotating (IE_QWEN35_GROUP_WAIT_US; IE_QWEN35_REGROUP=0 = off)\n",
+                         regroup_us);
+        else std::fprintf(stderr, "[qwen35split] decode regroup OFF (IE_QWEN35_REGROUP=0): groups form from the lanes queued at stage 0\n");
+    }
     if (q27_share_) std::fprintf(stderr, "[qwen35split] shared-prefix cache ON (--parallel 1 splits its prefill there too, on the "
                                          "%u-row piece grid; IE_QWEN35_SHARED_PREFIX=0 = off)\n", pf);
     LanesServe::Options so;
@@ -4509,11 +4544,11 @@ std::string Engine::q27_lanes_init() {
     // decodes while at most IE_QWEN35_LANES_MTP_MAX lanes decode (default: the card count -- two lanes on two cards fill
     // both stages, 63.1 against rows groups' 51.8 tok/s together; four lanes are faster in rows groups) drafts with the MTP
     // head and verifies the drafts in one step; more decoding lanes share the cards in rows groups. IE_QWEN35_LANES_MTP=0
-    // = off. Rows a round: --spec-k when given, else 3 on a Q8_0 file and 2 on the K-quants (gate_k3, two lanes, one alone /
-    // both together: Q8_0 K=2 27.4 / 49.0, K=3 30.6 / 53.1 tok/s; Q4_K_M K=2 37.2 / 63.1, K=3 37.9 / 60.9, K=4 34.5 / 54.3).
+    // = off. Rows a round: --spec-k when given, else 3 (two lanes, one alone / both together, tok/s: Q8_0 K=2 27.4 / 49.0, K=3
+    // 30.6 / 53.1. The K-quants took 2 until the c32 rows ran on the hardware dot (2026-10-21): Q4_K_M K=2 38.9 / 67.5, K=3
+    // 41.9 / 66.2, K=4 41.0 / 64.2; Q6_K K=2 33.1 / 57.1, K=3 37.4 / 61.7).
     if (spec_ && m.mtp_loaded() && ![] { const char* v = std::getenv("IE_QWEN35_LANES_MTP"); return v && *v == '0'; }()) {
-        const auto* ffn = gguf_.find_tensor("blk.0.ffn_gate.weight");
-        const uint32_t rows = opts_.spec_k_set ? opts_.spec_k : (ffn && ffn->dtype == DType::kQ8_0) ? 3u : 2u;
+        const uint32_t rows = opts_.spec_k_set ? opts_.spec_k : 3u;
         if (auto e = lm->init_draft(rows); !e.empty())
             std::fprintf(stderr, "[qwen35split] lanes MTP OFF: %s\n", e.c_str());
         else {
@@ -5844,8 +5879,10 @@ GenerateResult Engine::generate(const std::string& prompt,
         res.decode_ms = dec_ms();
         return res;
     }
-    if (q27_step) {   // P4 B48
-        if (auto m = qwen35_split_model_.spec_step_init(opts_.spec_k); !m.empty())
+    // P4 B48. Rows a round: --spec-k when given, else 3 as on the lanes (2026-10-21, one request, tok/s K=2 / 3 / 4: Q4_K_M
+    // 37.7 / 38.9 / 37.5, Q6_K 31.2 / 34.7 / 33.5, Q8_0 26.8 / 29.4 / 30.1; replies equal at every K).
+    if (q27_step) {
+        if (auto m = qwen35_split_model_.spec_step_init(opts_.spec_k_set ? opts_.spec_k : 3u); !m.empty())
             std::fprintf(stderr, "[spec-step] %s -- plain decode\n", m.c_str());
         else {
             qwen35_split_model_.spec_step_reset();
