@@ -35,7 +35,7 @@ int main(int argc, char** argv) {
         ie::EngineOptions opts;
         opts.max_ctx = 4096;
         opts.spec = spec;
-        opts.spec_k = K;
+        opts.spec_k = K; opts.spec_k_set = true;
         opts.prompt_cache = false;
         std::string err;
         auto eng = ie::Engine::load(gguf, opts, err);

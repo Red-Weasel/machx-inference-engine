@@ -189,6 +189,8 @@ struct EngineOptions {
                                      // 27B (verify cost grows ~linearly with K but accept
                                      // saturates): clean-box K=2 1.12× / K=3 1.06× / K=4
                                      // 0.98× (a LOSS). Same verify at all K. Override --spec-k.
+    bool     spec_k_set    = false;  // 2026-10-21: --spec-k was given (the 27B's request lanes pick their own rows
+                                     // per round when it was not: 3 on a Q8_0 file, 2 otherwise)
     std::string spec_head;           // gemma4 MTP draft head GGUF (separate file,
                                      // mtp-gemma-4-*-Q8_0.gguf). Empty → convention:
                                      // first mtp-*.gguf next to the target. CLI: --spec-head.

@@ -19,6 +19,7 @@
 
 **Latest**
 
+- **v0.2.28, October 21 — DeepSeek-V4.1's October 17 weights, faster tensor parallel, 27B Q8_0 drafts:** the [1017 update of DeepSeek-V4.1-Flash](#new-in-v0228) runs unchanged (perplexity 1.538 vs 1.517 for the September weights), and the disk prompt cache and the NVMe expert file now record the weight files they were made from. Tensor parallel (`IE_DS41_TP=1`) reads a 23.6K-token prompt at **325–352 tok/s** (was 280–288). The 27B's `--spec` lanes check three rows on Q8_0: one request **30.6 tok/s** (27.4), two at once 53.1 together (49.0), the same replies. GLM-5.3-Flash no longer refuses a conversation whose earlier reply was cut inside a tool call.
 - **v0.2.27, October 21 — Qwen3.8-27B: MTP on the request lanes, Q4, pictures on the lanes; DeepSeek-V4.1 on more than two cards:** with `--spec --parallel N` the [27B's request lanes](#new-in-v0227) draft with its MTP head: one request writes **38 tok/s** at Q4_K_M (27.2 plain) and **27.4** at Q8_0 (17.4), two at once 63.1 together (51.8), with the same replies. The 27B's Q4_K_M decodes 27.5 tok/s on two cards (22.8) and 27.8 on one (19.1). Pictures work on the request lanes of the 27B and the 35B-A3B class, a VRAM leak of about 100 MiB a card per request is fixed, and DeepSeek-V4.1-Flash runs on more than two cards, with opt-in tensor parallel (`IE_DS41_TP=1`: 17.2 tok/s decode on two B70s against 14.6). [Details](#new-in-v0227)
 - **v0.2.26, October 20 — GLM-5.3-Flash served fast, and issue #2:** in `ie serve`, [GLM-5.3-Flash](#new-in-v0226) reads a 9.6K-token agent prompt in **32.4 s** (was 243 s), answers later turns from the prompt cache in **9.5–9.7 s** (was 273–311 s) and decodes **13.5–14.3 tok/s** (was 10.8–11.5); the re-published `glm5-next` GGUF loads. Host↔device copies on the Qwen3.8-27B and 35B-A3B two-card splits and in `--spec`'s draft head go through pinned memory, at most 64 MiB a copy, for [issue #2](https://github.com/Red-Weasel/machx-inference-engine/issues/2) (a B70 wedged under the 27B). [Details](#new-in-v0226)
 - **v0.2.25, October 20 — two new models:** [Laguna S 2.1](#new-in-v0225) (118B-A8B) and Inkling-Small (276B-A12B) run in `ie serve` on one card or two; Laguna writes **33.7–35.1 tok/s** on two cards. DeepSeek-V4.1-Flash decodes **10.6 % faster** with byte-identical output. Host↔device copies on the new models and in the VRAM self-test go through pinned memory, and the 27B's `ie serve` no longer crashes on exit. [Details](#new-in-v0225)
@@ -176,6 +177,85 @@ class ([New in v0.2.6](#new-in-v026)).
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
 
 ---
+
+<a id="new-in-v0228"></a>
+## 🆕 New in v0.2.28
+
+Everything since [v0.2.27](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.27). Measured
+October 21, 2026, on two Arc Pro B70 cards.
+
+### DeepSeek-V4.1-Flash: the October 17 weights
+
+DeepSeek's 1017 update of V4.1-Flash keeps the architecture, the tokenizer and the tensor layout and replaces every
+weight file (the routers and the embedding change). Mach X runs it unchanged. Measured on a community FP8 build of the
+1017 weights: perplexity **1.538** on 4,096 wikitext tokens (layer split, CPU expert leg off; the September weights
+1.517, a paired difference of +0.014 nats at t = 1.27, 94.4 % the same top token), the picture probes answered right
+(also after a 6,651-token prompt), tool calls structured 4 of 4.
+
+Two files the engine makes from the weights now record which weight files they were made from (each shard's size and
+modification time):
+
+- **The disk prompt cache.** Entries written under other weights are not restored. Before, the key held only the
+  embedding's first MiB, so an update or fine-tune that kept the embedding would have restored KV the old weights wrote.
+- **The NVMe expert file** (`ie_experts_tail.ieslot`). A file written from other weight files is skipped with a warning
+  (the tail then reads the shards: slower, and right). A file written before v0.2.28 has no record and keeps the
+  one-expert check, which stops the load when that expert differs; the message now says to rebuild the file or set
+  `IE_DS41_EXPERT_FILE=0`. **After a weight update, rebuild it** with `ie-ds41-expert-file`.
+  `ie-ds41-expert-file <model> <ranking> --verify --rebind` re-records a file whose bytes still match (a copy of the
+  model that did not keep the files' times); `--verify` alone exits 6 for such a file.
+
+### DeepSeek-V4.1-Flash tensor parallel reads long prompts faster
+
+`IE_DS41_TP=1` now runs 4096-token forwards: its two all-reduces a layer and its expert streams are paid once a
+forward, so a long prompt pays them half as often.
+
+| 23,581-token prompt, two cards | v0.2.27 | v0.2.28 |
+|---|---|---|
+| tensor parallel | 280–288 tok/s | **325–352** (six runs, both weight sets) |
+| layer split (unchanged) | 490–513 | 505 |
+
+- The layer split keeps 2048-token forwards: at 4096 it read 384 tok/s (505 at 2048).
+- **Checks:** perplexity on 8,192 wikitext tokens of the 1017 weights, CPU expert leg off: tensor parallel with
+  4096-token forwards 1.72309, the layer split 1.72277 (paired +0.0002 nats, within the noise). Short prompts give the
+  same replies as v0.2.27 under tensor parallel and in the layer split (CPU leg off, four runs each). `IE_DS41_MAX_FWD`
+  overrides the forward size; `IE_DS41_CPU_CONT_ROWS` now takes up to 4096 (the CPU leg's largest prompt chunk;
+  at 4096 it measured no faster under tensor parallel, so the default stays 2048).
+
+### Qwen3.8-27B: three drafted rows on Q8_0
+
+Without `--spec-k`, the request lanes' MTP rounds now check 3 rows on a Q8_0 file (2 on the K-quants, as before).
+
+| Qwen3.8-27B Q8_0, `--spec`, two cards, 256 tokens a reply | v0.2.27 | v0.2.28 |
+|---|---|---|
+| one request | 27.4 tok/s | **30.6** |
+| two at once, together | 49.0 | **53.1** |
+
+- Q4_K_M stays at 2: with 3 rows one request wrote 37.9 tok/s but two together 60.9 (63.1 at 2); 4 rows 34.5.
+- **Checks:** every `--spec` reply has the same text and token count as the plain lanes' (two lanes at Q8_0 and
+  Q4_K_M, four at Q8_0: 52 replies over eight runs). Four lanes at Q8_0 write 63.9–65.0 tok/s together, as v0.2.27 and
+  plain (64.8). Every other model gives the same tokens as v0.2.27 (Flash-Next, the 35B-A3B class, the 27B, MiMo,
+  Laguna; no GPU fault in any run).
+
+### GLM-5.3-Flash: a reply cut inside a tool call no longer ends the conversation
+
+When `max_tokens` cut a reply inside a tool call, the raw call went out as text, and the next request carrying that
+history was refused ("glm5next: incomplete assistant tool history"). The cut call now stays in the history as the
+model wrote it. Covered by `glm5_server_test` (it fails on the old code); not run against a loaded GLM in this
+release's checks.
+
+### What is still slow, and not checked
+
+- Tensor parallel still reads long prompts slower than the layer split on two cards (325–352 vs 505 tok/s). Real
+  four-card speed is not measured.
+- One of seven four-lane runs of the 27B fell to 44.3 tok/s together: the lanes fell out of step and stopped sharing
+  steps (same replies). The 35B-A3B class has a regroup wait for this; the 27B does not yet.
+- The shipped V4.1 expert ranking ([results/ds41-chat-ranking-2026-09-16](results/ds41-chat-ranking-2026-09-16)) was
+  profiled on the September weights; the 1017 routers differ, so expert placement may be less good until it is
+  re-profiled (`IE_DS41_PROFILE_OUT=<file>` on your own traffic). Replies are not affected.
+- The 27B's MTP checks pay for every extra row on Q4_K_M (3 rows about as fast as 2, 4 rows slower), which keeps the
+  gain near 1.4×. A decode kernel that reads each weight once for several rows is the next step.
+- DeepSeek-V4.1 with its CPU expert leg on (the default) is not repeatable token for token at long context; with
+  `IE_DS41_CPU_MISS=0` it is.
 
 <a id="new-in-v0227"></a>
 ## 🆕 New in v0.2.27

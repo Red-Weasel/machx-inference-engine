@@ -14,7 +14,11 @@ cache ("0 entries for this build") and cost a ~30 s cold first turn (fix list #4
     <model> | format 1 | numerics <16 hex> | runtime <oneDNN x.y.z hash> | <card 0 name> driver <v>; <card 1 name> driver <v>
 
 * **model**: unchanged. The layer count, dims, window, per-layer ratios and kv-source flags, and a fingerprint of the first
-  MiB of the embedding.
+  MiB of the embedding. Since 2026-10-21 (7d6b28a) also ` F<id>`, `SafetensorsModel::files_id()`: FNV-1a over each open
+  shard's size and modification time. The embedding alone let weights with the same embedding share entries (the
+  2026-10-13 uncensored swap kept shard 1; the 1017 update replaced all 48 shards with same-named, same-size files). A
+  copy of the model that keeps the files' times keeps the entries; a copy that does not starts cold. The NVMe expert
+  file (`ie_experts_tail.ieslot`) records the same id in its header and is skipped, with a warning, under other shards.
 * **format**: `kDs41PrefixDiskFormat` (1). It is the file header's `ver` field, now one named constant. Bump it when
   `prefix_persist`'s layout changes.
 * **numerics**: FNV-1a 64 of the **numerics manifest**, a text the build writes into

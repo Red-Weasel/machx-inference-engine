@@ -116,6 +116,10 @@ std::string Ds41Forward::set_prefix_cache(bool on, const PrefixCacheOptions& o) 
                             " IHD" + std::to_string(c.index_head_dim) + " W" + std::to_string(c.window_size) + " R";
         for (uint32_t L = 0; L < c.n_layers; ++L) model += std::to_string(m_->layers()[L].kind.compress_ratio) + (m_->layers()[L].kind.is_kv_source ? "s" : "");
         if (m_->embed.w && m_->embed.w->data) model += " E" + std::to_string(ds41pc_fnv(m_->embed.w->data, std::min<size_t>(m_->embed.w->nbytes, 1u << 20)));
+        // 2026-10-21: and the weight files themselves (SafetensorsModel::files_id: each shard's size and modification
+        // time). The embedding's first MiB alone let a fine-tune or an update with the same embedding (the V4.1 1017
+        // weights over the 09-11 ones, the same names and shapes) restore KV the old weights wrote.
+        model += " F" + std::to_string(m_->store().files_id());
         // tensor parallel (2026-10-20): n parts sum their partials in another order than one card does, so an entry is its
         // part count's only (and its entries hold every layer on every card); the layer split's key is unchanged
         if (tp_) model += " TP" + std::to_string(tp_);

@@ -126,6 +126,23 @@ std::string parallel_fill(uint32_t n, const std::function<std::string(uint32_t, 
     }
     return err;
 }
+
+// 2026-10-21: true (and a warning) when the expert file at `path` was packed from other weight files than `store`'s (an
+// update written over the shards). Its slots are then not used: the tail takes the pack path from the shards, slower and
+// right -- the one-slot byte check cannot see an update that leaves the sampled expert alone. A file written before the
+// id existed (0) keeps only that check; an unreadable header or another kind of file is left to the checks that report it.
+bool ds41_expert_file_foreign(const std::string& path, const SafetensorsModel& store) {
+    Ds41ExpertFileHeader hd{};
+    const int fd = open(path.c_str(), O_RDONLY);
+    if (fd < 0) return false;
+    const bool got = pread(fd, &hd, sizeof hd, 0) == ssize_t(sizeof hd);
+    close(fd);
+    if (!got || std::memcmp(hd.magic, kDs41ExpertFileMagic, 8) != 0 || !hd.weights_id || hd.weights_id == store.files_id()) return false;
+    std::fprintf(stderr, "[ds41 tier] WARNING: expert file %s was written from other weight files (weights id %016llx, these shards %016llx): "
+                         "not used, the tail reads the shards; rebuild it with ie-ds41-expert-file (or --verify --rebind if the bytes are the same)\n",
+                 path.c_str(), (unsigned long long)hd.weights_id, (unsigned long long)store.files_id());
+    return true;
+}
 }  // namespace
 
 bool ds41_permute_plane_selftest(uint64_t bytes, uint32_t seed) {
@@ -402,6 +419,7 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint
                      tp_part_, tp_n_, file_path.c_str());
         file_path.clear();
     }
+    if (!file_path.empty() && ds41_expert_file_foreign(file_path, *s.store)) file_path.clear();
     // the file holds the text layers' experts; an MTP tier (the drafter's) skips it
     if (!file_path.empty()) {
         // the staging slots as anonymous huge-page memory imported into the driver (docs/40 step 0(c):
@@ -471,7 +489,7 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint
     // Phase 15 C2: the expert file -- validated, coverage counted, one slot checked byte for byte
     if (!file_path.empty()) {
         const int fd = open(file_path.c_str(), O_RDONLY), dfd = open(file_path.c_str(), O_RDONLY | O_DIRECT);
-        if (fd < 0 || dfd < 0) return "tier: IE_DS41_EXPERT_FILE " + file_path + ": " + std::strerror(errno);
+        if (fd < 0 || dfd < 0) { const int en = errno; if (fd >= 0) close(fd); if (dfd >= 0) close(dfd); return "tier: IE_DS41_EXPERT_FILE " + file_path + ": " + std::strerror(en); }
         Ds41ExpertFileHeader hd{};
         if (pread(fd, &hd, sizeof hd, 0) != ssize_t(sizeof hd) || std::memcmp(hd.magic, kDs41ExpertFileMagic, 8) != 0) { close(fd); close(dfd); return "tier: expert file: not an IESLOT01 file"; }
         if (hd.H != H_ || hd.EF != EF_ || hd.n_layers != s.n_text_layers || hd.n_experts != E_ || hd.slot_bytes != lay_.bytes) { close(fd); close(dfd);
@@ -487,13 +505,16 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint
         }
         if (covered) {   // the sample: the pack path's bytes == the file's, byte for byte
             void* a = nullptr; void* b = nullptr;
-            if (posix_memalign(&a, kPage, size_t(lay_.bytes)) != 0 || posix_memalign(&b, kPage, size_t(lay_.bytes)) != 0) { close(dfd); return "tier: expert file: sample alloc failed"; }
+            if (posix_memalign(&a, kPage, size_t(lay_.bytes)) != 0 || posix_memalign(&b, kPage, size_t(lay_.bytes)) != 0) { std::free(a); close(dfd); return "tier: expert file: sample alloc failed"; }
             const auto& Lw = s.layers[L0_ + uint32_t(sl0)];
             std::string e1 = ds41_slot_pack_pread(lay_, store, Lw.exp_w1[se0], Lw.exp_w3[se0], Lw.exp_w2[se0], a, bounce_[0]);
             std::string e2 = e1.empty() ? ds41_slot_pread_file(dfd, mm_file_off_[size_t(sl0) * E_ + se0], b, lay_.bytes, 0, 1, nullptr) : std::string();
             const bool same = e1.empty() && e2.empty() && std::memcmp(a, b, size_t(lay_.bytes)) == 0;
             std::free(a); std::free(b);
-            if (!same) { close(dfd); mm_file_off_.clear(); return "tier: expert file REFUSED: layer " + std::to_string(L0_ + uint32_t(sl0)) + " expert " + std::to_string(se0) + " differs from the pack path" + (e1.empty() ? "" : " (" + e1 + ")") + (e2.empty() ? "" : " (" + e2 + ")"); }
+            // stays fatal (2026-10-21): each card's tier samples its own expert, so skipping here could leave another card
+            // whose sample happened to match running the stale file; the weights id above is the same answer on every card
+            if (!same) { close(dfd); mm_file_off_.clear(); return "tier: expert file REFUSED: layer " + std::to_string(L0_ + uint32_t(sl0)) + " expert " + std::to_string(se0) + " differs from the pack path" + (e1.empty() ? "" : " (" + e1 + ")") + (e2.empty() ? "" : " (" + e2 + ")") +
+                                         " -- rebuild it with ie-ds41-expert-file, or IE_DS41_EXPERT_FILE=0 to load without it"; }
         }
         mm_file_fd_ = dfd;
         // 2026-10-20: IE_DS41_DISK_CACHE=1 reads the file through the page cache instead of O_DIRECT: the RAM the
@@ -504,8 +525,9 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint
             const int cfd = open(file_path.c_str(), O_RDONLY);
             if (cfd >= 0) { close(dfd); mm_file_fd_ = cfd; }
         }
-        std::fprintf(stderr, "[ds41 tier] expert file %s: covers %u of this tier's %u mmap experts (layers %u..%u); staging imported; one slot verified byte for byte%s\n",
-                     file_path.c_str(), covered, wanted, L0_, L0_ + n_layers - 1, mm_file_fd_ != dfd ? "; read through the page cache" : "");
+        std::fprintf(stderr, "[ds41 tier] expert file %s: covers %u of this tier's %u mmap experts (layers %u..%u); staging imported; %s%s\n",
+                     file_path.c_str(), covered, wanted, L0_, L0_ + n_layers - 1, covered ? "one slot verified byte for byte" : "nothing to verify",
+                     mm_file_fd_ != dfd ? "; read through the page cache" : "");
     }
     cpu_start(q);
     for (uint32_t l = 0; l < n_layers; ++l) {
@@ -542,7 +564,11 @@ void Ds41ExpertTier::cpu_start(sycl::queue& q) {
     if (share_) cpu_.qstar = 0.60f;                         // under expert parallel (a parity share): the sweep's optimum (docs/52); 0.30 for a whole tier
     if (const char* qs = std::getenv("IE_DS41_QSTAR")) cpu_.qstar = std::max(0.f, std::min(1.f, float(std::atof(qs))));
     if (const char* qs = std::getenv("IE_DS41_QSTAR_MULTI")) cpu_.qstar_multi = std::max(0.f, std::min(1.f, float(std::atof(qs))));
-    if (const char* v = std::getenv("IE_DS41_CPU_CONT_ROWS")) cpu_.cont_rows = uint32_t(std::max(0, std::min(2048, std::atoi(v))));
+    // 2026-10-21: a chunk above cont_rows skips the leg entirely (tensor parallel's 4096-row forwards included). The env takes
+    // up to 4096; the default stays 2048 everywhere: under TP the leg on 4096-row chunks measured 352 / 351 tok/s against
+    // 352 / 349 without (a 23,581-token prompt, A-B-A-B; an earlier single pair, 325 -> 357, was noise), and
+    // the split's 4096-row forwards lose with the leg too (505 -> 384).
+    if (const char* v = std::getenv("IE_DS41_CPU_CONT_ROWS")) cpu_.cont_rows = uint32_t(std::max(0, std::min(4096, std::atoi(v))));
     if (const char* qs = std::getenv("IE_DS41_QSTAR_CONT")) cpu_.qstar_cont = std::max(0.f, std::min(1.f, float(std::atof(qs))));
     const char* ev = std::getenv("IE_DS41_CPU_CORES");
     const std::string cores = !cpu_cores_override_.empty() ? cpu_cores_override_ : ev && *ev ? std::string(ev) : ds41_cpu_leg_default_cores();

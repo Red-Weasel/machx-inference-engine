@@ -116,6 +116,11 @@ public:
     // The shard descriptors (buffered, and O_DIRECT or -1) and file offset behind a pointer into
     // some tensor's data (SafeTensorInfo::data or inside it). False if no shard maps it.
     bool                                locate(const uint8_t* p, int& fd, int& direct_fd, uint64_t& off) const;
+    // 2026-10-21: the identity of the files this view maps -- FNV-1a over the shard count and each open shard's size
+    // and modification time (ns), in shard order; never 0. A weight update written over the old files changes it (the
+    // V4.1 1017 update replaced all 48 shards with the same names, sizes and tensor layout); a copy that keeps the
+    // times does not. Files derived from the weights (a disk prompt cache, an expert file) record it.
+    uint64_t                            files_id() const;
 
 private:
     std::vector<std::unique_ptr<SafetensorsReader>> shards_;

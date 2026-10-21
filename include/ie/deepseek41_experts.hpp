@@ -53,6 +53,8 @@ struct Ds41ExpertFileHeader {
     uint64_t n_slots = 0;
     uint32_t cutoff = 0;          // the ranking position from which experts were written (informational)
     uint32_t reserved = 0;
+    uint64_t weights_id = 0;      // 2026-10-21: SafetensorsModel::files_id() of the weights the slots were packed from;
+                                  // 0 in a file written before (the zero-filled header page): not checked
 };
 // Read one slot -- or its slice-th of n_slices page-granular slices -- from the file at byte offset
 // `off` into `dst` (4 KiB-aligned, e.g. an imported staging slot) with O_DIRECT preads on `dfd`;

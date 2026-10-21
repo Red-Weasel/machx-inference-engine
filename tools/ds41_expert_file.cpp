@@ -4,6 +4,9 @@
 // ds41_slot_pack_pread produces, byte for byte.
 //   usage: ie-ds41-expert-file <model> <ranking> [--cutoff N=297] [--end M=N+44] [--out PATH=<model>/ie_experts_tail.ieslot]
 //          [--threads T=8] --confirm
+//   ie-ds41-expert-file <model> <ranking> --verify [--rebind] [--out PATH]: every slot against the shards, byte for byte;
+//   --rebind then writes these shards' weights id into the header when no slot differs (a copy of the model that did not
+//   keep the files' times has a new id, and the engine skips a file whose id is another set of shards')
 //   The window [cutoff, end) of every layer's ranking: the hot part of the mmap tier's tail (the ranking is by
 //   frequency, so a pass touches mostly its head); the whole tail (~60 GB) would leave the system volume under the
 //   50 GB floor, and an mmap expert the file does not hold takes the pack path (the init line prints the coverage).
@@ -29,7 +32,7 @@
 int main(int argc, char** argv) {
     if (argc < 3) { std::fprintf(stderr, "usage: ie-ds41-expert-file <model> <ranking> [--cutoff N] [--out PATH] [--threads T] --confirm\n"); return 2; }
     const std::string dir = argv[1], ranking = argv[2];
-    uint32_t cutoff = 297, end = 0, nthreads = 8; std::string out = dir + "/" + "ie_experts_tail.ieslot"; bool confirm = false, verify = false;
+    uint32_t cutoff = 297, end = 0, nthreads = 8; std::string out = dir + "/" + "ie_experts_tail.ieslot"; bool confirm = false, verify = false, rebind = false;
     for (int i = 3; i < argc; ++i) {
         const std::string a = argv[i];
         if (a == "--cutoff" && i + 1 < argc) cutoff = uint32_t(std::atoi(argv[++i]));
@@ -38,6 +41,7 @@ int main(int argc, char** argv) {
         else if (a == "--threads" && i + 1 < argc) nthreads = uint32_t(std::atoi(argv[++i]));
         else if (a == "--confirm") confirm = true;
         else if (a == "--verify") verify = true;
+        else if (a == "--rebind") rebind = true;
         else { std::fprintf(stderr, "unknown option %s\n", a.c_str()); return 2; }
     }
     ie::DeepSeek41Model m; if (auto e = m.load(dir); !e.empty()) { std::fprintf(stderr, "load: %s\n", e.c_str()); return 1; }
@@ -56,7 +60,8 @@ int main(int argc, char** argv) {
         if (pread(vfd, vt.data(), vt.size() * 8, off_t(vh.table_off)) != ssize_t(vt.size() * 8)) { std::fprintf(stderr, "table read failed\n"); return 1; }
         std::vector<std::pair<uint32_t, uint32_t>> work;
         for (uint32_t l = 0; l < NL; ++l) for (uint32_t e = 0; e < E; ++e) if (vt[size_t(l) * E + e]) work.push_back({l, e});
-        std::printf("verifying %zu slots of %s against the shards under %s (%u threads)\n", work.size(), out.c_str(), dir.c_str(), nthreads);
+        std::printf("verifying %zu slots of %s against the shards under %s (%u threads); its weights id %s\n", work.size(), out.c_str(), dir.c_str(), nthreads,
+                    !vh.weights_id ? "absent (written before 2026-10-21)" : vh.weights_id == m.store().files_id() ? "matches these shards" : "is OTHER shards' (the engine skips this file)");
         std::atomic<uint64_t> next{0}, done{0}, bad{0}; std::vector<std::atomic<uint32_t>> bad_by_layer(NL); std::mutex em; std::vector<std::pair<uint32_t, uint32_t>> firsts; std::string first_err;
         const auto t0 = std::chrono::steady_clock::now(); std::vector<std::thread> ts;
         for (uint32_t t = 0; t < nthreads; ++t) ts.emplace_back([&] {
@@ -78,7 +83,16 @@ int main(int argc, char** argv) {
         if (!first_err.empty()) std::printf("first read error: %s\n", first_err.c_str());
         for (auto [l, e] : firsts) std::printf("  differs: layer %u expert %u\n", l, e);
         if (bad) { std::printf("differing slots by layer:"); for (uint32_t l = 0; l < NL; ++l) if (bad_by_layer[l]) std::printf(" L%u=%u", l, bad_by_layer[l].load()); std::printf("\n"); }
-        return bad ? 5 : 0;
+        if (bad) return 5;
+        const uint64_t id = m.store().files_id();
+        if (vh.weights_id == id) return 0;
+        if (!rebind) { std::printf("the header's weights id is not these shards' (the engine skips the file): --rebind writes it\n"); return 6; }
+        vh.weights_id = id;
+        const int wfd = open(out.c_str(), O_WRONLY);
+        if (wfd < 0 || pwrite(wfd, &vh, sizeof vh, 0) != ssize_t(sizeof vh) || fsync(wfd) != 0) { std::perror("rebind: header write"); if (wfd >= 0) close(wfd); return 1; }
+        close(wfd);
+        std::printf("rebound: the header now names these shards (weights id %016llx)\n", (unsigned long long)id);
+        return 0;
     }
     std::vector<std::vector<uint32_t>> rank;
     if (auto e = ie::ds4_expert_priority_read_layers(ranking, E, NL, rank); !e.empty()) { std::fprintf(stderr, "ranking: %s\n", e.c_str()); return 1; }
@@ -100,7 +114,7 @@ int main(int argc, char** argv) {
     for (uint32_t l = 0; l < NL; ++l) for (uint32_t i = cutoff; i < end; ++i) table[size_t(l) * E + rank[l][i]] = slots_off + (uint64_t(l) * per_layer + (i - cutoff)) * lay.bytes;
     void* head = nullptr; if (posix_memalign(&head, 4096, size_t(slots_off)) != 0) return 1; std::memset(head, 0, size_t(slots_off));
     ie::Ds41ExpertFileHeader hd{}; std::memcpy(hd.magic, ie::kDs41ExpertFileMagic, 8); hd.H = c.dim; hd.EF = c.moe_inter_dim; hd.n_layers = NL; hd.n_experts = E;
-    hd.slot_bytes = lay.bytes; hd.table_off = table_off; hd.n_slots = n_slots; hd.cutoff = cutoff;
+    hd.slot_bytes = lay.bytes; hd.table_off = table_off; hd.n_slots = n_slots; hd.cutoff = cutoff; hd.weights_id = m.store().files_id();
     std::memcpy(head, &hd, sizeof hd); std::memcpy(static_cast<uint8_t*>(head) + table_off, table.data(), table_bytes);
     if (pwrite(fd, head, size_t(slots_off), 0) != ssize_t(slots_off)) { std::perror("pwrite header"); return 1; }
     // the slots, packed by the same path the tier uses, T threads

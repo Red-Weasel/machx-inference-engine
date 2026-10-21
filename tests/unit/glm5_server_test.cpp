@@ -31,6 +31,16 @@ int main() {
         assert(off==p+"</think>");
     }
     assert(ie::build_glm5_prompt(turns,true,"",err,"medium").empty() && !err.empty());
+    // a reply cut mid call (max_tokens): an earlier complete call is converted, the cut one stays as the model wrote it
+    {
+        std::vector<ie::ChatTurn> cut={{"user","look",{}},{"assistant",R"(<tool_call>{"name":"read","arguments":{"path":"a.txt"}}</tool_call>
+Next <tool_call>read<arg_key>pa)",{}},{"user","go on",{}}};
+        std::string cut_err;
+        const auto p=ie::build_glm5_prompt(cut,false,"",cut_err);
+        assert(cut_err.empty());
+        assert(p.find("<tool_call>read<arg_key>path</arg_key><arg_value>a.txt</arg_value></tool_call>")!=std::string::npos);
+        assert(p.find("Next <tool_call>read<arg_key>pa<|user|>go on")!=std::string::npos);
+    }
     turns={{"assistant",R"(<tool_call>{"name":"read","arguments":{"path":"a.txt","n":2}}</tool_call>)",{}},{"tool","found",{}},{"tool","other",{}}};
     auto prompt=ie::build_glm5_prompt(turns,false,"",err);
     assert(err.empty());

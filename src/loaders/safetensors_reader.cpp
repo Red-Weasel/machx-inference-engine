@@ -221,6 +221,18 @@ bool SafetensorsModel::locate(const uint8_t* p, int& fd, int& direct_fd, uint64_
     return false;
 }
 
+uint64_t SafetensorsModel::files_id() const {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](uint64_t v) { for (int i = 0; i < 8; ++i) { h ^= (v >> (8 * i)) & 0xFFu; h *= 1099511628211ull; } };
+    mix(shards_.size());
+    for (const auto& s : shards_) {
+        struct stat st{};
+        if (::fstat(s->fd(), &st) != 0) { mix(~0ull); continue; }
+        mix(uint64_t(st.st_size)); mix(uint64_t(st.st_mtim.tv_sec)); mix(uint64_t(st.st_mtim.tv_nsec));
+    }
+    return h ? h : 1;
+}
+
 std::vector<const SafeTensorInfo*> SafetensorsModel::all() const {
     std::vector<const SafeTensorInfo*> out;
     for (const auto& s : shards_)

@@ -4,6 +4,7 @@
 #include "ie/safetensors.hpp"
 
 #include <cassert>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -119,6 +120,23 @@ int main() {
     int32_t gb[2]; std::memcpy(gb, tb->data, 8);
     assert(gb[0] == 7 && gb[1] == -3);
     assert(m.find("missing") == nullptr);
+
+    // files_id (2026-10-21): the same files give the same id, never 0; a shard replaced by one with the same name, tensor
+    // and size but other bytes (a weight update downloaded over it) gives another, while a view opened before it keeps
+    // the id of the file it maps
+    const uint64_t id0 = m.files_id();
+    assert(id0 != 0);
+    { ie::SafetensorsModel again; assert(again.open(sdir).empty() && again.files_id() == id0); }
+    {
+        const uint16_t upd[2] = {0x3C01, 0x4001};
+        const std::string p1 = sdir + "/model-00001-of-00002.safetensors";
+        write_one(p1 + ".new", "a", "F16", "[2]", upd, 4);
+        fs::last_write_time(p1 + ".new", fs::last_write_time(p1) + std::chrono::seconds(1));
+        fs::rename(p1 + ".new", p1);
+        ie::SafetensorsModel updated; assert(updated.open(sdir).empty());
+        assert(updated.files_id() != id0);
+        assert(m.files_id() == id0);
+    }
 
     // Single-file directory → one shard.
     const std::string single_dir = "/tmp/ie_st_single_test";

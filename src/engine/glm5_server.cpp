@@ -26,7 +26,9 @@ std::string render_history_calls(std::string text,std::string& error) {
     size_t pos=0;
     while((pos=text.find("<tool_call>",pos))!=std::string::npos) {
         const size_t begin=pos+11, end=text.find("</tool_call>",begin);
-        if(end==std::string::npos){error="glm5next: incomplete assistant tool history";return {};}
+        // a reply cut mid call (max_tokens) streamed the raw call as content; the history then carries what the model
+        // wrote, so keep it verbatim (2026-10-21: it was refused, "incomplete assistant tool history", ending the chat)
+        if(end==std::string::npos)break;
         auto body=trim(std::string_view(text).substr(begin,end-begin));
         if(body.empty() || body.front()!='{'){pos=end+12;continue;}
         auto call=Json::parse(body,nullptr,false);

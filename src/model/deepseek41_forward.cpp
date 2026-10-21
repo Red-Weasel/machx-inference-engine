@@ -95,6 +95,11 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
     if (tp_) tp_ = uint32_t(qs.size());
     // Phase 24 (docs/deepseek41/64): the single-call bound for every per-call scratch buffer; the KV keeps max_tokens.
     fwd_cap_ = opt.max_forward_tokens ? opt.max_forward_tokens : opt.max_tokens;
+    // 2026-10-21: tensor parallel takes 4096-row forwards when the bound is the default 2048: its two all-reduces a layer
+    // and its expert streams are per forward (a 23,581-token prompt, two runs each: 280-288 ->
+    // 343-344 tok/s, 327 with this default; loads at --ctx 262144). The layer split keeps 2048 (4096: 490 -> 399, its
+    // pipelined chunks lose).
+    if (tp_ && opt.max_forward_tokens == 2048) fwd_cap_ = 4096;
     if (const char* v = std::getenv("IE_DS41_MAX_FWD")) if (const uint32_t n = uint32_t(std::atoi(v))) fwd_cap_ = n;
     if (fwd_cap_ > cap_pos_) fwd_cap_ = cap_pos_;
     if (fwd_cap_ < cap_pos_)

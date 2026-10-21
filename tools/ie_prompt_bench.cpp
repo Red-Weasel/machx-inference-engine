@@ -57,7 +57,7 @@ int main(int argc, char** argv) {
         if      (a == "--gguf"        && i + 1 < argc) gguf        = argv[++i];
         else if (a == "--gpus"        && i + 1 < argc) opts.n_gpus = uint32_t(std::atoi(argv[++i]));
         else if (a == "--spec")                        opts.spec   = true;
-        else if (a == "--spec-k"      && i + 1 < argc) opts.spec_k = uint32_t(std::atoi(argv[++i]));
+        else if (a == "--spec-k"      && i + 1 < argc) { opts.spec_k = uint32_t(std::atoi(argv[++i])); opts.spec_k_set = true; }
         else if (a == "--spec-head"   && i + 1 < argc) { spec_head = argv[++i]; opts.spec_head = spec_head; }
         else if (a == "--spec-draft"  && i + 1 < argc) opts.spec_draft = argv[++i];
         else if (a == "--decode"      && i + 1 < argc) decode_n    = uint32_t(std::atoi(argv[++i]));

@@ -132,7 +132,7 @@ inline LaunchOptions parse_launch_options(const std::vector<std::string>& args) 
         else if (flag == "--slot-ctx") e.slot_ctx = uint32_t(integer(0, INT32_MAX));
         else if (flag == "--int8-kv") e.int8_kv = true;
         else if (flag == "--spec") e.spec = true;
-        else if (flag == "--spec-k") e.spec_k = uint32_t(integer(1, 64));
+        else if (flag == "--spec-k") { e.spec_k = uint32_t(integer(1, 64)); e.spec_k_set = true; }
         else if (flag == "--spec-head") e.spec_head = value();
         else if (flag == "--spec-draft") e.spec_draft = value();
         else if (flag == "--mmproj") {   // P4 B45: the vision projector GGUF

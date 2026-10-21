@@ -4509,9 +4509,12 @@ std::string Engine::q27_lanes_init() {
     // decodes while at most IE_QWEN35_LANES_MTP_MAX lanes decode (default: the card count -- two lanes on two cards fill
     // both stages, 63.1 against rows groups' 51.8 tok/s together; four lanes are faster in rows groups) drafts with the MTP
     // head and verifies the drafts in one step; more decoding lanes share the cards in rows groups. IE_QWEN35_LANES_MTP=0
-    // = off.
+    // = off. Rows a round: --spec-k when given, else 3 on a Q8_0 file and 2 on the K-quants (gate_k3, two lanes, one alone /
+    // both together: Q8_0 K=2 27.4 / 49.0, K=3 30.6 / 53.1 tok/s; Q4_K_M K=2 37.2 / 63.1, K=3 37.9 / 60.9, K=4 34.5 / 54.3).
     if (spec_ && m.mtp_loaded() && ![] { const char* v = std::getenv("IE_QWEN35_LANES_MTP"); return v && *v == '0'; }()) {
-        if (auto e = lm->init_draft(opts_.spec_k); !e.empty())
+        const auto* ffn = gguf_.find_tensor("blk.0.ffn_gate.weight");
+        const uint32_t rows = opts_.spec_k_set ? opts_.spec_k : (ffn && ffn->dtype == DType::kQ8_0) ? 3u : 2u;
+        if (auto e = lm->init_draft(rows); !e.empty())
             std::fprintf(stderr, "[qwen35split] lanes MTP OFF: %s\n", e.c_str());
         else {
             so.draft = true;
