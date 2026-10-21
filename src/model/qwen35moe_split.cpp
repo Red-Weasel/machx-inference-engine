@@ -942,7 +942,7 @@ std::string Qwen35MoeSplitModel::forward(const int32_t* input_ids, uint32_t T,
 
     // positions on every card (+ the [3, T] M-RoPE streams while vision is staged, P4 B45); the reset on a fresh sequence
     for (uint32_t dev = 0; dev < n_dev_; ++dev) {
-        if (ws_[dev].positions) upload_positions(dev, start_pos, T);
+        if (ws_[dev].positions) upload_positions(dev, start_pos, T, vis_);
         if (reset_kv) {
             if (dn_at(dev).ready()) dn_at(dev).reset(fleet_->dev(dev).queue());
             if (kv_at(dev).ready()) kv_at(dev).reset();
@@ -950,7 +950,7 @@ std::string Qwen35MoeSplitModel::forward(const int32_t* input_ids, uint32_t T,
     }
 
     // embedding → ws_[embed_dev].x (+ the image rows spliced over it, P4 B45)
-    if (auto m = embed(input_ids, T, start_pos); !m.empty()) return m;
+    if (auto m = embed(input_ids, T, start_pos, vis_); !m.empty()) return m;
     g_dp35.phase(DecodeProf::kSetup);
 
     // IE_Q35MOE_TIMING: per-section wall-clock (adds q.wait barriers → relative
@@ -968,7 +968,7 @@ std::string Qwen35MoeSplitModel::forward(const int32_t* input_ids, uint32_t T,
             fleet_->copy_across(dev - 1, ws_[dev].x, dev, ws_[dev - 1].x, uint64_t(T) * H * sizeof(sycl::half));
             g_dp35.phase(DecodeProf::kHand);
         }
-        run_layers(dev, T, start_pos, dbg_timing, t_attn, t_moe);
+        run_layers(dev, T, start_pos, dbg_timing, t_attn, t_moe, vis_.n != 0);
         fleet_->dev(dev).queue().wait();
         if (aborting(T)) return kStopped;   // (P4 B33: the card's queue is drained; the next card and the head never start)
         g_dp35.phase(dev == 0 ? DecodeProf::kCard0 : DecodeProf::kCard1);
@@ -993,7 +993,7 @@ std::string Qwen35MoeSplitModel::forward(const int32_t* input_ids, uint32_t T,
     return {};
 }
 
-std::string Qwen35MoeSplitModel::embed(const int32_t* input_ids, uint32_t T, uint32_t start_pos) {
+std::string Qwen35MoeSplitModel::embed(const int32_t* input_ids, uint32_t T, uint32_t start_pos, const VisStage& v) {
     const uint32_t H = cfg_.hidden;
     auto& alloc = fleet_->dev(plan_.embed_dev);
     auto& q = alloc.queue();
@@ -1012,67 +1012,88 @@ std::string Qwen35MoeSplitModel::embed(const int32_t* input_ids, uint32_t T, uin
                              ws_[plan_.embed_dev].x, T, H);
     else
         embedding_lookup_q6k(q, d_ids, token_embd_, ws_[plan_.embed_dev].x, T, H);
-    // P4 B45 vision: the staged projector rows over the gathered rows (in-order: after the gather, before layer 0; a no-op
-    // without spans -- the lanes' forward_stage refuses while vision is staged, so only forward() reaches this with any)
-    splice_vision(q, ws_[plan_.embed_dev].x, start_pos, T);
+    // P4 B45 vision: v's projector rows over the gathered rows (in-order: after the gather, before layer 0; a no-op
+    // without spans)
+    splice_vision(ws_[plan_.embed_dev].x, start_pos, T, v);
     q.wait();
     return {};
 }
 
 // ---- P4 B45 step 2: image input (the header's note; the 27B split's set, qwen35_split.cpp). ---------------------------
-std::string Qwen35MoeSplitModel::set_vision(const float* rows_f32, uint32_t t0, uint32_t n_rows) {
+std::string Qwen35MoeSplitModel::vis_append(VisStage& v, const float* rows_f32, uint32_t t0, uint32_t n_rows) const {
     if (!rows_f32 || !n_rows) return "qwen35moe_split set_vision: empty rows";
     if (uint64_t(t0) + n_rows > max_ctx_) return "qwen35moe_split set_vision: span past max_ctx";
     const uint32_t H = cfg_.hidden;
-    const size_t row0 = vis_rows_.size() / H;
-    vis_rows_.resize(vis_rows_.size() + size_t(n_rows) * H);
-    for (size_t i = 0; i < size_t(n_rows) * H; ++i) vis_rows_[row0 * H + i] = sycl::half(rows_f32[i]);
-    vis_spans_.push_back({t0, n_rows, uint32_t(row0)});
+    const size_t row0 = v.rows.size() / H;
+    v.rows.resize(v.rows.size() + size_t(n_rows) * H);
+    for (size_t i = 0; i < size_t(n_rows) * H; ++i) v.rows[row0 * H + i] = sycl::half(rows_f32[i]);
+    v.spans.push_back({t0, n_rows, uint32_t(row0)});
     return {};
 }
 
-void Qwen35MoeSplitModel::set_mrope(const int32_t* pos3, uint32_t n_total, int32_t delta) {
-    mrope3_.assign(pos3, pos3 + size_t(3) * n_total);
-    mrope_n_ = n_total;
-    mrope_delta_ = delta;
+std::string Qwen35MoeSplitModel::set_vision(const float* rows_f32, uint32_t t0, uint32_t n_rows) {
+    return vis_append(vis_, rows_f32, t0, n_rows);
 }
 
-void Qwen35MoeSplitModel::clear_vision() {
-    vis_spans_.clear();
-    vis_rows_.clear();
-    mrope3_.clear();
-    mrope_n_ = 0;
-    mrope_delta_ = 0;
+void Qwen35MoeSplitModel::set_mrope(const int32_t* pos3, uint32_t n_total, int32_t delta) {
+    vis_.mrope3.assign(pos3, pos3 + size_t(3) * n_total);
+    vis_.n = n_total;
+    vis_.delta = delta;
+}
+
+void Qwen35MoeSplitModel::clear_vision() { vis_ = VisStage{}; }
+
+std::string Qwen35MoeSplitModel::set_lane_vision(uint32_t lane, const float* rows_f32,
+                                                 std::span<const std::pair<uint32_t, uint32_t>> spans, const int32_t* pos3,
+                                                 uint32_t n_total, int32_t delta) {
+    if (lane >= lane_vis_.size()) return "qwen35moe_split set_lane_vision: no lane " + std::to_string(lane);
+    if (!pos3 || !n_total || uint64_t(n_total) > lane_ctx(lane)) return "qwen35moe_split set_lane_vision: bad M-RoPE table";
+    VisStage v;
+    size_t row = 0;
+    for (const auto& [t0, n] : spans) {
+        if (uint64_t(t0) + n > n_total) return "qwen35moe_split set_lane_vision: a span past the prompt";
+        if (auto e = vis_append(v, rows_f32 + row * cfg_.hidden, t0, n); !e.empty()) return e;
+        row += n;
+    }
+    v.mrope3.assign(pos3, pos3 + size_t(3) * n_total);
+    v.n = n_total;
+    v.delta = delta;
+    lane_vis_[lane] = std::move(v);
+    return {};
+}
+
+void Qwen35MoeSplitModel::clear_lane_vision(uint32_t lane) {
+    if (lane < lane_vis_.size()) lane_vis_[lane] = VisStage{};
 }
 
 // The piece [start, start + T)'s positions onto card dev: the linear token positions (every path's KV index and, without
-// vision, the rope) and, while vision is staged, the [3, T] M-RoPE slice the rope reads instead (one blocking copy each,
-// as forward() did before B45).
-void Qwen35MoeSplitModel::upload_positions(uint32_t dev, uint32_t start, uint32_t T) {
+// a table, the rope) and, with v's table, the [3, T] M-RoPE slice the rope reads instead (one blocking copy each, as
+// forward() did before B45).
+void Qwen35MoeSplitModel::upload_positions(uint32_t dev, uint32_t start, uint32_t T, const VisStage& v) {
     Workspace& w = ws_[dev];
     std::vector<int32_t> pos(T);
     for (uint32_t t = 0; t < T; ++t) pos[t] = int32_t(start + t);
     fleet_->dev(dev).h2d(w.positions, pos.data(), T * sizeof(int32_t));
-    if (mrope_n_) {
+    if (v.n) {
         std::vector<int32_t> p3(size_t(3) * T);
-        qwen4_mrope3_slice(mrope3_.data(), mrope_n_, mrope_delta_, start, T, p3.data());
+        qwen4_mrope3_slice(v.mrope3.data(), v.n, v.delta, start, T, p3.data());
         fleet_->dev(dev).h2d(w.positions3, p3.data(), p3.size() * sizeof(int32_t));
     }
 }
 
-// The staged projector rows over the piece's gathered embedding rows (f16 row copies on the embed card's in-order queue),
-// through the embed card's pinned stage (blocking).
-void Qwen35MoeSplitModel::splice_vision(sycl::queue&, sycl::half* x, uint32_t start, uint32_t T) {
-    if (vis_spans_.empty()) return;
+// v's projector rows over the piece's gathered embedding rows (f16 row copies on the embed card's in-order queue), through
+// the embed card's pinned stage (blocking).
+void Qwen35MoeSplitModel::splice_vision(sycl::half* x, uint32_t start, uint32_t T, const VisStage& v) {
+    if (v.spans.empty()) return;
     const uint32_t H = cfg_.hidden;
-    for (const Qwen4VisSplice& r : qwen4_vis_splice_ranges(vis_spans_, start, T))
-        fleet_->dev(plan_.embed_dev).h2d(x + uint64_t(r.dst) * H, vis_rows_.data() + uint64_t(r.src) * H,
+    for (const Qwen4VisSplice& r : qwen4_vis_splice_ranges(v.spans, start, T))
+        fleet_->dev(plan_.embed_dev).h2d(x + uint64_t(r.dst) * H, v.rows.data() + uint64_t(r.src) * H,
                                          uint64_t(r.n) * H * sizeof(sycl::half));
 }
 
 // One card's layers of a T-row step at start_pos (the selected lane's state on that card): x → x in ws_[dev].
 void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_pos, bool dbg_timing,
-                                     double& t_attn, double& t_moe) {
+                                     double& t_attn, double& t_moe, bool mrope) {
     const uint32_t H    = cfg_.hidden;                  // 2048
     const uint32_t HD   = cfg_.head_dim;                // 256
     const uint32_t N_q  = cfg_.n_q_heads  * HD;         // 4096
@@ -1153,7 +1174,7 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
             sgemv(dev, w.x_normed, w_l.attn_v, w.v, H, N_kv, T);
             DPE(dev, kAttnPre, rms_norm_f32w(q, w.q, w_l.attn_q_norm, w.q, T * cfg_.n_q_heads,  HD, eps));
             DPE(dev, kAttnPre, rms_norm_f32w(q, w.k, w_l.attn_k_norm, w.k, T * cfg_.n_kv_heads, HD, eps));
-            if (mrope_n_) {   // P4 B45 vision: the 3-stream M-RoPE (== rope_partial when the streams are equal)
+            if (mrope) {   // P4 B45 vision: the 3-stream M-RoPE (== rope_partial when the streams are equal)
                 rope_imrope3(q, w.q, w.positions3, w.q, T, cfg_.n_q_heads,  HD, rope_n, cfg_.rope_theta);
                 rope_imrope3(q, w.k, w.positions3, w.k, T, cfg_.n_kv_heads, HD, rope_n, cfg_.rope_theta);
             } else {
@@ -1620,7 +1641,7 @@ std::string Qwen35MoeSplitModel::init_lanes(uint32_t n_lanes, uint32_t lane_ctx,
     }
     if (fit) {
         n_lanes = fit->n = lanes_auto_fit(fit->cards, fit->n_max);
-        if (n_lanes < 2) { lane_bytes_.clear(); return {}; }   // one lane: nothing allocated (the workspace keeps its size)
+        if (n_lanes < 2) { lane_bytes_.clear(); lane_vis_.assign(1, VisStage{}); return {}; }   // one lane: nothing allocated (the workspace keeps its size)
     }
     lane_ctx_ = lane_ctx;
     lane_kv_.resize(n_lanes - 1);
@@ -1678,6 +1699,7 @@ std::string Qwen35MoeSplitModel::init_lanes(uint32_t n_lanes, uint32_t lane_ctx,
         rows_partials_[dev] = static_cast<float*>(p);
         rows_table_[dev] = t;
     }
+    lane_vis_.assign(this->n_lanes(), VisStage{});   // (2026-10-21: per-lane images; sized before any stage thread reads it)
     return {};
 }
 
@@ -1721,22 +1743,24 @@ std::string Qwen35MoeSplitModel::forward_stage(uint32_t dev, uint32_t lane, cons
     if (T == 0) return "T == 0";
     if (aborting(T)) return kStopped;
     if (lane >= n_lanes() || n_dev_ > 2 || dev >= n_dev_ || !lane_logits_) return "forward_stage: no such lane/card (lanes not initialised?)";
-    if (vision_active()) return "forward_stage: vision is staged but the lanes have no per-lane image state (P4 B45 step 3)";
+    if (vision_active()) return "forward_stage: the --parallel 1 image staging is set while the lanes run";
     if (auto m = ensure_ws(dev, T); !m.empty()) return m;
     cur_[dev] = lane;
     auto& q = fleet_->dev(dev).queue();
     Workspace& w = ws_[dev];
+    // the lane's images (set in its serial turn): every piece ropes through the lane's table (prompt rows from it, later
+    // rows at position + delta); the KV index stays the token position. Without: the text path (static: no table, no spans)
+    static const VisStage kText;
+    const VisStage& lv = lane_vision_active(lane) ? lane_vis_[lane] : kText;
     // forward()'s per-card order: positions, the reset at pos 0, the embedding (card 0) or the residual in (card 1), the
     // layers, then the residual out (card 0) or the head (card 1)
-    std::vector<int32_t> pos(T);
-    for (uint32_t t = 0; t < T; ++t) pos[t] = int32_t(pos0 + t);
-    if (w.positions) fleet_->dev(dev).h2d(w.positions, pos.data(), T * sizeof(int32_t));
+    if (w.positions) upload_positions(dev, pos0, T, lv);
     if (pos0 == 0) {
         if (dn_at(dev).ready()) dn_at(dev).reset(q);
         if (kv_at(dev).ready()) kv_at(dev).reset();
     }
     const uint64_t xb = uint64_t(T) * cfg_.hidden * sizeof(sycl::half);
-    if (dev == plan_.embed_dev) { if (auto m = embed(ids, T, pos0); !m.empty()) return m; }
+    if (dev == plan_.embed_dev) { if (auto m = embed(ids, T, pos0, lv); !m.empty()) return m; }
     else fleet_->dev(dev).h2d(w.x, x_host, xb);
     if (look && !ls_.rows) return "forward_stage: a lookup round without look_step_init";
     if (look == 1) {   // P4 B55: the lane's state before the round, aside
@@ -1751,7 +1775,7 @@ std::string Qwen35MoeSplitModel::forward_stage(uint32_t dev, uint32_t lane, cons
     }
     double t_attn = 0.0, t_moe = 0.0;
     look_rows_[dev] = look != 0;
-    run_layers(dev, T, pos0, false, t_attn, t_moe);
+    run_layers(dev, T, pos0, false, t_attn, t_moe, lv.n != 0);
     look_rows_[dev] = false;
     if (aborting(T)) { q.wait(); return kStopped; }   // (P4 B33: nothing of the step still runs on the card)
     if (dev != plan_.head_dev) { fleet_->dev(dev).d2h(x_host, w.x, xb); return {}; }
@@ -1988,17 +2012,25 @@ std::string Qwen35MoeSplitModel::forward_stage_rows(uint32_t dev, std::span<cons
         if (pos0[i] == 0) return "forward_stage_rows: lane " + std::to_string(lanes[i]) + " at position 0 (a group row never starts a sequence)";
     }
     if (dev == plan_.embed_dev && !ids) return "forward_stage_rows: no ids";
-    if (vision_active()) return "forward_stage_rows: vision is staged but the lanes have no per-lane image state (P4 B45 step 3)";
+    if (vision_active()) return "forward_stage_rows: the --parallel 1 image staging is set while the lanes run";
+    for (uint32_t i = 0; i < G; ++i)
+        if (lane_vision_active(lanes[i]) && pos0[i] < lane_vis_[lanes[i]].n)
+            return "forward_stage_rows: lane " + std::to_string(lanes[i]) + " has a group row at " + std::to_string(pos0[i]) +
+                   ", inside its image prompt (" + std::to_string(lane_vis_[lanes[i]].n) + " rows)";
     if (auto m = ensure_ws(dev, G); !m.empty()) return m;
     auto& q = fleet_->dev(dev).queue();
     Workspace& w = ws_[dev];
     if (kv_[dev].ready() && !w.attn_partials) return "forward_stage_rows: no decode attention scratch on card " + std::to_string(dev);
+    // the rope positions (w.positions is read only by the rope): a lane with images ropes its decode row at position + delta
+    // (its table's past-the-prompt rule); the KV index and length stay pos0
     int32_t pos[kMaxRows];
-    for (uint32_t i = 0; i < G; ++i) pos[i] = int32_t(pos0[i]);
+    for (uint32_t i = 0; i < G; ++i)
+        pos[i] = int32_t(pos0[i]) + (lane_vision_active(lanes[i]) ? lane_vis_[lanes[i]].delta : 0);
     fleet_->dev(dev).h2d(w.positions, pos, G * sizeof(int32_t));
     const uint64_t xb = uint64_t(G) * cfg_.hidden * sizeof(sycl::half);
-    // (the G rows are one decode row each of different lanes: no piece position; the splice is a no-op -- guarded above)
-    if (dev == plan_.embed_dev) { if (auto m = embed(ids, G, /*start_pos=*/0); !m.empty()) return m; }
+    // (the G rows are one decode row each of different lanes: no piece position, nothing to splice)
+    static const VisStage kText;
+    if (dev == plan_.embed_dev) { if (auto m = embed(ids, G, /*start_pos=*/0, kText); !m.empty()) return m; }
     else fleet_->dev(dev).h2d(w.x, x_host, xb);
     run_layers_rows(dev, lanes, pos0);
     if (dev != plan_.head_dev) { fleet_->dev(dev).d2h(x_host, w.x, xb); return {}; }

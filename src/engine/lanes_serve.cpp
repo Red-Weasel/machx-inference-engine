@@ -163,6 +163,7 @@ void LanesServe::end_lane(Lane& l, const std::string& finish, bool lost) {
     l.lost = l.lost || lost; l.phase = Lane::Phase::kDone; l.parked = false; l.next = -1; l.reprep = false;
     if (look_owner_ == int(&l - lanes_.data())) look_owner_ = -1;   // (P4 B55)
     l.look_n = l.redo_n = 0; l.redo_fly = l.look_end = false;
+    l.draft_n = 0;   // (2026-10-21)
     fifo_drop(uint32_t(&l - lanes_.data()));
     cv_.notify_all();
 }
@@ -376,6 +377,9 @@ void LanesServe::submit(Lane& l, uint32_t li) {
     } else if (look_try(l, li)) {
         l.pend = 0;
         e = m_.pipe_submit_look(li, l.look_ids.data(), l.look_n, l.look_base);
+    } else if (draft_try(l, li)) {   // 2026-10-21: an MTP round
+        l.pend = 0;
+        e = m_.pipe_submit_draft(li, l.draft_ids.data(), l.draft_n, l.draft_base);
     } else {
         l.pend = 0;
         e = m_.pipe_submit(li, &l.next, 1, l.pos);
@@ -534,6 +538,7 @@ bool LanesServe::step_landed(Lane& l, uint32_t li) {
         return false;
     }
     if (l.look_n) { look_landed(l, li); return false; }   // P4 B55: a lookup round
+    if (l.draft_n) { draft_landed(l, li); return false; }  // 2026-10-21: an MTP round
     ++steps_; ++l.steps; ++l.dsteps;
     step_ms_ = steps_ == 1 ? step : 0.9 * step_ms_ + 0.1 * step;
     l.pos += 1;
@@ -581,20 +586,10 @@ void LanesServe::look_landed(Lane& l, uint32_t li) {
         look_gap_t0_ = Clock::now();
     }
     const LanesSampling& sp = l.rq->sp;
-    // row r's sampler as if rows 0..r-1 were followed: the window over hist ++ drafts, the seed of the (n_new + r)-th id
     std::vector<int32_t> ext;
-    std::vector<std::span<const int32_t>> wins(R);
-    std::vector<uint64_t> seeds(R);
-    if (sp.penalties()) {
-        ext = l.hist;
-        ext.insert(ext.end(), l.look_ids.begin() + 1, l.look_ids.end());
-        for (uint32_t r = 0; r < R; ++r) {
-            const size_t end = l.hist.size() + r;
-            const size_t nw = std::min<size_t>({size_t(sp.repeat_window), end, size_t(512)});
-            wins[r] = std::span<const int32_t>(ext.data() + (end - nw), nw);
-        }
-    }
-    for (uint32_t r = 0; r < R; ++r) seeds[r] = l.rq->rng + l.n_new + r;
+    std::vector<std::span<const int32_t>> wins;
+    std::vector<uint64_t> seeds;
+    round_samplers(l, l.look_ids, R, ext, wins, seeds);
     std::vector<int32_t> picks(R, 0);
     std::string err;
     try { err = m_.sample_look(li, R, sp, wins, seeds, picks); }
@@ -626,6 +621,79 @@ void LanesServe::look_landed(Lane& l, uint32_t li) {
     l.redo_n = acc; l.look_end = ended; l.look_finish = ended ? l.finish : std::string();
     if (ended) l.finish.clear();   // (end_lane sets it when the redo landed)
     if (stopping_) { end_lane(l, "abort", true); return; }
+    decode_next(l, li);
+}
+
+void LanesServe::round_samplers(const Lane& l, const std::vector<int32_t>& ids, uint32_t R, std::vector<int32_t>& ext,
+                                std::vector<std::span<const int32_t>>& wins, std::vector<uint64_t>& seeds) const {
+    const LanesSampling& sp = l.rq->sp;
+    wins.assign(R, {});
+    seeds.assign(R, 0);
+    if (sp.penalties()) {
+        ext = l.hist;
+        ext.insert(ext.end(), ids.begin() + 1, ids.begin() + R);
+        for (uint32_t r = 0; r < R; ++r) {
+            const size_t end = l.hist.size() + r;
+            const size_t nw = std::min<size_t>({size_t(sp.repeat_window), end, size_t(512)});
+            wins[r] = std::span<const int32_t>(ext.data() + (end - nw), nw);
+        }
+    }
+    for (uint32_t r = 0; r < R; ++r) seeds[r] = l.rq->rng + l.n_new + r;
+}
+
+// ---- 2026-10-21: MTP draft rounds (mu held throughout) -------------------------------------------------------------------------
+
+bool LanesServe::draft_try(Lane& l, uint32_t li) {
+    if (!o_.draft) return false;
+    const uint32_t V = m_.draft_rows();
+    if (V < 2 || decoding() > o_.draft_max) return false;
+    const uint32_t room = std::min(l.max_new - l.n_new, l.cap > l.pos ? l.cap - l.pos : 0u);   // a row may give one id
+    if (room < V) return false;
+    std::vector<int32_t> d;
+    std::string e;
+    try { e = m_.draft(li, l.next, l.pos, l.rq->sp, l.rq->rng + l.n_new, d); }
+    catch (const std::exception& x) { e = std::string("threw: ") + x.what(); }
+    if (!e.empty()) {   // the lane takes plain steps; the reply is the same
+        if (!draft_said_) std::fprintf(stderr, "[%s] lane %u MTP draft: %s -- plain steps\n", m_.tag(), li, e.c_str());
+        draft_said_ = true;
+        return false;
+    }
+    if (d.size() + 1 != V) return false;   // (no hidden for pos - 1 yet: this plain step leaves one)
+    l.draft_ids.assign(1, l.next);
+    l.draft_ids.insert(l.draft_ids.end(), d.begin(), d.end());
+    l.draft_n = V; l.draft_base = l.pos;
+    ++draft_rounds_; draft_drafted_ += V - 1;
+    return true;
+}
+
+void LanesServe::draft_landed(Lane& l, uint32_t li) {
+    const uint32_t R = l.draft_n;
+    l.draft_n = 0;
+    ++steps_; ++l.steps;
+    const LanesSampling& sp = l.rq->sp;
+    std::vector<int32_t> ext;
+    std::vector<std::span<const int32_t>> wins;
+    std::vector<uint64_t> seeds;
+    round_samplers(l, l.draft_ids, R, ext, wins, seeds);
+    std::vector<int32_t> picks(R, 0);
+    std::string err;
+    try { err = m_.sample_draft(li, R, sp, wins, seeds, picks); }
+    catch (const std::exception& x) { err = std::string("threw: ") + x.what(); }
+    if (!err.empty()) { end_lane(l, std::string("error: ") + m_.tag() + " lane " + std::to_string(li) + " MTP sample: " + err, true); return; }
+    uint32_t acc = 0;      // rows followed: the lane's state must end at draft_base + acc
+    bool ended = false;
+    for (uint32_t r = 0; r < R; ++r) {
+        acc = r + 1; l.pos = l.draft_base + acc; ++l.dsteps;
+        if (!commit(l, picks[r])) { ended = true; break; }
+        l.next = picks[r];
+        if (r + 1 < R && picks[r] != l.draft_ids[r + 1]) break;
+    }
+    draft_hits_ += acc - 1;
+    try { err = m_.draft_keep(li, R, acc, l.draft_base); }
+    catch (const std::exception& x) { err = std::string("threw: ") + x.what(); }
+    if (!err.empty()) { end_lane(l, std::string("error: ") + m_.tag() + " lane " + std::to_string(li) + " MTP keep: " + err, true); return; }
+    if (o_.trace) std::fprintf(stderr, "[%s step] lane %u MTP %u row(s) at %u: %u followed\n", m_.tag(), li, R, l.draft_base, acc);
+    if (ended) { end_lane(l, l.finish, false); return; }
     decode_next(l, li);
 }
 
@@ -873,6 +941,7 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     l.idx_on = look_on; if (look_on) l.idx = std::move(look_idx);   // (P4 B55)
     l.look_n = l.redo_n = l.look_streak = l.look_blocked = 0; l.redo_fly = l.look_end = false;
     l.look_block_len = o_.look_block; l.look_grow = o_.look_probe;
+    l.draft_n = 0;   // (2026-10-21)
     l.max_new = lanes_reply_budget(T, rq.sp.max_tokens, l.cap); l.n_new = 0;   // (T < l.cap)
     uint32_t others = 0;                                               // lanes of other requests still running
     for (uint32_t k = 0; k < lanes_.size(); ++k) others += k != lane && lanes_[k].busy && lanes_[k].phase != Lane::Phase::kDone;
@@ -1199,6 +1268,11 @@ std::string LanesServe::status_json() const {
         js.pop_back();
         js += ",\"lookup\":{\"rounds\":" + std::to_string(look_rounds_) + ",\"drafted\":" + std::to_string(look_drafted_) +
               ",\"followed\":" + std::to_string(look_hits_) + ",\"redos\":" + std::to_string(look_redos_) + "}}";
+    }
+    if (o_.draft) {   // (2026-10-21)
+        js.pop_back();
+        js += ",\"mtp\":{\"rounds\":" + std::to_string(draft_rounds_) + ",\"drafted\":" + std::to_string(draft_drafted_) +
+              ",\"followed\":" + std::to_string(draft_hits_) + "}}";
     }
     return js;
 }

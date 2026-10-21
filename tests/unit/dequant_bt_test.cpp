@@ -91,6 +91,15 @@ int main() {
         fails += check(q, W, sizeof(ie::block_q5_K), K, N, "Q5_K",
                        ie::dequant_q5_K_to_Bt, ie::dequant_q5_K);
     }
+    // 2026-10-21: N not a multiple of 64 -- the tiled kernels' grid is whole 64-column groups (they dropped the tail
+    // before the guard); the per-(block, column) fallback takes any N.
+    {
+        const uint32_t N2 = 96;
+        const auto W4 = rand_blocks<true>(size_t(N2) * (K / 256), sizeof(ie::block_q4_K), rng);
+        fails += check(q, W4, sizeof(ie::block_q4_K), K, N2, "Q4_K", ie::dequant_q4_K_to_Bt, ie::dequant_q4_K);
+        const auto W5 = rand_blocks<true>(size_t(N2) * (K / 256), sizeof(ie::block_q5_K), rng);
+        fails += check(q, W5, sizeof(ie::block_q5_K), K, N2, "Q5_K", ie::dequant_q5_K_to_Bt, ie::dequant_q5_K);
+    }
     // Q8_0 (34 B, 32 elem/blk): K/32 blocks per column.
     {
         const auto W = rand_blocks<false>(size_t(N) * (K / 32), sizeof(ie::block_q8_0), rng);

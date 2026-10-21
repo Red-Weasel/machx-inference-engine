@@ -12,8 +12,12 @@
 // Primitive + memory-desc creation is cached per (M, N, K) — decode/prefill
 // shapes recur every layer/step.  The dnnl engine/stream wrap the caller's
 // in-order SYCL queue, so ordering with surrounding kernels is automatic.
+// The scratch is the queue's one buffer (scratchpad_mode::user,
+// ie/onednn_scratch.hpp): a cached primitive owns no device memory.
 
 #include "ie/ops.hpp"
+
+#include "ie/onednn_scratch.hpp"
 
 #include <sycl/sycl.hpp>
 
@@ -21,9 +25,11 @@
 #include <dnnl_sycl.hpp>
 
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -47,12 +53,16 @@ static bool onednn_deterministic() {
 struct CachedMatmul {
     dnnl::matmul prim;
     dnnl::memory a_mem, b_mem, y_mem;   // handles swapped per call
+    dnnl::memory sp_mem;                // the queue's scratch, when the primitive needs one
+    size_t       sp_bytes = 0;
 };
 struct CachedS8 {
     bool             ok = false;      // false => no primitive; `why` says so
     std::string      impl;            // impl_info_str(), or the failure reason
     dnnl::matmul     prim;
     dnnl::memory     a_mem, b_mem, y_mem, s_mem;
+    dnnl::memory     sp_mem;          // the queue's scratch, when the primitive needs one
+    size_t           sp_bytes = 0;
 };
 
 struct OnednnCtx {
@@ -106,9 +116,11 @@ sycl::event gemm_fp16_onednn(sycl::queue& q,
         dnnl::memory::desc y_md({M, N}, dt::f16, tag::ab);
         dnnl::primitive_attr attr;
         attr.set_deterministic(onednn_deterministic());
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         dnnl::matmul::primitive_desc pd(ctx.eng, a_md, b_md, y_md, attr);
         CachedMatmul cm;
         cm.prim  = dnnl::matmul(pd);
+        onednn_scratch_desc(pd, ctx.eng, cm.sp_mem, cm.sp_bytes);
         cm.a_mem = dnnl::memory(a_md, ctx.eng, nullptr);
         cm.b_mem = dnnl::memory(b_md, ctx.eng, nullptr);
         cm.y_mem = dnnl::memory(y_md, ctx.eng, nullptr);
@@ -122,11 +134,13 @@ sycl::event gemm_fp16_onednn(sycl::queue& q,
     cm.b_mem.set_data_handle(const_cast<sycl::half*>(B));
     cm.y_mem.set_data_handle(y);
 
-    return dnnl::sycl_interop::execute(
-        cm.prim, ctx.strm,
+    std::string err;
+    sycl::event e = onednn_execute(q, ctx.strm, cm.prim,
         {{DNNL_ARG_SRC, cm.a_mem}, {DNNL_ARG_WEIGHTS, cm.b_mem},
          {DNNL_ARG_DST, cm.y_mem}},
-        deps);
+        cm.sp_mem, cm.sp_bytes, deps, err);
+    if (!err.empty()) throw std::runtime_error("oneDNN matmul: " + err);
+    return e;
 }
 
 bool onednn_available() noexcept { return true; }
@@ -160,9 +174,11 @@ sycl::event gemm_nt_f16_onednn(sycl::queue& q,
         dnnl::memory::desc y_md({M, N}, dt::f32, tag::ab);
         dnnl::primitive_attr attr;
         attr.set_deterministic(onednn_deterministic());
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         dnnl::matmul::primitive_desc pd(ctx.eng, a_md, b_md, y_md, attr);
         CachedMatmul cm;
         cm.prim  = dnnl::matmul(pd);
+        onednn_scratch_desc(pd, ctx.eng, cm.sp_mem, cm.sp_bytes);
         cm.a_mem = dnnl::memory(a_md, ctx.eng, nullptr);
         cm.b_mem = dnnl::memory(b_md, ctx.eng, nullptr);
         cm.y_mem = dnnl::memory(y_md, ctx.eng, nullptr);
@@ -174,11 +190,13 @@ sycl::event gemm_nt_f16_onednn(sycl::queue& q,
     cm.b_mem.set_data_handle(const_cast<sycl::half*>(W));
     cm.y_mem.set_data_handle(y);
 
-    return dnnl::sycl_interop::execute(
-        cm.prim, ctx.strm,
+    std::string err;
+    sycl::event e = onednn_execute(q, ctx.strm, cm.prim,
         {{DNNL_ARG_SRC, cm.a_mem}, {DNNL_ARG_WEIGHTS, cm.b_mem},
          {DNNL_ARG_DST, cm.y_mem}},
-        deps);
+        cm.sp_mem, cm.sp_bytes, deps, err);
+    if (!err.empty()) throw std::runtime_error("oneDNN matmul: " + err);
+    return e;
 }
 
 // The fp32 twin of gemm_nt_f16_onednn: A [M, K], W [N, K] (read in place, the same strides trick) and y all fp32,
@@ -201,10 +219,12 @@ sycl::event gemm_nt_f32_onednn(sycl::queue& q,
         dnnl::memory::desc y_md({M, N}, dt::f32, tag::ab);
         dnnl::primitive_attr attr;
         attr.set_deterministic(onednn_deterministic());
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         attr.set_fpmath_mode(dnnl::fpmath_mode::strict);
         dnnl::matmul::primitive_desc pd(ctx.eng, a_md, b_md, y_md, attr);
         CachedMatmul cm;
         cm.prim  = dnnl::matmul(pd);
+        onednn_scratch_desc(pd, ctx.eng, cm.sp_mem, cm.sp_bytes);
         cm.a_mem = dnnl::memory(a_md, ctx.eng, nullptr);
         cm.b_mem = dnnl::memory(b_md, ctx.eng, nullptr);
         cm.y_mem = dnnl::memory(y_md, ctx.eng, nullptr);
@@ -216,11 +236,13 @@ sycl::event gemm_nt_f32_onednn(sycl::queue& q,
     cm.b_mem.set_data_handle(const_cast<float*>(W));
     cm.y_mem.set_data_handle(y);
 
-    return dnnl::sycl_interop::execute(
-        cm.prim, ctx.strm,
+    std::string err;
+    sycl::event e = onednn_execute(q, ctx.strm, cm.prim,
         {{DNNL_ARG_SRC, cm.a_mem}, {DNNL_ARG_WEIGHTS, cm.b_mem},
          {DNNL_ARG_DST, cm.y_mem}},
-        deps);
+        cm.sp_mem, cm.sp_bytes, deps, err);
+    if (!err.empty()) throw std::runtime_error("oneDNN matmul: " + err);
+    return e;
 }
 
 // ---------------------------------------------------------------------------
@@ -280,10 +302,12 @@ CachedS8& s8_entry(sycl::queue& q, uint32_t M, uint32_t N, uint32_t K, uint32_t 
         attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1),
                         dnnl::memory::dims{int64_t(g), 1}, dt::f16);
         attr.set_deterministic(onednn_deterministic());
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
         dnnl::matmul::primitive_desc pd(ctx.eng, a_md, b_md, y_md, attr);
         cm.impl  = pd.impl_info_str();
         cm.prim  = dnnl::matmul(pd);
+        onednn_scratch_desc(pd, ctx.eng, cm.sp_mem, cm.sp_bytes);
         cm.a_mem = dnnl::memory(a_md, ctx.eng, nullptr);
         cm.b_mem = dnnl::memory(b_md, ctx.eng, nullptr);
         cm.y_mem = dnnl::memory(y_md, ctx.eng, nullptr);
@@ -315,11 +339,16 @@ bool gemm_nt_s8_onednn(sycl::queue& q,
     cm.b_mem.set_data_handle(const_cast<int8_t*>(qs));
     cm.y_mem.set_data_handle(y);
     cm.s_mem.set_data_handle(const_cast<sycl::half*>(d));
-    *out = dnnl::sycl_interop::execute(
-        cm.prim, ctx_for(q).strm,
+    std::string err;
+    sycl::event e = onednn_execute(q, ctx_for(q).strm, cm.prim,
         {{DNNL_ARG_SRC, cm.a_mem}, {DNNL_ARG_WEIGHTS, cm.b_mem}, {DNNL_ARG_DST, cm.y_mem},
          {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, cm.s_mem}},
-        deps);
+        cm.sp_mem, cm.sp_bytes, deps, err);
+    if (!err.empty()) {
+        std::fprintf(stderr, "[onednn] s8 product not run (%s): the caller's other path\n", err.c_str());
+        return false;
+    }
+    *out = e;
     return true;
 }
 
@@ -352,9 +381,11 @@ sycl::event gemm_bmm_nt_f16_onednn(sycl::queue& q,
                                 dnnl::memory::dims{OPG, int64_t(G) * OPG, 1});
         dnnl::primitive_attr attr;
         attr.set_deterministic(onednn_deterministic());
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         dnnl::matmul::primitive_desc pd(ctx.eng, a_md, b_md, y_md, attr);
         CachedMatmul cm;
         cm.prim  = dnnl::matmul(pd);
+        onednn_scratch_desc(pd, ctx.eng, cm.sp_mem, cm.sp_bytes);
         cm.a_mem = dnnl::memory(a_md, ctx.eng, nullptr);
         cm.b_mem = dnnl::memory(b_md, ctx.eng, nullptr);
         cm.y_mem = dnnl::memory(y_md, ctx.eng, nullptr);
@@ -366,11 +397,13 @@ sycl::event gemm_bmm_nt_f16_onednn(sycl::queue& q,
     cm.b_mem.set_data_handle(const_cast<sycl::half*>(W));
     cm.y_mem.set_data_handle(y);
 
-    return dnnl::sycl_interop::execute(
-        cm.prim, ctx.strm,
+    std::string err;
+    sycl::event e = onednn_execute(q, ctx.strm, cm.prim,
         {{DNNL_ARG_SRC, cm.a_mem}, {DNNL_ARG_WEIGHTS, cm.b_mem},
          {DNNL_ARG_DST, cm.y_mem}},
-        deps);
+        cm.sp_mem, cm.sp_bytes, deps, err);
+    if (!err.empty()) throw std::runtime_error("oneDNN matmul: " + err);
+    return e;
 }
 
 }  // namespace ie

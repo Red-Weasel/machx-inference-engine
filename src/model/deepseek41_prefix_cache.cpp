@@ -116,6 +116,9 @@ std::string Ds41Forward::set_prefix_cache(bool on, const PrefixCacheOptions& o) 
                             " IHD" + std::to_string(c.index_head_dim) + " W" + std::to_string(c.window_size) + " R";
         for (uint32_t L = 0; L < c.n_layers; ++L) model += std::to_string(m_->layers()[L].kind.compress_ratio) + (m_->layers()[L].kind.is_kv_source ? "s" : "");
         if (m_->embed.w && m_->embed.w->data) model += " E" + std::to_string(ds41pc_fnv(m_->embed.w->data, std::min<size_t>(m_->embed.w->nbytes, 1u << 20)));
+        // tensor parallel (2026-10-20): n parts sum their partials in another order than one card does, so an entry is its
+        // part count's only (and its entries hold every layer on every card); the layer split's key is unchanged
+        if (tp_) model += " TP" + std::to_string(tp_);
         std::string runtime = onednn_runtime_version();
         for (size_t ci = 0; ci < cards_.size(); ++ci) {
             const sycl::device dev = cards_[ci]->q->get_device();
@@ -202,6 +205,7 @@ std::string Ds41Forward::pc_restore_live(const PcCkpt& e, size_t index) {
         }
     }
     for (auto& cp : cards_) cp->q->wait_and_throw();
+    mirror_sync(lane_, false);   // 2026-10-20: the boundary mirrors keep the rows below the restored counts
     return {};
 }
 
@@ -316,6 +320,7 @@ std::string Ds41Forward::pc_load_slot(PcSlot& s, size_t k) {
         }
     }
     S.n_pos = e.pos; S.all_ids.assign(s.ids.begin(), s.ids.begin() + e.pos);
+    mirror_sync(lane_, true);   // 2026-10-20: another conversation's rows -- the next forward sends the mirrors everything
     // the slot's checkpoints at or below the restored position become the live ones again (the highest first)
     {
         std::lock_guard<std::mutex> lk(pc_mu_);
@@ -475,7 +480,10 @@ std::string Ds41Forward::prefix_persist(uint32_t pos) {
     if (bytes > pc_opt_.disk_budget) return {};
     body.resize(floats);
     uint64_t at = 0;
-    for (size_t ci = 0; ci < cards_.size(); ++ci) {
+    // the body holds each layer once, in model order: the layer split's cards hold disjoint ascending ranges; under tensor
+    // parallel every card holds every layer with the same bits (the stream is all-reduced before each cache write), so
+    // card 0 alone is the body (2026-10-20: walking every card wrote the body twice over -- a segfault after a long prompt)
+    for (size_t ci = 0; ci < (tp_ ? size_t(1) : cards_.size()); ++ci) {
         Card& card = *cards_[ci]; sycl::queue& q = *card.q; float* bb = pc_bounce_[ci];
         const float* blk = S.pc_pool[ci][size_t(idx)];
         for (uint32_t L = card.L0; L < card.L1; ++L) {
@@ -561,7 +569,10 @@ std::string Ds41Forward::pc_load_disk(const PcDisk& d) {
         std::lock_guard<std::mutex> lk(pc_mu_);
         for (auto& x : S.pc_ckpts) x = PcCkpt{};
     }
-    for (size_t ci = 0; ci < cards_.size(); ++ci) {
+    // tensor parallel: the file is read once (card 0's pass, every layer) and each piece goes to every card as it lands --
+    // they hold every layer with the same bits; the layer split reads each card's own range in turn, as before
+    const size_t n_pass = tp_ ? size_t(1) : cards_.size();
+    for (size_t ci = 0; ci < n_pass; ++ci) {
         Card& card = *cards_[ci]; sycl::queue& q = *card.q; float* bb = pc_bounce_[ci]; float* blk = S.pc_pool[ci][0];
         // the file holds the layers in model order, and the cards' ranges are contiguous and ascending
         for (uint32_t L = card.L0; L < card.L1; ++L) {
@@ -574,22 +585,45 @@ std::string Ds41Forward::pc_load_disk(const PcDisk& d) {
                 if (!f.r(blk + off + WIN * HD, 2 * R * HD * 4)) return "truncated half";
                 q.memcpy(st.part_kv, blk + off + WIN * HD, R * HD * 4); q.memcpy(st.part_gate, blk + off + WIN * HD + R * HD, R * HD * 4);
             }
+            if (tp_)   // the ring and the halves into the other cards' pools and states
+                for (size_t cr = 1; cr < cards_.size(); ++cr) {
+                    Card& cd = *cards_[cr]; auto& sr = cd.state[lane_][L]; float* br = S.pc_pool[cr][0] + pc_off_[cr][L];
+                    std::memcpy(br, blk + off, WIN * HD * 4); cd.q->memcpy(sr.win_kv, br, WIN * HD * 4);
+                    if (k.is_kv_source && k.compress_ratio > 1) {
+                        const uint64_t R = k.compress_ratio;
+                        std::memcpy(br + WIN * HD, blk + off + WIN * HD, 2 * R * HD * 4);
+                        cd.q->memcpy(sr.part_kv, br + WIN * HD, R * HD * 4); cd.q->memcpy(sr.part_gate, br + WIN * HD + R * HD, R * HD * 4);
+                    }
+                }
             if (k.is_kv_source) {
                 const uint64_t nr = e.nc[L];
-                for (const auto& [dst, width] : {std::pair<float*, uint64_t>{st.comp_kv, HD}, {st.idx_k, IHD}})
+                for (const bool idx_k : {false, true}) {
+                    const uint64_t width = idx_k ? IHD : HD;
+                    float* dst = idx_k ? st.idx_k : st.comp_kv;
                     for (uint64_t r0 = 0; r0 < nr; ) {
                         const uint64_t rn = std::min<uint64_t>(nr - r0, pc_bounce_n_ / width);
                         q.wait();                                           // the bounce is reused: the previous copy must have landed
                         if (!f.r(bb, rn * width * 4)) return "truncated latents";
                         q.memcpy(dst + r0 * width, bb, rn * width * 4);
+                        if (tp_)
+                            for (size_t cr = 1; cr < cards_.size(); ++cr) {
+                                Card& cd = *cards_[cr]; auto& sr = cd.state[lane_][L]; float* bbr = pc_bounce_[cr];
+                                cd.q->wait();                               // its bounce too
+                                std::memcpy(bbr, bb, rn * width * 4);
+                                cd.q->memcpy((idx_k ? sr.idx_k : sr.comp_kv) + r0 * width, bbr, rn * width * 4);
+                            }
                         r0 += rn;
                     }
+                }
             }
             st.nc = e.nc[L]; st.part_valid = e.part_valid[L] != 0;
+            if (tp_) for (size_t cr = 1; cr < cards_.size(); ++cr) { auto& sr = cards_[cr]->state[lane_][L]; sr.nc = e.nc[L]; sr.part_valid = e.part_valid[L] != 0; }
         }
         q.wait_and_throw();
+        if (tp_) for (size_t cr = 1; cr < cards_.size(); ++cr) cards_[cr]->q->wait_and_throw();
     }
     S.n_pos = n; S.all_ids = ids;
+    mirror_sync(lane_, true);   // 2026-10-20: as for a host slot
     {
         std::lock_guard<std::mutex> lk(pc_mu_);
         S.pc_ckpts[0] = e; S.pc_ckpts[0].tick = ++pc_tick_;

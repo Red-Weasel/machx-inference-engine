@@ -14,12 +14,18 @@
 // steady-window aggregate tokens/s against the mean of the solo arms. --slot-arm: a lane's conversation kept in a host slot
 // (the per-lane live checkpoints, the shared slots) when an unrelated prompt arrives on that lane, restored into ANOTHER
 // lane, the continuation identical to a control that never left lane 0.
+// 2026-10-20 (more than 2 cards): the cards are ie serve's (deepseek41_cards.hpp; IE_DS41_LOGICAL_CARDS=2 runs 4 stages on two
+// B70s). --static N --pinned P fix every layer's tiers (the budgets otherwise follow the free VRAM, which differs between
+// card counts); --dump F writes the solo and slot-arm traces (logits FNVs, tokens, positions) so two runs -- 2 cards and 4
+// -- can be compared byte for byte (tools/ds41_lanes_dump_compare.py).
 //   usage: ie-ds41-lanes-test <model_dir> (--prompt-file F | --user-file F)... [--lanes L] [--n N] [--ctx C] [--lane-ctx C2]
 //          [--chunk C] [--lookup] [--cpu-miss] [--pipeline] [--aba] [--slot-arm] [--tables DIR] [--ranking FILE]
+//          [--static N --pinned P] [--dump FILE]
 //   --prompt-file: the text as is (a rendered prompt); --user-file: the text as one user turn in the V4.1 chat format (no
 //   thinking). The engram tables default to the model directory, the ranking to ie_ranking_decode_chat.txt beside the model
 //   (else ie_ranking_heldout.txt), the expert tail file beside the model is used when present -- ie serve's configuration.
 #include "ie/deepseek41.hpp"
+#include "ie/deepseek41_cards.hpp"
 #include "ie/deepseek41_engram.hpp"
 #include "ie/deepseek41_forward.hpp"
 #include "ie/deepseek41_prompt.hpp"
@@ -187,13 +193,13 @@ struct Seq {
 int main(int argc, char** argv) {
     if (argc < 3) {
         std::fprintf(stderr, "usage: ie-ds41-lanes-test <model_dir> (--prompt-file F | --user-file F)... [--lanes L] [--n N] [--ctx C] [--lane-ctx C2] "
-                             "[--chunk C] [--lookup] [--cpu-miss] [--pipeline] [--aba] [--slot-arm] [--tables DIR] [--ranking FILE]\n");
+                             "[--chunk C] [--lookup] [--cpu-miss] [--pipeline] [--aba] [--slot-arm] [--tables DIR] [--ranking FILE] [--static N --pinned P] [--dump FILE]\n");
         return 2;
     }
     const std::string dir = argv[1];
     std::vector<std::pair<std::string, bool>> files;   // (path, rendered as a user turn)
-    std::string tables = dir, ranking_path;
-    uint32_t lanes = 2, N = 64, ctx = 16384, lane_ctx = 0, chunk = 2048;
+    std::string tables = dir, ranking_path, dump_path;
+    uint32_t lanes = 2, N = 64, ctx = 16384, lane_ctx = 0, chunk = 2048, n_static = 0, n_pinned = 0;
     bool lookup = false, cpu_miss = false, pipeline = false, aba = false, slot_arm = false;
     for (int i = 2; i < argc; ++i) {
         const std::string a = argv[i];
@@ -212,9 +218,13 @@ int main(int argc, char** argv) {
         else if (a == "--slot-arm") slot_arm = true;
         else if (a == "--tables") tables = val();
         else if (a == "--ranking") ranking_path = val();
+        else if (a == "--static") n_static = uint32_t(std::atol(val().c_str()));
+        else if (a == "--pinned") n_pinned = uint32_t(std::atol(val().c_str()));
+        else if (a == "--dump") dump_path = val();
         else { std::fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
     }
     if (files.empty() || lanes == 0 || N < 2) { std::fprintf(stderr, "need a prompt, --lanes >= 1, --n >= 2\n"); return 2; }
+    if (!n_static != !n_pinned) { std::fprintf(stderr, "--static and --pinned go together (both 0 = derive from the budgets)\n"); return 2; }
     if (!cpu_miss) setenv("IE_DS41_CPU_MISS", "0", 1);
     // ie serve's configuration (Engine::ds41_load): the expert tail file beside the model, the chat decode ranking when present
     if (const char* ef = std::getenv("IE_DS41_EXPERT_FILE"); ef && std::string(ef) == "0") unsetenv("IE_DS41_EXPERT_FILE");
@@ -245,21 +255,17 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "%s: %zu tokens + %u + a verify block do not fit ctx %u\n", f.c_str(), prompts.back().size(), N, cap_small); return 2; }
     }
 
-    std::vector<sycl::device> devs;
-    for (const auto& p : sycl::platform::get_platforms()) {
-        if (p.get_backend() != sycl::backend::ext_oneapi_level_zero) continue;
-        for (const auto& d : p.get_devices(sycl::info::device_type::gpu))
-            if (d.get_info<sycl::info::device::name>().find("Arc") != std::string::npos) devs.push_back(d);
-    }
-    if (devs.empty()) { std::fprintf(stderr, "no Arc GPU\n"); return 1; }
-    std::vector<std::unique_ptr<sycl::queue>> queues; std::vector<sycl::queue*> qs;
-    for (const auto& d : devs) { queues.push_back(std::make_unique<sycl::queue>(sycl::context(d), d, sycl::property_list{sycl::property::queue::in_order{}})); qs.push_back(queues.back().get()); }
+    const ie::Ds41Cards cards = ie::ds41_cards();
+    if (!cards.error.empty()) { std::fprintf(stderr, "%s\n", cards.error.c_str()); return 1; }
+    std::vector<std::unique_ptr<sycl::queue>> queues = ie::ds41_card_queues(cards.devs); std::vector<sycl::queue*> qs;
+    for (auto& qp : queues) qs.push_back(qp.get());
     std::vector<std::vector<uint32_t>> ranking;
     if (exists(ranking_path)) { if (auto e = ie::ds4_expert_priority_read_layers(ranking_path, m.config().n_routed_experts, m.config().n_layers, ranking); !e.empty()) { std::fprintf(stderr, "ranking: %s\n", e.c_str()); return 1; } }
     else std::fprintf(stderr, "no ranking file at %s: index-order placement (slower)\n", ranking_path.c_str());
     const auto t_init = std::chrono::steady_clock::now();
     ie::Ds41Forward fwd; ie::Ds41Forward::ResidentOptions ro;
     ro.max_tokens = ctx; ro.head_fp8 = true; ro.lanes = lanes;   // Phase 54: the server's FP8 head
+    ro.n_static = n_static; ro.n_pinned = n_pinned;
     if (lane_ctx) ro.lane_ctx = lane_ctx;
     if (auto e = fwd.init_resident(qs, m, tb, ranking, ro); !e.empty()) { std::printf("init_resident: %s\n", e.c_str()); return 1; }
     fwd.set_logits_last_only(true);
@@ -283,6 +289,17 @@ int main(int argc, char** argv) {
                 const auto& k = m.layers()[L].kind;
                 want += uint64_t(cfg.window_size) * cfg.head_dim * 4;
                 if (k.is_kv_source) { want += uint64_t(fwd.lane_capacity(1)) * (cfg.head_dim + cfg.index_head_dim) * 4; if (k.compress_ratio > 1) want += 2ull * k.compress_ratio * cfg.head_dim * 4; }
+            }
+            // the boundary mirror (2026-10-20): where a kv source sits before this card's first layer and that layer is not
+            // itself a kv + index source, a copy of that source's rows (a ratio-R source: lane_ctx / R of them)
+            if (c > 0) {
+                int src = -1; for (uint32_t L = 0; L < ci.first_layer; ++L) if (m.layers()[L].kind.is_kv_source) src = int(L);
+                const auto& k0 = m.layers()[ci.first_layer].kind;
+                const char* sf = std::getenv("IE_DS41_SETUP_FAST"); const bool setup_fast = !(sf && *sf && std::string(sf) == "0");   // the forward's rule
+                if (src >= 0 && !(setup_fast && k0.is_kv_source && k0.is_index_source)) {
+                    const uint64_t R = std::max(1u, m.layers()[uint32_t(src)].kind.compress_ratio);
+                    want += (uint64_t(fwd.lane_capacity(1)) + R - 1) / R * (cfg.head_dim + cfg.index_head_dim) * 4;
+                }
             }
             check(fwd.lane_bytes(c) == want, "card " + std::to_string(c) + ": one extra lane's device state equals the arithmetic", std::to_string(fwd.lane_bytes(c)) + " B = " + std::to_string(fwd.lane_bytes(c) / 1048576.0) + " MiB");
         }
@@ -573,6 +590,7 @@ int main(int argc, char** argv) {
     fd_solo.print("solo decode");
 
     // ---- --slot-arm: a lane's conversation through a host slot into another lane (the per-lane live checkpoints) --------
+    std::vector<std::pair<std::string, Trace>> slot_dump;   // --dump
     if (slot_arm) {
         size_t pa = 0;   // the longest prompt (a kept state must be >= min_slot_tokens), the continuation from another prompt
         for (size_t i = 1; i < prompts.size(); ++i) if (prompts[i].size() > prompts[pa].size()) pa = i;
@@ -635,8 +653,22 @@ int main(int argc, char** argv) {
               "served " + std::to_string(L) + " from " + src + " in " + std::to_string(int(s2.last_restore_ms)) + " ms");
         check(first_diff(t16, c16).empty(), "slot arm: the continuation's logits and 16 tokens identical to the control that never left lane 0", first_diff(t16, c16));
         fwd.set_prefix_cache(false);
+        slot_dump = {{"c8", c8}, {"c16", c16}, {"t8", t8}, {"t16", t16}};
     }
 
+    if (!dump_path.empty()) {   // --dump: the traces a run of another card count must reproduce byte for byte
+        std::ofstream o(dump_path);
+        auto put = [&](const std::string& name, const Trace& t) {
+            o << name << " n_pos " << t.n_pos << " tokens";
+            for (int32_t x : t.tokens) o << ' ' << x;
+            o << " logits";
+            for (uint64_t h : t.logits) { char b[24]; std::snprintf(b, sizeof b, " %016llx", (unsigned long long)h); o << b; }
+            o << '\n';
+        };
+        for (size_t i = 0; i < solo.size(); ++i) put("solo " + std::to_string(i) + " " + names[i], solo[i]);
+        for (size_t i = 0; i < slot_dump.size(); ++i) put("slot " + slot_dump[i].first, slot_dump[i].second);
+        std::printf("dump: %s (%zu solo, %zu slot-arm traces; %u cards)\n", dump_path.c_str(), solo.size(), slot_dump.size(), fwd.n_cards());
+    }
     std::printf("MemAvailable at the end: %.1f GiB (%.1f before the load, %.1f after it)\n", mem_available_gib(), mem0, mem1);
     fwd.free_resident();
     for (auto& qp : queues) qp->wait_and_throw();

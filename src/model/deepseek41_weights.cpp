@@ -38,6 +38,20 @@ struct Up {
         sycl::free(dw, q); sycl::free(ds, q);
         d.owned.push_back(o); d.bytes += size_t(N) * K * 2; return o;
     }
+    // tensor parallel: rows [r0, r0 + nr) x columns [k0, k0 + nk) of an FP8 matrix (whole 32 x 32 blocks), resident as its own pair
+    std::string dense_slice(const Ds41Tensor& t, Ds41Fp8Mat& f8, uint32_t r0, uint32_t nr, uint32_t k0, uint32_t nk) {
+        const uint32_t N = uint32_t(t.w->shape[0]), K = uint32_t(t.w->shape[1]);
+        if (N / uint32_t(t.s->shape[0]) != 32 || K / uint32_t(t.s->shape[1]) != 32) return "not 32 x 32 FP8 blocks";
+        if ((r0 | nr | k0 | nk) % 32 || r0 + nr > N || k0 + nk > K || !nr || !nk) return "slice off the 32-blocks or outside the matrix";
+        std::vector<uint8_t> w(size_t(nr) * nk), sc(size_t(nr / 32) * (nk / 32));
+        for (uint32_t r = 0; r < nr; ++r) std::memcpy(w.data() + size_t(r) * nk, t.w->data + size_t(r0 + r) * K + k0, nk);
+        for (uint32_t b = 0; b < nr / 32; ++b) std::memcpy(sc.data() + size_t(b) * (nk / 32), t.s->data + size_t(r0 / 32 + b) * (K / 32) + k0 / 32, nk / 32);
+        uint8_t* dw = sycl::malloc_device<uint8_t>(w.size(), q); uint8_t* ds = sycl::malloc_device<uint8_t>(sc.size(), q);
+        if (!dw || !ds) { if (dw) sycl::free(dw, q); if (ds) sycl::free(ds, q); return "alloc failed"; }
+        q.memcpy(dw, w.data(), w.size()); q.memcpy(ds, sc.data(), sc.size()); q.wait();
+        f8.w = dw; f8.s = ds; f8.N = nr; f8.K = nk;
+        d.owned.push_back(dw); d.owned.push_back(ds); d.bytes += w.size() + sc.size(); return {};
+    }
     sycl::half* bf16_16(const Ds41Tensor& t) {
         const size_t n = size_t(t.w->numel()); const auto* s = reinterpret_cast<const uint16_t*>(t.w->data);
         h16.resize(n); for (size_t i = 0; i < n; ++i) h16[i] = sycl::half(bf16f(s[i]));
@@ -68,13 +82,43 @@ std::string Ds41DenseCache::upload_layer(sycl::queue& q, const DeepSeek41Model& 
         const char* v = std::getenv("IE_DS41_DENSE_FP8"); fp8_ = !(v && *v && std::string(v) == "0");   /* ON since gate 17 (docs/47); =0 the fp16 dense */   // decided at the first layer
     }
     u.fp8 = fp8_;
+    if (tp_n_ > 1) {
+        // tensor parallel: this card's query heads [h0, h0 + nh) = o_groups [g0, g0 + ng) (heads per group = n_heads / o_groups),
+        // and the shared expert's units [f0, f0 + nf)
+        const uint32_t n = tp_n_, NH = c.n_heads, HD = c.head_dim, G = c.o_groups, OPG = c.o_lora_rank, EF = c.moe_inter_dim;
+        if (!fp8_) return "upload_layer: tensor parallel needs the FP8-resident dense (IE_DS41_DENSE_FP8 is 0)";
+        if (NH % n || G % n || (NH / G) * (G / n) != NH / n || EF % (32 * n)) return "upload_layer: " + std::to_string(n) + " tensor-parallel parts do not split the heads, o_groups and shared units";
+        const uint32_t nh = NH / n, h0 = tp_part_ * nh, ng = G / n, g0 = tp_part_ * ng, nf = EF / n, f0 = tp_part_ * nf;
+        auto chk = [&](const char* nm, const Ds41Tensor& t, uint64_t N, uint64_t K) -> std::string {
+            return (uint64_t(t.w->shape[0]) == N && uint64_t(t.w->shape[1]) == K) ? std::string() : std::string(nm) + " is not [" + std::to_string(N) + ", " + std::to_string(K) + "]"; };
+        const uint32_t IPG = NH * HD / G;
+        std::string e = chk("wq_b", Lw.wq_b, uint64_t(NH) * HD, c.q_lora_rank);
+        if (e.empty()) e = chk("wo_a", Lw.wo_a, uint64_t(G) * OPG, IPG);
+        if (e.empty()) e = chk("wo_b", Lw.wo_b, c.dim, uint64_t(G) * OPG);
+        if (e.empty()) e = chk("sh_w1", Lw.sh_w1, EF, c.dim);
+        if (e.empty()) e = chk("sh_w3", Lw.sh_w3, EF, c.dim);
+        if (e.empty()) e = chk("sh_w2", Lw.sh_w2, c.dim, EF);
+        if (e.empty()) e = u.dense_slice(Lw.wq_b, d.f8_wq_b, h0 * HD, nh * HD, 0, c.q_lora_rank);
+        if (e.empty()) e = u.dense_slice(Lw.wo_a, d.f8_wo_a, g0 * OPG, ng * OPG, 0, IPG);
+        if (e.empty()) e = u.dense_slice(Lw.wo_b, d.f8_wo_b, 0, c.dim, g0 * OPG, ng * OPG);
+        if (e.empty()) e = u.dense_slice(Lw.sh_w1, d.f8_sh_w1, f0, nf, 0, c.dim);
+        if (e.empty()) e = u.dense_slice(Lw.sh_w3, d.f8_sh_w3, f0, nf, 0, c.dim);
+        if (e.empty()) e = u.dense_slice(Lw.sh_w2, d.f8_sh_w2, 0, c.dim, f0, nf);
+        if (!e.empty()) return "upload_layer: tensor-parallel slice (layer " + std::to_string(L) + "): " + e;
+        if (uint64_t(Lw.attn_sink.w->numel()) != NH) return "upload_layer: attn_sink is not one value per head";
+        d.sinks = sycl::malloc_device<float>(nh, q);
+        q.memcpy(d.sinks, reinterpret_cast<const float*>(Lw.attn_sink.w->data) + h0, size_t(nh) * 4).wait();
+        d.owned.push_back(d.sinks); d.bytes += size_t(nh) * 4;
+        d.wq_a = u.dense(Lw.wq_a, &d.f8_wq_a); d.wkv = u.dense(Lw.wkv, &d.f8_wkv);
+    } else {
     d.wq_a = u.dense(Lw.wq_a, &d.f8_wq_a); d.wq_b = u.dense(Lw.wq_b, &d.f8_wq_b); d.wkv = u.dense(Lw.wkv, &d.f8_wkv);
     d.wo_a = u.dense(Lw.wo_a, &d.f8_wo_a); d.wo_b = u.dense(Lw.wo_b, &d.f8_wo_b);
     d.sh_w1 = u.dense(Lw.sh_w1, &d.f8_sh_w1); d.sh_w3 = u.dense(Lw.sh_w3, &d.f8_sh_w3); d.sh_w2 = u.dense(Lw.sh_w2, &d.f8_sh_w2);
+    d.sinks = u.f32(Lw.attn_sink);
+    }
     if (fp8_ && !(d.f8_wq_a.w && d.f8_wq_b.w && d.f8_wkv.w && d.f8_wo_a.w && d.f8_wo_b.w && d.f8_sh_w1.w && d.f8_sh_w3.w && d.f8_sh_w2.w))
         return "upload_layer: IE_DS41_DENSE_FP8 needs 32x32 FP8 blocks and K % 32 == 0 on every dense matrix (layer " + std::to_string(L) + ")";
     d.n_q = u.bf16_32(Lw.q_norm); d.n_kv = u.bf16_32(Lw.kv_norm); d.n_at = u.bf16_32(Lw.attn_norm); d.n_ff = u.bf16_32(Lw.ffn_norm);
-    d.sinks = u.f32(Lw.attn_sink);
     d.a_fn = u.f32(Lw.hc_attn_fn); d.a_bs = u.f32(Lw.hc_attn_base); d.a_sc = u.f32(Lw.hc_attn_scale);
     d.f_fn = u.f32(Lw.hc_ffn_fn);  d.f_bs = u.f32(Lw.hc_ffn_base);  d.f_sc = u.f32(Lw.hc_ffn_scale);
     d.g_w = u.bf16_32(Lw.gate_w);  d.g_b = u.f32(Lw.gate_bias);

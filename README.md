@@ -19,6 +19,7 @@
 
 **Latest**
 
+- **v0.2.27, October 21 — Qwen3.8-27B: MTP on the request lanes, Q4, pictures on the lanes; DeepSeek-V4.1 on more than two cards:** with `--spec --parallel N` the [27B's request lanes](#new-in-v0227) draft with its MTP head: one request writes **38 tok/s** at Q4_K_M (27.2 plain) and **27.4** at Q8_0 (17.4), two at once 63.1 together (51.8), with the same replies. The 27B's Q4_K_M decodes 27.5 tok/s on two cards (22.8) and 27.8 on one (19.1). Pictures work on the request lanes of the 27B and the 35B-A3B class, a VRAM leak of about 100 MiB a card per request is fixed, and DeepSeek-V4.1-Flash runs on more than two cards, with opt-in tensor parallel (`IE_DS41_TP=1`: 17.2 tok/s decode on two B70s against 14.6). [Details](#new-in-v0227)
 - **v0.2.26, October 20 — GLM-5.3-Flash served fast, and issue #2:** in `ie serve`, [GLM-5.3-Flash](#new-in-v0226) reads a 9.6K-token agent prompt in **32.4 s** (was 243 s), answers later turns from the prompt cache in **9.5–9.7 s** (was 273–311 s) and decodes **13.5–14.3 tok/s** (was 10.8–11.5); the re-published `glm5-next` GGUF loads. Host↔device copies on the Qwen3.8-27B and 35B-A3B two-card splits and in `--spec`'s draft head go through pinned memory, at most 64 MiB a copy, for [issue #2](https://github.com/Red-Weasel/machx-inference-engine/issues/2) (a B70 wedged under the 27B). [Details](#new-in-v0226)
 - **v0.2.25, October 20 — two new models:** [Laguna S 2.1](#new-in-v0225) (118B-A8B) and Inkling-Small (276B-A12B) run in `ie serve` on one card or two; Laguna writes **33.7–35.1 tok/s** on two cards. DeepSeek-V4.1-Flash decodes **10.6 % faster** with byte-identical output. Host↔device copies on the new models and in the VRAM self-test go through pinned memory, and the 27B's `ie serve` no longer crashes on exit. [Details](#new-in-v0225)
 - **Video, October 5–6:** [LTX-2.5](docs/ltx25/LTX25_ON_ARC.md) makes 5 seconds of 1280×704 video with sound in about 21 s on two Arc Pro B70 cards (stock PyTorch: 79 s).
@@ -127,13 +128,14 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 **Qwen3.8-27B** · Q8_0 GGUF, split over both cards
 - **Prefill:** 2,962 / 3,001 tok/s at 2.4K / 10.7K tokens (`ie-prompt-bench`, prompt cache off, greedy; October 4, v0.2.13; it was 1,037 / 820 before). Q6_K: 1,378 / 1,549. An earlier version of this table said 945 tok/s at 2K, measured in August.
 - **Decode:** 17.1 tok/s plain; 24.3 with `--spec` (`ie serve`, temperature 0.7, short prompt) and 29.7 as the median of five short prompts (bench, greedy). Q6_K 21.5 / 19.8 plain, 26.9 / 21.6 with `--spec`; Q5_K 23.3 / 21.4 and 26.3 / 22.9 (2.4K / 10.7K-token prompts, October 4–5). An August figure of 24.5 tok/s used the opt-in tensor-parallel path (`IE_QWEN35_TP`) with speculative decoding.
-- **Serving:** prompt cache (layer-split); 16 requests at once at 153.5 tok/s together, 17.2–17.3 alone (`--ctx 8192 --parallel 16`, October 1); a reply that returns a file with one identifier renamed (1,800 tokens, temperature 0.7) takes 108.5 s plain and 28.4 s with `--spec`.
+- **Serving:** prompt cache (layer-split); 16 requests at once at 153.5 tok/s together, 17.2–17.3 alone (`--ctx 8192 --parallel 16`, October 1); a reply that returns a file with one identifier renamed (1,800 tokens, temperature 0.7) takes 108.5 s plain and 28.4 s with `--spec`. With `--spec --parallel N` the lanes draft with the MTP head (v0.2.27, October 21, greedy): one request 17.4 → 27.4 tok/s, four at once 64.8 / 63.9 together.
+- **Q4_K_M** (October 21, v0.2.27, a Q4_K_M re-quantized from the Q8_0): decode 27.5 tok/s on two cards and 27.8 on one; a 3,382-token prompt read at 1,393 / 1,045 tok/s; one request with `--spec` 37.1–39.6, at `--parallel N` 36.0–40.2 alone and 63.1 for two together.
 - **One card** (Q6_K, October 5): prefill 823 / 830, decode 22.0 / 20.4, 32.6 / 19.8 with `--spec`.
 
 **Qwen3.8-35B-A3B** · Q8_0 GGUF, split over both cards; measured on community fine-tunes (October 4–5: the Qwen3.8-35B-A3B Distill; earlier rows: a Qwen3.6-35B-A3B fine-tune, where this README says "35B-A3B class")
 - **Prefill:** 2,896 / 2,808 tok/s at 2.4K / 10.7K tokens (October 4, v0.2.13; it was 1,816 / 1,256). One request, cold prompt: 2K in 1.28 s (October 2), 8K in 5.96 s, 32K in 48.4 s (October 1, before v0.2.13).
 - **Decode:** 78.2 / 72.5 tok/s plain at 2.4K / 10.7K tokens (October 4–5); 85.7 on a short prompt (October 1); 60.9 at a 33K-token prompt (September 30). One card, Q5_K_M: 87.2 / 82.9 (October 5).
-- **Serving:** up to 16 requests at once, the lane count picked at load: 16 at 414.1 tok/s together, 25.9 each (October 1); the 15-agent replay takes 77.1–77.2 s (October 4; 116.1 s before v0.2.13); a file edit takes 24.3 s plain and 7.1 s with `--spec`; XML tool calls and reasoning in the OpenAI fields; native Q6_K / Q5_K; image input at `--parallel 1` with `--mmproj`.
+- **Serving:** up to 16 requests at once, the lane count picked at load: 16 at 414.1 tok/s together, 25.9 each (October 1); the 15-agent replay takes 77.1–77.2 s (October 4; 116.1 s before v0.2.13); a file edit takes 24.3 s plain and 7.1 s with `--spec`; XML tool calls and reasoning in the OpenAI fields; native Q6_K / Q5_K; image input with `--mmproj`, on every request lane since v0.2.27.
 
 **Qwen3.8-Flash-Next** · UD-Q4_K_XL GGUF (104 GB)
 - **Prefill:** 470 tok/s on text it had not seen and 688 on a repeated prompt (bench, October 4; it was 241 / 487); 495–502 pipelined once warm (standalone runner, September 27).
@@ -174,6 +176,112 @@ class ([New in v0.2.6](#new-in-v026)).
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
 
 ---
+
+<a id="new-in-v0227"></a>
+## 🆕 New in v0.2.27
+
+Everything since [v0.2.26](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.26). Measured
+October 20–21, 2026, on two Arc Pro B70 cards.
+
+### Qwen3.8-27B: MTP drafts on the request lanes (`--spec --parallel N`)
+
+Until now `--spec` turned the 27B's request lanes off: the model's MTP draft head ran only at `--parallel 1`. Now the
+lanes draft with it. While at most one lane a card decodes, a lane's next step checks the head's draft in the same
+step as its next token (`--spec-k` rows); with more lanes decoding they share the cards in row groups, as without
+`--spec`.
+
+| greedy, 256 tokens a reply, two cards | plain | `--spec` |
+|---|---|---|
+| Q4_K_M, one request | 27.2 tok/s | **36.0–40.2** |
+| Q4_K_M, two at once, together | 51.8 | **63.1** |
+| Q4_K_M, four at once, together | 91.1 | 90.7 (row groups) |
+| Q8_0, one request | 17.4 | **26.7–28.0** |
+| Q8_0, four at once, together | 64.8 | 63.9 (row groups) |
+
+- **Checks:** every reply above has the same text and token count as the plain server's: 39 replies, pictures
+  included (the streamed chunks differ: a round sends two tokens at once). `--spec` at `--parallel 1` gives the same
+  replies at the same speed as before the change (the code it shares with the lanes moved). 68–71 % of the drafts were
+  kept. No kernel GPU fault in any run.
+- `--spec` is near-lossless, not lossless: on a rare near-tie the checking step can pick a different token than plain
+  decoding (see [v0.2.25](#new-in-v0225)). Run without `--spec` for bit-exact output.
+- About 0.14 GiB a lane on each card (checked against free memory at load; if it does not fit, the lanes run without
+  drafts and the load says why). Switches: `IE_QWEN35_LANES_MTP=0` turns the rounds off, `IE_QWEN35_LANES_MTP_MAX`
+  sets how many decoding lanes may run them (default: the card count).
+
+### Qwen3.8-27B: Q4_K_M on the fast path
+
+The 27B's Q4_K files ran on an older kernel; they now take the same path as Q8_0, Q6_K and Q5_K.
+
+| Qwen3.8-27B Q4_K_M | v0.2.26 | v0.2.27 |
+|---|---|---|
+| decode, two cards | 22.8 tok/s | **27.5** |
+| decode, one card | 19.1 | **27.8** |
+| reading a 3,382-token prompt, two cards | 1,232 tok/s | **1,393** |
+| reading a 3,382-token prompt, one card | 390 | **1,045** |
+| decode with `--spec` (one request) | | **37.1–39.6** |
+
+- Q6_K reads that prompt at 1,330 tok/s (was 965) with the same replies; Q8_0 and the 35B-A3B class give the same
+  replies at the same speed.
+- **Checks:** perplexity on 4,096 wikitext tokens 5.8107 (old kernel 5.8133); one of three test replies differs from
+  v0.2.26 after a near-tie (a different summation order); one card and two cards give the same replies.
+- Measured on a Q4_K_M made from the Q8_0 file (`llama-quantize --allow-requantize`). Pictures on it are answered right
+  in our probes, including after 16.7K tokens; a 640 px synthetic picture got "Sorry, I need..." on 3 of 9 (the Q8_0
+  file 9 of 9). That is a near-tie in the twice-quantized file: the GPU encoder matches the CPU one, and the old kernel
+  fails a different picture.
+
+### Pictures on the request lanes: Qwen3.8-27B and the 35B-A3B class
+
+`ie serve --parallel N --mmproj <projector>` now takes images on every lane (before: `--parallel 1` only, and `/props`
+said vision was not ready). Each lane keeps its own picture rows and M-RoPE positions. An image request skips the
+prompt cache and the reuse paths (sticky lane checkpoints, restart points).
+
+- **Checks** (four lanes, Q4_K_M and Q8_0 27B, 35B-A3B Q6_K): every answer right; four at once give the same replies as
+  each alone; a lane's picture reply is byte-identical to `--parallel 1`'s; text requests unchanged.
+- The vision encoder's scratch leaked on every growth (270 MiB on card 1 after four picture sizes), a failed allocation
+  passed a null pointer to a kernel, and its copies were pageable. All three fixed (pinned copies, as in issue #2).
+
+### A VRAM leak on every request (v0.2.26 and earlier)
+
+The oneDNN products used for prompt reading were cached per server thread and per row count, and each kept its own
+12–20 MiB scratch buffer on the card for the life of the server. On the 27B that was about 100 MiB a card per request
+(Q4_K_M, 12 requests: 9,648 → 10,939 MiB on card 0, still climbing). Each card queue now shares one scratch buffer:
+after the first request the same 12 requests stay at 9,688–9,689 MiB, with the same replies and the same kernels
+(oneDNN picks the same implementation for all 720 shapes checked). Every model whose prompt reading goes through
+oneDNN gets the fix. DeepSeek-V4.1's disk prompt cache is keyed by its numerics files, so its first turn on a cached
+prompt after the upgrade is read cold once.
+
+### DeepSeek-V4.1-Flash on more than two cards, and tensor parallel
+
+What the [v0.2.27-rc1 test build](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.27-rc1)
+carried:
+
+- **More than two cards:** v0.2.26 had to be told `--cards 0,1` (past two cards, prompts over 2,048 tokens failed and
+  attention past 16K tokens was wrong). The pipeline now carries everything a later card needs across a card boundary;
+  integrated graphics are skipped and `--gpus N` takes the first N discrete Arc cards; the CPU expert leg picks its
+  cores from the machine, and each card's link is measured at load. Checked by emulating four cards as four pipeline
+  stages on two B70s: 15 of 15 traces byte-identical to two cards (prompts up to 19,783 tokens; CPU expert leg off).
+  Two-card replies are identical to v0.2.26's.
+- **Tensor parallel, opt-in (`IE_DS41_TP=1`):** every card runs all 40 layers on its share of each layer. On two B70s
+  it decodes 17.2 tok/s on a short prompt (layer split 14.6) and 12.3 at 23.5K tokens of context (10.5), and reads a
+  23,581-token prompt at 301 tok/s (layer split 513). Perplexity on 4,096 wikitext tokens 1.51707 (layer split
+  1.51685). Switches: `IE_DS41_TP_1BAR=0`, `IE_DS41_TP_AFFINITY=0`, `IE_DS41_DISK_CACHE`, `IE_DS41_STEP_DETAIL=1`.
+
+### Also
+
+- `dequant_q4_K_to_Bt` / `dequant_q5_K_to_Bt` skipped the last columns of a matrix whose width is not a multiple of 64
+  (no shipped model has one); fixed, with a test that fails on the old kernels.
+
+### What is still slow, and not checked
+
+- **Real four-card DeepSeek-V4.1 speed is not measured** (emulation shares one card's memory and link between two
+  stages). Tensor parallel reads long prompts about 40 % slower than the layer split on two cards.
+- The 27B's MTP rounds help one or two decoding lanes on two cards; at four and more, row groups are faster and the
+  rounds stay off. The 35B-A3B class and Flash-Next keep their lookup drafts.
+- The other models (Flash-Next, the DeepSeeks, MiMo, GLM, Gemma and more) still copy host memory directly, mostly
+  whole tensors at load. GLM-5.3-Flash prefill is bound by the host expert bank over PCIe; `ie serve` runs GLM one
+  request at a time.
+- DeepSeek-V4.1 with its CPU expert leg on (the default) is not repeatable token for token at long context; with
+  `IE_DS41_CPU_MISS=0` it is.
 
 <a id="new-in-v0226"></a>
 ## 🆕 New in v0.2.26
@@ -236,9 +344,9 @@ a copy:
 
 ### What is still slow, and not checked
 
-- **DeepSeek-V4.1-Flash runs on two cards only.** On a machine with more Arc cards it takes all of them, and past two
-  cards prompts over 2,048 tokens fail and attention past 16K tokens of context is wrong. Run it with `--cards 0,1`
-  (`ie cards` lists the numbers). Four-card support is planned.
+- **DeepSeek-V4.1-Flash runs on two cards only in v0.2.26.** On a machine with more Arc cards it takes all of them, and
+  past two cards prompts over 2,048 tokens fail and attention past 16K tokens of context is wrong. Run it with
+  `--cards 0,1` (`ie cards` lists the numbers). Fixed in [v0.2.27](#new-in-v0227).
 - GLM-5.3-Flash prefill is bound by streaming the host expert bank over PCIe 5.0 x8 and by per-expert compute;
   dequantizing inside the split-K GEMM is the next step. `ie serve` runs GLM one request at a time.
 - The other models (Flash-Next, the DeepSeeks, MiMo, GLM, Gemma and more) still copy host memory directly, mostly
@@ -1304,8 +1412,9 @@ and four ×1.27 (below).
   byte-identical to the same request alone. `IE_QWEN35_LANES=0` restores the joint-step path; on it, two requests
   decoded at 32.28 tok/s together against 17.32 for one (×1.86, September 26), and a long prompt held up the other
   request while it prefilled (13.0 tok/s decode during a 3.4K-token prefill).
-- **Images at `--parallel` > 1:** where the lanes cannot take images (MiMo-V2.6-Flash, Qwen3.8-Flash, the Qwen3.8-27B
-  split, and DeepSeek-V4-Flash with its vision sidecar), `/props` says vision is not ready and an image request gets
+- **Images at `--parallel` > 1:** since v0.2.27 the Qwen3.8-27B and 35B-A3B splits take images on every lane
+  ([New in v0.2.27](#new-in-v0227)). Where the lanes cannot take images (MiMo-V2.6-Flash, Qwen3.8-Flash, and
+  DeepSeek-V4-Flash with its vision sidecar), `/props` says vision is not ready and an image request gets
   HTTP 400 `vision_not_ready` before admission. The DeepSeek-V4-Flash case was verified with host tests and a code
   probe, not with the model loaded.
 - **Qwen3.8-27B and 35B-A3B image input** (`--gpus 2 --parallel 1 --mmproj <mmproj-...-F16.gguf>`): the Flash-Next
@@ -1432,11 +1541,11 @@ the benchmarked models. Prebuilt container images may lag these source updates.
 | Family / GGUF architecture | Models | Entry point and coverage |
 |---|---|---|
 | **GLM-5.3-Flash** · `glm5next` | UD-Q4_K_XL GGUF | `ie serve` and `ie-glm5next-run`; sparse MLA + KDA, host-resident MoE, two-GPU pipelined prefill and MTP draft; kernel and full-model validation in [PERFORMANCE.md](PERFORMANCE.md); request lanes and a two-card lane pipe in a test tool (`ie-glm-lanes-test`, off by default; `ie serve` runs one request at a time) |
-| **DeepSeek-V4.1** · safetensors directory (`deepseek_v41`) | Flash (FP8 dense, MXFP4 experts) | `ie serve <model dir>` and `ie-ds41-run`; two-card pipeline, CSA/engram/hyper-connections, three expert tiers (VRAM, pinned host RAM, NVMe), chunked long-context prefill, native DSML tool calls, native vision, prefix cache (memory + disk, keyed by its numerics), prompt-lookup speculation, request lanes and a two-card decode pipe served with `ie serve --parallel N` (both cards); needs ~256 GB of system RAM. |
+| **DeepSeek-V4.1** · safetensors directory (`deepseek_v41`) | Flash (FP8 dense, MXFP4 experts) | `ie serve <model dir>` and `ie-ds41-run`; a pipeline over two or more cards (`--gpus N`) or opt-in tensor parallel (`IE_DS41_TP=1`), CSA/engram/hyper-connections, three expert tiers (VRAM, pinned host RAM, NVMe), chunked long-context prefill, native DSML tool calls, native vision, prefix cache (memory + disk, keyed by its numerics), prompt-lookup speculation, request lanes and a decode pipe across the cards served with `ie serve --parallel N`; needs ~256 GB of system RAM. |
 | **MiMo-V2.6** · safetensors directory (`mimo_v2`) | Flash-RL (FP8 dense, MXFP4 experts) | `ie serve <model dir>` and `ie-mimo26-run`; two-card pipeline, 9 full-attention + 39 sliding-window layers with sinks (K 192 / V 128) on XMX prefill and split-K decode kernels, FP8-resident dense weights, three expert tiers (VRAM, pinned host RAM, NVMe) with a CPU expert path, the checkpoint's DFlash drafter for speculative decoding (on by default; prompt-lookup speculation when a checkpoint has none), XML tool calls, thinking on/off, native vision (the checkpoint's own tower), conversations kept in host memory and a prompt-end snapshot, request lanes (card-pipelined, row-batched) served with `ie serve --parallel N`, opt-in vital signs; measured with 256 GB of system RAM. Pro not yet qualified |
 | **DeepSeek-V4** · `deepseek4` | Flash (ggml-org MXFP4, Q8_0 dense), Flash-Vision-Exp | `ie serve`; streaming expert caches, long-context sparse attention, prompt caching and structured tool calls; experimental native vision requires sidecar weights |
 | **Qwen3.8-Flash-Next** · `qwen4exp` | Qwen4 preview | `ie serve`; DeltaNet + sparse QSA, hyper-connections, PLE embeddings, streamed MoE and native vision; request lanes on two cards served with `ie serve --parallel N` (up to 16, row-batched, shared-prefix cache; 4 lanes when `--parallel` is left out, images at `--parallel 1`) |
-| **Qwen3.5 / Qwen3.6 / Qwen3.8 hybrid** · `qwen35`, `qwen35moe` | 27B dense (incl. Qwen3.8-27B), 35B-A3B MoE | `ie serve`; gated-DeltaNet + full attention, dense or MoE feed-forward paths; the 27B and 35B-A3B MoE splits serve request lanes with row batching and a shared-prefix cache (up to 16 lanes, picked at load or set with `--parallel N`), run Q8_0, Q6_K and Q5_K natively, and return XML tool calls and reasoning in the OpenAI fields; the 35B-A3B split adds the agent-swarm scheduling of v0.2.6 (a prefill FIFO, per-lane checkpoints, a lane pipeline, short-first, a decode quota) |
+| **Qwen3.5 / Qwen3.6 / Qwen3.8 hybrid** · `qwen35`, `qwen35moe` | 27B dense (incl. Qwen3.8-27B), 35B-A3B MoE | `ie serve`; gated-DeltaNet + full attention, dense or MoE feed-forward paths; the 27B and 35B-A3B MoE splits serve request lanes with row batching and a shared-prefix cache (up to 16 lanes, picked at load or set with `--parallel N`), run Q8_0, Q6_K, Q5_K and (the 27B) Q4_K natively, take images on every lane with `--mmproj`, draft with the 27B's MTP head on the lanes with `--spec`, and return XML tool calls and reasoning in the OpenAI fields; the 35B-A3B split adds the agent-swarm scheduling of v0.2.6 (a prefill FIFO, per-lane checkpoints, a lane pipeline, short-first, a decode quota) |
 | **Qwen3 MoE** · `qwen3moe` | Coder-30B-A3B, Tongyi-30B | `ie serve`; QK-normalized attention and routed MoE |
 | **Qwen3-Next** · `qwen3next` | 80B-A3B | `ie serve`; DeltaNet + full attention and 512-expert MoE |
 | **gpt-oss** · `gpt-oss` | 20b, 120b (MXFP4) | `ie serve`; attention sinks, sliding-window attention, Harmony chat and tool calls |

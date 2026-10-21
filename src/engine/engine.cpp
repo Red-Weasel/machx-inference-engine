@@ -1296,15 +1296,16 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         // token (Megatron). Mutually exclusive with the layer-split Q8 path below.
         const bool use_tp = opts.n_gpus > 1 && std::getenv("IE_QWEN35_TP");
         // P4 B58: ONE card takes the split model too (one stage) when the file is one it packs natively (Q8_0 / Q6_K /
-        // Q5_K): its prefill and decode kernels, prompt cache, --spec with lookup drafts and restart points are the
-        // two-card path's. Measured 2026-10-05 (Q6_K, one B70, 2.4K / 10.7K-token prompts): prefill 190 / 173 -> 818 / 827
-        // tok/s, decode 13.1 / 12.5 -> 21.9 / 20.2. IE_QWEN35_ONE_CARD_SPLIT=0 keeps the F16 Qwen35DenseModel; other
-        // files (Q4_K_M, ...) stay on it.
+        // Q5_K / Q4_K, the last since 2026-10-20's c32 Q4_K): its prefill and decode kernels, prompt cache, --spec with
+        // lookup drafts and restart points are the two-card path's. Measured 2026-10-05 (Q6_K, one B70, 2.4K / 10.7K-token
+        // prompts): prefill 190 / 173 -> 818 / 827 tok/s, decode 13.1 / 12.5 -> 21.9 / 20.2. IE_QWEN35_ONE_CARD_SPLIT=0
+        // keeps the F16 Qwen35DenseModel; other files stay on it.
         const bool one_card_split = [&] {
             if (opts.n_gpus > 1) return false;
             if (const char* v = std::getenv("IE_QWEN35_ONE_CARD_SPLIT"); v && *v == '0') return false;
             const auto* t = e->gguf_.find_tensor("blk.0.ffn_up.weight");
-            return t && (t->dtype == DType::kQ8_0 || t->dtype == DType::kQ6_K || t->dtype == DType::kQ5_K);
+            return t && (t->dtype == DType::kQ8_0 || t->dtype == DType::kQ6_K || t->dtype == DType::kQ5_K ||
+                         t->dtype == DType::kQ4_K);
         }();
         const bool use_split = !use_tp && (opts.n_gpus > 1 || std::getenv("IE_QWEN35_Q8") || one_card_split);
         if (one_card_split) std::fprintf(stderr, "[qwen35] one card: the split model's kernels on one stage (IE_QWEN35_ONE_CARD_SPLIT=0 = the previous one-card path)\n");
@@ -1378,16 +1379,15 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             }
             // P4 B18: --parallel N > 1 = N request lanes served by the shared lanes module (lane 0 = the live state at --ctx,
             // lanes 1..N-1 at --slot-ctx, 0 = 65,536; Engine::q27_lanes_init after the tokenizer). IE_QWEN35_LANES=0 keeps the
-            // joint-step path (slot banks + BatchStepper), and so does --spec (spec_generate runs on the live state, which the
-            // lanes use as lane 0). (--int8-kv with --parallel > 1 is refused at the CLI; init_lanes refuses it too.)
-            const bool q27_lanes_on = !e->spec_ &&
-                                      [] { const char* v = std::getenv("IE_QWEN35_LANES"); return !(v && *v == '0'); }();
+            // joint-step path (slot banks + BatchStepper). 2026-10-21: with --spec too -- the lanes run MTP draft rounds
+            // (q27_lanes_init); before, --spec took the joint-step path. (--int8-kv with --parallel > 1 is refused at the CLI;
+            // init_lanes refuses it too.)
+            const bool q27_lanes_on = [] { const char* v = std::getenv("IE_QWEN35_LANES"); return !(v && *v == '0'); }();
             // P4 B60: no --parallel = ONE request lane on the 27B (as it has been in practice); --parallel N sets the count
             const bool q27_auto = false;
             const bool q27_lanes = (opts.parallel > 1 && q27_lanes_on) || q27_auto;
             if (opts.parallel > 1 && !q27_lanes)
-                std::fprintf(stderr, "[qwen35split] --parallel %u: the joint-step path (%s)\n", opts.parallel,
-                             e->spec_ ? "--spec" : "IE_QWEN35_LANES=0");
+                std::fprintf(stderr, "[qwen35split] --parallel %u: the joint-step path (IE_QWEN35_LANES=0)\n", opts.parallel);
             // The shared-prefix split + snapshot at --parallel 1 AND on the lanes, ON by default like the crown and Flash-Next
             // (P4 B25: the cut sits on the prefill piece grid, q27_share_cut, so --parallel 1's bytes are the cache-off path's;
             // release gate F1 failed a2046bf's unaligned cut). IE_QWEN35_SHARED_PREFIX=0: --parallel 1's prefill as before B18,
@@ -2456,10 +2456,17 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         if (e->q4e_ && !opts.mmproj.empty())
             if (auto m = e->qvis_upload_tower(); !m.empty()) { err = m; return nullptr; }
         if (e->qwen35_split_ || e->qwen35moe_split_) {
+            // 2026-10-21: the request lanes take images too (the 27B's, then the crown's)
+            const bool lanes27 = (e->q27_ && e->q27_->serve) || (e->q35m_ && e->q35m_->serve);
+            const bool resident = e->qvis_tower_ && e->qvis_tower_->gpu_resident();
+            const uint32_t nl = e->qwen35_split_ ? e->qwen35_split_model_.n_lanes() : e->qwen35moe_split_model_.n_lanes();
+            const std::string where = lanes27 ? "images on all " + std::to_string(nl) + " request lanes"
+                                              : std::string("images at --parallel 1");
             const std::string state = e->qvis_mmproj_.empty()
                 ? std::string("no mmproj (images refused: --mmproj <mmproj-F16.gguf> or IE_MMPROJ enables them)")
-                : (e->qvis_tower_ ? "images at --parallel 1, tower resident (" : "images at --parallel 1, tower loads at the first image (") +
-                  e->qvis_mmproj_ + ")";
+                : lanes27 && !resident
+                ? "images refused on the request lanes: the tower must load at start (--mmproj " + e->qvis_mmproj_ + ")"
+                : where + (e->qvis_tower_ ? ", tower resident (" : ", tower loads at the first image (") + e->qvis_mmproj_ + ")";
             std::fprintf(stderr, "[vision] %s split: %s\n", e->qwen35_split_ ? "27B" : "35B-A3B", state.c_str());
         }
     }
@@ -2576,7 +2583,10 @@ std::string Engine::qvis_upload_tower() {
     return {};
 }
 
-std::string Engine::qvis_stage(const std::vector<int32_t>& ids) {
+std::string Engine::qvis_encode(const std::vector<int32_t>& ids, std::vector<QvisPendingImage>& imgs, std::vector<float>& rows,
+                                std::vector<std::pair<uint32_t, uint32_t>>& spans, std::vector<uint64_t>& hash,
+                                std::vector<int32_t>& pos3, int32_t& delta) {
+    std::lock_guard<std::mutex> lk(qvis_mu_);   // one tower, one encode scratch
     if (auto e = qvis_upload_tower(); !e.empty()) return e;   // lazy (no --mmproj): the first image loads + uploads
     DeviceAllocator& va = *qvis_alloc();
     // The image-pad id: Flash-Next's PLE key when the GGUF has one, else the vocabulary's <|image_pad|> -- the token chat()'s
@@ -2588,40 +2598,46 @@ std::string Engine::qvis_stage(const std::vector<int32_t>& ids) {
         pad = pid[0];
     }
     // Pad runs in prompt order must match the pending images one-to-one.
-    qvis_rows_.clear();
-    qvis_spans_.clear();
-    qvis_hash_.clear();
+    rows.clear();
+    spans.clear();
+    hash.clear();
     std::vector<Qwen4VisGrid> grids;
     size_t img = 0;
     for (uint32_t t = 0; t < ids.size(); ) {
         if (ids[t] != pad) { ++t; continue; }
         uint32_t n = 0;
         while (t + n < ids.size() && ids[t + n] == pad) ++n;
-        if (img >= qvis_pending_.size())
+        if (img >= imgs.size())
             return "vision: more image_pad runs than attached images";
-        auto& im = qvis_pending_[img];
+        auto& im = imgs[img];
         const uint32_t gh2 = im.H / 32, gw2 = im.W / 32;
         if (n != gh2 * gw2)
             return "vision: image_pad run length mismatch (client-injected pads?)";
         std::vector<float> emb;
         if (auto e = qvis_tower_->encode_gpu(va, im.px.data(), im.H, im.W, emb);
             !e.empty()) return "vision encode: " + e;
-        qvis_spans_.push_back({t, n});
+        spans.push_back({t, n});
         {   // P4 B62: the image's identity for the restart points (its pad ids cannot tell one image from another)
             uint64_t h = 0xCBF29CE484222325ull ^ (uint64_t(im.H) << 32 | im.W);
             const unsigned char* pb = reinterpret_cast<const unsigned char*>(im.px.data());
             const size_t nb = im.px.size() * sizeof(float);
             for (size_t i = 0; i + 8 <= nb; i += 8) { uint64_t w; std::memcpy(&w, pb + i, 8); h = (h ^ w) * 0x100000001B3ull; h ^= h >> 29; }
-            qvis_hash_.push_back(h);
+            hash.push_back(h);
         }
         grids.push_back({t, gh2, gw2});
-        qvis_rows_.insert(qvis_rows_.end(), emb.begin(), emb.end());
+        rows.insert(rows.end(), emb.begin(), emb.end());
         ++img;
         t += n;
     }
-    if (img != qvis_pending_.size())
+    if (img != imgs.size())
         return "vision: fewer image_pad runs than attached images";
-    qwen4_build_mrope3(uint32_t(ids.size()), grids, qvis_pos3_, qvis_delta_);
+    qwen4_build_mrope3(uint32_t(ids.size()), grids, pos3, delta);
+    return {};
+}
+
+std::string Engine::qvis_stage(const std::vector<int32_t>& ids) {
+    if (auto e = qvis_encode(ids, qvis_pending_, qvis_rows_, qvis_spans_, qvis_hash_, qvis_pos3_, qvis_delta_); !e.empty())
+        return e;
     qvis_pending_.clear();
     qvis_active_ = true;
     return {};
@@ -3280,6 +3296,15 @@ public:
     std::string prefix_prepare(uint32_t lane, const LanesRequest& rq, uint32_t& reused, std::string& source) override {
         source.clear();   // (--parallel 1 reports no cache source on this arch)
         std::lock_guard<std::mutex> cl(cache_mu_);
+        if (rq.vision) {   // 2026-10-21: the request's images on its lane; a new sequence (pad ids cannot key a restore)
+            const LanesVision& v = *rq.vision;
+            sticky_.drop(lane);          // (the lane's rows are about to be overwritten)
+            lad_set_live(lane, {}, 0);   // (lane 0's restart points: none of this sequence's)
+            m_.reset_lane_state(lane);
+            reused = 0;
+            return m_.set_lane_vision(lane, v.rows.data(), v.spans, v.pos3.data(), uint32_t(v.pos3.size() / 3), v.delta);
+        }
+        m_.clear_lane_vision(lane);   // (a text request after an image one: the text path's rope, no splice)
         // P4 B29 Fix B: the lane's own checkpoint, in place, when it serves at least as much as the shared cache would
         const uint32_t own = sticky_.match(lane, *rq.ids), peek = peek_locked(rq);
         // P4 B59: the lead lane's restart point, when it is deeper than the lane's one checkpoint and at least as deep as
@@ -3312,7 +3337,7 @@ public:
     // P4 B15: the shared prefix [0, pos) into the prompt cache (--parallel 1's insert at share_at): any lane restores it
     // (prefix_prepare's fleet_cache_restore finds the deepest endpoint along a prompt)
     std::string mark(uint32_t lane, const LanesRequest& rq, uint32_t pos) override {
-        if (!cache_) return {};
+        if (!cache_ || rq.vision) return {};
         const auto t0 = std::chrono::steady_clock::now();
         const std::vector<int32_t> pref(rq.ids->begin(), rq.ids->begin() + pos);
         Q35mLaneView view{m_, lane};
@@ -3327,6 +3352,7 @@ public:
     }
     // what prefix_prepare's fleet_cache_restore would restore now (its clamp: a DeltaNet model never restores a full-length match)
     uint32_t cache_peek(const LanesRequest& rq) const override {
+        if (rq.vision) return 0;   // (an image request restores nothing)
         std::unique_lock<std::mutex> cl(cache_mu_, std::try_to_lock);
         if (!cl.owns_lock()) return 0;   // (P4 B39: the serial worker holds the cache -- a restore or an insert -- nothing to report now)
         return peek_locked(rq);
@@ -3366,6 +3392,7 @@ public:
         const std::string pe = pipe_.reset_lane(lane);
         sticky_.drop(lane);   // (P4 B29)
         lad_set_live(lane, {}, 0);   // (P4 B59)
+        m_.clear_lane_vision(lane);
         try {
             m_.reset_lane_state(lane);
             for (uint32_t d = 0; d < m_.n_devices(); ++d) m_.fleet()->dev(d).queue().wait();
@@ -3377,7 +3404,7 @@ public:
     // serial loop's step; that turn drains the pipe: serial_drains) and the state is then prompt ++ reply exactly.
     std::string finish(uint32_t lane, const LanesRequest& rq, std::span<const int32_t> out, const std::string&,
                        uint32_t pos) override {
-        if (!cache_) return {};
+        if (!cache_ || rq.vision) return {};
         const auto t0 = std::chrono::steady_clock::now();
         std::vector<int32_t> full(rq.ids->begin(), rq.ids->end());
         full.insert(full.end(), out.begin(), out.end());
@@ -3542,6 +3569,7 @@ private:
     // (P4 B36 (B): as the anchor when the prompt ends with a user query) and P4 B29 Fix B's in-place checkpoint (the lane's
     // DeltaNet + conv state; its KV rows stay). By lane index (P4 B39).
     void conv_snapshot(uint32_t lane, const LanesRequest& rq, uint32_t pos) {
+        if (rq.vision) return;   // (2026-10-21: an image request's state keys nothing -- no insert, no lane checkpoint)
         const std::vector<int32_t>& ids = *rq.ids;
         if (cache_) {
             const std::vector<int32_t> pref(ids.begin(), ids.begin() + pos);
@@ -3719,6 +3747,7 @@ private:
     void lad_track(uint32_t dev, uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0, int look) {
         if (!lad_on_ || lane != 0) return;
         std::lock_guard<std::mutex> g(lad_mu_);
+        if (m_.lane_vision_active(lane)) { lad_live_.clear(); lad_live_ok_ = false; lad_drop_above(0); return; }   // (2026-10-21)
         if (dev == 0) {
             if (pos0 == 0) { lad_live_.clear(); lad_live_ok_ = true; lad_drop_above(0); }
             if (!lad_live_ok_ || pos0 > lad_live_.size() || !ids) { lad_live_.clear(); lad_live_ok_ = false; lad_drop_above(0); return; }
@@ -3987,7 +4016,8 @@ std::string Engine::q35m_lanes_init() {
 // of the generation gate. The reply snapshot --parallel 1 inserts after a reply (the gen-cache endpoint, when chat() passes
 // reply_cache) is Q35mLanesModel::finish, in a serial turn after the reply.
 GenerateResult Engine::q35m_generate_lanes(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token,
-                                           uint32_t cache_prefix_len, bool reply_cache, uint32_t shared_prefix_len, bool anchor) {
+                                           uint32_t cache_prefix_len, bool reply_cache, uint32_t shared_prefix_len, bool anchor,
+                                           std::vector<QvisPendingImage>* imgs) {
     GenerateResult res;
     const auto ids = tok_.encode(prompt, /*allow_special=*/true);
     res.prompt_tokens = uint32_t(ids.size());
@@ -4012,6 +4042,28 @@ GenerateResult Engine::q35m_generate_lanes(const std::string& prompt, const Samp
     rq.think_close = think_close_id_;   // P4 B27
     rq.anchor = anchor && prompt_cache_on_ && cache_prefix_len > 0;   // P4 B36 (B): snap_at is the last user query's end
     if (rq.sp.max_tokens == 0) { res.finish_reason = "length"; return res; }   // --parallel 1: zero steps
+    // 2026-10-21: the lanes' images (the 27B's, the crown's), encoded now on this request's thread (the tower on card 1
+    // beside the running pipe, under qvis_mu_) and staged on the lane in its serial turn (the lanes model's prefix_prepare).
+    // Pad ids cannot tell one image from another, so the request stays out of the prompt cache: no restore, snapshot, shared
+    // prefix or reply snapshot (--parallel 1's rule for image requests); on the crown, out of the lane's own checkpoint and
+    // lane 0's restart points too.
+    LanesVision vis;
+    if (imgs && !imgs->empty()) {
+        std::vector<uint64_t> hash;
+        const auto t0 = std::chrono::steady_clock::now();
+        if (auto e = qvis_encode(ids, *imgs, vis.rows, vis.spans, hash, vis.pos3, vis.delta); !e.empty()) {
+            res.finish_reason = "error: " + e;
+            return res;
+        }
+        rq.vision = &vis;
+        rq.snap_at = uint32_t(ids.size());
+        rq.share_at = 0;
+        rq.reply_cache = false;
+        rq.anchor = false;
+        std::fprintf(stderr, "[vision] lanes: %zu image span(s), %zu prompt rows, decode rope delta %d (encoded in %.0f ms)\n",
+                     vis.spans.size(), vis.pos3.size() / 3, vis.delta,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
     const LanesResult lr = (q35m_ ? q35m_->serve : q27_->serve)->run(rq, on_token);   // (P4 B18: the 27B's lanes too)
     res.text = lr.text;
     res.answer_start = lr.answer_start;
@@ -4098,6 +4150,14 @@ public:
     std::string prefix_prepare(uint32_t lane, const LanesRequest& rq, uint32_t& reused, std::string& source) override {
         source.clear();   // (--parallel 1 reports no cache source on this arch)
         m_.select_lane(lane);
+        forget_round(lane);   // (2026-10-21: the lane's next MTP round waits for a step of this sequence)
+        if (rq.vision) {   // 2026-10-21: the request's images on its lane; no restore (pad ids cannot key the cache)
+            const LanesVision& v = *rq.vision;
+            reused = 0;
+            m_.reset_state();
+            return m_.set_lane_vision(lane, v.rows.data(), v.spans, v.pos3.data(), uint32_t(v.pos3.size() / 3), v.delta);
+        }
+        m_.clear_lane_vision(lane);   // (a text request after an image one: the text path's rope, no splice)
         reused = cache_ ? fleet_cache_restore(m_, *cache_, *rq.ids, "27b-split-cache") : 0;
         if (!reused) m_.reset_state();   // a new sequence (a failed restore's half-copied state goes too)
         return {};
@@ -4105,12 +4165,12 @@ public:
     LanesPlan plan(const LanesRequest& rq, uint32_t reused) override { return q27_plan(ops(rq, reused), reused, uint32_t(rq.ids->size())); }
     // the shared prefix [0, pos) into the prompt cache (--parallel 1's insert at the grid cut of share_at; IE_QWEN35_SHARED_PREFIX=0 off)
     std::string mark(uint32_t lane, const LanesRequest& rq, uint32_t pos) override {
-        if (!cache_) return {};
+        if (!cache_ || rq.vision) return {};
         m_.select_lane(lane);
         return insert(rq, pos, "shared prefix");
     }
     uint32_t cache_peek(const LanesRequest& rq) const override {
-        if (!cache_) return 0;
+        if (!cache_ || rq.vision) return 0;
         const uint32_t M = cache_->peek_longest_match(*rq.ids);
         return M < rq.ids->size() ? M : 0u;
     }
@@ -4142,6 +4202,8 @@ public:
         try {
             m_.select_lane(lane);
             m_.reset_state();
+            m_.clear_lane_vision(lane);
+            forget_round(lane);
             for (uint32_t d = 0; d < m_.n_devices(); ++d) m_.fleet()->dev(d).queue().wait();
         } catch (const sycl::exception& x) { return x.what(); }
         return pe;
@@ -4150,7 +4212,7 @@ public:
     // last one of a "length" reply too (a 1-row decode step); a lane has not forwarded that one yet, so it runs here first.
     std::string finish(uint32_t lane, const LanesRequest& rq, std::span<const int32_t> out, const std::string&,
                        uint32_t pos) override {
-        if (!cache_) return {};
+        if (!cache_ || rq.vision) return {};
         const auto t0 = std::chrono::steady_clock::now();
         m_.select_lane(lane);
         std::vector<int32_t> full(rq.ids->begin(), rq.ids->end());
@@ -4229,10 +4291,69 @@ public:
     std::string pipe_error() const override { return pipe_.error(); }
     uint32_t    pipe_max_rows() const override { return pipe_.max_rows(); }
 
+    // 2026-10-21: MTP draft rounds on the lanes (--spec): the model's round state for every lane (V rows a round), the
+    // rows' picks, and the per-lane mark that tells the two stage threads which step is a round
+    std::string init_draft(uint32_t V) {
+        if (auto e = m_.init_lane_mtp(V); !e.empty()) return e;
+        sycl::queue& q = hq();
+        draft_picks_dev_  = sycl::malloc_device<int32_t>(16, q);
+        draft_picks_host_ = sycl::malloc_host<int32_t>(16, q);
+        dev_.insert(dev_.end(), {draft_picks_dev_, draft_picks_host_});
+        if (!draft_picks_dev_ || !draft_picks_host_) return "MTP round picks alloc failed";
+        round_.assign(m_.n_lanes(), {0u, 0u});
+        draft_V_ = m_.lane_mtp_rows();
+        return {};
+    }
+    uint32_t draft_rows() const override { return draft_V_; }
+    std::string draft(uint32_t lane, int32_t next, uint32_t pos, const LanesSampling& sp, uint64_t seed,
+                      std::vector<int32_t>& out) override {
+        Qwen35SplitModel::SpecDraftSampling ds;
+        ds.temperature = sp.temperature; ds.top_k = sp.top_k; ds.top_p = sp.top_p; ds.min_p = sp.min_p; ds.seed = seed;
+        return m_.lane_draft(lane, next, pos, ds, out);
+    }
+    std::string pipe_submit_draft(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) override {
+        if (!draft_V_ || lane >= round_.size()) return "MTP rounds are off";
+        { std::lock_guard<std::mutex> g(round_mu_); round_[lane] = {T, pos0}; }
+        std::string e = pipe_.submit(lane, ids, T, pos0);
+        if (!e.empty()) forget_round(lane);
+        return e;
+    }
+    std::string sample_draft(uint32_t lane, uint32_t rows, const LanesSampling& sp, std::span<const std::span<const int32_t>> windows,
+                             std::span<const uint64_t> seeds, std::span<int32_t> picks) override {
+        if (rows > draft_V_ || rows > 16) return "sample_draft: " + std::to_string(rows) + " rows";
+        const sycl::half* all = m_.lane_round_logits(lane);
+        if (!all) return "sample_draft: lane " + std::to_string(lane) + " has no round logits";
+        sycl::queue& q = hq();
+        try {
+            for (uint32_t r = 0; r < rows; ++r) {   // (in order on the queue: recent_[lane] is row r's while its kernels run)
+                sycl::half* lg = const_cast<sycl::half*>(all) + uint64_t(r) * V_;
+                if (!windows[r].empty()) {
+                    m_.fleet()->dev(m_.head_dev()).h2d_async(recent_[lane], windows[r].data(), windows[r].size() * sizeof(int32_t));
+                    sampling_penalties(q, lg, V_, recent_[lane], uint32_t(windows[r].size()), sp.repeat_penalty, sp.presence_penalty,
+                                       sp.frequency_penalty);
+                }
+                sample_softmax_topk_topp(q, lg, draft_picks_dev_ + r, V_, sp.temperature, sp.top_k, sp.top_p, sp.min_p, seeds[r]);
+            }
+            q.memcpy(draft_picks_host_, draft_picks_dev_, rows * sizeof(int32_t)).wait();
+        } catch (const sycl::exception& x) { return x.what(); }
+        for (uint32_t r = 0; r < rows; ++r) picks[r] = draft_picks_host_[r];
+        return {};
+    }
+    std::string draft_keep(uint32_t lane, uint32_t rows, uint32_t kept, uint32_t pos0) override {
+        if (auto e = m_.lane_round_keep(lane, kept); !e.empty()) return e;
+        return kept < rows ? pipe_.rewind_lane(lane, pos0 + kept) : std::string();
+    }
+
 private:
     sycl::queue& hq() { return m_.fleet()->dev(m_.head_dev()).queue(); }
-    std::vector<Q27Op> ops(const LanesRequest& rq, uint32_t reused) const {
-        return q27_prefill_ops(uint32_t(rq.ids->size()), reused, rq.snap_at, rq.share_at, cache_ != nullptr, pf_chunk_, pipeline_);
+    void forget_round(uint32_t lane) {
+        m_.lane_mtp_forget(lane);
+        std::lock_guard<std::mutex> g(round_mu_);
+        if (lane < round_.size()) round_[lane] = {0u, 0u};
+    }
+    std::vector<Q27Op> ops(const LanesRequest& rq, uint32_t reused) const {   // (an image request: no cache inserts)
+        return q27_prefill_ops(uint32_t(rq.ids->size()), reused, rq.snap_at, rq.share_at, cache_ != nullptr && !rq.vision,
+                               pf_chunk_, pipeline_);
     }
     // the selected lane's state [0, pos) of rq.ids into the prompt cache (--parallel 1's inserts); logged, never the request's error
     std::string insert(const LanesRequest& rq, uint32_t pos, const char* what) {
@@ -4246,11 +4367,23 @@ private:
     // One card's part of one lane's step (a stage thread; only this thread touches that card while the pipe runs). A 1-row
     // pipe step is a decode row (the plan keeps 1-row pipelined pieces out of the pipe).
     std::string stage(uint32_t s, const Glm5LanePipe::Step& st) {
+        bool round = false;   // 2026-10-21: the lane's MTP round (its mark: the rows and the position it was submitted with)
+        if (draft_V_ && st.T >= 2) {
+            std::lock_guard<std::mutex> g(round_mu_);
+            round = st.lane < round_.size() && round_[st.lane].first == st.T && round_[st.lane].second == st.pos0;
+            if (round && s == m_.head_dev()) round_[st.lane] = {0u, 0u};
+        }
         std::string e;
-        try { e = m_.forward_stage(s, st.lane, st.ids, st.T, st.pos0, reinterpret_cast<sycl::half*>(st.wide), false); }
+        try {
+            e = round ? m_.forward_stage_verify(s, st.lane, st.ids, st.T, st.pos0, reinterpret_cast<sycl::half*>(st.wide))
+                      : m_.forward_stage(s, st.lane, st.ids, st.T, st.pos0, reinterpret_cast<sycl::half*>(st.wide), false);
+        }
         catch (const std::exception& x) { e = x.what(); }
-        if (!e.empty()) { try { m_.fleet()->dev(s).queue().wait(); } catch (...) {} }   // nothing of a failed step still runs
-        else if (s == m_.head_dev()) lg_[st.lane] = m_.logits();
+        if (!e.empty()) {
+            try { m_.fleet()->dev(s).queue().wait(); } catch (...) {}   // nothing of a failed step still runs
+            if (round) forget_round(st.lane);
+        }
+        else if (s == m_.head_dev() && !round) lg_[st.lane] = m_.logits();   // (a round's rows: lane_round_logits)
         return e;
     }
     // one card's part of a group's step (G >= 2 lanes, one decode row each); card 1 leaves row r's logits at rows_logits() +
@@ -4332,6 +4465,12 @@ private:
     int32_t* picks_dev_ = nullptr;         // [n_lanes] a group's picks (card 1)
     int32_t* picks_host_ = nullptr;        // [n_lanes] pinned host
     std::vector<void*> dev_;
+    // 2026-10-21 MTP rounds (init_draft)
+    uint32_t draft_V_ = 0;
+    std::mutex round_mu_;
+    std::vector<std::pair<uint32_t, uint32_t>> round_;   // [lane] (rows, pos0) of its round in the pipe; (0, 0) = none
+    int32_t* draft_picks_dev_ = nullptr;   // [16] a round's picks (card 1)
+    int32_t* draft_picks_host_ = nullptr;
 };
 }  // namespace
 
@@ -4366,6 +4505,31 @@ std::string Engine::q27_lanes_init() {
                                          "%u-row piece grid; IE_QWEN35_SHARED_PREFIX=0 = off)\n", pf);
     LanesServe::Options so;
     if (const char* v = std::getenv("IE_QWEN35_STEP_TRACE")) so.trace = *v == '1';
+    // 2026-10-21: --spec on the lanes = MTP draft rounds (Qwen35SplitModel::init_lane_mtp; --spec-k rows a round): a lane that
+    // decodes while at most IE_QWEN35_LANES_MTP_MAX lanes decode (default: the card count -- two lanes on two cards fill
+    // both stages, 63.1 against rows groups' 51.8 tok/s together; four lanes are faster in rows groups) drafts with the MTP
+    // head and verifies the drafts in one step; more decoding lanes share the cards in rows groups. IE_QWEN35_LANES_MTP=0
+    // = off.
+    if (spec_ && m.mtp_loaded() && ![] { const char* v = std::getenv("IE_QWEN35_LANES_MTP"); return v && *v == '0'; }()) {
+        if (auto e = lm->init_draft(opts_.spec_k); !e.empty())
+            std::fprintf(stderr, "[qwen35split] lanes MTP OFF: %s\n", e.c_str());
+        else {
+            so.draft = true;
+            so.draft_max = std::min(m.n_devices(), m.n_lanes());
+            if (const char* v = std::getenv("IE_QWEN35_LANES_MTP_MAX"))
+                so.draft_max = uint32_t(std::clamp(std::atoi(v), 1, int(m.n_lanes())));
+            std::string per_card;
+            for (uint32_t d = 0; d < m.n_devices(); ++d) {
+                char b[64];
+                std::snprintf(b, sizeof b, "%s%.3f on card %u", d ? ", " : "", m.lane_mtp_bytes(d) / 1073741824.0, d);
+                per_card += b;
+            }
+            std::fprintf(stderr, "[qwen35split] lanes MTP ON (--spec): rounds of %u rows (the MTP head's %u drafts + the lane's next "
+                                 "input) while at most %u lane(s) decode; GiB a lane: %s "
+                                 "(IE_QWEN35_LANES_MTP=0 = off, IE_QWEN35_LANES_MTP_MAX = the lanes)\n",
+                         m.lane_mtp_rows(), m.lane_mtp_rows() - 1, so.draft_max, per_card.c_str());
+        }
+    } else if (spec_) std::fprintf(stderr, "[qwen35split] lanes MTP OFF (%s)\n", m.mtp_loaded() ? "IE_QWEN35_LANES_MTP=0" : "no MTP head");
     q27_ = std::make_unique<Q35mLanes>();
     q27_->lanes = std::move(lm);
     q27_->serve = std::make_unique<LanesServe>(*q27_->lanes, so);
@@ -6209,12 +6373,14 @@ std::string Engine::vision_status_json() const {
             reason = q4e_vision_refusal(opts_.parallel);
             ready = reason.empty();
             break;
-        case ModelArch::kQwen35Dense:   // P4 B45: the 27B's two-card split with an mmproj at --parallel 1 (Engine::chat: the same rule)
-            reason = q27_vision_refusal(qwen35_split_, !qvis_mmproj_.empty() /* resolved at load */, opts_.parallel);
+        case ModelArch::kQwen35Dense:   // P4 B45: the 27B's split with an mmproj at --parallel 1, or on its lanes (Engine::chat: the same rule)
+            reason = q27_vision_refusal(qwen35_split_, !qvis_mmproj_.empty() /* resolved at load */, opts_.parallel,
+                                        q27_ && q27_->serve, qvis_tower_ && qvis_tower_->gpu_resident());
             ready = reason.empty();
             break;
         case ModelArch::kQwen35Moe:   // P4 B45 step 2: the crown's two-card split with an mmproj at --parallel 1 (Engine::chat: the same rule)
-            reason = q35m_vision_refusal(qwen35moe_split_, !qvis_mmproj_.empty() /* resolved at load */, opts_.parallel);
+            reason = q35m_vision_refusal(qwen35moe_split_, !qvis_mmproj_.empty() /* resolved at load */, opts_.parallel,
+                                         q35m_ && q35m_->serve, qvis_tower_ && qvis_tower_->gpu_resident());
             ready = reason.empty();
             break;
         default:
@@ -6265,13 +6431,17 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
             return res;
         }
     } else if (has_images && arch_ == ModelArch::kQwen35Dense) {
-        if (const std::string why = q27_vision_refusal(qwen35_split_, !qvis_mmproj_.empty(), opts_.parallel); !why.empty()) {
+        if (const std::string why = q27_vision_refusal(qwen35_split_, !qvis_mmproj_.empty(), opts_.parallel, q27_ && q27_->serve,
+                                                       qvis_tower_ && qvis_tower_->gpu_resident());
+            !why.empty()) {
             GenerateResult res;
             res.finish_reason = "error: " + why;
             return res;
         }
     } else if (has_images && arch_ == ModelArch::kQwen35Moe) {   // step 2: the crown split
-        if (const std::string why = q35m_vision_refusal(qwen35moe_split_, !qvis_mmproj_.empty(), opts_.parallel); !why.empty()) {
+        if (const std::string why = q35m_vision_refusal(qwen35moe_split_, !qvis_mmproj_.empty(), opts_.parallel, q35m_ && q35m_->serve,
+                                                        qvis_tower_ && qvis_tower_->gpu_resident());
+            !why.empty()) {
             GenerateResult res;
             res.finish_reason = "error: " + why;
             return res;
@@ -6283,8 +6453,13 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
     }
     // Per-request image staging lives in engine members that are written
     // BEFORE the generation gate; with --parallel > 1 two requests could
-    // clobber each other's images. Refuse plainly instead of racing.
-    if (const std::string why = has_images ? q4e_vision_refusal(opts_.parallel) : std::string(); !why.empty()) {
+    // clobber each other's images. Refuse plainly instead of racing. The 27B
+    // and crown splits' request lanes (2026-10-21) keep each request's images
+    // in the request (lane_imgs below) and stage them on its lane.
+    const bool q27_lane_images = has_images && ((arch_ == ModelArch::kQwen35Dense && q27_ && q27_->serve) ||
+                                                 (arch_ == ModelArch::kQwen35Moe && q35m_ && q35m_->serve));
+    std::vector<QvisPendingImage> lane_imgs;
+    if (const std::string why = has_images && !q27_lane_images ? q4e_vision_refusal(opts_.parallel) : std::string(); !why.empty()) {
         GenerateResult res;
         res.finish_reason = "error: " + why;
         return res;
@@ -6548,7 +6723,7 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
                 runs += "<|vision_start|>";
                 for (uint32_t i = 0; i < nm; ++i) runs += "<|image_pad|>";
                 runs += "<|vision_end|>";
-                qvis_pending_.push_back(std::move(im));
+                (q27_lane_images ? lane_imgs : qvis_pending_).push_back(std::move(im));
             }
             for (size_t p = t.content.find(kChatImageMarker); p != std::string::npos;
                  p = t.content.find(kChatImageMarker)) t.content.erase(p, kChatImageMarker.size());
@@ -6605,7 +6780,9 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
     // P4 B36 (B): the prompt ends with a user query (not a tool result), so cache_prefix_len is that query's end -- the depth the
     // conversation's next query still shares after the template re-renders the turns between (the crown's lanes keep it)
     const bool query_last = !render_turns.empty() && render_turns.back().role == "user";
-    GenerateResult r = generate(full, sp, on_token, cache_prefix_len, /*reply_cache=*/!model_has_think, shared_prefix_len, query_last);
+    GenerateResult r = q27_lane_images
+        ? q35m_generate_lanes(full, sp, on_token, cache_prefix_len, /*reply_cache=*/false, 0, false, &lane_imgs)
+        : generate(full, sp, on_token, cache_prefix_len, /*reply_cache=*/!model_has_think, shared_prefix_len, query_last);
     // P4 B27 / B28: the XML tool calls; P4 B35: then, thinking on with a Qwen thinking template, the reasoning split off
     finish_chatml_reply(r, tools_json, xml_tools.enabled, model_has_think && enable_thinking, chatml_think_ && enable_thinking);
     return r;

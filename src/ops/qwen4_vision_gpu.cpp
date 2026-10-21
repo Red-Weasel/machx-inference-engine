@@ -268,6 +268,12 @@ std::string Qwen4Vision::encode_gpu(DeviceAllocator& alloc, const float* img,
     if (auto e = upload_gpu(alloc); !e.empty()) return e;
     GpuState& g = *gpu_;
     if (g.cap < N) {
+        // 2026-10-21: the smaller scratch goes first (it leaked on every growth before; the last encode waited, so
+        // nothing still reads it), and a failed allocation is an error, not a null kernel argument
+        for (void* p : {(void*)g.px, (void*)g.posadd, (void*)g.cs, (void*)g.sn, (void*)g.res, (void*)g.C, (void*)g.xh,
+                        (void*)g.qkv, (void*)g.ffn, (void*)g.att})
+            if (p) alloc.free(p);
+        g.cap = 0;
         auto am = [&](size_t bytes) { return alloc.malloc(bytes); };
         g.px = static_cast<sycl::half*>(am(size_t(N) * pd * 2));
         g.posadd = static_cast<float*>(am(size_t(N) * kVisHid * 4));
@@ -279,6 +285,13 @@ std::string Qwen4Vision::encode_gpu(DeviceAllocator& alloc, const float* img,
         g.qkv = static_cast<sycl::half*>(am(size_t(N) * 3 * kVisHid * 2));
         g.ffn = static_cast<sycl::half*>(am(size_t(N) * kVisFfn * 2));
         g.att = static_cast<sycl::half*>(am(size_t(N) * kVisHid * 2));
+        if (!g.px || !g.posadd || !g.cs || !g.sn || !g.res || !g.C || !g.xh || !g.qkv || !g.ffn || !g.att) {
+            for (void* p : {(void*)g.px, (void*)g.posadd, (void*)g.cs, (void*)g.sn, (void*)g.res, (void*)g.C, (void*)g.xh,
+                            (void*)g.qkv, (void*)g.ffn, (void*)g.att})
+                if (p) alloc.free(p);
+            g.px = nullptr; g.posadd = nullptr; g.cs = g.sn = g.res = g.C = nullptr; g.xh = g.qkv = g.ffn = g.att = nullptr;
+            return "qwen4 vision gpu: encode scratch alloc failed (" + std::to_string(N) + " patches)";
+        }
         g.cap = N;
     }
 
@@ -341,10 +354,12 @@ std::string Qwen4Vision::encode_gpu(DeviceAllocator& alloc, const float* img,
                         }
                     }
     }
-    q.memcpy(g.px, px.data(), px.size() * 2);
-    q.memcpy(g.posadd, posadd.data(), posadd.size() * 4);
-    q.memcpy(g.cs, cs.data(), cs.size() * 4);
-    q.memcpy(g.sn, sn.data(), sn.size() * 4);
+    // through the allocator's pinned stage (2026-10-21; GitHub issue #2: pageable copies have faulted the copy engine on this
+    // stack): blocking, in order on the card's queue before the forward
+    alloc.h2d(g.px, px.data(), px.size() * 2);
+    alloc.h2d(g.posadd, posadd.data(), posadd.size() * 4);
+    alloc.h2d(g.cs, cs.data(), cs.size() * 4);
+    alloc.h2d(g.sn, sn.data(), sn.size() * 4);
 
     // ---- forward (in-order queue) -------------------------------------------
     gemm_fp16(q, g.px, g.patch, g.C, N, kVisHid, pd);
@@ -383,7 +398,7 @@ std::string Qwen4Vision::encode_gpu(DeviceAllocator& alloc, const float* img,
                    [C = g.C, b = g.mm2_b, od](sycl::id<1> i) {
         C[i] += b[uint32_t(i % od)];
     });
-    q.memcpy(out.data(), g.C, out.size() * 4).wait();
+    alloc.d2h(out.data(), g.C, out.size() * 4);   // (pinned stage, after the bias kernel on the in-order queue)
     return {};
 }
 

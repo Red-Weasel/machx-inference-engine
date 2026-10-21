@@ -690,14 +690,16 @@ sycl::event dequant_q6_soa_to_Bt(sycl::queue& q,
                                  sycl::half* Bt, uint32_t K, uint32_t N,
                                  const std::vector<sycl::event>& deps = {});
 
-// P4 B21 (gemv_kq_c32.cpp): native Q6_K / Q5_K decode for the 2-card 27B split. "c32" = a load-time per-column repack into
+// P4 B21 (gemv_kq_c32.cpp): native Q6_K / Q5_K / Q4_K decode for the 27B split. "c32" = a load-time per-column repack into
 // 32-element chunks (one Q8_1 activation block each; layout in the .cpp) so a lane owns a chunk, like the Q8_0-SoA kernel.
 // Needs K % 256 == 0. Buffer sizes per weight [K, N]: Q6_K lo N*K/2, hi N*K/4, sc N*K/16, d N*K/256 (fp16);
-// Q5_K lo N*K/2, hi N*K/32 (uint32), sm N*K/32 (uint16), dm N*K/256 (uint32). The quants and scales are the GGUF's bits.
+// Q5_K lo N*K/2, hi N*K/32 (uint32), sm N*K/32 (uint16), dm N*K/256 (uint32); Q4_K (2026-10-20) = Q5_K without hi.
+// The quants and scales are the GGUF's bits.
 void repack_q6_K_to_c32(const void* W_blocks, uint32_t K, uint32_t N,
                         uint8_t* lo, uint8_t* hi, int8_t* sc, uint16_t* d);
 void repack_q5_K_to_c32(const void* W_blocks, uint32_t K, uint32_t N,
                         uint8_t* lo, uint32_t* hi, uint16_t* sm, uint32_t* dm);
+void repack_q4_K_to_c32(const void* W_blocks, uint32_t K, uint32_t N, uint8_t* lo, uint16_t* sm, uint32_t* dm);
 // y[T, N] (y[t*N + n]) = rows of x_q8 (T block_q8_1x streams of K/32 blocks, quantize_q8_1 over [T, K]) @ W. Any T: T = 1 is
 // the decode GEMV, T 2..16 the request-lane rows / spec verify (the weight is read once for all rows), T > 16 loops in 16s.
 // One kernel template for every T: row t of a T-row call equals the T = 1 call on that row bit for bit.
@@ -707,6 +709,8 @@ sycl::event gemv_q6k_c32_q8(sycl::queue& q, const void* x_q8, const uint8_t* lo,
 sycl::event gemv_q5k_c32_q8(sycl::queue& q, const void* x_q8, const uint8_t* lo, const uint32_t* hi, const uint16_t* sm,
                             const uint32_t* dm, sycl::half* y, uint32_t K, uint32_t N, uint32_t T,
                             const std::vector<sycl::event>& deps = {});
+sycl::event gemv_q4k_c32_q8(sycl::queue& q, const void* x_q8, const uint8_t* lo, const uint16_t* sm, const uint32_t* dm,
+                            sycl::half* y, uint32_t K, uint32_t N, uint32_t T, const std::vector<sycl::event>& deps = {});
 // c32 streams -> fp16 Bt[K, N] (prefill: the F16 gemm/oneDNN route, like dequant_q8_0_soa_to_Bt). Values as ggml's dequant.
 sycl::event dequant_q6k_c32_to_Bt(sycl::queue& q, const uint8_t* lo, const uint8_t* hi, const int8_t* sc,
                                   const uint16_t* d, sycl::half* Bt, uint32_t K, uint32_t N,
@@ -714,6 +718,8 @@ sycl::event dequant_q6k_c32_to_Bt(sycl::queue& q, const uint8_t* lo, const uint8
 sycl::event dequant_q5k_c32_to_Bt(sycl::queue& q, const uint8_t* lo, const uint32_t* hi, const uint16_t* sm,
                                   const uint32_t* dm, sycl::half* Bt, uint32_t K, uint32_t N,
                                   const std::vector<sycl::event>& deps = {});
+sycl::event dequant_q4k_c32_to_Bt(sycl::queue& q, const uint8_t* lo, const uint16_t* sm, const uint32_t* dm, sycl::half* Bt,
+                                  uint32_t K, uint32_t N, const std::vector<sycl::event>& deps = {});
 // P4 B21: c32 expert banks for the qwen35moe crown split. A [K, N, E] expert tensor repacked over E*N columns (expert e's
 // column n = bank column e*N + n). kind 6 = Q6_K streams, 5 = Q5_K streams (types as in repack_q{6,5}_K_to_c32).
 struct C32Bank { const uint8_t* lo = nullptr; const void* hi = nullptr; const void* sc = nullptr; const void* d = nullptr; int kind = 0; };

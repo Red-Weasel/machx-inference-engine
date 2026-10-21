@@ -279,8 +279,8 @@ has work on a card can leave the GPU faulting. DeepSeek-V4.1-Flash and
 MiMo-V2.6-Flash stop as before, at the next token.
 
 Image inputs are refused with an error when the server runs `--parallel > 1`:
-per-request image staging is engine-global and not slot-safe. (DeepSeek-V4.1-Flash
-takes images on its lanes.) Since v0.2.6 a load of MiMo-V2.6-Flash or Qwen3.8-Flash
+per-request image staging is engine-global and not slot-safe. (DeepSeek-V4.1-Flash and
+the Qwen3.8-27B and 35B-A3B splits take images on their lanes.) Since v0.2.6 a load of MiMo-V2.6-Flash or Qwen3.8-Flash
 without `--parallel` has 4 lanes, so pass `--parallel 1` to serve images on them.
 
 The Qwen3.8-27B and the 35B-A3B two-card splits (`--gpus 2`) take images at `--parallel 1`
@@ -289,8 +289,11 @@ abliterated 27B's BF16 projector; the tower loads onto the second card at load, 
 lanes are sized, and the 27B's `[budget]` line counts it), else `IE_MMPROJ` or an
 `mmproj*.gguf` beside the model (an F16 first), loaded at the first image. `/props`
 `vision.ready` says whether a load takes them. An image request runs without the prompt
-cache and without `--spec`; its text turns are unchanged. The lanes (`--parallel` > 1, the
-default load of both splits) refuse images with that reason.
+cache, and at `--parallel 1` without `--spec` (on the 27B's lanes `--spec`'s MTP rounds take it too, since v0.2.27); its text turns are unchanged. Both splits' request lanes (`--parallel N`; the
+35B-A3B's default load) take them when the tower loads at start (`--mmproj`): each request's images are encoded
+on its own thread (one at a time) and staged on its lane, beside the other lanes' requests; an image request
+stays out of the prompt cache (and, on the 35B-A3B, out of the lanes' own checkpoints and restart points).
+Without `--mmproj` they refuse images (a tower loaded at the first image would land after the lanes were sized).
 
 ## Request lanes on the 35B-A3B class: scheduling switches (v0.2.6, v0.2.8)
 
@@ -338,6 +341,7 @@ Each is on by default and read once per process; `=0` restores the previous path
 | `IE_QWEN35_DN_SCAN`, `IE_Q35MOE_DN_SCAN`, `IE_Q4E_DN_SCAN` | the register-resident DeltaNet scan for prefill chunks |
 | `IE_QWEN35_SPEC_STEP` | with `--spec` on the 27B split: speculation as a step of the normal decode loop (any sampler, the prompt cache, any prompt length); `=0` = the greedy-only path with its 4,096-token limit |
 | `IE_QWEN35_SPEC_ROWS` | the speculative verify rows' attention in one pass |
+| `IE_QWEN35_LANES_MTP`, `IE_QWEN35_LANES_MTP_MAX` | v0.2.27, with `--spec --parallel N` on the 27B split: the request lanes' MTP draft rounds (a lane checks the head's `--spec-k - 1` drafts in one step while at most `IE_QWEN35_LANES_MTP_MAX` lanes decode, default the card count; more decoding lanes run in row groups); `IE_QWEN35_LANES_MTP=0` = the lanes without drafts |
 | `IE_Q4E_PLE_PREFETCH` | Flash-Next reads its per-layer token table into RAM in the background at load; `=wait` makes the load wait for it |
 | `IE_NO_ALLOC_ALIAS_TEST`, `IE_ALLOC_ALIAS_MIN_MIB` (64), `IE_ALLOC_ALIAS_STATS` | the page-alias self-test of every large device allocation; its size threshold; print its totals at exit |
 | `IE_Q4E_NO_ALIAS_TEST` | Flash-Next's own test of its expert caches |

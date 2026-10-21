@@ -6,6 +6,8 @@
 
 #include "ie/prefill_gemm.hpp"
 
+#include "ie/onednn_scratch.hpp"
+
 #include <sycl/sycl.hpp>
 
 #include <dnnl.hpp>
@@ -16,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <map>
+#include <stdexcept>
 #include <string>
 #include <tuple>
 #include <unordered_map>
@@ -38,9 +41,12 @@ struct B48Matmul {
     std::string  impl;
     dnnl::matmul prim;
     dnnl::memory a_mem, b_mem, y_mem, s_mem;
+    dnnl::memory sp_mem;     // the scratch (scratchpad_mode::user): the queue's one buffer (ie/onednn_scratch.hpp)
+    size_t       sp_bytes = 0;
 };
 
 constexpr size_t kAttnShapes = 1024;   // rounded shapes (ie/prefill_gemm.hpp): ~2 a 512-key step of context
+constexpr size_t kS8Shapes   = 2048;   // a few hundred row counts of the model's weight shapes
 
 // IE_B48_PRIM_PROF=1: how many primitives this process built and how long that took, printed at exit.
 struct B48PrimProf {
@@ -61,7 +67,7 @@ struct B48Ctx {
     dnnl::engine eng;
     dnnl::stream strm;
     std::map<std::tuple<uint32_t, uint32_t, uint32_t>, B48Matmul> qk, pv;              // bounded: kAttnShapes
-    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, B48Matmul> s8;        // the model's weight shapes
+    std::map<std::tuple<uint32_t, uint32_t, uint32_t, uint32_t>, B48Matmul> s8;        // bounded: kS8Shapes
 };
 
 // Per caller queue and per host thread (gemm_onednn.cpp's rule: the stream is bound to the queue it was made for, and
@@ -86,7 +92,7 @@ sycl::event b48_attn_matmul(sycl::queue& q, bool nt, const sycl::half* A, const 
     const auto key = std::make_tuple(M, N, K);
     auto it = cache.find(key);
     if (it == cache.end()) {
-        if (cache.size() >= kAttnShapes) cache.clear();
+        if (cache.size() >= kAttnShapes) { q.wait(); cache.clear(); }   // (nothing of theirs still in flight)
         B48PrimTimer timer;
         using dt  = dnnl::memory::data_type;
         using tag = dnnl::memory::format_tag;
@@ -96,9 +102,11 @@ sycl::event b48_attn_matmul(sycl::queue& q, bool nt, const sycl::half* A, const 
         dnnl::memory::desc y_md({M, N}, dt::f32, tag::ab);
         dnnl::primitive_attr attr;
         attr.set_deterministic(b48_deterministic());
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
         dnnl::matmul::primitive_desc pd(ctx.eng, a_md, b_md, y_md, attr);
         B48Matmul cm;
         cm.prim  = dnnl::matmul(pd);
+        onednn_scratch_desc(pd, ctx.eng, cm.sp_mem, cm.sp_bytes);
         cm.a_mem = dnnl::memory(a_md, ctx.eng, nullptr);
         cm.b_mem = dnnl::memory(b_md, ctx.eng, nullptr);
         cm.y_mem = dnnl::memory(y_md, ctx.eng, nullptr);
@@ -109,10 +117,12 @@ sycl::event b48_attn_matmul(sycl::queue& q, bool nt, const sycl::half* A, const 
     cm.a_mem.set_data_handle(const_cast<sycl::half*>(A));
     cm.b_mem.set_data_handle(const_cast<sycl::half*>(B));
     cm.y_mem.set_data_handle(y);
-    return dnnl::sycl_interop::execute(
-        cm.prim, ctx.strm,
-        {{DNNL_ARG_SRC, cm.a_mem}, {DNNL_ARG_WEIGHTS, cm.b_mem}, {DNNL_ARG_DST, cm.y_mem}},
-        deps);
+    std::string err;
+    sycl::event e = onednn_execute(q, ctx.strm, cm.prim,
+                                   {{DNNL_ARG_SRC, cm.a_mem}, {DNNL_ARG_WEIGHTS, cm.b_mem}, {DNNL_ARG_DST, cm.y_mem}},
+                                   cm.sp_mem, cm.sp_bytes, deps, err);
+    if (!err.empty()) throw std::runtime_error("b48 attention matmul: " + err);
+    return e;
 }
 
 // gemm_onednn.cpp's s8_entry with an fp16 result; `ok` only for a jitted kernel.
@@ -121,6 +131,7 @@ B48Matmul& b48_s8_entry(sycl::queue& q, uint32_t M, uint32_t N, uint32_t K, uint
     const auto key = std::make_tuple(M, N, K, g);
     auto it = ctx.s8.find(key);
     if (it != ctx.s8.end()) return it->second;
+    if (ctx.s8.size() >= kS8Shapes) { q.wait(); ctx.s8.clear(); }   // (nothing of theirs still in flight)
 
     B48Matmul cm;
     if (K == 0 || g == 0 || (K % g) != 0) {
@@ -141,12 +152,14 @@ B48Matmul& b48_s8_entry(sycl::queue& q, uint32_t M, uint32_t N, uint32_t K, uint
         attr.set_fpmath_mode(dnnl::fpmath_mode::f16, /*apply_to_int=*/true);
         attr.set_scales(DNNL_ARG_WEIGHTS, (1 << 0) | (1 << 1), dnnl::memory::dims{int64_t(g), 1}, dt::f16);
         attr.set_deterministic(b48_deterministic());
+        attr.set_scratchpad_mode(dnnl::scratchpad_mode::user);
 
         dnnl::matmul::primitive_desc pd(ctx.eng, a_md, b_md, y_md, attr);
         cm.impl  = pd.impl_info_str();
         cm.ok    = cm.impl.find("jit") != std::string::npos;
         if (cm.ok) {
             cm.prim  = dnnl::matmul(pd);
+            onednn_scratch_desc(pd, ctx.eng, cm.sp_mem, cm.sp_bytes);
             cm.a_mem = dnnl::memory(a_md, ctx.eng, nullptr);
             cm.b_mem = dnnl::memory(b_md, ctx.eng, nullptr);
             cm.y_mem = dnnl::memory(y_md, ctx.eng, nullptr);
@@ -179,10 +192,16 @@ bool gemm_nt_s8_f16_onednn(sycl::queue& q, const sycl::half* A, const int8_t* qs
     cm.b_mem.set_data_handle(const_cast<int8_t*>(qs));
     cm.y_mem.set_data_handle(y);
     cm.s_mem.set_data_handle(const_cast<sycl::half*>(dt));
-    *out = dnnl::sycl_interop::execute(
-        cm.prim, b48_ctx(q).strm,
-        {{DNNL_ARG_SRC, cm.a_mem}, {DNNL_ARG_WEIGHTS, cm.b_mem}, {DNNL_ARG_DST, cm.y_mem},
-         {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, cm.s_mem}});
+    std::string err;
+    sycl::event e = onednn_execute(q, b48_ctx(q).strm, cm.prim,
+                                   {{DNNL_ARG_SRC, cm.a_mem}, {DNNL_ARG_WEIGHTS, cm.b_mem}, {DNNL_ARG_DST, cm.y_mem},
+                                    {DNNL_ARG_ATTR_SCALES | DNNL_ARG_WEIGHTS, cm.s_mem}},
+                                   cm.sp_mem, cm.sp_bytes, {}, err);
+    if (!err.empty()) {
+        std::fprintf(stderr, "[b48] s8 product not run (%s): the caller's other path\n", err.c_str());
+        return false;
+    }
+    *out = e;
     return true;
 }
 

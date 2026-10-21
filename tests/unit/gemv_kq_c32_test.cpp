@@ -1,14 +1,20 @@
-// tests/unit/gemv_kq_c32_test.cpp -- P4 B21: the c32 Q6_K / Q5_K GEMV (src/ops/gemv_kq_c32.cpp).
+// tests/unit/gemv_kq_c32_test.cpp -- P4 B21: the c32 Q6_K / Q5_K / Q4_K GEMV (src/ops/gemv_kq_c32.cpp; Q4_K 2026-10-20).
 //
-//  1. Host, no device: repack_q{6,5}_K_to_c32 of random GGUF blocks, then a host dequant written from the documented c32
-//     layout, must equal ggml's dequant (ie::ref::dequant_q{6,5}_K_buffer) bit for bit: the repack is a pure layout move.
-//  2. Device: gemv_q{6,5}k_c32_q8 at T = 1 against a double-precision reference Σ_k W[n,k] * (d8 * q8[k]) over the SAME
+//  1. Host, no device: repack_q{6,5,4}_K_to_c32 of random GGUF blocks, then a host dequant written from the documented c32
+//     layout, must equal ggml's dequant (ie::ref::dequant_q{6,5,4}_K_buffer) bit for bit: the repack is a pure layout move.
+//  2. Device: gemv_q{6,5,4}k_c32_q8 at T = 1 against a double-precision reference Σ_k W[n,k] * (d8 * q8[k]) over the SAME
 //     quantized activation (the int-dot's only approximation is the activation's int8 rounding, which both sides share).
 //  3. Device: every T in {2, 3, 4, 5, 8, 16, 19}: row t of the T-row call == the T = 1 call on row t, bit for bit (the
 //     request lanes' same-reduction-order rule).
-//  4. Device: dequant_q{6,5}k_c32_to_Bt and embedding_lookup_q5k against fp16(ggml dequant) (<= 1 ulp: device fma).
-// `--bench` (not a ctest): GB/s per 27B decode shape at T = 1 for c32 Q6_K / Q5_K, the Q8_0-SoA kernel and the old Q6 SoA.
-// Any SYCL device: ONEAPI_DEVICE_SELECTOR=opencl:cpu runs it without a GPU.
+//  4. Device: dequant_q{6,5,4}k_c32_to_Bt and embedding_lookup_q5k against fp16(ggml dequant) (<= 1 ulp: device fma).
+//  5. Device: the tiled dequant (N % 64 == 0) == the per-column kernel bit for bit (IE_C32_DEQ_COL=1 picks it).
+// `--bench` (not a ctest): GB/s per 27B decode shape at T = 1 for c32 Q6_K / Q5_K / Q4_K, the Q8_0-SoA kernel, the old Q6
+// SoA, and for Q4_K the AoS kernel (gemv_q4_K: what the split and the one-card default ran before) and the SoA-Q4
+// int-dot kernel (the one-card IE_QWEN35_Q4_SOA opt-in). `--bench-deq`: the prefill expand to fp16 per shape (tiled,
+// per-column, and the AoS dequant_q4_K / q5_K_to_Bt).
+// Any SYCL device: ONEAPI_DEVICE_SELECTOR=opencl:cpu runs it without a GPU (with SYCL_PROGRAM_COMPILE_OPTIONS=-w: the
+// image carries the B70 backend options, which the CPU compiler rejects).
+#include "ie/dequant.hpp"
 #include "ie/dequant_ref.hpp"
 #include "ie/ops.hpp"
 #include "ie/quant_blocks.hpp"
@@ -19,6 +25,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <random>
 #include <string>
@@ -54,6 +61,17 @@ void rand_q5(std::mt19937& r, std::vector<block_q5_K>& b) {
     }
 }
 
+void rand_q4(std::mt19937& r, std::vector<block_q4_K>& b) {
+    std::uniform_int_distribution<int> byte(0, 255);
+    std::uniform_real_distribution<float> d(0.0005f, 0.004f);
+    for (auto& x : b) {
+        for (auto& v : x.qs) v = uint8_t(byte(r));
+        for (auto& v : x.scales) v = uint8_t(byte(r));
+        x.d = fp32_to_fp16(d(r));
+        x.dmin = fp32_to_fp16(d(r));
+    }
+}
+
 // Host dequant of one column from the c32 streams, straight from the layout comment in gemv_kq_c32.cpp.
 void c32_col_q6(const uint8_t* lo, const uint8_t* hi, const int8_t* sc, const uint16_t* d, uint32_t K, uint32_t n, float* out) {
     for (uint32_t k = 0; k < K; ++k) {
@@ -78,28 +96,48 @@ void c32_col_q5(const uint8_t* lo, const uint32_t* hi, const uint16_t* sm, const
     }
 }
 
-struct Streams {   // host c32 streams of one weight (either type)
+void c32_col_q4(const uint8_t* lo, const uint16_t* sm, const uint32_t* dm, uint32_t K, uint32_t n, float* out) {
+    for (uint32_t k = 0; k < K; ++k) {
+        const uint32_t c = k / 32, e = k % 32, hh = e / 16, j = e % 16;
+        const uint8_t lb = lo[uint64_t(n) * (K / 2) + 16 * c + j];
+        const uint32_t nib = hh ? (lb >> 4) : (lb & 0xF);
+        const uint16_t s = sm[uint64_t(n) * (K / 32) + c];
+        const uint32_t w = dm[uint64_t(n) * (K / 256) + k / 256];
+        const float d1 = h2f(uint16_t(w & 0xFFFF)) * float(s & 0xFF), m1 = h2f(uint16_t(w >> 16)) * float(s >> 8);
+        out[k] = d1 * float(nib) - m1;
+    }
+}
+
+const char* kind_name(int kind) { return kind == 6 ? "Q6_K" : kind == 5 ? "Q5_K" : "Q4_K"; }
+
+struct Streams {   // host c32 streams of one weight (any type; Q4_K's hi is empty)
     std::vector<uint8_t> lo, hi, sc, d;
 };
 
-Streams repack(bool q6, const void* W, uint32_t K, uint32_t N) {
+Streams repack(int kind, const void* W, uint32_t K, uint32_t N) {
+    const bool q6 = kind == 6;
     Streams s;
     s.lo.assign(uint64_t(N) * K / 2, 0);
-    s.hi.assign(q6 ? uint64_t(N) * K / 4 : uint64_t(N) * K / 8, 0);
+    s.hi.assign(q6 ? uint64_t(N) * K / 4 : kind == 5 ? uint64_t(N) * K / 8 : 0, 0);
     s.sc.assign(uint64_t(N) * K / 16, 0);
     s.d.assign(q6 ? uint64_t(N) * K / 128 : uint64_t(N) * K / 64, 0);
     if (q6) repack_q6_K_to_c32(W, K, N, s.lo.data(), s.hi.data(), reinterpret_cast<int8_t*>(s.sc.data()),
                                reinterpret_cast<uint16_t*>(s.d.data()));
-    else    repack_q5_K_to_c32(W, K, N, s.lo.data(), reinterpret_cast<uint32_t*>(s.hi.data()),
-                               reinterpret_cast<uint16_t*>(s.sc.data()), reinterpret_cast<uint32_t*>(s.d.data()));
+    else if (kind == 5) repack_q5_K_to_c32(W, K, N, s.lo.data(), reinterpret_cast<uint32_t*>(s.hi.data()),
+                                           reinterpret_cast<uint16_t*>(s.sc.data()), reinterpret_cast<uint32_t*>(s.d.data()));
+    else    repack_q4_K_to_c32(W, K, N, s.lo.data(), reinterpret_cast<uint16_t*>(s.sc.data()),
+                               reinterpret_cast<uint32_t*>(s.d.data()));
     return s;
 }
 
-void host_col(bool q6, const Streams& s, uint32_t K, uint32_t n, float* out) {
-    if (q6) c32_col_q6(s.lo.data(), s.hi.data(), reinterpret_cast<const int8_t*>(s.sc.data()),
-                       reinterpret_cast<const uint16_t*>(s.d.data()), K, n, out);
-    else    c32_col_q5(s.lo.data(), reinterpret_cast<const uint32_t*>(s.hi.data()),
-                       reinterpret_cast<const uint16_t*>(s.sc.data()), reinterpret_cast<const uint32_t*>(s.d.data()), K, n, out);
+void host_col(int kind, const Streams& s, uint32_t K, uint32_t n, float* out) {
+    if (kind == 6) c32_col_q6(s.lo.data(), s.hi.data(), reinterpret_cast<const int8_t*>(s.sc.data()),
+                              reinterpret_cast<const uint16_t*>(s.d.data()), K, n, out);
+    else if (kind == 5) c32_col_q5(s.lo.data(), reinterpret_cast<const uint32_t*>(s.hi.data()),
+                                   reinterpret_cast<const uint16_t*>(s.sc.data()),
+                                   reinterpret_cast<const uint32_t*>(s.d.data()), K, n, out);
+    else    c32_col_q4(s.lo.data(), reinterpret_cast<const uint16_t*>(s.sc.data()),
+                       reinterpret_cast<const uint32_t*>(s.d.data()), K, n, out);
 }
 
 struct Dev {   // device copies
@@ -107,21 +145,28 @@ struct Dev {   // device copies
     void* p[4] = {};
     Dev(sycl::queue& qq, const Streams& s) : q(qq) {
         const std::vector<uint8_t>* v[4] = {&s.lo, &s.hi, &s.sc, &s.d};
-        for (int i = 0; i < 4; ++i) { p[i] = sycl::malloc_device(v[i]->size(), q); q.memcpy(p[i], v[i]->data(), v[i]->size()); }
+        for (int i = 0; i < 4; ++i) {   // an empty stream (Q4_K's hi) stays null
+            if (v[i]->empty()) continue;
+            p[i] = sycl::malloc_device(v[i]->size(), q); q.memcpy(p[i], v[i]->data(), v[i]->size());
+        }
         q.wait();
     }
-    ~Dev() { for (void* x : p) sycl::free(x, q); }
-    sycl::event gemv(bool q6, const void* xq8, sycl::half* y, uint32_t K, uint32_t N, uint32_t T) {
-        if (q6) return gemv_q6k_c32_q8(q, xq8, static_cast<uint8_t*>(p[0]), static_cast<uint8_t*>(p[1]),
-                                       static_cast<int8_t*>(p[2]), static_cast<uint16_t*>(p[3]), y, K, N, T);
-        return gemv_q5k_c32_q8(q, xq8, static_cast<uint8_t*>(p[0]), static_cast<uint32_t*>(p[1]),
-                               static_cast<uint16_t*>(p[2]), static_cast<uint32_t*>(p[3]), y, K, N, T);
+    ~Dev() { for (void* x : p) if (x) sycl::free(x, q); }
+    sycl::event gemv(int kind, const void* xq8, sycl::half* y, uint32_t K, uint32_t N, uint32_t T) {
+        if (kind == 6) return gemv_q6k_c32_q8(q, xq8, static_cast<uint8_t*>(p[0]), static_cast<uint8_t*>(p[1]),
+                                              static_cast<int8_t*>(p[2]), static_cast<uint16_t*>(p[3]), y, K, N, T);
+        if (kind == 5) return gemv_q5k_c32_q8(q, xq8, static_cast<uint8_t*>(p[0]), static_cast<uint32_t*>(p[1]),
+                                              static_cast<uint16_t*>(p[2]), static_cast<uint32_t*>(p[3]), y, K, N, T);
+        return gemv_q4k_c32_q8(q, xq8, static_cast<uint8_t*>(p[0]), static_cast<uint16_t*>(p[2]),
+                               static_cast<uint32_t*>(p[3]), y, K, N, T);
     }
-    sycl::event deq(bool q6, sycl::half* Bt, uint32_t K, uint32_t N) {
-        if (q6) return dequant_q6k_c32_to_Bt(q, static_cast<uint8_t*>(p[0]), static_cast<uint8_t*>(p[1]),
-                                             static_cast<int8_t*>(p[2]), static_cast<uint16_t*>(p[3]), Bt, K, N);
-        return dequant_q5k_c32_to_Bt(q, static_cast<uint8_t*>(p[0]), static_cast<uint32_t*>(p[1]),
-                                     static_cast<uint16_t*>(p[2]), static_cast<uint32_t*>(p[3]), Bt, K, N);
+    sycl::event deq(int kind, sycl::half* Bt, uint32_t K, uint32_t N) {
+        if (kind == 6) return dequant_q6k_c32_to_Bt(q, static_cast<uint8_t*>(p[0]), static_cast<uint8_t*>(p[1]),
+                                                    static_cast<int8_t*>(p[2]), static_cast<uint16_t*>(p[3]), Bt, K, N);
+        if (kind == 5) return dequant_q5k_c32_to_Bt(q, static_cast<uint8_t*>(p[0]), static_cast<uint32_t*>(p[1]),
+                                                    static_cast<uint16_t*>(p[2]), static_cast<uint32_t*>(p[3]), Bt, K, N);
+        return dequant_q4k_c32_to_Bt(q, static_cast<uint8_t*>(p[0]), static_cast<uint16_t*>(p[2]),
+                                     static_cast<uint32_t*>(p[3]), Bt, K, N);
     }
 };
 
@@ -130,28 +175,32 @@ int ulp16(sycl::half a, sycl::half b) {   // distance in fp16 steps (sign-magnit
     return std::abs(ord(a) - ord(b));
 }
 
-void run_type(sycl::queue& q, bool q6, uint32_t K, uint32_t N, uint32_t seed) {
-    const char* tn = q6 ? "Q6_K" : "Q5_K";
+void run_type(sycl::queue& q, int kind, uint32_t K, uint32_t N, uint32_t seed) {
+    const char* tn = kind_name(kind);
     std::mt19937 r(seed);
     const uint64_t nblk = uint64_t(N) * (K / 256);
     std::vector<uint8_t> raw;
     std::vector<float> ref(uint64_t(N) * K);
-    if (q6) {
+    if (kind == 6) {
         std::vector<block_q6_K> b(nblk); rand_q6(r, b);
         raw.assign(reinterpret_cast<uint8_t*>(b.data()), reinterpret_cast<uint8_t*>(b.data() + nblk));
         ie::ref::dequant_q6_K_buffer(b.data(), ref.size(), ref.data());
-    } else {
+    } else if (kind == 5) {
         std::vector<block_q5_K> b(nblk); rand_q5(r, b);
         raw.assign(reinterpret_cast<uint8_t*>(b.data()), reinterpret_cast<uint8_t*>(b.data() + nblk));
         ie::ref::dequant_q5_K_buffer(b.data(), ref.size(), ref.data());
+    } else {
+        std::vector<block_q4_K> b(nblk); rand_q4(r, b);
+        raw.assign(reinterpret_cast<uint8_t*>(b.data()), reinterpret_cast<uint8_t*>(b.data() + nblk));
+        ie::ref::dequant_q4_K_buffer(b.data(), ref.size(), ref.data());
     }
-    const Streams s = repack(q6, raw.data(), K, N);
+    const Streams s = repack(kind, raw.data(), K, N);
 
     // 1. repack == ggml dequant, bit for bit
     std::vector<float> col(K);
     uint64_t bad = 0;
     for (uint32_t n = 0; n < N; ++n) {
-        host_col(q6, s, K, n, col.data());
+        host_col(kind, s, K, n, col.data());
         for (uint32_t k = 0; k < K; ++k) bad += std::memcmp(&col[k], &ref[uint64_t(n) * K + k], 4) != 0;
     }
     CHECK(bad == 0, "%s [%u,%u] repack: %llu elements differ from ggml's dequant", tn, K, N, (unsigned long long)bad);
@@ -174,7 +223,7 @@ void run_type(sycl::queue& q, bool q6, uint32_t K, uint32_t N, uint32_t seed) {
     q.memcpy(hq8.data(), dq8, hq8.size() * sizeof(block_q8_1x)).wait();
     const uint64_t row_bytes = uint64_t(K / 32) * sizeof(block_q8_1x);
     for (uint32_t t = 0; t < TMAX; ++t)
-        dv.gemv(q6, static_cast<uint8_t*>(dq8) + t * row_bytes, y1 + uint64_t(t) * N, K, N, 1);
+        dv.gemv(kind, static_cast<uint8_t*>(dq8) + t * row_bytes, y1 + uint64_t(t) * N, K, N, 1);
     q.wait();
     std::vector<sycl::half> h1(uint64_t(TMAX) * N), hT(uint64_t(TMAX) * N);
     q.memcpy(h1.data(), y1, h1.size() * 2).wait();
@@ -204,7 +253,7 @@ void run_type(sycl::queue& q, bool q6, uint32_t K, uint32_t N, uint32_t seed) {
 
     for (uint32_t T : {2u, 3u, 4u, 5u, 8u, 16u, 19u}) {
         q.memset(yT, 0xFF, uint64_t(TMAX) * N * 2).wait();
-        dv.gemv(q6, dq8, yT, K, N, T).wait();
+        dv.gemv(kind, dq8, yT, K, N, T).wait();
         q.memcpy(hT.data(), yT, uint64_t(T) * N * 2).wait();
         const bool same = std::memcmp(hT.data(), h1.data(), uint64_t(T) * N * 2) == 0;
         CHECK(same, "%s [%u,%u] T=%u rows differ from the T=1 calls", tn, K, N, T);
@@ -213,7 +262,7 @@ void run_type(sycl::queue& q, bool q6, uint32_t K, uint32_t N, uint32_t seed) {
 
     // 4. prefill dequant
     auto* Bt = sycl::malloc_device<sycl::half>(uint64_t(K) * N, q);
-    dv.deq(q6, Bt, K, N).wait();
+    dv.deq(kind, Bt, K, N).wait();
     std::vector<sycl::half> hb(uint64_t(K) * N);
     q.memcpy(hb.data(), Bt, hb.size() * 2).wait();
     uint64_t off1 = 0, offmore = 0;
@@ -225,6 +274,39 @@ void run_type(sycl::queue& q, bool q6, uint32_t K, uint32_t N, uint32_t seed) {
     CHECK(offmore == 0, "%s [%u,%u] dequant: %llu elements > 1 ulp from fp16(ggml)", tn, K, N, (unsigned long long)offmore);
     if (offmore == 0) std::printf("[ ok ] %s [%u,%u] dequant == fp16(ggml) (%llu at 1 ulp)\n", tn, K, N, (unsigned long long)off1);
     sycl::free(Bt, q); sycl::free(dx, q); sycl::free(dq8, q); sycl::free(y1, q); sycl::free(yT, q);
+}
+
+// 5. The tiled prefill dequant (N % 64 == 0) against the per-column kernel (IE_C32_DEQ_COL=1): equal bit for bit, and
+// <= 1 ulp from fp16(ggml).
+void test_deq_tiled(sycl::queue& q, int kind, uint32_t K, uint32_t N, uint32_t seed) {
+    const char* tn = kind_name(kind);
+    std::mt19937 r(seed);
+    const uint64_t nblk = uint64_t(N) * (K / 256);
+    std::vector<uint8_t> raw;
+    std::vector<float> ref(uint64_t(N) * K);
+    if (kind == 6)      { std::vector<block_q6_K> b(nblk); rand_q6(r, b); raw.assign((uint8_t*)b.data(), (uint8_t*)(b.data() + nblk));
+                          ie::ref::dequant_q6_K_buffer(b.data(), ref.size(), ref.data()); }
+    else if (kind == 5) { std::vector<block_q5_K> b(nblk); rand_q5(r, b); raw.assign((uint8_t*)b.data(), (uint8_t*)(b.data() + nblk));
+                          ie::ref::dequant_q5_K_buffer(b.data(), ref.size(), ref.data()); }
+    else                { std::vector<block_q4_K> b(nblk); rand_q4(r, b); raw.assign((uint8_t*)b.data(), (uint8_t*)(b.data() + nblk));
+                          ie::ref::dequant_q4_K_buffer(b.data(), ref.size(), ref.data()); }
+    Dev dv(q, repack(kind, raw.data(), K, N));
+    auto* Bt = sycl::malloc_device<sycl::half>(uint64_t(K) * N, q);
+    std::vector<sycl::half> col(uint64_t(K) * N), til(col.size());
+    setenv("IE_C32_DEQ_COL", "1", 1);
+    q.memset(Bt, 0xFF, col.size() * 2).wait(); dv.deq(kind, Bt, K, N).wait();
+    q.memcpy(col.data(), Bt, col.size() * 2).wait();
+    unsetenv("IE_C32_DEQ_COL");
+    q.memset(Bt, 0xFF, til.size() * 2).wait(); dv.deq(kind, Bt, K, N).wait();
+    q.memcpy(til.data(), Bt, til.size() * 2).wait();
+    sycl::free(Bt, q);
+    const bool same = std::memcmp(col.data(), til.data(), col.size() * 2) == 0;
+    uint64_t far = 0;
+    for (uint32_t n = 0; n < N; ++n)
+        for (uint32_t k = 0; k < K; ++k) far += ulp16(til[uint64_t(k) * N + n], sycl::half(ref[uint64_t(n) * K + k])) > 1;
+    CHECK(same, "%s [%u,%u] tiled dequant differs from the per-column kernel", tn, K, N);
+    CHECK(far == 0, "%s [%u,%u] tiled dequant: %llu elements > 1 ulp from fp16(ggml)", tn, K, N, (unsigned long long)far);
+    if (same && far == 0) std::printf("[ ok ] %s [%u,%u] tiled dequant == per-column bit for bit, <= 1 ulp from ggml\n", tn, K, N);
 }
 
 void test_embed_q5(sycl::queue& q) {
@@ -266,8 +348,8 @@ void test_moe(sycl::queue& q, bool q6gu, bool q6d, uint32_t seed) {
     };
     std::vector<uint8_t> rg, ru, rd; std::vector<float> fg, fu, fd;
     make(q6gu, H, E * EFF, rg, fg); make(q6gu, H, E * EFF, ru, fu); make(q6d, EFF, E * H, rd, fd);
-    const Streams sg = repack(q6gu, rg.data(), H, E * EFF), su = repack(q6gu, ru.data(), H, E * EFF),
-                  sd = repack(q6d, rd.data(), EFF, E * H);
+    const Streams sg = repack(q6gu ? 6 : 5, rg.data(), H, E * EFF), su = repack(q6gu ? 6 : 5, ru.data(), H, E * EFF),
+                  sd = repack(q6d ? 6 : 5, rd.data(), EFF, E * H);
     Dev dg(q, sg), du(q, su), dd(q, sd);
     auto bank = [](Dev& d, bool q6) {
         C32Bank b; b.lo = static_cast<const uint8_t*>(d.p[0]); b.hi = d.p[1]; b.sc = d.p[2]; b.d = d.p[3]; b.kind = q6 ? 6 : 5;
@@ -432,23 +514,47 @@ void bench(sycl::queue& q) {
         quantize_q8_1(q, dx, dq8, 16 * K).wait();
         std::string line;
         char buf[160];
-        for (int ty = 0; ty < 2; ++ty) {
-            const bool q6 = ty == 0;
+        for (int kind : {6, 5, 4}) {
+            const bool q6 = kind == 6;
             const uint64_t nblk = uint64_t(N) * (K / 256);
             std::vector<uint8_t> raw;
             if (q6) { std::vector<block_q6_K> b(nblk); rand_q6(r, b); raw.assign((uint8_t*)b.data(), (uint8_t*)(b.data() + nblk)); }
-            else    { std::vector<block_q5_K> b(nblk); rand_q5(r, b); raw.assign((uint8_t*)b.data(), (uint8_t*)(b.data() + nblk)); }
-            const Streams st = repack(q6, raw.data(), K, N);
+            else if (kind == 5) { std::vector<block_q5_K> b(nblk); rand_q5(r, b); raw.assign((uint8_t*)b.data(), (uint8_t*)(b.data() + nblk)); }
+            else    { std::vector<block_q4_K> b(nblk); rand_q4(r, b); raw.assign((uint8_t*)b.data(), (uint8_t*)(b.data() + nblk)); }
+            const Streams st = repack(kind, raw.data(), K, N);
             Dev dv(q, st);
             const double bytes = double(st.lo.size() + st.hi.size() + st.sc.size() + st.d.size());
-            const double t1 = time_it([&] { dv.gemv(q6, dq8, y, K, N, 1); });
-            const double t2 = time_it([&] { dv.gemv(q6, dq8, y, K, N, 2); });
-            const double t4 = time_it([&] { dv.gemv(q6, dq8, y, K, N, 4); });
-            const double t8 = time_it([&] { dv.gemv(q6, dq8, y, K, N, 8); });
-            const double t16 = time_it([&] { dv.gemv(q6, dq8, y, K, N, 16); });
-            std::snprintf(buf, sizeof buf, " %s c32 %.0f (%.0f) T2 %.0f T4 %.0f T8 %.0f T16 %.0f |", q6 ? "Q6" : "Q5",
+            const double t1 = time_it([&] { dv.gemv(kind, dq8, y, K, N, 1); });
+            const double t2 = time_it([&] { dv.gemv(kind, dq8, y, K, N, 2); });
+            const double t4 = time_it([&] { dv.gemv(kind, dq8, y, K, N, 4); });
+            const double t8 = time_it([&] { dv.gemv(kind, dq8, y, K, N, 8); });
+            const double t16 = time_it([&] { dv.gemv(kind, dq8, y, K, N, 16); });
+            std::snprintf(buf, sizeof buf, " Q%d c32 %.0f (%.0f) T2 %.0f T4 %.0f T8 %.0f T16 %.0f |", kind,
                           bytes / t1 / 1e9, t1 * 1e6, t2 * 1e6, t4 * 1e6, t8 * 1e6, t16 * 1e6);
             line += buf;
+            if (kind == 4) {   // the AoS Q4_K kernel the split ran before (dense::gemv_q_T's T = 1 route) on the same blocks
+                void* aw = sycl::malloc_device(raw.size(), q);
+                q.memcpy(aw, raw.data(), raw.size()).wait();
+                const double to = time_it([&] { gemv_q4_K(q, dx, aw, y, K, N); });
+                std::snprintf(buf, sizeof buf, " Q4 AoS %.0f (%.0f) |", double(raw.size()) / to / 1e9, to * 1e6);
+                line += buf;
+                sycl::free(aw, q);
+                // the SoA-Q4 int-dot kernel (the one-card dense path's IE_QWEN35_Q4_SOA opt-in) on the same blocks
+                std::vector<uint8_t> sq(uint64_t(N) * K / 2);
+                std::vector<int8_t> ssc(uint64_t(N) * K / 32), smn(uint64_t(N) * K / 32);
+                std::vector<uint16_t> sd(uint64_t(N) * K / 256), sdm(uint64_t(N) * K / 256);
+                repack_q4_K_to_soa(raw.data(), K, N, sq.data(), ssc.data(), smn.data(), sd.data(), sdm.data());
+                auto* a = sycl::malloc_device<uint8_t>(sq.size(), q);
+                auto* b = sycl::malloc_device<int8_t>(ssc.size(), q); auto* c = sycl::malloc_device<int8_t>(smn.size(), q);
+                auto* e = sycl::malloc_device<uint16_t>(sd.size(), q); auto* f = sycl::malloc_device<uint16_t>(sdm.size(), q);
+                q.memcpy(a, sq.data(), sq.size()); q.memcpy(b, ssc.data(), ssc.size()); q.memcpy(c, smn.data(), smn.size());
+                q.memcpy(e, sd.data(), sd.size() * 2); q.memcpy(f, sdm.data(), sdm.size() * 2).wait();
+                const double ts = time_it([&] { gemv_q4_soa_q8(q, dq8, a, b, c, e, f, y, K, N); });
+                const double sb = double(sq.size() + ssc.size() + smn.size() + 2 * (sd.size() + sdm.size()));
+                std::snprintf(buf, sizeof buf, " Q4 soa %.0f (%.0f) |", sb / ts / 1e9, ts * 1e6);
+                line += buf;
+                sycl::free(a, q); sycl::free(b, q); sycl::free(c, q); sycl::free(e, q); sycl::free(f, q);
+            }
             if (q6) {   // the old SoA-Q6 v1 kernel (the dense 1-card path) on the same weights
                 std::vector<uint8_t> lo(uint64_t(N) * K / 2, 0), hi(uint64_t(N) * K / 4, 0);
                 std::vector<int8_t> sc(uint64_t(N) * K / 16);
@@ -483,19 +589,81 @@ void bench(sycl::queue& q) {
         sycl::free(dx, q); sycl::free(dq8, q); sycl::free(y, q);
     }
 }
+// `--bench-deq` (2026-10-21): the prefill expand (c32 -> fp16 Bt) per 27B shape: the tiled kernel, the per-column one
+// (IE_C32_DEQ_COL=1) and, for Q4_K / Q5_K, the AoS dequant_q*_K_to_Bt the split ran before c32 took Q4_K. GB/s counts
+// the bytes read + the K * N * 2 written.
+void bench_deq(sycl::queue& q) {
+    struct S { uint32_t K, N; const char* name; };
+    const S shapes[] = {{5120, 10240, "(warm-up)"}, {5120, 10240, "attn_qkv"}, {5120, 6144, "attn_gate"},
+                        {6144, 5120, "ssm_out/attn_output"}, {5120, 12288, "attn_q"}, {5120, 1024, "attn_k/v"},
+                        {5120, 17408, "ffn_gate/up"}, {17408, 5120, "ffn_down"}};
+    std::mt19937 r(9);
+    auto time_it = [&](auto&& f) {
+        for (int i = 0; i < 3; ++i) f();
+        q.wait();
+        const int it = 20;
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < it; ++i) f();
+        q.wait();
+        return std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / it;
+    };
+    std::printf("%-20s %8s %8s | %s\n", "shape", "K", "N", "expand to fp16 Bt: GB/s (us)");
+    for (const S& s : shapes) {
+        const uint32_t K = s.K, N = s.N;
+        auto* bt = sycl::malloc_device<sycl::half>(uint64_t(K) * N, q);
+        std::string line;
+        char buf[160];
+        for (int kind : {6, 5, 4}) {
+            const uint64_t nblk = uint64_t(N) * (K / 256);
+            std::vector<uint8_t> raw;
+            if (kind == 6) { std::vector<block_q6_K> b(nblk); rand_q6(r, b); raw.assign((uint8_t*)b.data(), (uint8_t*)(b.data() + nblk)); }
+            else if (kind == 5) { std::vector<block_q5_K> b(nblk); rand_q5(r, b); raw.assign((uint8_t*)b.data(), (uint8_t*)(b.data() + nblk)); }
+            else { std::vector<block_q4_K> b(nblk); rand_q4(r, b); raw.assign((uint8_t*)b.data(), (uint8_t*)(b.data() + nblk)); }
+            const Streams st = repack(kind, raw.data(), K, N);
+            Dev dv(q, st);
+            const double wr = double(K) * N * 2, rd = double(st.lo.size() + st.hi.size() + st.sc.size() + st.d.size());
+            unsetenv("IE_C32_DEQ_COL");
+            const double tt = time_it([&] { dv.deq(kind, bt, K, N); });
+            setenv("IE_C32_DEQ_COL", "1", 1);
+            const double tc = time_it([&] { dv.deq(kind, bt, K, N); });
+            unsetenv("IE_C32_DEQ_COL");
+            std::snprintf(buf, sizeof buf, " Q%d tiled %.0f (%.0f) col %.0f (%.0f) |", kind, (rd + wr) / tt / 1e9, tt * 1e6,
+                          (rd + wr) / tc / 1e9, tc * 1e6);
+            line += buf;
+            if (kind != 6) {
+                void* aw = sycl::malloc_device(raw.size(), q);
+                q.memcpy(aw, raw.data(), raw.size()).wait();
+                const double ta = time_it([&] {
+                    if (kind == 4) dequant_q4_K_to_Bt(q, aw, bt, K, N);
+                    else           dequant_q5_K_to_Bt(q, aw, bt, K, N);
+                });
+                std::snprintf(buf, sizeof buf, " Q%d AoS %.0f (%.0f) |", kind, (double(raw.size()) + wr) / ta / 1e9, ta * 1e6);
+                line += buf;
+                sycl::free(aw, q);
+            }
+        }
+        std::printf("%-20s %8u %8u |%s\n", s.name, K, N, line.c_str());
+        sycl::free(bt, q);
+    }
+}
 }  // namespace
 
 int main(int argc, char** argv) {
     sycl::queue q{sycl::default_selector_v, sycl::property::queue::in_order{}};   // like the engine's queues
     std::printf("device: %s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
     if (argc > 1 && std::string(argv[1]) == "--bench") { bench(q); return 0; }
+    if (argc > 1 && std::string(argv[1]) == "--bench-deq") { bench_deq(q); return 0; }
     // the 27B's K values (5120, 6144, 17408) and small N so the double reference stays quick; N not a multiple of 16
-    run_type(q, true, 5120, 67, 11);
-    run_type(q, false, 5120, 67, 12);
-    run_type(q, true, 17408, 33, 13);
-    run_type(q, false, 17408, 33, 14);
-    run_type(q, true, 6144, 48, 15);
-    run_type(q, false, 6144, 48, 16);
+    run_type(q, 6, 5120, 67, 11);
+    run_type(q, 5, 5120, 67, 12);
+    run_type(q, 6, 17408, 33, 13);
+    run_type(q, 5, 17408, 33, 14);
+    run_type(q, 6, 6144, 48, 15);
+    run_type(q, 5, 6144, 48, 16);
+    run_type(q, 4, 5120, 67, 17);
+    run_type(q, 4, 17408, 33, 18);
+    run_type(q, 4, 6144, 48, 19);
+    for (int kind : {6, 5, 4}) { test_deq_tiled(q, kind, 5120, 128, 30 + kind); test_deq_tiled(q, kind, 17408, 64, 40 + kind); }
     test_embed_q5(q);
     test_moe(q, true, true, 21);
     test_moe(q, false, true, 22);

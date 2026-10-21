@@ -2,7 +2,7 @@
 # builds — see docs/cuda_multiplatform_readiness_2026-06-13.md.
 if(IE_ENABLE_ONEDNN)
   find_package(DNNL CONFIG REQUIRED PATHS /opt/intel/oneapi/dnnl/latest/lib/cmake)
-  set(IE_ONEDNN_SRC ops/gemm_onednn.cpp ops/gemm_onednn_b48.cpp)
+  set(IE_ONEDNN_SRC ops/gemm_onednn.cpp ops/gemm_onednn_b48.cpp ops/onednn_scratch.cpp)
 else()
   set(IE_ONEDNN_SRC ops/gemm_onednn_stub.cpp)  # gemm_fp16_onednn -> gemm_fp16 fallback
 endif()
@@ -128,6 +128,7 @@ add_library(ie_core
   model/deepseek4.cpp
   model/deepseek41.cpp
   model/deepseek41_engram.cpp
+  model/deepseek41_cards.cpp
   model/deepseek41_forward.cpp
   model/deepseek41_dspark.cpp
   model/deepseek41_prompt.cpp

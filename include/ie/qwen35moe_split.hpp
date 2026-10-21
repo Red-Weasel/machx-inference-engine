@@ -35,6 +35,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ie {
@@ -96,11 +97,21 @@ public:
     // run_layers ropes through rope_imrope3 over each piece's [3, T] slice (prompt rows from the table, decode rows at
     // position + delta on all streams) while the KV index / attention bound / cache length keep the token position.
     // clear_vision() = the text path (rope_partial over w.positions, no splice); the engine calls it at every generate().
-    // The lanes (forward_stage / forward_stage_rows) have no per-lane image state yet and refuse while staging is set.
     std::string set_vision(const float* rows_f32, uint32_t t0, uint32_t n_rows);
     void        set_mrope(const int32_t* pos3, uint32_t n_total, int32_t delta);
     void        clear_vision();
-    bool        vision_active() const noexcept { return mrope_n_ != 0 || !vis_spans_.empty(); }
+    bool        vision_active() const noexcept { return vis_.active(); }
+    // Images on the request LANES (2026-10-21; the 27B split's contract, qwen35_split.hpp): the same staging per lane. The
+    // engine sets a lane's in the request's serial turn (prefix_prepare: the lane is idle, no stage thread reads it), and a
+    // text request clears it. forward_stage splices the lane's rows on the embed card and ropes every piece of the lane
+    // through its table (prompt rows from it, later rows -- a decode step, a lookup round -- at position + delta on all
+    // streams); a rows-group row of the lane ropes at position + delta through rope_partial (== rope_imrope3 on equal
+    // streams, bit for bit). The KV index and length stay the token position. The --parallel 1 staging above must stay
+    // clear while the lanes run.
+    std::string set_lane_vision(uint32_t lane, const float* rows_f32, std::span<const std::pair<uint32_t, uint32_t>> spans,
+                                const int32_t* pos3, uint32_t n_total, int32_t delta);
+    void        clear_lane_vision(uint32_t lane);
+    bool        lane_vision_active(uint32_t lane) const noexcept { return lane < lane_vis_.size() && lane_vis_[lane].active(); }
 
     // P4 B10 (docs/lanes/LANES_SERVE.md): request lanes for `ie serve --parallel N` on the two-card split. A lane is
     // one sequence's KV + DeltaNet state on every card; lane 0 is the state load() allocated (nothing else changes with one
@@ -310,15 +321,22 @@ private:
     std::vector<uint64_t>                   lane_bytes_;   // [dev] one extra lane
     uint32_t    max_ctx_ = 0, lane_ctx_ = 0;
     sycl::half* lane_logits_ = nullptr;                    // [vocab] on head_dev
-    // P4 B45 step 2: the vision staging (set_vision / set_mrope / clear_vision above) and its two helpers: the piece's
-    // positions onto a card (w.positions always; w.positions3 while staged) and the splice over the gathered rows.
-    std::vector<Qwen4VisSpan> vis_spans_;
-    std::vector<sycl::half>   vis_rows_;      // concat [sum n, hidden] f16
-    std::vector<int32_t>      mrope3_;        // [3, mrope_n_] host
-    uint32_t mrope_n_ = 0;
-    int32_t  mrope_delta_ = 0;
-    void upload_positions(uint32_t dev, uint32_t start, uint32_t T);
-    void splice_vision(sycl::queue& q, sycl::half* x, uint32_t start, uint32_t T);
+    // P4 B45 step 2: the vision staging (set_vision / set_mrope / clear_vision above; per lane since 2026-10-21) and its
+    // two helpers: the piece's positions onto a card (w.positions always; w.positions3 with a table) and the splice over
+    // the gathered rows.
+    struct VisStage {   // one sequence's staged images: the --parallel 1 path's, or one lane's
+        std::vector<Qwen4VisSpan> spans;
+        std::vector<sycl::half>   rows;     // concat [sum n, hidden] f16
+        std::vector<int32_t>      mrope3;   // [3, n] host
+        uint32_t n = 0;                     // the table's length (0 = no table: the text path's rope_partial)
+        int32_t  delta = 0;
+        bool active() const noexcept { return n != 0 || !spans.empty(); }
+    };
+    VisStage vis_;                    // --parallel 1
+    std::vector<VisStage> lane_vis_;  // [n_lanes()] once init_lanes ran
+    std::string vis_append(VisStage& v, const float* rows_f32, uint32_t t0, uint32_t n_rows) const;
+    void upload_positions(uint32_t dev, uint32_t start, uint32_t T, const VisStage& v);
+    void splice_vision(sycl::half* x, uint32_t start, uint32_t T, const VisStage& v);
     KvCache&       kv_at(uint32_t dev) { return cur_[dev] ? lane_kv_[cur_[dev] - 1][dev] : kv_[dev]; }
     DeltaNetState& dn_at(uint32_t dev) { return cur_[dev] ? lane_dn_[cur_[dev] - 1][dev] : dn_[dev]; }
     // P4 B14 rows: a lane's state by index (the rows path never touches cur_), the G-row int-dot activation per card
@@ -341,8 +359,11 @@ private:
                         uint32_t T);
 
     // forward()'s pieces (kept in its order): the embedding into card embed_dev's x, one card's layers, the head.
-    std::string embed(const int32_t* input_ids, uint32_t T, uint32_t start_pos);   // (start_pos: the splice's piece position, P4 B45)
-    void        run_layers(uint32_t dev, uint32_t T, uint32_t start_pos, bool dbg_timing, double& t_attn, double& t_moe);
+    // (start_pos: the splice's piece position, P4 B45; v: whose images -- the --parallel 1 staging or a lane's)
+    std::string embed(const int32_t* input_ids, uint32_t T, uint32_t start_pos, const VisStage& v);
+    // mrope: the step's rope reads w.positions3 (rope_imrope3; the caller uploaded the slice), else w.positions.
+    void        run_layers(uint32_t dev, uint32_t T, uint32_t start_pos, bool dbg_timing, double& t_attn, double& t_moe,
+                           bool mrope);
     void        head(uint32_t T, sycl::half* d_logits);
     void        head_all(uint32_t T, sycl::half* d_all);   // P4 B53: every row's logits [T, vocab] (rows rounded up to 8)
 

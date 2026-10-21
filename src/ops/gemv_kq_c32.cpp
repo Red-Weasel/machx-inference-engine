@@ -1,4 +1,4 @@
-// src/ops/gemv_kq_c32.cpp — native Q6_K / Q5_K decode GEMV for the 2-card 27B split (P4 B21, 2026-09-28).
+// src/ops/gemv_kq_c32.cpp — native Q6_K / Q5_K / Q4_K decode GEMV for the 27B split (P4 B21, 2026-09-28; Q4_K 2026-10-20).
 //
 // WHY: the split's non-Q8_0 weights ran the AoS dense fallbacks (Q6_K: W6A16 gemv_q6_K / gemm_q6_K at M=1, the 140 GB/s
 // cliff; Q5_K: dequanted to F16 at load, 2.9x the bytes), so a Q6_K or Q5_K_M 27B could not turn fewer bytes into speed.
@@ -15,12 +15,14 @@
 //   Q5_K hi plane [n*(K/8) + 4c + b] (uint32 per chunk): bit s of byte b = bit 4 of element 4s + b.
 //     sm [n*(K/32) + c] uint16 = 6-bit scale | 6-bit min << 8 (get_scale_min_k4 unpacked). dm [n*(K/256) + c/8] uint32 =
 //     fp16 d | fp16 dmin << 16.
-// The 6-/5-bit quants and every scale are the GGUF's own bits (a pure layout move; tests/unit/gemv_kq_c32_test checks the
+//   Q4_K (2026-10-20, the Q4_K_M 27B): the Q5_K streams without the hi plane -- lo, sm, dm exactly as Q5_K (4.58 bpw).
+// The 6-/5-/4-bit quants and every scale are the GGUF's own bits (a pure layout move; tests/unit/gemv_kq_c32_test checks the
 // host dequant of the repack against ggml's dequant bit for bit).
 //
 // Math per lane chunk and activation row t (x = d8 * q8, block_q8_1x from quantize_q8_1):
 //   Q6_K: it = sc0 * (Σ q6u·q8 − 32 Σ q8)[elements 0..15] + sc1 * (...)[16..31]  (exact int32), acc_t += d6 * d8 * it
 //   Q5_K: idot = Σ q5·q8, acc_t += (d·sc) * d8 * idot − (dmin·m) * s8           (s8 = d8 Σ q8 from the activation block)
+//   Q4_K: Q5_K's fold with q4 (0..15) for q5
 // then a subgroup sum per row. ONE kernel template serves every row count: T = 1 (decode) is the T_MAX = 1 instance of the
 // code the rows buckets (T 2..16, the request lanes / spec verify) run, and a row's operands, per-lane chunk order and
 // float expression do not depend on T -- so row t of a T-row call equals the T = 1 call on that row, bit for bit (the
@@ -36,6 +38,7 @@
 #include "ie/kernel_profiler.hpp"
 
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <thread>
 #include <vector>
@@ -45,6 +48,11 @@ namespace ie {
 namespace {
 
 inline float c32_h2f(uint16_t h) { return float(sycl::bit_cast<sycl::half>(h)); }
+
+// A kernel's profiler label per type: c32_label<KIND>("gemv_q6k_c32", "gemv_q5k_c32", "gemv_q4k_c32").
+template <int KIND> constexpr const char* c32_label(const char* q6, const char* q5, const char* q4) {
+    return KIND == 6 ? q6 : KIND == 5 ? q5 : q4;
+}
 
 // ggml get_scale_min_k4: the 6-bit (scale, min) of sub-block j (0..7) from the 12-byte K-quant scales table.
 inline void c32_scale_min(int j, const uint8_t* q, uint8_t& sc, uint8_t& m) {
@@ -154,16 +162,47 @@ void repack_q5_K_to_c32(const void* W_blocks, uint32_t K, uint32_t N,
     });
 }
 
+void repack_q4_K_to_c32(const void* W_blocks, uint32_t K, uint32_t N, uint8_t* lo, uint16_t* sm, uint32_t* dm) {
+    const uint32_t bpc = K / 256;
+    const auto* blocks = static_cast<const block_q4_K*>(W_blocks);
+    c32_for_columns(N, [&](uint32_t n) {
+        const block_q4_K* col = blocks + uint64_t(n) * bpc;
+        uint8_t*  lo_c = lo + uint64_t(n) * (K / 2);
+        uint16_t* sm_c = sm + uint64_t(n) * (K / 32);
+        uint32_t* dm_c = dm + uint64_t(n) * (K / 256);
+        uint8_t q[256];
+        for (uint32_t b = 0; b < bpc; ++b) {
+            const block_q4_K& blk = col[b];
+            uint16_t dd, dmin;
+            std::memcpy(&dd, &blk.d, 2); std::memcpy(&dmin, &blk.dmin, 2);
+            dm_c[b] = uint32_t(dd) | (uint32_t(dmin) << 16);
+            // ggml dequantize_row_q4_K's order: 64-element groups j, low nibbles then high nibbles of qs[32j..32j+31]
+            for (int j = 0; j < 4; ++j)
+                for (int l = 0; l < 32; ++l) {
+                    q[64 * j + l]      = uint8_t(blk.qs[32 * j + l] & 0xF);
+                    q[64 * j + 32 + l] = uint8_t(blk.qs[32 * j + l] >> 4);
+                }
+            for (int ci = 0; ci < 8; ++ci) {
+                const uint32_t c = b * 8 + ci;
+                c32_put_lo(q + ci * 32, lo_c + uint64_t(c) * 16);
+                uint8_t s6, m6;
+                c32_scale_min(ci, blk.scales, s6, m6);
+                sm_c[c] = uint16_t(s6 | (uint16_t(m6) << 8));
+            }
+        }
+    });
+}
+
 namespace {
 
 constexpr int kC32Sg = 16;        // lanes per column
 
 // One lane's decoded chunk c of weight column n (kind 6: lo uint4 + hi uint2 + sc int8 x2 + d fp16/256; kind 5: lo uint4 +
-// hi uint32 + sm uint16 + dm uint32/256). Shared by the dense GEMV and the MoE kernels below, so every path folds a chunk
-// with the SAME operations.
+// hi uint32 + sm uint16 + dm uint32/256; kind 4: kind 5 without hi). Shared by the dense GEMV and the MoE kernels below, so
+// every path folds a chunk with the SAME operations.
 template <int KIND> struct C32Chunk {
     uint32_t P[8];            // the 32 quants as 8 dp4a words (bytes 0..63, so signed dp4a = the exact unsigned product)
-    float    f0, f1;          // Q6: d6 (f1 unused). Q5: d*sc, dmin*m.
+    float    f0, f1;          // Q6: d6 (f1 unused). Q5 / Q4: d*sc, dmin*m.
     int32_t  sc0, sc1;        // Q6 per-16 scales
 
     void load(const uint8_t* lo, const void* hi, const void* sc, const void* d, uint64_t n, uint32_t K, uint32_t c) {
@@ -181,8 +220,9 @@ template <int KIND> struct C32Chunk {
                 P[i]     = (lw[i] & 0x0F0F0F0Fu)        | (((H.x() >> (2 * i)) & 0x03030303u) << 4);
                 P[i + 4] = ((lw[i] >> 4) & 0x0F0F0F0Fu) | (((H.y() >> (2 * i)) & 0x03030303u) << 4);
             }
-        } else {
-            const uint32_t H  = static_cast<const uint32_t*>(hi)[n * (K / 32) + c];
+        } else {   // Q5_K, and Q4_K: no fifth bit (H = 0 folds the OR away)
+            uint32_t H = 0;
+            if constexpr (KIND == 5) H = static_cast<const uint32_t*>(hi)[n * (K / 32) + c];
             const uint16_t s2 = static_cast<const uint16_t*>(sc)[n * (K / 32) + c];
             const uint32_t dmw = static_cast<const uint32_t*>(d)[n * (K / 256) + c / 8];
             sc0 = sc1 = 0;
@@ -240,7 +280,7 @@ sycl::event c32_gemv_impl(sycl::queue& q, const void* x_q8, const uint8_t* lo, c
     const auto* X8 = static_cast<const block_q8_1x*>(x_q8);
     const uint32_t nb = K / 32;                                   // chunks per column = q8 blocks per row
     const uint32_t n_wgs = (N + COLS * CPS - 1) / (COLS * CPS);
-    return ie::ps(q, KIND == 6 ? "gemv_q6k_c32" : "gemv_q5k_c32", [&](sycl::handler& h) {
+    return ie::ps(q, c32_label<KIND>("gemv_q6k_c32", "gemv_q5k_c32", "gemv_q4k_c32"), [&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::nd_range<1>(uint64_t(n_wgs) * WG, WG),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kC32Sg)]] {
@@ -310,16 +350,52 @@ sycl::event c32_gemv(sycl::queue& q, const void* x_q8, const uint8_t* lo, const 
 #undef IE_C32_GO
 }
 
-// Prefill: c32 streams -> fp16 Bt[K, N] (row k, column n; the layout gemv_q_T's F16 branch / oneDNN take). One work-item
-// per (super-block b, column n) with n the fastest local dimension, so each of its 256 stores is one element of a 64-wide
-// contiguous Bt row segment (dequant_q6_soa_to_Bt_v2's geometry). Values as ggml: Q6 d*sc*(q-32), Q5 (d*sc)*q - dmin*m.
+// Prefill: c32 streams -> fp16 Bt[K, N] (row k, column n; the layout gemv_q_T's F16 branch / oneDNN take). Values as
+// ggml: Q6 d*sc*(q-32), Q5 / Q4 (d*sc)*q - dmin*m. One chunk's 32 values, shared by both kernels below so they compute
+// every value with the same expressions (tests/unit/gemv_kq_c32_test checks them equal bit for bit).
 template <int KIND>
-sycl::event c32_dequant(sycl::queue& q, const uint8_t* lo, const void* hi, const void* sc, const void* d,
-                        sycl::half* Bt, uint32_t K, uint32_t N, const std::vector<sycl::event>& deps) {
+inline void c32_chunk_vals(const uint32_t* lw, uint32_t hx, uint32_t hy, int8_t s0, int8_t s1, float d6, uint16_t s2,
+                           uint32_t dmw, sycl::half* v) {
+    if constexpr (KIND == 6) {
+        #pragma unroll
+        for (int e = 0; e < 32; ++e) {
+            const int hh = e >> 4, r = e & 15, i = r >> 2, bb = r & 3;
+            const uint32_t nib = (lw[i] >> (8 * bb + 4 * hh)) & 0xFu;
+            const uint32_t h2 = ((hh ? hy : hx) >> (8 * bb + 2 * i)) & 3u;
+            const int qv = int(nib | (h2 << 4)) - 32;
+            v[e] = sycl::half(d6 * float(hh ? s1 : s0) * float(qv));
+        }
+    } else {   // Q5_K (hx = the chunk's fifth-bit word), Q4_K (hx = 0)
+        const float d1 = c32_h2f(uint16_t(dmw & 0xFFFF)) * float(s2 & 0xFF);
+        const float m1 = c32_h2f(uint16_t(dmw >> 16)) * float(s2 >> 8);
+        #pragma unroll
+        for (int e = 0; e < 32; ++e) {
+            const int hh = e >> 4, r = e & 15, i = r >> 2, bb = r & 3;
+            const uint32_t nib = (lw[i] >> (8 * bb + 4 * hh)) & 0xFu;
+            const uint32_t h1 = (hx >> (8 * bb + (e >> 2))) & 1u;
+            v[e] = sycl::half(d1 * float(nib | (h1 << 4)) - m1);
+        }
+    }
+}
+template <int KIND>
+inline void c32_put_chunk(const uint32_t* lw, uint32_t hx, uint32_t hy, int8_t s0, int8_t s1, float d6, uint16_t s2,
+                          uint32_t dmw, sycl::half* dc, uint32_t N) {
+    sycl::half v[32];
+    c32_chunk_vals<KIND>(lw, hx, hy, s0, s1, d6, s2, dmw, v);
+    #pragma unroll
+    for (int e = 0; e < 32; ++e) dc[uint64_t(e) * N] = v[e];
+}
+
+// One work-item per (super-block b, column n), n the fastest local dimension: each store row is 64 contiguous halves,
+// but each lane reads its own column's streams (16 B at a K/2-byte stride: uncoalesced). The fallback for N % 64 != 0
+// (and IE_C32_DEQ_COL=1, the A/B).
+template <int KIND>
+sycl::event c32_dequant_col(sycl::queue& q, const uint8_t* lo, const void* hi, const void* sc, const void* d,
+                            sycl::half* Bt, uint32_t K, uint32_t N, const std::vector<sycl::event>& deps) {
     constexpr uint32_t WG_N = 64;
     const uint32_t bpc = K / 256;
     const uint32_t n_pad = ((N + WG_N - 1) / WG_N) * WG_N;
-    return ie::ps(q, KIND == 6 ? "dequant_q6k_c32" : "dequant_q5k_c32", [&](sycl::handler& h) {
+    return ie::ps(q, c32_label<KIND>("dequant_q6k_c32", "dequant_q5k_c32", "dequant_q4k_c32"), [&](sycl::handler& h) {
         h.depends_on(deps);
         h.parallel_for(sycl::nd_range<2>({bpc, n_pad}, {1, WG_N}), [=](sycl::nd_item<2> it) {
             const uint32_t b = uint32_t(it.get_group(0));
@@ -337,31 +413,92 @@ sycl::event c32_dequant(sycl::queue& q, const uint8_t* lo, const void* hi, const
                         static_cast<const uint8_t*>(hi) + uint64_t(n) * (K / 4))[c];
                     const int8_t* s = static_cast<const int8_t*>(sc) + uint64_t(n) * (K / 16) + 2u * c;
                     const float d6 = c32_h2f(static_cast<const uint16_t*>(d)[uint64_t(n) * (K / 256) + b]);
-                    #pragma unroll
-                    for (int e = 0; e < 32; ++e) {
-                        const int hh = e >> 4, r = e & 15, i = r >> 2, bb = r & 3;
-                        const uint32_t nib = (lw[i] >> (8 * bb + 4 * hh)) & 0xFu;
-                        const uint32_t h2 = ((hh ? H.y() : H.x()) >> (8 * bb + 2 * i)) & 3u;
-                        const int qv = int(nib | (h2 << 4)) - 32;
-                        dc[uint64_t(e) * N] = sycl::half(d6 * float(s[hh]) * float(qv));
-                    }
+                    c32_put_chunk<6>(lw, H.x(), H.y(), s[0], s[1], d6, 0, 0, dc, N);
                 } else {
-                    const uint32_t H  = static_cast<const uint32_t*>(hi)[uint64_t(n) * (K / 32) + c];
+                    uint32_t H = 0;   // Q4_K: no fifth bit
+                    if constexpr (KIND == 5) H = static_cast<const uint32_t*>(hi)[uint64_t(n) * (K / 32) + c];
                     const uint16_t s2 = static_cast<const uint16_t*>(sc)[uint64_t(n) * (K / 32) + c];
                     const uint32_t dmw = static_cast<const uint32_t*>(d)[uint64_t(n) * (K / 256) + b];
-                    const float d1 = c32_h2f(uint16_t(dmw & 0xFFFF)) * float(s2 & 0xFF);
-                    const float m1 = c32_h2f(uint16_t(dmw >> 16)) * float(s2 >> 8);
-                    #pragma unroll
-                    for (int e = 0; e < 32; ++e) {
-                        const int hh = e >> 4, r = e & 15, i = r >> 2, bb = r & 3;
-                        const uint32_t nib = (lw[i] >> (8 * bb + 4 * hh)) & 0xFu;
-                        const uint32_t h1 = (H >> (8 * bb + (e >> 2))) & 1u;
-                        dc[uint64_t(e) * N] = sycl::half(d1 * float(nib | (h1 << 4)) - m1);
-                    }
+                    c32_put_chunk<KIND>(lw, H, 0, 0, 0, 0.f, s2, dmw, dc, N);
                 }
             }
         });
     });
+}
+
+// Tiled (2026-10-21; dequant_q4_K_to_Bt's scheme): a 256-lane work-group takes 64 consecutive columns of one super-block
+// b. It copies their streams' words for b to SLM with coalesced 4-byte loads (per column: lo 32 words, Q6 hi 16 / Q5 hi
+// 8, sc / sm 4, Q5 / Q4 dm 1; row stride odd), then lane = 32 x chunk + column pair writes that chunk of two neighbouring
+// columns as 4-byte pairs (half the store instructions of one half a lane). N % 64 == 0 (the 27B's every shape).
+template <int KIND>
+sycl::event c32_dequant_tiled(sycl::queue& q, const uint8_t* lo, const void* hi, const void* sc, const void* d,
+                              sycl::half* Bt, uint32_t K, uint32_t N, const std::vector<sycl::event>& deps) {
+    constexpr uint32_t COLS = 64, LANES = 256;
+    constexpr uint32_t LW = 32, HW = KIND == 6 ? 16 : KIND == 5 ? 8 : 0, SW = 4, DW = KIND == 6 ? 0 : 1;
+    constexpr uint32_t RW = LW + HW + SW + DW, ST = RW | 1u;
+    static_assert(COLS * SW == LANES, "the scale stage loads one word a lane");
+    const uint32_t bpc = K / 256;
+    const auto* lo_w = reinterpret_cast<const uint32_t*>(lo);
+    const auto* hi_w = static_cast<const uint32_t*>(hi);   // null for Q4_K (HW = 0: never read)
+    const auto* sc_w = static_cast<const uint32_t*>(sc);
+    const auto* dm_w = static_cast<const uint32_t*>(d);    // Q5 / Q4 dm; Q6's fp16 d is read per lane below
+    const uint64_t lo_cs = K / 8, hi_cs = KIND == 6 ? K / 16 : K / 32, sc_cs = K / 64, dm_cs = K / 256;   // words a column
+    return ie::ps(q, c32_label<KIND>("dequant_q6k_c32t", "dequant_q5k_c32t", "dequant_q4k_c32t"), [&](sycl::handler& h) {
+        h.depends_on(deps);
+        sycl::local_accessor<uint32_t, 1> sm(sycl::range<1>(COLS * ST), h);
+        h.parallel_for(sycl::nd_range<2>({bpc, uint64_t(N / COLS) * LANES}, {1, LANES}), [=](sycl::nd_item<2> it) {
+            const uint32_t b = uint32_t(it.get_group(0));
+            const uint32_t n0 = uint32_t(it.get_group(1)) * COLS;
+            const uint32_t lid = uint32_t(it.get_local_id(1));
+            uint32_t* slm = sm.get_multi_ptr<sycl::access::decorated::no>().get();
+            // one loop per stream (a sub-group never splits across streams; the word counts are powers of two)
+            for (uint32_t w = lid; w < COLS * LW; w += LANES) {
+                const uint32_t j = w / LW, c = w % LW;
+                slm[j * ST + c] = lo_w[uint64_t(n0 + j) * lo_cs + uint64_t(b) * LW + c];
+            }
+            if constexpr (HW != 0)
+                for (uint32_t w = lid; w < COLS * HW; w += LANES) {
+                    const uint32_t j = w / HW, c = w % HW;
+                    slm[j * ST + LW + c] = hi_w[uint64_t(n0 + j) * hi_cs + uint64_t(b) * HW + c];
+                }
+            {
+                const uint32_t j = lid / SW, c = lid % SW;   // COLS * SW == LANES: one word a lane
+                slm[j * ST + LW + HW + c] = sc_w[uint64_t(n0 + j) * sc_cs + uint64_t(b) * SW + c];
+            }
+            if constexpr (DW != 0)
+                if (lid < COLS) slm[lid * ST + LW + HW + SW] = dm_w[uint64_t(n0 + lid) * dm_cs + b];
+            sycl::group_barrier(it.get_group());
+            // lane = 32 x chunk + column pair: two neighbouring columns' chunk ci, one 4-byte store a row (a sub-group's
+            // store is 32 consecutive halves)
+            const uint32_t p = lid % (COLS / 2), ci = lid / (COLS / 2);
+            sycl::half v[2][32];
+            #pragma unroll
+            for (uint32_t h = 0; h < 2; ++h) {
+                const uint32_t* row = slm + (2 * p + h) * ST;
+                const uint32_t lw[4] = {row[4 * ci], row[4 * ci + 1], row[4 * ci + 2], row[4 * ci + 3]};
+                const uint32_t sw = row[LW + HW + ci / 2];   // chunk ci's 2 scale bytes (Q6) / its u16 (Q5, Q4)
+                if constexpr (KIND == 6) {
+                    const float d6 = c32_h2f(static_cast<const uint16_t*>(d)[uint64_t(n0 + 2 * p + h) * (K / 256) + b]);
+                    c32_chunk_vals<6>(lw, row[LW + 2 * ci], row[LW + 2 * ci + 1], int8_t(uint8_t(sw >> (16 * (ci & 1)))),
+                                      int8_t(uint8_t(sw >> (16 * (ci & 1) + 8))), d6, 0, 0, v[h]);
+                } else {
+                    c32_chunk_vals<KIND>(lw, KIND == 5 ? row[LW + ci] : 0u, 0, 0, 0, 0.f, uint16_t(sw >> (16 * (ci & 1))),
+                                         row[LW + HW + SW], v[h]);
+                }
+            }
+            auto* dc = reinterpret_cast<sycl::vec<sycl::half, 2>*>(Bt + (uint64_t(b) * 256u + ci * 32u) * N + n0 + 2 * p);
+            #pragma unroll
+            for (uint32_t e = 0; e < 32; ++e) dc[uint64_t(e) * (N / 2)] = sycl::vec<sycl::half, 2>(v[0][e], v[1][e]);
+        });
+    });
+}
+
+template <int KIND>
+sycl::event c32_dequant(sycl::queue& q, const uint8_t* lo, const void* hi, const void* sc, const void* d,
+                        sycl::half* Bt, uint32_t K, uint32_t N, const std::vector<sycl::event>& deps) {
+    const char* v = std::getenv("IE_C32_DEQ_COL");   // read per call: the unit test flips it between calls
+    if (N % 64 == 0 && !(v && *v == '1')) return c32_dequant_tiled<KIND>(q, lo, hi, sc, d, Bt, K, N, deps);
+    return c32_dequant_col<KIND>(q, lo, hi, sc, d, Bt, K, N, deps);
 }
 
 }  // namespace
@@ -378,6 +515,11 @@ sycl::event gemv_q5k_c32_q8(sycl::queue& q, const void* x_q8, const uint8_t* lo,
     return c32_gemv<5>(q, x_q8, lo, hi, sm, dm, y, K, N, T, deps);
 }
 
+sycl::event gemv_q4k_c32_q8(sycl::queue& q, const void* x_q8, const uint8_t* lo, const uint16_t* sm, const uint32_t* dm,
+                            sycl::half* y, uint32_t K, uint32_t N, uint32_t T, const std::vector<sycl::event>& deps) {
+    return c32_gemv<4>(q, x_q8, lo, nullptr, sm, dm, y, K, N, T, deps);
+}
+
 sycl::event dequant_q6k_c32_to_Bt(sycl::queue& q, const uint8_t* lo, const uint8_t* hi, const int8_t* sc,
                                   const uint16_t* d, sycl::half* Bt, uint32_t K, uint32_t N,
                                   const std::vector<sycl::event>& deps) {
@@ -388,6 +530,11 @@ sycl::event dequant_q5k_c32_to_Bt(sycl::queue& q, const uint8_t* lo, const uint3
                                   const uint32_t* dm, sycl::half* Bt, uint32_t K, uint32_t N,
                                   const std::vector<sycl::event>& deps) {
     return c32_dequant<5>(q, lo, hi, sm, dm, Bt, K, N, deps);
+}
+
+sycl::event dequant_q4k_c32_to_Bt(sycl::queue& q, const uint8_t* lo, const uint16_t* sm, const uint32_t* dm, sycl::half* Bt,
+                                  uint32_t K, uint32_t N, const std::vector<sycl::event>& deps) {
+    return c32_dequant<4>(q, lo, nullptr, sm, dm, Bt, K, N, deps);
 }
 
 // ============================================================================================================================
@@ -406,7 +553,7 @@ sycl::event c32_moe_gate_up(sycl::queue& q, const void* x_q8, const C32Bank& g, 
     const uint32_t nb = H / 32, col_wgs = (EFF + COLS - 1) / COLS;
     const uint64_t n_wgs = uint64_t(T) * Kt * col_wgs;
     const auto* X8 = static_cast<const block_q8_1x*>(x_q8);
-    return ie::ps(q, KIND == 6 ? "moe_gate_up_q6k_c32" : "moe_gate_up_q5k_c32", [&](sycl::handler& h) {
+    return ie::ps(q, c32_label<KIND>("moe_gate_up_q6k_c32", "moe_gate_up_q5k_c32", "moe_gate_up_q4k_c32"), [&](sycl::handler& h) {
         h.parallel_for(sycl::nd_range<1>(n_wgs * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kC32Sg)]] {
             const uint32_t lid = uint32_t(it.get_local_id(0)), lane = lid % kC32Sg;
             const uint32_t tk = uint32_t(it.get_group(0) / col_wgs), cw = uint32_t(it.get_group(0) % col_wgs);
@@ -438,7 +585,7 @@ sycl::event c32_moe_down(sycl::queue& q, const void* h_q8, const C32Bank& dw, co
     const uint32_t nb = EFF / 32, col_wgs = (H + COLS - 1) / COLS;
     const uint64_t n_wgs = uint64_t(T) * Kt * col_wgs;
     const auto* X8 = static_cast<const block_q8_1x*>(h_q8);
-    return ie::ps(q, KIND == 6 ? "moe_down_q6k_c32" : "moe_down_q5k_c32", [&](sycl::handler& h) {
+    return ie::ps(q, c32_label<KIND>("moe_down_q6k_c32", "moe_down_q5k_c32", "moe_down_q4k_c32"), [&](sycl::handler& h) {
         h.parallel_for(sycl::nd_range<1>(n_wgs * WG, WG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kC32Sg)]] {
             const uint32_t lid = uint32_t(it.get_local_id(0)), lane = lid % kC32Sg;
             const uint32_t tk = uint32_t(it.get_group(0) / col_wgs), cw = uint32_t(it.get_group(0) % col_wgs);
@@ -471,7 +618,7 @@ sycl::event c32_moe_prefill_gate_up(sycl::queue& q, const void* xp_q8, const C32
     constexpr int COLS = 16, WG = kC32Sg * COLS;
     const uint32_t nb = H / 32, col_wgs = (EFF + COLS - 1) / COLS;
     const auto* X8 = static_cast<const block_q8_1x*>(xp_q8);
-    return ie::ps(q, KIND == 6 ? "moe_pfl_gate_up_q6k_c32" : "moe_pfl_gate_up_q5k_c32", [&](sycl::handler& h) {
+    return ie::ps(q, c32_label<KIND>("moe_pfl_gate_up_q6k_c32", "moe_pfl_gate_up_q5k_c32", "moe_pfl_gate_up_q4k_c32"), [&](sycl::handler& h) {
         h.parallel_for(sycl::nd_range<1>(uint64_t(E) * col_wgs * WG, WG),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kC32Sg)]] {
             const uint32_t lid = uint32_t(it.get_local_id(0)), lane = lid % kC32Sg;
@@ -517,7 +664,7 @@ sycl::event c32_moe_prefill_down(sycl::queue& q, const void* hq8, const C32Bank&
     constexpr int COLS = 16, WG = kC32Sg * COLS;
     const uint32_t nb = EFF / 32, col_wgs = (H + COLS - 1) / COLS;
     const auto* X8 = static_cast<const block_q8_1x*>(hq8);
-    return ie::ps(q, KIND == 6 ? "moe_pfl_down_q6k_c32" : "moe_pfl_down_q5k_c32", [&](sycl::handler& h) {
+    return ie::ps(q, c32_label<KIND>("moe_pfl_down_q6k_c32", "moe_pfl_down_q5k_c32", "moe_pfl_down_q4k_c32"), [&](sycl::handler& h) {
         h.parallel_for(sycl::nd_range<1>(uint64_t(E) * col_wgs * WG, WG),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kC32Sg)]] {
             const uint32_t lid = uint32_t(it.get_local_id(0)), lane = lid % kC32Sg;

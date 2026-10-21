@@ -305,7 +305,8 @@ sycl::event dequant_q4_K_to_Bt(sycl::queue& q, const void* packed_in,
                                const std::vector<sycl::event>& deps) {
     const uint32_t blocks_per_col = K / 256;
     auto* W = static_cast<const block_q4_K*>(packed_in);
-    if (reinterpret_cast<uintptr_t>(packed_in) % 4 == 0) {
+    // tiled: whole 64-column groups only (2026-10-21: the grid is N / 64 groups, so a tail would stay unwritten)
+    if (reinterpret_cast<uintptr_t>(packed_in) % 4 == 0 && N % kBtCols == 0) {
         constexpr uint32_t BW = sizeof(block_q4_K) / 4;   // 36
         const auto* Ww = static_cast<const uint32_t*>(packed_in);
         return ie::ps(q, "dequant_q4k_bt", [&](sycl::handler& h) {
@@ -346,12 +347,14 @@ sycl::event dequant_q4_K_to_Bt(sycl::queue& q, const void* packed_in,
         });
     }
     constexpr uint32_t WG = 64;
+    const uint32_t n_pad = (N + WG - 1) / WG * WG;   // any N (the range must be whole work-groups)
     return ie::ps(q, "dequant_q4k_bt_scalar", [&](sycl::handler& h) {
         h.depends_on(deps);
-        h.parallel_for(sycl::nd_range<2>({blocks_per_col, N}, {1, WG}),
+        h.parallel_for(sycl::nd_range<2>({blocks_per_col, n_pad}, {1, WG}),
                        [=](sycl::nd_item<2> it) {
             const uint32_t b = uint32_t(it.get_group(0));
             const uint32_t n = uint32_t(it.get_global_id(1));
+            if (n >= N) return;
             const block_q4_K& blk = W[uint64_t(n) * blocks_per_col + b];
             sycl::half* dst = out + uint64_t(b) * 256 * N + n;
 
@@ -631,7 +634,8 @@ sycl::event dequant_q5_K_to_Bt(sycl::queue& q, const void* packed_in,
                                const std::vector<sycl::event>& deps) {
     const uint32_t blocks_per_col = K / 256;
     auto* W = static_cast<const block_q5_K*>(packed_in);
-    if (reinterpret_cast<uintptr_t>(packed_in) % 4 == 0) {
+    // tiled: whole 64-column groups only (2026-10-21: the grid is N / 64 groups, so a tail would stay unwritten)
+    if (reinterpret_cast<uintptr_t>(packed_in) % 4 == 0 && N % kBtCols == 0) {
         constexpr uint32_t BW = sizeof(block_q5_K) / 4;   // 44: d|dmin, scales (words 1-3), qh (4-11), qs (12-43)
         const auto* Ww = static_cast<const uint32_t*>(packed_in);
         return ie::ps(q, "dequant_q5k_bt", [&](sycl::handler& h) {
@@ -677,12 +681,14 @@ sycl::event dequant_q5_K_to_Bt(sycl::queue& q, const void* packed_in,
         });
     }
     constexpr uint32_t WG = 64;
+    const uint32_t n_pad = (N + WG - 1) / WG * WG;   // any N (the range must be whole work-groups)
     return ie::ps(q, "dequant_q5k_bt_scalar", [&](sycl::handler& h) {
         h.depends_on(deps);
-        h.parallel_for(sycl::nd_range<2>({blocks_per_col, N}, {1, WG}),
+        h.parallel_for(sycl::nd_range<2>({blocks_per_col, n_pad}, {1, WG}),
                        [=](sycl::nd_item<2> it) {
             const uint32_t b = uint32_t(it.get_group(0));
             const uint32_t n = uint32_t(it.get_global_id(1));
+            if (n >= N) return;
             const block_q5_K& blk = W[uint64_t(n) * blocks_per_col + b];
             sycl::half* dst = out + uint64_t(b) * 256 * N + n;
 

@@ -38,6 +38,7 @@
 #include <sycl/sycl.hpp>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ie {
@@ -228,23 +229,61 @@ public:
     // position + delta on all streams) while the KV index, the attention bound and the cache length stay the token
     // position. clear_vision() returns to the text path (rope_partial over w.positions, no splice) -- the engine calls it
     // at every generate(), so a text request never ropes through the vision kernel: its bytes are the pre-B45 bytes.
-    // Lanes (forward_stage / forward_stage_rows) have no per-lane vision state yet and refuse while staging is set.
     std::string set_vision(const float* rows_f32, uint32_t t0, uint32_t n_rows);
     void        set_mrope(const int32_t* pos3, uint32_t n_total, int32_t delta);
     void        clear_vision();
-    bool        vision_active() const noexcept { return mrope_n_ != 0 || !vis_spans_.empty(); }
+    bool        vision_active() const noexcept { return vis_.active(); }
+    // Images on the request LANES (2026-10-21, STUDY.md step 3): the same staging per lane. The engine sets a lane's in the
+    // request's serial turn (prefix_prepare: the lane is idle, and no stage thread reads it), and a text request clears it.
+    // forward_stage splices the lane's rows on the embed card and ropes its prompt pieces through the lane's table; a decode
+    // row of the lane (forward_stage's 1-row walk, forward_stage_rows) ropes at position + delta through rope_partial (==
+    // rope_imrope3 on equal streams, bit for bit) while the KV index and length stay the token position. The --parallel 1
+    // staging above must stay clear while the lanes run.
+    std::string set_lane_vision(uint32_t lane, const float* rows_f32, std::span<const std::pair<uint32_t, uint32_t>> spans,
+                                const int32_t* pos3, uint32_t n_total, int32_t delta);
+    void        clear_lane_vision(uint32_t lane);
+    bool        lane_vision_active(uint32_t lane) const noexcept { return lane < lane_vis_.size() && lane_vis_[lane].active(); }
+
+    // ---- 2026-10-21: MTP draft rounds on the request LANES (--spec with --parallel N) --------------------------------
+    // spec_step's draft -> verify -> keep, per lane, through the lane pipe. A decoding lane's round: lane_draft runs the MTP
+    // head on the lane's last hidden and its next input (V - 1 drafts, sampled with the sampler and seeds their targets
+    // will use); ONE pipe step of V rows [next, drafts] runs forward()'s spec-verify walk (card_layers: per-row DeltaNet
+    // checkpoints, the batched int-dot rows) on the lane's own KV and DeltaNet state, card by card (forward_stage_verify),
+    // keeping every row's logits (lane_round_logits) and hidden; lane_round_keep(lane, kept) then leaves the lane's state at
+    // its first `kept` rows (the checkpoint after row kept - 1, the KV lengths) and its hidden at that row. Every other step
+    // of the lane (a prompt piece, a 1-row step, a rows group) leaves its last row's hidden too, so the next round can
+    // start. Each returned row is the model's logits for that prefix, so the lane's tokens are those of its plain decode
+    // with the same sampler and seed (up to the verify rows' rounding: --spec's near-tie note).
+    //   init_lane_mtp(V)   V = rows a round (2..16) for every lane; after init_lanes, with the MTP head loaded.
+    std::string init_lane_mtp(uint32_t V);
+    uint32_t    lane_mtp_rows() const noexcept { return lmtp_V_; }
+    uint64_t    lane_mtp_bytes(uint32_t dev) const;   // what one lane's round state takes on card dev (init_lane_mtp's sum / lanes)
+    // out = the V - 1 drafts, or empty when the lane has no hidden for position pos - 1 (a restore, a reset, the lane
+    // never stepped since): the caller takes a plain step, which leaves one.
+    std::string lane_draft(uint32_t lane, int32_t next, uint32_t pos, const SpecDraftSampling& ds, std::vector<int32_t>& out);
+    std::string forward_stage_verify(uint32_t dev, uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0,
+                                     sycl::half* x_host);
+    const sycl::half* lane_round_logits(uint32_t lane) const noexcept { return lane < lmtp_.size() ? lmtp_[lane].d_all : nullptr; }
+    std::string lane_round_keep(uint32_t lane, uint32_t kept);
+    void        lane_mtp_forget(uint32_t lane) noexcept { if (lane < lmtp_.size()) lmtp_[lane].have_h = false; }
 
 private:
-    std::vector<Qwen4VisSpan> vis_spans_;
-    std::vector<sycl::half>   vis_rows_;      // concat [sum n, hidden] f16
-    std::vector<int32_t>      mrope3_;        // [3, mrope_n_] host
-    uint32_t mrope_n_ = 0;
-    int32_t  mrope_delta_ = 0;
-    // The piece [start, start + T)'s rope positions onto card dev: w.positions (linear, every path) and, with vision
-    // staged, w.positions3 ([3, T]); the one place every forward path uploads them.
-    void upload_positions(uint32_t dev, uint32_t start, uint32_t T);
-    // The staged rows over the piece's gathered embedding rows in x (card embed_dev's queue; no-op without vision).
-    void splice_vision(sycl::queue& q, sycl::half* x, uint32_t start, uint32_t T);
+    struct VisStage {   // one sequence's staged images: the --parallel 1 path's, or one lane's
+        std::vector<Qwen4VisSpan> spans;
+        std::vector<sycl::half>   rows;     // concat [sum n, hidden] f16
+        std::vector<int32_t>      mrope3;   // [3, n] host
+        uint32_t n = 0;                     // the table's length (0 = no table: the text path's rope_partial)
+        int32_t  delta = 0;
+        bool active() const noexcept { return n != 0 || !spans.empty(); }
+    };
+    VisStage vis_;                    // --parallel 1
+    std::vector<VisStage> lane_vis_;  // [n_lanes()] once init_lanes ran
+    std::string vis_append(VisStage& v, const float* rows_f32, uint32_t t0, uint32_t n_rows) const;
+    // The piece [start, start + T)'s rope positions onto card dev: w.positions (linear, every path) and, with v's table,
+    // w.positions3 ([3, T]); the one place every prefill path uploads them.
+    void upload_positions(uint32_t dev, uint32_t start, uint32_t T, const VisStage& v);
+    // v's rows over the piece's gathered embedding rows in x (card embed_dev's queue; no-op without spans).
+    void splice_vision(sycl::half* x, uint32_t start, uint32_t T, const VisStage& v);
     // Slot banks (batched decode). bank_kv_[slot][dev] / bank_dn_[slot][dev];
     // d_slot_logits_ is an [n_banks, vocab] fp16 staging buffer on head_dev.
     std::vector<std::vector<KvCache>>       bank_kv_;
@@ -255,16 +294,17 @@ private:
     // (no F16 doubling → ~13.5 GB/card): q8_qs[n*K+k] int8 column-contiguous +
     // q8_d[n*(K/32)+b] fp16 per-32-block scale (de-interleaved from on-disk AoS
     // block_q8_0 — bit-exact, no requant). Consumed by gemv_q8_0_soa_q8 on decode
-    // and a SoA→fp16 dequant + gemm_fp16 on prefill. Q6_K/Q5_K → the c32 repack (kq,
-    // P4 B21); other tensors (Q4_K packed, F16) fall back to `fp`. See sgemv().
+    // and a SoA→fp16 dequant + gemm_fp16 on prefill. Q6_K/Q5_K/Q4_K → the c32 repack (kq,
+    // P4 B21; Q4_K 2026-10-20); other tensors (F16, ...) fall back to `fp`. See sgemv().
     struct SplitW {
         int8_t*   q8_qs = nullptr;   // [N*K] int8 (Q8_0-SoA)
         uint16_t* q8_d  = nullptr;   // [N*(K/32)] fp16 bits
         uint32_t  K = 0, N = 0;
         DenseQuantPtr fp;            // fallback when q8_qs == nullptr and kq == kCount
-        // P4 B21: a Q6_K / Q5_K weight repacked at load into the c32 streams (gemv_kq_c32.cpp) -- kq names the type
+        // P4 B21: a Q6_K / Q5_K / Q4_K weight repacked at load into the c32 streams (gemv_kq_c32.cpp) -- kq names the type
         // (kQ6_K: kq_hi uint8 2-bit plane, kq_sc int8 per 16, kq_d fp16 per 256; kQ5_K: kq_hi uint32 1-bit plane, kq_sc
-        // uint16 scale|min per 32, kq_d uint32 d|dmin per 256). T = 1 and the rows run gemv_q{6,5}k_c32_q8; prefill dequants.
+        // uint16 scale|min per 32, kq_d uint32 d|dmin per 256; kQ4_K: kQ5_K's without kq_hi, which stays null). T = 1 and
+        // the rows run gemv_q{6,5,4}k_c32_q8; prefill dequants.
         DType     kq = DType::kCount;
         uint8_t*  kq_lo = nullptr;
         void*     kq_hi = nullptr;
@@ -393,7 +433,8 @@ private:
 
     // Enqueue one card's full layer stage for a prefill chunk (no waits/prof/ckpt;
     // used by forward_pipelined — the serial forward keeps its own validated loop).
-    void stage_card_prefill(uint32_t dev, uint32_t T, uint32_t start_pos);
+    // mrope: the chunk's rope reads w.positions3 (rope_imrope3; the caller uploaded the slice), else w.positions.
+    void stage_card_prefill(uint32_t dev, uint32_t T, uint32_t start_pos, bool mrope);
 
     std::string ensure_ws(uint32_t dev, uint32_t max_T);
     void free_ws(uint32_t dev);
@@ -452,6 +493,30 @@ private:
         uint32_t look_streak = 0, look_block = 0;
     };
     SpecStep ss_;
+    // 2026-10-21: one lane's MTP round state (init_lane_mtp)
+    struct LaneMtp {
+        std::vector<Qwen35SpecCheckpoint>  ck;       // [dev] (cards with DeltaNet layers)
+        std::vector<std::vector<uint32_t>> kvsnap;   // [dev][full layer] the KV lengths before the round
+        sycl::half* d_all  = nullptr;                // [V, vocab] the round's logits rows (head card)
+        sycl::half* d_hid  = nullptr;                // [V, H]     the round's hidden rows
+        sycl::half* h_last = nullptr;                // [H]        the hidden of position h_pos
+        bool     have_h = false;
+        uint32_t h_pos = 0;
+        uint32_t base = 0, rows = 0;                 // the round that landed: rows at base..
+    };
+    std::vector<LaneMtp> lmtp_;
+    uint32_t lmtp_V_ = 0;
+    std::vector<uint64_t> lmtp_bytes_;              // [dev] the sum over the lanes
+    // the head card leaves row `row` of ws_[head].x (the final residual, before output_norm) as the lane's hidden of `pos`
+    void lane_keep_hidden(uint32_t lane, uint32_t row, uint32_t pos);
+    // forward()'s per-card layer walk over `kv` / `dn` (2026-10-21; forward_stage_verify runs it on a lane's state): ws_[dev].x
+    // and .positions hold the T rows; ckp = the per-row DeltaNet checkpoints (null = none); verify = the per-row-exact verify
+    // leaves (sgemv's own route follows spec_verify_gemv_ or the calling thread's lane-verify flag); mrope = rope through
+    // w.positions3; vpart / vtable / vfloats = the verify rows' attention partials (null = the per-row loop); mark(q, 0
+    // DeltaNet | 1 attention | 2 FFN) after each block (forward()'s profiler; null = none).
+    void card_layers(uint32_t dev, uint32_t T, uint32_t start_pos, KvCache& kv, DeltaNetState& dn, Qwen35SpecCheckpoint* ckp,
+                     bool verify, bool mrope, float* vpart, void* vtable, uint64_t vfloats,
+                     const std::function<void(sycl::queue&, int)>* mark);
 
     // P4 B48: the spec verify's own partials / table (forward()'s verify rows on ONE cache; allocated at the first verify,
     // in owned_), so that --spec without request lanes has them too.

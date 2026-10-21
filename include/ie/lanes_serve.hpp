@@ -50,8 +50,20 @@ struct LanesSampling {
     bool penalties() const { return repeat_penalty != 1.f || presence_penalty != 0.f || frequency_penalty != 0.f; }
 };
 
+// 2026-10-21: a request's images, encoded by the engine before the run (the Qwen3.8-27B split's lanes): the projector rows in
+// span order, each span's (first prompt position, rows), and the prompt's [3, n] stream-major M-RoPE table with the decode
+// delta (qwen4_build_mrope3). The module only carries it to the arch's hooks. Its pad ids cannot tell one image from
+// another, so an arch keeps such a request out of the prompt cache.
+struct LanesVision {
+    std::vector<float> rows;
+    std::vector<std::pair<uint32_t, uint32_t>> spans;
+    std::vector<int32_t> pos3;
+    int32_t delta = 0;
+};
+
 struct LanesRequest {
     const std::vector<int32_t>* ids = nullptr;   // the prompt (the caller owns it for the whole run)
+    const LanesVision* vision = nullptr;         // the request's images (the caller owns them for the run); null = text only
     LanesSampling sp;
     uint64_t rng = 0;        // the sampler's seed: the k-th sampled id uses rng + k (the engine's serial loop)
     uint32_t snap_at = 0;    // the prompt-cache boundary the arch snapshots at (<= ids->size(); 0 = none)
@@ -259,6 +271,33 @@ public:
         (void)lane; (void)ids; (void)T; (void)pos0;
         return "lookup rounds not supported";
     }
+    // 2026-10-21: MTP draft ROUNDS on a decoding lane (Options::draft). draft_rows() = V, the rows a round (0 = none). A round
+    // is ONE step of V rows at the lane's position -- ids[0] the lane's next input, ids[1..] the drafts the model's draft
+    // head made for it (draft(): `out` empty = no round now, the lane takes a plain step) -- that keeps every row's logits
+    // (pipe_submit_draft); sample_draft gives one id per row as sample_look does; draft_keep(lane, rows, kept, pos0) then
+    // leaves the lane's state, and the pipe's position, at the round's first `kept` rows (from the lane's own done callback,
+    // before its next step). Unlike lookup rounds, rounds of different lanes may be in flight together, and nothing runs
+    // again: the model keeps a state per row.
+    virtual uint32_t draft_rows() const { return 0; }
+    virtual std::string draft(uint32_t lane, int32_t next, uint32_t pos, const LanesSampling& sp, uint64_t seed,
+                              std::vector<int32_t>& out) {
+        (void)lane; (void)next; (void)pos; (void)sp; (void)seed;
+        out.clear();
+        return {};
+    }
+    virtual std::string pipe_submit_draft(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) {
+        (void)lane; (void)ids; (void)T; (void)pos0;
+        return "draft rounds not supported";
+    }
+    virtual std::string sample_draft(uint32_t lane, uint32_t rows, const LanesSampling& sp, std::span<const std::span<const int32_t>> windows,
+                                     std::span<const uint64_t> seeds, std::span<int32_t> picks) {
+        (void)lane; (void)rows; (void)sp; (void)windows; (void)seeds; (void)picks;
+        return "draft rounds not supported";
+    }
+    virtual std::string draft_keep(uint32_t lane, uint32_t rows, uint32_t kept, uint32_t pos0) {
+        (void)lane; (void)rows; (void)kept; (void)pos0;
+        return "draft rounds not supported";
+    }
     // P4 B39 (5): the lane's step AHEAD of the other lanes' queued steps (a prompt's tail piece past plan.snap, <= kTailFront rows:
     // v0.2.6 ran it inside the drained prompt-end turn, before everything; through the pipe it landed behind the other prompts'
     // first pieces -- the wave leader's 7 rows waited 1.4 s behind 14 followers). Default: no priority (pipe_submit).
@@ -393,6 +432,12 @@ public:
         uint32_t look_gap = 2, look_gap_ms = 250;
         bool     look = false;
         uint32_t look_min = 16, look_probe = 8, look_strong = 24, look_strong_rows = 32, look_block = 24, look_block_max = 384;
+        // 2026-10-21 MTP draft rounds (off here; the 27B sets it with --spec): a decoding lane's next step is a round of the
+        // model's draft_rows() rows while at most draft_max lanes decode (this one included) -- one lane alone gets the
+        // draft head's speed, more share the cards in rows groups as before. A round's rows are sampled as lookup rounds'
+        // are, and the reply follows them while the sampled id is the drafted one.
+        bool     draft = false;
+        uint32_t draft_max = 1;
     };
     LanesServe(LanesModel& m, Options o);
     ~LanesServe();
@@ -450,6 +495,9 @@ public:
         uint32_t redo_n = 0; bool redo_fly = false; // rows to run again (pending, or in the pipe)
         bool     look_end = false; std::string look_finish;   // the lane ends (with look_finish) once its redo landed
         uint32_t look_streak = 0, look_blocked = 0, look_block_len = 0, look_grow = 0;
+        // 2026-10-21 MTP draft rounds
+        std::vector<int32_t> draft_ids;             // the round's inputs
+        uint32_t draft_n = 0, draft_base = 0;       // a round of draft_n rows at draft_base is in the pipe
     };
 
 private:
@@ -482,6 +530,12 @@ private:
     bool look_try(Lane& l, uint32_t li);          // a lookup round is due: look_ids / look_n / look_base are set
     void look_landed(Lane& l, uint32_t li);       // the round's callback: sample its rows, follow them, roll back or go on
     void decode_next(Lane& l, uint32_t li);       // a decode lane's next step is due (abort / park / submit)
+    bool draft_try(Lane& l, uint32_t li);         // 2026-10-21: an MTP round is due: draft_ids / draft_n / draft_base are set
+    void draft_landed(Lane& l, uint32_t li);      // the round's callback: sample its rows, follow them, keep that many
+    // row r's sampler for a round's rows (lookup or draft) as if rows 0..r-1 were followed: the windows over hist ++ ids[1..],
+    // the seeds of the (n_new + r)-th ids; `ext` holds the windows' storage
+    void round_samplers(const Lane& l, const std::vector<int32_t>& ids, uint32_t R, std::vector<int32_t>& ext,
+                        std::vector<std::span<const int32_t>>& wins, std::vector<uint64_t>& seeds) const;
     void pipe_failed(const std::string& e);
     // P4 B33: false = stopping, the turn not taken. P4 B39: drain = pause the pipe for the turn (every step in flight finished);
     // false = the pipe runs on (LanesModel::serial_drains answered false for the turn's kind). kind: a lane at its mark / snapshot
@@ -524,6 +578,8 @@ private:
     std::vector<uint64_t> look_gap_base_;      //   every lane's dsteps when the last round landed
     Clock::time_point look_gap_t0_{};
     uint64_t look_rounds_ = 0, look_drafted_ = 0, look_hits_ = 0, look_redos_ = 0;
+    uint64_t draft_rounds_ = 0, draft_drafted_ = 0, draft_hits_ = 0;   // 2026-10-21 MTP rounds
+    bool     draft_said_ = false;              //   a draft() error is logged once
     uint32_t turn_waiters_ = 0;
     uint64_t tick_ = 0;
     double   step_ms_ = 0;

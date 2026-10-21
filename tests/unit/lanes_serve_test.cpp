@@ -117,6 +117,8 @@ struct FakeModel final : ie::LanesModel {
         : st(caps.size()), cap(caps),
           pipe(uint32_t(caps.size()), 8, 1, 2, [this](uint32_t s, const ie::Glm5LanePipe::Step& x) { return stage(s, x); }, pipeline) {
         pipeline_on = pipeline;
+        round_mark.assign(caps.size(), {0u, 0u});
+        round_rows.resize(caps.size());
     }
 
     std::string forward(uint32_t lane, uint32_t s, const int32_t* ids, uint32_t T, uint32_t pos0) {
@@ -147,6 +149,7 @@ struct FakeModel final : ie::LanesModel {
         if (auto e = layers(x.T); !e.empty()) return e;
         std::string e = forward(x.lane, s, x.ids, x.T, x.pos0);
         if (record.load() && x.T > 1) { std::lock_guard<std::mutex> g(mu); tl.emplace_back(s, x.lane, x.pos0, t0, now_ms()); }
+        if (e.empty() && s == 1 && draft_V && x.T > 1) round_landed_stage1(x.lane, x.T, x.pos0);
         return e;
     }
     const char* tag() const override { return "fake lanes"; }
@@ -254,6 +257,61 @@ struct FakeModel final : ie::LanesModel {
     }
     std::string pipe_start(DoneFn d) override { return pipe.start(std::move(d)); }
     std::string pipe_submit(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) override { return pipe.submit(lane, ids, T, pos0); }
+    // 2026-10-21 MTP draft rounds: draft() predicts the model's own next ids (as a good draft head would), wrong on purpose in
+    // a fixed pattern (the last draft, the first one) and sometimes gives none (no hidden yet); stage 1 keeps a round's rows'
+    // "logits" (the hash after each row); draft_keep cuts both stages back to the followed rows
+    uint32_t draft_V = 0;
+    std::atomic<uint64_t> drafts{0}, keeps{0}, keep_bad{0};
+    std::vector<std::pair<uint32_t, uint32_t>> round_mark;      // [lane] (T, pos0)
+    std::vector<std::vector<std::pair<uint64_t, uint32_t>>> round_rows;   // [lane][r] (hash, depth)
+    uint32_t draft_rows() const override { return draft_V; }
+    std::string draft(uint32_t lane, int32_t next, uint32_t pos, const ie::LanesSampling&, uint64_t seed,
+                      std::vector<int32_t>& out) override {
+        out.clear();
+        const St& L = st[lane];
+        if (L.seq[1].size() != pos) { ++keep_bad; return "draft at " + std::to_string(pos) + ", stage 1 holds " + std::to_string(L.seq[1].size()); }
+        const uint64_t k = drafts++;
+        if (k % 5 == 4) return {};   // no hidden: a plain step
+        uint64_t h = mix(L.h, next);
+        for (uint32_t r = 0; r + 1 < draft_V; ++r) {
+            const int32_t t = id_of(h, seed + r, stop_at, pos + 1 + r);
+            out.push_back(t);
+            h = mix(h, t);
+        }
+        if (k % 3 == 1) out.back() += 1;    // the last draft wrong
+        if (k % 3 == 2) out.front() += 1;   // the first draft wrong
+        return {};
+    }
+    std::string pipe_submit_draft(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) override {
+        { std::lock_guard<std::mutex> g(mu); round_mark[lane] = {T, pos0}; }
+        return pipe.submit(lane, ids, T, pos0);
+    }
+    void round_landed_stage1(uint32_t lane, uint32_t T, uint32_t pos0) {   // (stage 1, after its forward)
+        std::lock_guard<std::mutex> g(mu);
+        if (round_mark[lane] != std::make_pair(T, pos0)) return;
+        round_mark[lane] = {0u, 0u};
+        const St& L = st[lane];
+        uint64_t h = 0xcbf29ce484222325ull;
+        for (uint32_t i = 0; i < pos0; ++i) h = mix(h, L.seq[1][i]);
+        round_rows[lane].clear();
+        for (uint32_t r = 0; r < T; ++r) { h = mix(h, L.seq[1][pos0 + r]); round_rows[lane].emplace_back(h, pos0 + r + 1); }
+    }
+    std::string sample_draft(uint32_t lane, uint32_t rows, const ie::LanesSampling&, std::span<const std::span<const int32_t>>,
+                             std::span<const uint64_t> seeds, std::span<int32_t> picks) override {
+        if (round_rows[lane].size() != rows) return "sample_draft: " + std::to_string(rows) + " rows, the round has " +
+                                                    std::to_string(round_rows[lane].size());
+        for (uint32_t r = 0; r < rows; ++r) picks[r] = id_of(round_rows[lane][r].first, seeds[r], stop_at, round_rows[lane][r].second);
+        return {};
+    }
+    std::string draft_keep(uint32_t lane, uint32_t rows, uint32_t kept, uint32_t pos0) override {
+        ++keeps;
+        St& L = st[lane];
+        if (kept == 0 || kept > rows || L.seq[0].size() != pos0 + rows || L.seq[1].size() != pos0 + rows) { ++keep_bad; return "keep: bad state"; }
+        for (auto& q : L.seq) q.resize(pos0 + kept);
+        L.h = 0xcbf29ce484222325ull;
+        for (int32_t id : L.seq[1]) L.h = mix(L.h, id);
+        return kept < rows ? pipe.rewind_lane(lane, pos0 + kept) : std::string();
+    }
     std::string pipe_pause() override { return pipe.pause(); }
     std::string pipe_resume() override { return pipe.resume(); }
     bool pipe_paused() const override { return pipe.paused(); }
@@ -372,9 +430,17 @@ void test_q4e_rules() {
     check(ie::q27_vision_refusal(true, false, 1).find("--mmproj") != std::string::npos &&
           ie::q27_vision_refusal(true, false, 1).find("IE_MMPROJ") != std::string::npos,
           "q27_vision_refusal: the split without an mmproj names --mmproj and IE_MMPROJ");
+    // 2026-10-21 (step 3): the request lanes take images with the tower loaded at start; the joint-step path (no lanes) does not
+    check(ie::q27_vision_refusal(true, true, 4, /*lanes=*/true, /*tower_resident=*/true).empty() &&
+          ie::q27_vision_refusal(true, true, 2, true, true).empty(),
+          "q27_vision_refusal: the split's request lanes with a resident tower take images");
+    check(ie::q27_vision_refusal(true, true, 4, true, false).find("--mmproj") != std::string::npos,
+          "q27_vision_refusal: the lanes without a resident tower name --mmproj (the tower must be placed before the lanes)");
     check(ie::q27_vision_refusal(true, true, 4).find("--parallel 1") != std::string::npos &&
-          ie::q27_vision_refusal(true, true, 2).find("--parallel 1") != std::string::npos,
-          "q27_vision_refusal: the split's lanes refuse images (step 3)");
+          ie::q27_vision_refusal(true, true, 2, false, true).find("--parallel 1") != std::string::npos,
+          "q27_vision_refusal: --parallel > 1 without the request lanes (the joint-step path) refuses images");
+    check(ie::q27_vision_refusal(true, true, 1, false, false).empty(),
+          "q27_vision_refusal: --parallel 1 needs no resident tower (the first image loads it)");
     // P4 B45 step 2: the crown's rule, the same shape
     check(ie::q35m_vision_refusal(true, true, 1).empty() && ie::q35m_vision_refusal(true, true, 0).empty(),
           "q35m_vision_refusal: the split with an mmproj at --parallel 1 takes images");
@@ -383,8 +449,16 @@ void test_q4e_rules() {
     check(ie::q35m_vision_refusal(true, false, 1).find("--mmproj") != std::string::npos &&
           ie::q35m_vision_refusal(true, false, 1).find("IE_MMPROJ") != std::string::npos,
           "q35m_vision_refusal: the split without an mmproj names --mmproj and IE_MMPROJ");
+    // 2026-10-21: the crown's request lanes take images with the tower loaded at start, as the 27B's
+    check(ie::q35m_vision_refusal(true, true, 16, /*lanes=*/true, /*tower_resident=*/true).empty() &&
+          ie::q35m_vision_refusal(true, true, 2, true, true).empty(),
+          "q35m_vision_refusal: the split's request lanes with a resident tower take images");
+    check(ie::q35m_vision_refusal(true, true, 16, true, false).find("--mmproj") != std::string::npos,
+          "q35m_vision_refusal: the lanes without a resident tower name --mmproj");
     check(ie::q35m_vision_refusal(true, true, 16).find("--parallel 1") != std::string::npos,
-          "q35m_vision_refusal: the lanes refuse images (step 3)");
+          "q35m_vision_refusal: --parallel > 1 without the request lanes refuses images");
+    check(ie::q35m_vision_refusal(true, true, 1, false, false).empty(),
+          "q35m_vision_refusal: --parallel 1 needs no resident tower (the first image loads it)");
 }
 
 void test_choose() {
@@ -578,6 +652,61 @@ void test_serve() {
         s.shutdown();   // idempotent
     }
     check(true, "teardown with the pipe and the serial worker joined");
+}
+
+// 2026-10-21: MTP draft rounds (LanesServe::Options::draft) never change a reply: alone, with three lanes' rounds in flight
+// together, with the rounds limited to a lane decoding alone, a stop id inside a round, and a follow-up turn on the lane
+void test_draft_rounds() {
+    for (uint32_t draft_max : {4u, 1u}) {
+        FakeModel m({400, 160, 160});
+        m.draft_V = 3;
+        ie::LanesServe::Options o;
+        o.draft = true;
+        o.draft_max = draft_max;
+        ie::LanesServe s(m, o);
+        const std::string tag = "MTP rounds (draft_max " + std::to_string(draft_max) + ")";
+        Req a(prompt_of(23, 100), 60, 11);
+        a.run(s);
+        check(a.res.finish_reason == "length" && a.res.text == text_of(ref_ids(a.ids, 60, 11, 0)),
+              tag + ": a solo request == its reference (" + std::to_string(a.res.completion_tokens) + " ids)");
+        std::vector<Req> rs;
+        rs.reserve(3);
+        rs.emplace_back(prompt_of(37, 200), 50, 5);
+        rs.emplace_back(prompt_of(12, 300), 45, 6);
+        rs.emplace_back(prompt_of(58, 400), 40, 7);
+        std::vector<std::thread> th;
+        for (auto& r : rs) th.emplace_back([&r, &s] { r.run(s); });
+        for (auto& t : th) t.join();
+        bool all = true;
+        for (auto& r : rs) all = all && r.res.text == text_of(ref_ids(r.ids, r.rq.sp.max_tokens, r.rq.rng, 0)) && r.res.finish_reason == "length";
+        check(all, tag + ": 3 concurrent requests: each == its solo reference");
+        m.stop_at = 31;
+        Req st(prompt_of(25, 700), 20, 9);
+        st.run(s);
+        check(st.res.finish_reason == "stop" && st.res.text == text_of(ref_ids(st.ids, 20, 9, 31)), tag + ": a stop id inside a round -> \"stop\"");
+        m.stop_at = 0;
+        Req f(prompt_of(23, 1234), 12, 11, 20);
+        f.run(s);
+        Req g(prompt_of(23, 1234), 12, 11, 0);
+        g.ids.push_back(5); g.ids.push_back(6); g.rq.snap_at = uint32_t(g.ids.size());
+        g.run(s);
+        check(g.res.text == text_of(ref_ids(g.ids, 12, 11, 0)), tag + ": a follow-up turn on the lane == its reference");
+        const std::string js = s.status_json();
+        const size_t at = js.find("\"mtp\":{");
+        check(at != std::string::npos, tag + ": status_json reports the rounds");
+        auto field = [&](const std::string& k) {   // a number in the "mtp" object
+            const size_t q = js.find("\"" + k + "\":", at);
+            if (q == std::string::npos) return std::string("0");
+            const size_t a0 = q + k.size() + 3;
+            return js.substr(a0, js.find_first_of(",}", a0) - a0);
+        };
+        const std::string rounds = field("rounds"), followed = field("followed"), drafted = field("drafted");
+        check(rounds != "0" && followed != "0" && std::stoull(followed) < std::stoull(drafted),
+              tag + ": rounds ran, some drafts followed and some not (rounds " + rounds + ", drafted " + drafted + ", followed " + followed + ")");
+        check(m.bad == 0 && m.keep_bad == 0 && m.keeps.load() == std::stoull(rounds),
+              tag + ": every round kept once at the right state, no stage saw a wrong position (keeps " + std::to_string(m.keeps.load()) + ")");
+        s.shutdown();
+    }
 }
 
 }  // namespace
@@ -952,6 +1081,7 @@ int main() {
     test_abort_all();
     test_lane_pipeline();
     test_abort_pipeline();
+    test_draft_rounds();
     std::printf("%s\n", g_fail ? "LANES SERVE TEST: FAIL" : "LANES SERVE TEST: PASS");
     return g_fail ? 1 : 0;
 }

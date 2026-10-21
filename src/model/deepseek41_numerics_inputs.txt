@@ -31,8 +31,10 @@
 #                                                    lanes' serving path prefills with Ds41Generator::plan_prefill (this
 #                                                    list's deepseek41_generate.cpp) -- run()'s chunks -- and writes no disk
 #                                                    entry from a prefill it chunked otherwise (IE_DS41_MIX_CHUNK)
-#   unlisted: src/core/allocator.cpp                 the vision tower's pinned staging (DeviceAllocator::malloc) and the
-#                                                    P2P probe deepseek4.cpp calls: allocation and topology, no arithmetic
+#   unlisted: src/core/allocator.cpp                 the vision tower's pinned staging (DeviceAllocator::malloc), the
+#                                                    P2P probe deepseek4.cpp calls and the oneDNN scratch buffer
+#                                                    (onednn_scratch.cpp's malloc_device_checked): allocation and
+#                                                    topology, no arithmetic
 #   unlisted: src/core/dtype.cpp                     type_info/bytes_for: dtype names in expert_stream.cpp's error messages,
 #                                                    V4 GGUF tensor sizes in deepseek4.cpp; no V4.1 value passes through
 #   unlisted: src/loaders/gguf_reader.cpp            GgufReader::find_tensor: V4's GGUF load (deepseek4.cpp); V4.1 reads
@@ -62,6 +64,9 @@ src/model/deepseek41_weights.cpp           # the resident dense set: FP8 to fp16
 src/model/deepseek41_engram.cpp            # the engram tables, the hash and the row gathers added to the stream at 1 and 14
 src/model/deepseek41_experts.cpp           # the routed-expert tier: slot packing, the int-dot and XMX routes, the CPU leg,
                                            # the scatter
+src/model/deepseek41_cards.cpp             # the cards (the stage count: the layer split's boundaries), the CPU leg's
+                                           # cores and the q* odds scale (ds41_qstar_scale) the expert tier applies
+                                           # (2026-10-21: the four-card work added it unlisted; ds41_prefix_key_test)
 src/model/deepseek4.cpp                    # ds4_hc_mix, the hyper-connection mix every V4.1 layer runs (V4's kernel)
 src/model/qwen3moe_pack.cpp                # build_moe_packing: the routed rows' order the expert kernels and the scatter use
 src/model/ds41_vision.cpp                  # an image inside a persisted prefix: the V4.1 image plan and its rows
@@ -83,6 +88,7 @@ src/ops/deepseek4_experts.cpp              # expert gather and cast, the grouped
 src/ops/gemv_fp8.cpp                       # the FP8 GEMVs and gemv_f16_rows: decode-shaped rows and short continuations
 src/ops/gemv_q8dot.cpp                     # quantize_q8_1: the expert activations' Q8_1 quantisation
 src/ops/gemm_onednn.cpp                    # the oneDNN GEMM wrapper behind every prefill projection, its determinism switch
+src/ops/onednn_scratch.cpp                 # the oneDNN products' scratch buffer (where it lives, not what it holds)
 src/ops/gemm_fp16.cpp                      # gemm_fp16: the vision tower's GEMMs (ds4_vision.cpp)
 src/ops/cpu_moe_mxfp4.cpp                  # the CPU expert leg, which also serves prefill chunks
 src/core/expert_stream.cpp                 # the expert cache and arena the tier fetches from, the slot views (ds4_slot_bank)
@@ -93,6 +99,7 @@ include/ie/deepseek4.hpp
 include/ie/deepseek41.hpp
 include/ie/deepseek41_attn_xmx.hpp
 include/ie/deepseek41_candidate.hpp
+include/ie/deepseek41_cards.hpp
 include/ie/deepseek41_dspark.hpp
 include/ie/deepseek41_engram.hpp
 include/ie/deepseek41_experts.hpp
@@ -119,6 +126,7 @@ include/ie/gguf.hpp
 include/ie/kernel_profiler.hpp
 include/ie/model_config.hpp
 include/ie/ngram_draft.hpp
+include/ie/onednn_scratch.hpp
 include/ie/ops.hpp
 include/ie/quant_blocks.hpp
 include/ie/qwen3moe_pack.hpp

@@ -638,9 +638,12 @@ private:
     // P4 B18: the 27B split at --parallel N > 1 -- the lanes module over Qwen35SplitModel's request lanes (engine.cpp,
     // Q27LanesModel); requests run through q35m_generate_lanes (the same front half)
     std::string    q27_lanes_init();
+    // imgs (2026-10-21, the 27B's lanes only): the request's decoded images, encoded here against the prompt's pad runs
+    // and staged on the request's lane (LanesRequest::vision); such a request stays out of the prompt cache.
+    struct QvisPendingImage;
     GenerateResult q35m_generate_lanes(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token,
                                        uint32_t cache_prefix_len, bool reply_cache, uint32_t shared_prefix_len = 0,
-                                       bool anchor = false);
+                                       bool anchor = false, std::vector<QvisPendingImage>* imgs = nullptr);
     sycl::event glm5_forward(sycl::queue& q, const int32_t* ids, uint32_t T, uint32_t pos);
     sycl::event glm5_logits(sycl::queue& q);
     sycl::event glm5_host_logits(sycl::queue& q);
@@ -754,7 +757,8 @@ private:
     // the model (q4e_forward: right AFTER its pos==0 reset, which would otherwise
     // wipe them; the 27B split: once before its prefill, its staging survives
     // resets and is cleared at every generate()). Staging clears at the next
-    // generate(). Engine-global, so images need --parallel 1 on both archs.
+    // generate(). Engine-global, so images need --parallel 1 here; the 27B split's request lanes encode each request's
+    // images into the request (qvis_encode) and stage them on its lane instead.
     std::unique_ptr<Qwen4Vision> qvis_tower_;
     std::string     model_path_;          // gguf path from load() (mmproj discovery)
     std::string     qvis_mmproj_;         // resolved mmproj path ("" = none found yet)
@@ -780,6 +784,12 @@ private:
     // above; apply the staging to the loaded model ("" or the first error).
     std::string qvis_stage(const std::vector<int32_t>& ids);
     std::string qvis_apply();
+    // qvis_stage's encode into caller-owned parts (rows in span order, (t0, n) spans, per-image hashes, the [3, n] M-RoPE
+    // table and delta); the tower runs under qvis_mu_ (one encode scratch: the lanes' requests encode on their own threads)
+    std::string qvis_encode(const std::vector<int32_t>& ids, std::vector<QvisPendingImage>& imgs, std::vector<float>& rows,
+                            std::vector<std::pair<uint32_t, uint32_t>>& spans, std::vector<uint64_t>& hash,
+                            std::vector<int32_t>& pos3, int32_t& delta);
+    std::mutex  qvis_mu_;
     // Deepest prefix the deepseek4 prompt cache will snapshot. Capped at load
     // because the snapshot (22.55 MiB + 6.88 kB/token PER CARD at the default fp16 values) is drawn from
     // the same reserve the expert arena is derived from, and trading expert

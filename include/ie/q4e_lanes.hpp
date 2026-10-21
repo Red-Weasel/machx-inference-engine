@@ -152,24 +152,30 @@ inline std::string ds4_vision_refusal(bool sidecar_loaded, uint32_t parallel) {
 
 // P4 B45: why a Qwen3.8-27B (qwen35) load refuses image requests, "" when it takes them: images run on the layer-split
 // model only (Qwen35SplitModel: --gpus 2, or IE_QWEN35_Q8 on one card; the single-card Qwen35DenseModel has no splice),
-// need an mmproj (--mmproj, IE_MMPROJ, or mmproj-F16.gguf / mmproj-BF16.gguf beside the model) and --parallel 1 (the
-// staging is engine-global like Flash-Next's; the 27B's request lanes take text only until step 3 of
-// ~/ds41_work/p60/vision-splits/STUDY.md). Engine::vision_status_json (/props "vision") and Engine::chat's refusal both
-// come from here, so they cannot disagree.
-inline std::string q27_vision_refusal(bool split, bool mmproj_known, uint32_t parallel) {
+// need an mmproj (--mmproj, IE_MMPROJ, or mmproj-F16.gguf / mmproj-BF16.gguf beside the model), and above --parallel 1 the
+// request lanes (2026-10-21, step 3 of the image-on-splits study: each request's images are staged on its own
+// lane) with the tower loaded at start (--mmproj: the lanes are sized beside it; a tower loaded at the first image would
+// land after them). The joint-step path (IE_QWEN35_LANES=0) stages engine-globally: --parallel 1 only.
+// Engine::vision_status_json (/props "vision") and Engine::chat's refusal both come from here, so they cannot disagree.
+inline std::string q27_vision_refusal(bool split, bool mmproj_known, uint32_t parallel, bool lanes = false,
+                                      bool tower_resident = false) {
     if (!split) return "this 27B load has no vision path (images need the layer-split model: --gpus 2)";
     if (!mmproj_known) return "this 27B load has no vision projector (pass --mmproj <mmproj-F16.gguf>, or set IE_MMPROJ, or put mmproj-F16.gguf beside the model)";
-    if (parallel > 1) return "image inputs need --parallel 1 (the 27B split's request lanes take text only; per-request image staging is engine-global)";
+    if (parallel > 1 && !lanes) return "image inputs need --parallel 1 or the 27B split's request lanes (this --parallel runs the joint-step path, whose image staging is engine-global)";
+    if (parallel > 1 && !tower_resident) return "image inputs at --parallel above 1 need the vision tower loaded at start: pass --mmproj <mmproj-F16.gguf> (the request lanes are sized beside it)";
     return {};
 }
 
 // P4 B45 step 2: the same rule for the Qwen3.6/3.8-35B-A3B crown (qwen35moe) -- its two-card split (Qwen35MoeSplitModel) with a
 // projector (the 35B Distill repo's mmproj-Qwen3.8-35B-A3B-F16.gguf, mm.2 2048) at --parallel 1; the single-card QwenModel has
-// no splice and the lanes take text only (step 3). /props "vision" and Engine::chat read this one helper.
-inline std::string q35m_vision_refusal(bool split, bool mmproj_known, uint32_t parallel) {
+// no splice. Above --parallel 1 its request lanes take them (2026-10-21, the 27B's step 3) with the tower loaded at start
+// (--mmproj). /props "vision" and Engine::chat read this one helper.
+inline std::string q35m_vision_refusal(bool split, bool mmproj_known, uint32_t parallel, bool lanes = false,
+                                       bool tower_resident = false) {
     if (!split) return "this 35B-A3B load has no vision path (images need the two-card split: --gpus 2)";
     if (!mmproj_known) return "this 35B-A3B load has no vision projector (pass --mmproj <mmproj-...-F16.gguf>, or set IE_MMPROJ, or put an mmproj*.gguf beside the model)";
-    if (parallel > 1) return "image inputs need --parallel 1 (the 35B-A3B split's request lanes take text only; per-request image staging is engine-global)";
+    if (parallel > 1 && !lanes) return "image inputs need --parallel 1 or the 35B-A3B split's request lanes (this --parallel runs without them, and its image staging is engine-global)";
+    if (parallel > 1 && !tower_resident) return "image inputs at --parallel above 1 need the vision tower loaded at start: pass --mmproj <mmproj-...-F16.gguf> (the request lanes are sized beside it)";
     return {};
 }
 

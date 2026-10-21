@@ -1,5 +1,6 @@
 // src/model/deepseek41_experts.cpp — see the header.
 #include "ie/deepseek41_experts.hpp"
+#include "ie/deepseek41_cards.hpp"
 #include "ie/cpu_moe_mxfp4.hpp"
 
 #include <cmath>
@@ -37,6 +38,11 @@ inline uint64_t align64(uint64_t x) { return (x + 63) & ~uint64_t(63); }
 constexpr uint32_t kReaders = 8;
 
 constexpr uint64_t kPage = 4096;
+// 2026-10-20: IE_DS41_DISK_CACHE -- the disk tier's reads through the page cache instead of O_DIRECT. Unset: a
+// tensor-parallel part's row slices through the cache (measured 16.6 -> 17.3 tok/s, the fill 17.0 -> 14.0 ms/step), the
+// layer split's expert file O_DIRECT (through the cache it read in half the time and the fill did not shorten:
+// 14.0 / 13.4 tok/s, srv/runs/u1-u3). 1: both through the cache; 0: neither.
+int ds41_disk_cache() { static const int v = [] { const char* e = std::getenv("IE_DS41_DISK_CACHE"); return e && *e ? (*e == '1' ? 1 : 0) : -1; }(); return v; }
 // Read file bytes [off, off+len) into `buf`: O_DIRECT through `dfd` when it exists (the aligned
 // superset lands in buf, and *at says where the wanted bytes start), buffered `fd` otherwise
 // (*at = 0). O_DIRECT reads may come back short only at end of file, so the loop stops once
@@ -89,10 +95,15 @@ inline void permute_plane(const uint8_t* src, uint8_t* qs, uint64_t len0) {
 }
 std::string plane_check(const Ds4MatPlanes& m, const Ds41Tensor& t, const char* nm) {
     if (!t.w || !t.s) return std::string(nm) + ": not bound";
-    if (t.w->shape != std::vector<int64_t>{m.N, m.K / 2}) return std::string(nm) + ": plane is not [N, K/2]";
-    if (t.w->nbytes != m.len0 || t.s->nbytes != m.len1) return std::string(nm) + ": byte count disagrees with the layout";
+    // the checkpoint's whole matrix [src_N, src_K/2]; a tensor-parallel slot holds rows [n0, n0 + N) x columns [k0, k0 + K) of it
+    if (t.w->shape != std::vector<int64_t>{m.src_N, m.src_K / 2}) return std::string(nm) + ": plane is not [N, K/2]";
+    if (t.w->nbytes != uint64_t(m.src_N) * (m.src_K / 2) || t.s->nbytes != uint64_t(m.src_N) * (m.src_K / 32))
+        return std::string(nm) + ": byte count disagrees with the layout";
+    if (m.n0 + m.N > m.src_N || m.k0 + m.K > m.src_K || m.k0 % 32 || m.K % 32) return std::string(nm) + ": slice outside the matrix or off its 32-blocks";
     return {};
 }
+// a column slice (K < src_K): each row's bytes are a run inside the source row, so the plane is gathered row by row
+inline bool col_sliced(const Ds4MatPlanes& m) { return m.K != m.src_K; }
 // Run `pack(i, thread)` for i in [0, n) on kReaders threads; the first error wins, the rest stop.
 std::string parallel_fill(uint32_t n, const std::function<std::string(uint32_t, uint32_t)>& pack) {
     std::string err; std::atomic<bool> failed{false};
@@ -141,16 +152,23 @@ std::string ds41_slot_pread_file(int dfd, uint64_t off, void* dst, uint64_t byte
     return {};
 }
 
-std::string ds41_slot_layout(uint32_t H, uint32_t EF, Ds4SlotLayout& out) {
+std::string ds41_slot_layout(uint32_t H, uint32_t EF, Ds4SlotLayout& out) { return ds41_slot_layout_tp(H, EF, 0, 1, out); }
+
+std::string ds41_slot_layout_tp(uint32_t H, uint32_t EF, uint32_t part, uint32_t n_parts, Ds4SlotLayout& out) {
     if (H % 32 || EF % 32) return "ds41_slot_layout: H and EF must be multiples of 32";
-    auto mat = [](Ds4MatPlanes& m, uint32_t K, uint32_t N, uint64_t& cur) {
-        m.dt = DType::kMXFP4; m.K = K; m.N = N; m.src_K = K; m.src_N = N; m.k0 = 0; m.n0 = 0;
+    if (n_parts == 0 || part >= n_parts || (EF / 32) % n_parts)
+        return "ds41_slot_layout: EF's " + std::to_string(EF / 32) + " blocks of 32 do not split in " + std::to_string(n_parts);
+    const uint32_t efc = EF / n_parts, ef0 = part * efc;
+    auto mat = [](Ds4MatPlanes& m, uint32_t K, uint32_t N, uint32_t sK, uint32_t sN, uint32_t k0, uint32_t n0, uint64_t& cur) {
+        m.dt = DType::kMXFP4; m.K = K; m.N = N; m.src_K = sK; m.src_N = sN; m.k0 = k0; m.n0 = n0;
         m.off0 = cur; m.len0 = uint64_t(N) * (K / 2);  cur = align64(cur + m.len0);   // nibbles
         m.off1 = cur; m.len1 = uint64_t(N) * (K / 32); cur = align64(cur + m.len1);   // E8M0
         m.off2 = 0;   m.len2 = 0;
     };
     uint64_t cur = 0;
-    mat(out.gate, H, EF, cur); mat(out.up, H, EF, cur); mat(out.down, EF, H, cur);
+    // gate / up [EF, H]: this part's rows (its intermediate units); down [H, EF]: the same units as its columns, so a part's
+    // down output is a partial sum over its units and the parts' outputs add up to the whole expert's
+    mat(out.gate, H, efc, H, EF, 0, ef0, cur); mat(out.up, H, efc, H, EF, 0, ef0, cur); mat(out.down, efc, H, EF, H, ef0, 0, cur);
     out.bytes = cur;
     return {};
 }
@@ -160,21 +178,27 @@ std::string ds41_slot_pack(const Ds4SlotLayout& lay, const Ds41Tensor& w1, const
     auto one = [&](const Ds4MatPlanes& m, const Ds41Tensor& t, const char* nm) -> std::string {
         if (auto e = plane_check(m, t, nm); !e.empty()) return e;
         uint8_t* qs = static_cast<uint8_t*>(dst) + m.off0;
-        const uint8_t* src = t.w->data;
+        // rows [n0, n0 + N), columns [k0, k0 + K) of the source (the whole matrix outside tensor parallel, where srow == row
+        // and the blocks are the plane's in order, as before)
+        const uint64_t srow = m.src_K / 2, row = m.K / 2;
+        const uint8_t* src = t.w->data + uint64_t(m.n0) * srow + m.k0 / 2;
         // the Phase 4 shuffle, on the host: engine_byte[j] = nib(v[j/2], j&1) | nib(v[j/2+8], j&1) << 4
         // Parallel over the 16-byte blocks (each writes only its own 16 output bytes). Measured
         // (docs/deepseek41/23): this loop's time is the page-fault read of the mapping under it,
         // not the shuffle -- twenty threads moved it 5%; ds41_slot_pack_pread is the fix.
-        const int64_t n_blk = int64_t(m.len0 / 16);
+        const int64_t n_blk = int64_t(m.len0 / 16), bpr = int64_t(row / 16);
         #pragma omp parallel for schedule(static)
         for (int64_t blk = 0; blk < n_blk; ++blk) {
-            const uint8_t* v = src + blk * 16; uint8_t* o = qs + blk * 16;
+            const uint8_t* v = src + uint64_t(blk / bpr) * srow + uint64_t(blk % bpr) * 16; uint8_t* o = qs + blk * 16;
             for (int j = 0; j < 16; ++j) {
                 const int sh = (j & 1) * 4;
                 o[j] = uint8_t(((v[j >> 1] >> sh) & 0xF) | (((v[(j >> 1) + 8] >> sh) & 0xF) << 4));
             }
         }
-        std::memcpy(static_cast<uint8_t*>(dst) + m.off1, t.s->data, m.len1);
+        const uint64_t ssrow = m.src_K / 32, srw = m.K / 32;
+        const uint8_t* ss = t.s->data + uint64_t(m.n0) * ssrow + m.k0 / 32;
+        if (srw == ssrow) std::memcpy(static_cast<uint8_t*>(dst) + m.off1, ss, m.len1);
+        else for (uint32_t r = 0; r < m.N; ++r) std::memcpy(static_cast<uint8_t*>(dst) + m.off1 + uint64_t(r) * srw, ss + uint64_t(r) * ssrow, srw);
         return {};
     };
     if (auto e = one(lay.gate, w1, "w1"); !e.empty()) return e;
@@ -183,7 +207,10 @@ std::string ds41_slot_pack(const Ds4SlotLayout& lay, const Ds41Tensor& w1, const
 }
 
 uint64_t ds41_pack_bounce_bytes(const Ds4SlotLayout& lay) {
-    const uint64_t biggest = std::max({lay.gate.len0, lay.up.len0, lay.down.len0, lay.gate.len1, lay.up.len1, lay.down.len1});
+    // a column-sliced plane (tensor parallel's down) is read as whole source rows, so its read is the source plane's
+    auto rd0 = [](const Ds4MatPlanes& m) { return col_sliced(m) ? uint64_t(m.N) * (m.src_K / 2) : m.len0; };
+    auto rd1 = [](const Ds4MatPlanes& m) { return col_sliced(m) ? uint64_t(m.N) * (m.src_K / 32) : m.len1; };
+    const uint64_t biggest = std::max({rd0(lay.gate), rd0(lay.up), rd0(lay.down), rd1(lay.gate), rd1(lay.up), rd1(lay.down)});
     return (biggest + 2 * kPage + kPage - 1) & ~(kPage - 1);       // the aligned superset of any one plane
 }
 
@@ -199,21 +226,48 @@ std::string ds41_slot_pack_pread(const Ds4SlotLayout& lay, const SafetensorsMode
     auto tick = [] { return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); };
     auto one = [&](const Ds4MatPlanes& m, const Ds41Tensor& t, const char* nm) -> std::string {
         if (auto e = plane_check(m, t, nm); !e.empty()) return e;
-        // this slice's byte range of each plane: 16-byte blocks of the nibble plane, bytes of the scales
-        const uint64_t nb = m.len0 / 16, s0 = (nb * slice / n_slices) * 16, s1 = (nb * (slice + 1) / n_slices) * 16;
-        const uint64_t c0 = m.len1 * slice / n_slices, c1 = m.len1 * (slice + 1) / n_slices;
         int fd = -1, dfd = -1; uint64_t off = 0, at = 0;
         if (!store.locate(t.w->data, fd, dfd, off)) return std::string(nm) + ": nibble plane is not inside a shard mapping";
         uint64_t t0 = tick(), t1 = t0;
+        if (col_sliced(m)) {
+            // tensor parallel's down: columns [k0, k0 + K) of every row. This slice's rows are read whole (one run of the
+            // source) and each row's run is permuted out of the bounce; a run is K / 32 whole blocks of the shuffle.
+            // Every part reads the SAME whole rows, so they go through the page cache, not O_DIRECT: the parts' concurrent
+            // reads of one expert meet in the cache and the disk serves the rows once, not once per card (2026-10-20:
+            // O_DIRECT made the 2-card disk tier read 40% more than the layer split's). IE_DS41_TP_DOWN_DIRECT=1: O_DIRECT.
+            static const bool down_direct = [] { const char* v = std::getenv("IE_DS41_TP_DOWN_DIRECT"); return v && *v == '1'; }();
+            if (!down_direct) dfd = -1;
+            const uint64_t srow = m.src_K / 2, row = m.K / 2, ssrow = m.src_K / 32, srw = m.K / 32;
+            const uint64_t r0 = uint64_t(m.N) * slice / n_slices, r1 = uint64_t(m.N) * (slice + 1) / n_slices;
+            if (r1 == r0) return {};
+            if (auto e = read_range(fd, dfd, bb, off + (m.n0 + r0) * srow, (r1 - r0) * srow, &at); !e.empty()) return std::string(nm) + " nibbles: " + e;
+            t1 = tick(); nr += t1 - t0;
+            for (uint64_t r = r0; r < r1; ++r) permute_plane(bb + at + (r - r0) * srow + m.k0 / 2, static_cast<uint8_t*>(dst) + m.off0 + r * row, row);
+            t0 = tick(); np += t0 - t1;
+            if (!store.locate(t.s->data, fd, dfd, off)) return std::string(nm) + ": scale plane is not inside a shard mapping";
+            if (!down_direct) dfd = -1;
+            if (auto e = read_range(fd, dfd, bb, off + (m.n0 + r0) * ssrow, (r1 - r0) * ssrow, &at); !e.empty()) return std::string(nm) + " scales: " + e;
+            t1 = tick(); nr += t1 - t0;
+            for (uint64_t r = r0; r < r1; ++r) std::memcpy(static_cast<uint8_t*>(dst) + m.off1 + r * srw, bb + at + (r - r0) * ssrow + m.k0 / 32, srw);
+            np += tick() - t1;
+            return {};
+        }
+        // this slice's byte range of each plane: 16-byte blocks of the nibble plane, bytes of the scales; a row slice
+        // (tensor parallel's gate / up: rows [n0, n0 + N)) is one run of the source starting at row n0. A tensor-parallel
+        // part's rows go through the page cache (a slot read again is a memory copy; IE_DS41_DISK_CACHE=0: O_DIRECT)
+        if (m.n0 != 0 || m.N != m.src_N) { if (ds41_disk_cache() != 0) dfd = -1; }
+        const uint64_t nb = m.len0 / 16, s0 = (nb * slice / n_slices) * 16, s1 = (nb * (slice + 1) / n_slices) * 16;
+        const uint64_t c0 = m.len1 * slice / n_slices, c1 = m.len1 * (slice + 1) / n_slices;
+        const uint64_t base0 = uint64_t(m.n0) * (m.src_K / 2), base1 = uint64_t(m.n0) * (m.src_K / 32);
         if (s1 > s0) {
-            if (auto e = read_range(fd, dfd, bb, off + s0, s1 - s0, &at); !e.empty()) return std::string(nm) + " nibbles: " + e;
+            if (auto e = read_range(fd, dfd, bb, off + base0 + s0, s1 - s0, &at); !e.empty()) return std::string(nm) + " nibbles: " + e;
             t1 = tick(); nr += t1 - t0;
             permute_plane(bb + at, static_cast<uint8_t*>(dst) + m.off0 + s0, s1 - s0);
             t0 = tick(); np += t0 - t1;
         }
         if (c1 > c0) {
             if (!store.locate(t.s->data, fd, dfd, off)) return std::string(nm) + ": scale plane is not inside a shard mapping";
-            if (auto e = read_range(fd, dfd, bb, off + c0, c1 - c0, &at); !e.empty()) return std::string(nm) + " scales: " + e;
+            if (auto e = read_range(fd, dfd, bb, off + base1 + c0, c1 - c0, &at); !e.empty()) return std::string(nm) + " scales: " + e;
             t1 = tick(); nr += t1 - t0;
             std::memcpy(static_cast<uint8_t*>(dst) + m.off1 + c0, bb + at, c1 - c0);
             np += tick() - t1;
@@ -308,14 +362,14 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint
     kmp_set_blocktime(0);
     src_ = s;
     L0_ = first_layer; nL_ = n_layers; E_ = s.n_experts; TK_ = s.top_k;   // the layer kind's counts (the MTP stages: 128 / 3)
-    H_ = s.H; EF_ = s.EF; np_ = n_pinned; share_ = n_parts > 1;
+    H_ = s.H; EF_ = s.EF / tp_n_; np_ = n_pinned; share_ = n_parts > 1;   // tensor parallel: this part's intermediate units
     if (!s.store || first_layer + n_layers > s.layers.size()) return "tier: layer range out of the model's layers";
     for (uint32_t l = 0; l < n_layers; ++l)
         if (!s.layers[first_layer + l].exp_w1 || !s.layers[first_layer + l].exp_w3 || !s.layers[first_layer + l].exp_w2)
             return "tier: layer " + std::to_string(first_layer + l) + " has no routed experts";
     if (n_parts == 0 || part > n_parts) return "tier: part " + std::to_string(part) + " of " + std::to_string(n_parts) + " parts";
     // part == n_parts: the empty subset -- no expert of any layer (the expert-parallel control arm)
-    if (auto e = ds41_slot_layout(H_, EF_, lay_); !e.empty()) return e;
+    if (auto e = ds41_slot_layout_tp(H_, s.EF, tp_part_, tp_n_, lay_); !e.empty()) return e;
 
     if (part == n_parts) {   // the empty subset: a tier that CONSUMES NO RESOURCES (the control arm of docs/38, gate 14 finding 1)
         tier_.assign(n_layers, std::vector<uint8_t>(E_, 3)); empty_ = true; ready_ = true; return {};
@@ -340,7 +394,14 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint
     // MADV_NORMAL for it. One call per shard. No WILLNEED.
     if (!s.store->advise(MADV_NORMAL)) return "tier: madvise(MADV_NORMAL) failed on a shard mapping";
     mm_stage_.resize(mm_stage_slots_);
-    const std::string file_path = s.expert_file;
+    std::string file_path = s.expert_file;
+    // the expert file holds whole slots; a tensor-parallel part reads its slice through the pack path instead (a per-part
+    // file is not written yet), so its mmap tier pays the pack's permute on each fill
+    if (tp_n_ > 1 && !file_path.empty()) {
+        std::fprintf(stderr, "[ds41 tier] tensor parallel part %u of %u: the expert file %s holds whole slots; this part's mmap tier reads its slices from the checkpoint\n",
+                     tp_part_, tp_n_, file_path.c_str());
+        file_path.clear();
+    }
     // the file holds the text layers' experts; an MTP tier (the drafter's) skips it
     if (!file_path.empty()) {
         // the staging slots as anonymous huge-page memory imported into the driver (docs/40 step 0(c):
@@ -367,6 +428,23 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint
         if (posix_memalign(&b, size_t(kPage), size_t(ds41_pack_bounce_bytes(lay_))) != 0) return "tier: bounce alloc failed";
     dq_ = std::make_unique<sycl::queue>(q.get_context(), q.get_device(), sycl::property_list{sycl::property::queue::in_order{}});
     const auto& store = *s.store;
+    if (tp_n_ > 1) {
+        // tensor parallel: the sliced read path (every fill below, in 1 and in 3 reader slices) against the in-memory pack of
+        // the same part (ds41_tp_slice_test proves that one against the whole expert), one expert, byte for byte
+        void* a = nullptr; void* b = nullptr;
+        if (posix_memalign(&a, size_t(kPage), size_t(lay_.bytes)) != 0 || posix_memalign(&b, size_t(kPage), size_t(lay_.bytes)) != 0) { std::free(a); return "tier: tp sample alloc failed"; }
+        const auto& Lw = s.layers[L0_]; const uint32_t ex = sub[0].empty() ? 0u : sub[0].back();
+        std::memset(a, 0, size_t(lay_.bytes)); std::memset(b, 0xA5, size_t(lay_.bytes));
+        std::string e = ds41_slot_pack(lay_, Lw.exp_w1[ex], Lw.exp_w3[ex], Lw.exp_w2[ex], a);
+        if (e.empty()) e = ds41_slot_pack_pread(lay_, store, Lw.exp_w1[ex], Lw.exp_w3[ex], Lw.exp_w2[ex], b, bounce_[0]);
+        bool same = e.empty() && std::memcmp(a, b, size_t(lay_.bytes)) == 0;
+        std::memset(b, 0x5A, size_t(lay_.bytes));
+        for (uint32_t sl = 0; same && e.empty() && sl < 3; ++sl) e = ds41_slot_pack_pread(lay_, store, Lw.exp_w1[ex], Lw.exp_w3[ex], Lw.exp_w2[ex], b, bounce_[0], nullptr, nullptr, sl, 3);
+        same = same && e.empty() && std::memcmp(a, b, size_t(lay_.bytes)) == 0;
+        std::free(a); std::free(b);
+        if (!same) return "tier: tensor parallel part " + std::to_string(tp_part_) + " of " + std::to_string(tp_n_) + ": the sliced read of layer " + std::to_string(L0_) +
+                          " expert " + std::to_string(ex) + " differs from the pack" + (e.empty() ? std::string() : " (" + e + ")");
+    }
 
     // pinned tier: arena slots, pread-packed straight into the pinned slot, kReaders at a time
     if (n_pinned) {
@@ -418,8 +496,16 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint
             if (!same) { close(dfd); mm_file_off_.clear(); return "tier: expert file REFUSED: layer " + std::to_string(L0_ + uint32_t(sl0)) + " expert " + std::to_string(se0) + " differs from the pack path" + (e1.empty() ? "" : " (" + e1 + ")") + (e2.empty() ? "" : " (" + e2 + ")"); }
         }
         mm_file_fd_ = dfd;
-        std::fprintf(stderr, "[ds41 tier] expert file %s: covers %u of this tier's %u mmap experts (layers %u..%u); staging imported; one slot verified byte for byte\n",
-                     file_path.c_str(), covered, wanted, L0_, L0_ + n_layers - 1);
+        // 2026-10-20: IE_DS41_DISK_CACHE=1 reads the file through the page cache instead of O_DIRECT: the RAM the
+        // pinned tier leaves free (~35 GB on a 256 GB box) then keeps the disk tier's recently used slots, so a slot read
+        // again is a memory copy, not an NVMe read. The same bytes either way; the cache is the kernel's, reclaimable.
+        // Off by default: on the 2-card split it halved the reads but not the fill (ds41_disk_cache).
+        if (ds41_disk_cache() == 1) {
+            const int cfd = open(file_path.c_str(), O_RDONLY);
+            if (cfd >= 0) { close(dfd); mm_file_fd_ = cfd; }
+        }
+        std::fprintf(stderr, "[ds41 tier] expert file %s: covers %u of this tier's %u mmap experts (layers %u..%u); staging imported; one slot verified byte for byte%s\n",
+                     file_path.c_str(), covered, wanted, L0_, L0_ + n_layers - 1, mm_file_fd_ != dfd ? "; read through the page cache" : "");
     }
     cpu_start(q);
     for (uint32_t l = 0; l < n_layers; ++l) {
@@ -458,15 +544,10 @@ void Ds41ExpertTier::cpu_start(sycl::queue& q) {
     if (const char* qs = std::getenv("IE_DS41_QSTAR_MULTI")) cpu_.qstar_multi = std::max(0.f, std::min(1.f, float(std::atof(qs))));
     if (const char* v = std::getenv("IE_DS41_CPU_CONT_ROWS")) cpu_.cont_rows = uint32_t(std::max(0, std::min(2048, std::atoi(v))));
     if (const char* qs = std::getenv("IE_DS41_QSTAR_CONT")) cpu_.qstar_cont = std::max(0.f, std::min(1.f, float(std::atof(qs))));
-    std::string cores = !cpu_cores_override_.empty() ? cpu_cores_override_ : std::getenv("IE_DS41_CPU_CORES") ? std::getenv("IE_DS41_CPU_CORES") : "8-19";
-    cpu_.cores.clear();
-    for (size_t i = 0; i < cores.size();) {                // "8-19,0,1" -> the core list
-        size_t j = cores.find(',', i); if (j == std::string::npos) j = cores.size();
-        const std::string tok = cores.substr(i, j - i); const size_t d = tok.find('-');
-        if (d == std::string::npos) cpu_.cores.push_back(std::atoi(tok.c_str()));
-        else for (int c = std::atoi(tok.substr(0, d).c_str()); c <= std::atoi(tok.substr(d + 1).c_str()); ++c) cpu_.cores.push_back(c);
-        i = j + 1;
-    }
+    const char* ev = std::getenv("IE_DS41_CPU_CORES");
+    const std::string cores = !cpu_cores_override_.empty() ? cpu_cores_override_ : ev && *ev ? std::string(ev) : ds41_cpu_leg_default_cores();
+    cpu_.cores = ds41_parse_cores(cores);
+    if (cpu_.cores.empty()) { cpu_.on = false; std::fprintf(stderr, "[ds41 tier] CPU miss path OFF: no cores for it (\"%s\")\n", cores.c_str()); return; }
     cpu_.nthreads = int(cpu_.cores.size());
     if (cpu_.x) { sycl::free(cpu_.x, q); cpu_.x = nullptr; cpu_.x_bytes = 0; }   // (a second start: no leak)
     cpu_.x = sycl::malloc_host<float>(size_t(cpu_.max_rows()) * H_, q);
@@ -492,8 +573,56 @@ void Ds41ExpertTier::cpu_start(sycl::queue& q) {
         }
     }
     cpu_.th = std::thread([this] { cpu_run(); });
+    // 2026-10-20: the shares' defaults scaled to this box's link and leg (ds41_qstar_factor; a share an env names stays as named).
+    // Not under expert parallel: its 0.60 was swept with half the E-cores per tier, a reference not measured yet.
+    if (link_gbs_ > 0 && !share_) {
+        const double cpu_gbs = cpu_probe_gbs(), f = ds41_qstar_factor(link_gbs_, cpu_gbs);
+        const char* off = std::getenv("IE_DS41_QSTAR_AUTO");
+        const bool scale = f != 1.0 && !(off && *off == '0');
+        const float q0 = cpu_.qstar, m0 = cpu_.qstar_multi, c0 = cpu_.qstar_cont;
+        if (scale) {
+            if (!std::getenv("IE_DS41_QSTAR")) cpu_.qstar = ds41_qstar_scale(cpu_.qstar, f);
+            if (!std::getenv("IE_DS41_QSTAR_MULTI")) cpu_.qstar_multi = ds41_qstar_scale(cpu_.qstar_multi, f);
+            if (!std::getenv("IE_DS41_QSTAR_CONT")) cpu_.qstar_cont = ds41_qstar_scale(cpu_.qstar_cont, f);
+        }
+        std::fprintf(stderr, "[ds41 tier] this box: link %.1f GB/s, CPU leg %.1f GB/s of expert weights (the shares were swept at %.0f / %.1f): factor %.2f, "
+                             "q* %.2f -> %.2f, verify %.2f -> %.2f, continuation %.2f -> %.2f%s\n", link_gbs_, cpu_gbs, kDs41RefLinkGBs, kDs41RefCpuGBs,
+                     f, q0, cpu_.qstar, m0, cpu_.qstar_multi, c0, cpu_.qstar_cont,
+                     f == 1.0 ? " (within 2x of that box, or a rate unknown: kept)" : scale ? " (IE_DS41_QSTAR_AUTO=0 keeps the defaults)" : " (IE_DS41_QSTAR_AUTO=0: kept)");
+    }
     std::fprintf(stderr, "[ds41 tier] CPU miss path ON: q* %.2f (PCIe share of the pinned misses), %d threads on cores %s\n", cpu_.qstar, cpu_.nthreads, cores.c_str());
     if (cpu_.cont_rows > CpuMiss::kMaxRows) std::fprintf(stderr, "[ds41 tier] ... and continuation chunks up to %u rows, split by cost at q* %.2f\n", cpu_.cont_rows, cpu_.qstar_cont);
+}
+
+double Ds41ExpertTier::cpu_probe_gbs() {
+    // up to 16 pinned experts, one per layer round-robin (~285 MB: DRAM, not cache), one zero row each, through the worker
+    // exactly as a decode step's leg; the best of two timed passes after a warm one. The rows land in h_rows before any
+    // forward reads it.
+    constexpr uint32_t kProbe = 16;
+    std::vector<const void*> slots;
+    for (uint32_t k = 0; k < E_ && slots.size() < kProbe; ++k) {
+        bool any = false;
+        for (uint32_t l = 0; l < tier_.size() && slots.size() < kProbe; ++l) {
+            uint32_t seen = 0;
+            for (uint32_t e = 0; e < E_; ++e)
+                if (tier_[l][e] == 1 && seen++ == k) { if (const void* p = arena_.slot(l, e)) { slots.push_back(p); any = true; } break; }
+        }
+        if (!any) break;
+    }
+    if (slots.empty() || slots.size() > size_t(cpu_.max_rows()) * TK_) return 0;
+    double best_ms = 0;
+    for (int pass = 0; pass < 3; ++pass) {
+        cpu_.work.clear();
+        for (uint32_t i = 0; i < slots.size(); ++i) cpu_.work.push_back({slots[i], i, 0u});
+        cpu_.limit = 10.f; cpu_.f32 = false;
+        { std::lock_guard<std::mutex> lk(cpu_.mu); cpu_.pending = true; cpu_.done = false;
+          cpu_.done_a.store(false, std::memory_order_relaxed); cpu_.pending_a.store(true, std::memory_order_release); }
+        cpu_.cv.notify_all();
+        { std::unique_lock<std::mutex> lk(cpu_.mu); cpu_.cv.wait(lk, [&] { return cpu_.done; }); }
+        if (pass && cpu_.work_ms > 0 && (best_ms == 0 || cpu_.work_ms < best_ms)) best_ms = cpu_.work_ms;
+    }
+    cpu_.work.clear();
+    return best_ms > 0 ? double(slots.size()) * double(lay_.bytes) / (best_ms * 1e6) : 0;
 }
 
 void Ds41ExpertTier::mm_reader_post(int which, std::function<void()> job) {
@@ -633,8 +762,17 @@ void Ds41ExpertTier::cpu_run() {
     }
 }
 
+void Ds41ExpertTier::stage_x(sycl::queue& q, const float* x, uint32_t T) {
+    cpu_.x_staged = nullptr; cpu_.x_staged_rows = 0;
+    if (!cpu_.on || !cpu_.x || T == 0 || T > CpuMiss::kMaxRows) return;   // a decode step's rows only
+    q.memcpy(cpu_.x, x, size_t(T) * H_ * 4);
+    cpu_.x_staged = x; cpu_.x_staged_rows = T;
+}
+
 std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, const int32_t* ridx, const float* rw,
                                 uint32_t T, float* y, float swiglu_limit) {
+    const bool x_on_host = cpu_.x_staged == x && cpu_.x_staged_rows == T && x;   // stage_x ran for this call (and a wait followed)
+    cpu_.x_staged = nullptr; cpu_.x_staged_rows = 0;
     if (!ready_) return "tier: not initialised";
     if (L < L0_ || L >= L0_ + nL_) return "tier: layer " + std::to_string(L) + " is not in this tier";
     if (empty_) { st_ = Ds41TierStats{}; ep_rows_.clear(); if (pre_groups_) pre_groups_(); if (!ep_export_ && y) q.memset(y, 0, size_t(T) * H_ * 4).wait(); return {}; }   // nothing to serve (the caller's pre-groups work still runs: gate 18 finding 3)
@@ -714,7 +852,7 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
                 occ.erase(std::find(occ.begin(), occ.end(), e));
             }
             cpu_.limit = swiglu_limit;
-            q.memcpy(cpu_.x, x, size_t(T) * H * 4).wait();      // the activations, host side
+            if (!x_on_host) q.memcpy(cpu_.x, x, size_t(T) * H * 4).wait();      // the activations, host side (staged: already there)
             cpu_.f32 = T > CpuMiss::kMaxRows || src_.fp32_out;   // the rows the XMX route's fp32 scatter reads
             if (cpu_.f32 && !cpu_.h_rows32) return "tier: the CPU leg has no fp32 row staging";
             { std::lock_guard<std::mutex> lk(cpu_.mu); cpu_.pending = true; cpu_.done = false;
@@ -934,7 +1072,10 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
         }
         if (xmx) { if (auto e = ds4_expert_gemm_xmx_grouped(q, xmx_jobs.data(), uint32_t(xmx_jobs.size()), bws_.h_h, EF, bws_.w16, bws_.w16_cap); !e.empty()) return fail("tier down (xmx): " + e); }
         else if (auto e = ds4_expert_gemm_q8_grouped(q, bws_.jobs.data(), uint32_t(bws_.jobs.size()), bws_.grp); !e.empty()) return fail("tier down: " + e);
-        q.wait_and_throw();   // the drain: group g's slots are free for group g+2's fetch
+        // the drain: group g's slots are free for group g+2's fetch. The LAST group's is not needed for that, and the
+        // scatter's wait below covers its kernels (the queue is in order), so the CPU rows and the scatter go in behind it
+        // without a round trip -- 2026-10-20, the same launches in the same order
+        if (g + 1 < NG) q.wait_and_throw();
         if (!pipe && g + 1 < NG) issue(g + 1);
     }
     st_.ms_groups = ms_since(t2);

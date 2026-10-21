@@ -1402,9 +1402,11 @@ sycl::event ds4_gemm_mxfp4_xmx(sycl::queue& q, const Ds4MxXmxJob* jobs, uint32_t
     bool aligned_inputs = true;
     for (uint32_t j = 0; j < n_jobs; ++j) {
         const Ds4MxXmxJob& J = jobs[j];
-        if (!J.qs || !J.e || !J.x || !J.y || J.K % BK != 0 || J.N % BN != 0 || J.K == 0 || J.N == 0)
+        // N: whole 16-column sub-group tiles; the last 128-column tile may be part-full (2026-10-20: V4.1 tensor
+        // parallel over 4 cards gives an expert part 576 = 4.5 x 128 columns)
+        if (!J.qs || !J.e || !J.x || !J.y || J.K % BK != 0 || J.N % TN != 0 || J.K == 0 || J.N == 0)
             throw std::invalid_argument("ds4_gemm_mxfp4_xmx: job " + std::to_string(j) +
-                                        ": null operand or K % 32 / N % 128 != 0 (K=" +
+                                        ": null operand or K % 32 / N % 16 != 0 (K=" +
                                         std::to_string(J.K) + ", N=" + std::to_string(J.N) + ")");
         constexpr uint64_t max_bytes = std::numeric_limits<size_t>::max();
         if (J.M && (uint64_t(J.K) > max_bytes / sizeof(sycl::half) / J.M
@@ -1413,7 +1415,7 @@ sycl::event ds4_gemm_mxfp4_xmx(sycl::queue& q, const Ds4MxXmxJob* jobs, uint32_t
         aligned_inputs &= (reinterpret_cast<uintptr_t>(J.x) % 16 == 0 &&
                            reinterpret_cast<uintptr_t>(J.qs) % 16 == 0);
         validated.push_back(Job{J.qs, J.e, J.x, J.y, J.M, J.K, J.N, uint32_t(wg)});
-        wg += ((uint64_t(J.M) + BM - 1) / BM) * (J.N / BN);
+        wg += ((uint64_t(J.M) + BM - 1) / BM) * ((J.N + BN - 1) / BN);
         if (wg > std::numeric_limits<uint32_t>::max())
             throw std::invalid_argument("ds4_gemm_mxfp4_xmx: workgroup index overflow");
     }
@@ -1468,19 +1470,23 @@ sycl::event ds4_gemm_mxfp4_xmx(sycl::queue& q, const Ds4MxXmxJob* jobs, uint32_t
             }
             const Job J = dj[lo];
             const uint32_t local = g - J.wg0;
-            const uint32_t nbs   = J.N / BN;
+            const uint32_t nbs   = (J.N + BN - 1) / BN;
             const uint32_t m0    = (local / nbs) * BM;
             const uint32_t n0    = (local % nbs) * BN;
             const int sg_id = lid / SG;
             auto sg = it.get_sub_group();
+            // a part-full last column tile: lanes past N stage zero columns and their sub-groups store nothing (N is
+            // whole 16-column tiles, so a sub-group is all in or all out); a full tile never takes either branch
+            const bool b_ok  = n0 + uint32_t(lid) < J.N;
+            const bool sg_ok = n0 + uint32_t(sg_id) * TN < J.N;
 
             mat::joint_matrix<sycl::sub_group, float, mat::use::accumulator, TM, TN> acc[MR];
             #pragma unroll
             for (int mr = 0; mr < MR; ++mr) mat::joint_matrix_fill(sg, acc[mr], 0.0f);
 
             const uint32_t bpc  = J.K / 32u;
-            const uint8_t* qcol = J.qs + uint64_t(n0 + lid) * (uint64_t(J.K) / 2);
-            const uint8_t* ecol = J.e  + uint64_t(n0 + lid) * bpc;
+            const uint8_t* qcol = J.qs + uint64_t(b_ok ? n0 + lid : 0u) * (uint64_t(J.K) / 2);
+            const uint8_t* ecol = J.e  + uint64_t(b_ok ? n0 + lid : 0u) * bpc;
             const int  ar   = lid / 4, ac = (lid % 4) * 8;   // A: row, first column of 8
             const bool a_ok = (m0 + uint32_t(ar)) < J.M;
             const sycl::half* arow = a_ok ? J.x + uint64_t(m0 + ar) * J.K : J.x;
@@ -1501,7 +1507,10 @@ sycl::event ds4_gemm_mxfp4_xmx(sycl::queue& q, const Ds4MxXmxJob* jobs, uint32_t
                     for (int dc = 0; dc < 8; ++dc) A_smem[ar][ac + dc] = sycl::half(0);
                 }
                 // ---- B tile: this lane's column, one MXFP4 block -> 32 halves ----
-                {
+                if (!b_ok) {
+                    #pragma unroll
+                    for (int idx = 0; idx < 32; ++idx) B_smem[idx][lid] = sycl::half(0);
+                } else {
                     const float d = mxfp4_e8m0_half(ecol[kb]);
                     sycl::vec<uint8_t, 16> bytes;
                     const uint8_t* bp = qcol + uint64_t(kb) * 16;
@@ -1554,7 +1563,7 @@ sycl::event ds4_gemm_mxfp4_xmx(sycl::queue& q, const Ds4MxXmxJob* jobs, uint32_t
             #pragma unroll
             for (int mr = 0; mr < MR; ++mr) {
                 const uint32_t rbase = m0 + uint32_t(mr) * TM;
-                if (rbase >= J.M) continue;                       // uniform across the sub-group
+                if (rbase >= J.M || !sg_ok) continue;             // uniform across the sub-group
                 float* yb = J.y + uint64_t(rbase) * J.N + n0 + uint32_t(sg_id) * TN;
                 const uint32_t rows_left = J.M - rbase;
                 const uint32_t N = J.N;
@@ -1607,8 +1616,8 @@ std::string ds4_expert_gemm_xmx_grouped(sycl::queue& q, const DS4XmxGemmJob* job
         const auto& J = jobs[j];
         if (!J.M) continue;
         const auto& B = J.bank;
-        if (B.dtype != DType::kMXFP4 || !B.K || B.K % 32 || !B.N || B.N % 128 || B.K != H_in)
-            return prefix + "job " + std::to_string(j) + ": requires MXFP4, K=H_in divisible by 32, N divisible by 128";
+        if (B.dtype != DType::kMXFP4 || !B.K || B.K % 32 || !B.N || B.N % 16 || B.K != H_in || (!fused && B.N % 128))
+            return prefix + "job " + std::to_string(j) + ": requires MXFP4, K=H_in divisible by 32, N divisible by 16 (128 off the fused kernel)";
         if (J.e >= B.E || !B.mx_qs || !B.mx_e || !J.y || !x_f16)
             return prefix + "job " + std::to_string(j) + ": null operand or expert index outside bank";
         const uint64_t rows_end = uint64_t(J.row0) + J.M;
@@ -1616,7 +1625,7 @@ std::string ds4_expert_gemm_xmx_grouped(sycl::queue& q, const DS4XmxGemmJob* job
             !plane_ok(B.mx_qs_stride, uint64_t(B.K / 2) * B.N, J.e) ||
             !plane_ok(B.mx_e_stride, uint64_t(B.K / 32) * B.N, J.e))
             return prefix + "tensor row/plane byte span overflow or short expert stride";
-        groups += ((uint64_t(J.M) + xm::BM - 1) / xm::BM) * (B.N / xm::BN);
+        groups += ((uint64_t(J.M) + xm::BM - 1) / xm::BM) * ((B.N + xm::BN - 1) / xm::BN);
         if (groups > std::numeric_limits<uint32_t>::max()) return prefix + "workgroup index overflow";
         if (!fused && (!w16_scratch || uint64_t(B.K) * B.N > w16_capacity ||
                        B.K > limit / sizeof(sycl::half) / B.N))
