@@ -849,6 +849,7 @@ int LanesServe::choose(const std::vector<int32_t>& ids, uint32_t max_tokens) con
         if (l.busy) continue;
         v[li].occupied = m_.occupied(li);
         v[li].last_end = m_.last_end(li);
+        v[li].warm = m_.lane_warm(li);
         if (l.cap > ids.size()) v[li].match = m_.own_match(li, ids);
     }
     return lanes_choose_lane(v, uint32_t(ids.size()), max_tokens, std::max<uint32_t>(1u, m_.min_match_tokens()));

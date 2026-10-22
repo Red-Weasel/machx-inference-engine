@@ -19,6 +19,7 @@
 
 **Latest**
 
+- **v0.2.30, October 22 — Flash-Next reads 35–45 % faster and its draft head is on by default; the 27B's lanes no longer starve its rounds and cache:** in `ie serve` on two cards at `--ctx 262000`, [Flash-Next](#new-in-v0230) reads a 9.8K-token conversation to its first token in **13.0 s** (was 16.7) and a 17.3K-token document in **21.1 s** (was 26.9); the bench reads unique text at **589 / 897 / 946 / 945 tok/s** at 2K / 8K / 16K / 32K (was 466 / 666 / 698 / 711), output byte-identical. The MTP draft head loads by itself when `mtp-head.gguf` sits beside the model (greedy decode +9–19 %, tokens identical; a sampled request gets speculative sampling and the rounds pause while they do not pay). The Qwen3.8-27B at `--parallel 8 --slot-ctx 60000` decodes **17.5 → 28.7 tok/s** and answers later turns from the prompt cache in **0.6–0.75 s** (were 4 s re-reads): its idle lanes had taken the VRAM the rounds and the cache needed. [Details](#new-in-v0230)
 - **v0.2.28, October 21 — DeepSeek-V4.1's October 17 weights, faster tensor parallel, 27B Q8_0 drafts:** the [1017 update of DeepSeek-V4.1-Flash](#new-in-v0228) runs unchanged (perplexity 1.538 vs 1.517 for the September weights), and the disk prompt cache and the NVMe expert file now record the weight files they were made from. Tensor parallel (`IE_DS41_TP=1`) reads a 23.6K-token prompt at **325–352 tok/s** (was 280–288). The 27B's `--spec` lanes check three rows on Q8_0: one request **30.6 tok/s** (27.4), two at once 53.1 together (49.0), the same replies. GLM-5.3-Flash no longer refuses a conversation whose earlier reply was cut inside a tool call.
 - **v0.2.27, October 21 — Qwen3.8-27B: MTP on the request lanes, Q4, pictures on the lanes; DeepSeek-V4.1 on more than two cards:** with `--spec --parallel N` the [27B's request lanes](#new-in-v0227) draft with its MTP head: one request writes **38 tok/s** at Q4_K_M (27.2 plain) and **27.4** at Q8_0 (17.4), two at once 63.1 together (51.8), with the same replies. The 27B's Q4_K_M decodes 27.5 tok/s on two cards (22.8) and 27.8 on one (19.1). Pictures work on the request lanes of the 27B and the 35B-A3B class, a VRAM leak of about 100 MiB a card per request is fixed, and DeepSeek-V4.1-Flash runs on more than two cards, with opt-in tensor parallel (`IE_DS41_TP=1`: 17.2 tok/s decode on two B70s against 14.6). [Details](#new-in-v0227)
 - **v0.2.26, October 20 — GLM-5.3-Flash served fast, and issue #2:** in `ie serve`, [GLM-5.3-Flash](#new-in-v0226) reads a 9.6K-token agent prompt in **32.4 s** (was 243 s), answers later turns from the prompt cache in **9.5–9.7 s** (was 273–311 s) and decodes **13.5–14.3 tok/s** (was 10.8–11.5); the re-published `glm5-next` GGUF loads. Host↔device copies on the Qwen3.8-27B and 35B-A3B two-card splits and in `--spec`'s draft head go through pinned memory, at most 64 MiB a copy, for [issue #2](https://github.com/Red-Weasel/machx-inference-engine/issues/2) (a B70 wedged under the 27B). [Details](#new-in-v0226)
@@ -85,10 +86,10 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 </tr>
 <tr>
 <td width="48" align="center" valign="middle"><img src="docs/images/logo-qwen.png" width="36" height="36" alt="Qwen"></td>
-<td align="left" valign="middle" nowrap><b>Qwen3.8-Flash-Next</b><br><sub>MoE · measured Oct 4–5<br>native vision · 16 lanes</sub></td>
+<td align="left" valign="middle" nowrap><b>Qwen3.8-Flash-Next</b><br><sub>MoE · measured Oct 22<br>native vision · 16 lanes</sub></td>
 <td align="left" valign="middle" nowrap>UD-Q4_K_XL GGUF<br><sub>104 GB</sub></td>
-<td align="left" valign="middle" nowrap><b>470</b> <sub>new text</sub><br><b>688</b> <sub>repeated prompt</sub></td>
-<td align="left" valign="middle" nowrap><b>28.7</b> <sub>plain</sub><br><b>40.7</b> <sub>copy edits, <code>--spec</code></sub></td>
+<td align="left" valign="middle" nowrap><b>978</b> <sub>at 8K</sub><br><b>1,031</b> <sub>at 16K</sub></td>
+<td align="left" valign="middle" nowrap><b>38.9</b> <sub>MTP head, greedy</sub><br><b>35.6</b> <sub>plain</sub></td>
 </tr>
 <tr>
 <td width="48" align="center" valign="middle"><img src="docs/images/logo-mimo.png" width="36" height="36" alt="Xiaomi MiMo"></td>
@@ -139,8 +140,8 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 - **Serving:** up to 16 requests at once, the lane count picked at load: 16 at 414.1 tok/s together, 25.9 each (October 1); the 15-agent replay takes 77.1–77.2 s (October 4; 116.1 s before v0.2.13); a file edit takes 24.3 s plain and 7.1 s with `--spec`; XML tool calls and reasoning in the OpenAI fields; native Q6_K / Q5_K; image input with `--mmproj`, on every request lane since v0.2.27.
 
 **Qwen3.8-Flash-Next** · UD-Q4_K_XL GGUF (104 GB)
-- **Prefill:** 470 tok/s on text it had not seen and 688 on a repeated prompt (bench, October 4; it was 241 / 487); 495–502 pipelined once warm (standalone runner, September 27).
-- **Decode:** 28.7 / 28.2 tok/s plain at 2.4K / 10.7K tokens (October 4–5); with `--spec` lookup drafts 40.7 on a copy prompt (26.9 plain). In the standalone runner with its MTP head: 37.1–38.2 chat, 44.4–44.6 code (lossless speculative, K=3, September 27); `ie serve` does not load that head.
+- **Prefill:** 628 / 978 / 1,031 / 1,006 tok/s on unique 2K / 8K / 16K / 32K-token prompts at `--ctx 40000` (bench, October 22, v0.2.30; it was 461 / 677 / 712 / 725) and 589 / 897 / 946 / 945 at `--ctx 262000`; served at that context a 9.8K-token conversation reaches its first token in 13.0 s (was 16.7) and a 17.3K-token document in 21.1 s (was 26.9). The expert cache kept re-uploading the whole bank every chunk (`IE_Q4E_PF_RING`, default 96 slots; 0 = the old behaviour); output byte-identical (greedy text and a 4,096-token perplexity to every digit). Earlier figures: 470 new text / 688 repeated prompt (October 4).
+- **Decode:** the MTP draft head loads by itself from `mtp-head.gguf` beside the model (`scripts/fetch_mtp_head.py` + `scripts/mtp_to_gguf.py` make it from the official checkpoint; `IE_Q4E_MTP=0` = off): greedy 35.6 → 38.9 tok/s on short prompts and 26.4 → 31.4 at 8–64K of context, tokens identical to plain decoding; a sampled request (temperature 1.0, top_k 20) gets speculative sampling — the plain sampler's distribution — at 30–33 tok/s where plain gives 31 (the rounds pause by themselves while they do not pay). Its prefill cost is ~1 % (was 17 %) and its experts load as a Q8_0 bank. `--spec` alone = the lookup drafts (40.7 on a copy prompt, 26.9 plain).
 - **Serving:** native vision; up to 16 requests at once (two at 59.0–62.6 tok/s together, ×1.94–2.06; 16 at 118.4 with row batching and 128.0 at `--ctx 8192`); a file edit takes 68.7 s plain and 30.7 s with `--spec`. Image prompts longer than 2,048 tokens are read with the image since v0.2.21 (v0.2.10 through v0.2.20 dropped it).
 
 **Xiaomi MiMo-V2.6-Flash** · 178 GB safetensors (FP8 dense, MXFP4 experts), 256 GB RAM
@@ -179,6 +180,36 @@ class ([New in v0.2.6](#new-in-v026)).
 ---
 
 <a id="new-in-v0229"></a>
+## 🆕 New in v0.2.30
+
+### Flash-Next reads 35–45 % faster, byte-identically
+
+A 2,048-token chunk routes nearly every one of a layer's 512 experts, and the VRAM expert cache holds about 257 of them, so the LRU, walked in ascending expert order, evicted each resident expert just before its turn: every chunk uploaded the whole bank again (~40 GiB per card). Now the experts resident at a chunk's start keep their slots for the pass, misses stream through a 96-slot ring, and the resident experts' jobs run first (`IE_Q4E_PF_RING`, 0 = the old LRU). The per-token sums keep their order, so the output is byte-identical: the greedy text of five prompts and a 4,096-token perplexity equal to every digit.
+
+| unique text, two cards, `ie-prompt-bench` | 2K | 8K | 16K | 32K |
+|---|---|---|---|---|
+| v0.2.29, `--ctx 40000` | 461 | 677 | 712 | 725 |
+| **v0.2.30**, `--ctx 40000` | **628** | **978** | **1,031** | **1,006** |
+| v0.2.29, `--ctx 262000` | 466 | 666 | 698 | 711 |
+| **v0.2.30**, `--ctx 262000` | **589** | **897** | **946** | **945** |
+
+Served at `--ctx 262000` (temperature 1.0, top_k 20): a 9.8K-token conversation reaches its first token in 13.0 s (was 16.7), a 17.3K-token document in 21.1 s (was 26.9). A 4,096-token pipeline chunk reads 16–32K prompts another 6–10 % faster but is not the same arithmetic (perplexity 1.0841 → 1.0854 over 8,192 tokens), so it stays an opt-in (`IE_Q4E_PIPE_CHUNK=4096`) until that is understood.
+
+### Flash-Next's MTP draft head is on by default, and exact at any sampler
+
+The head loads by itself when `mtp-head.gguf` sits beside the model (`scripts/fetch_mtp_head.py` and `scripts/mtp_to_gguf.py` make the 5.2 GB file from the official checkpoint; `IE_Q4E_MTP=0` = off), 3 rows a round. Its ingest ran the head's whole layer for every prompt token it read and nothing used the result (−17 % prefill): the ingest now stops after the attention half. Its experts load as a Q8_0 bank (the tail card keeps 186 instead of 157 expert slots at `--ctx 262000`). Greedy requests keep the bit-exact compare path: 35.6 → 38.9 tok/s on short prompts, 26.4 → 31.4 at 8–64K of context, the tokens plain decoding's. A sampled request used to lose with it (argmax drafts kept only when the sampled token happened to match: 31.0 → 26.1 tok/s at temperature 1.0 / top_k 20); now the drafts are drawn from the head's own distribution and verified by speculative sampling, a confidence gate ends an unsure draft (`IE_Q4E_MTP_QMIN`, 0.5), and a guard measures each request's plain step against its rounds and pauses them while they do not pay (`IE_Q4E_MTP_ADAPT=0` = always on). On this MoE a 4-row verify streams about 27 distinct experts against a step's 10, so a round costs about 2.6 plain steps and pays above about 2.6 tokens a round: maths and document conversations gain, free prose at temperature 1.0 comes out about even (30.7 / 29.6 / 33.4 against 31.4 / 31.1 / 30.8 plain). `IE_Q4E_LOOKUP_STATS=1` prints the rounds and the guard's yardstick per request.
+
+### Qwen3.8-27B: the request lanes no longer starve the rounds and the prompt cache
+
+At a launch like `--ctx 222222 --parallel 8 --slot-ctx 60000 --spec` on Q8_0, the seven idle lanes allocated 13.3 GiB a card at the load, the MTP rounds were then refused on "32 MiB free" and the prompt cache sized itself at 0 GB: the 27B decoded plain (17.5 tok/s) and re-read every turn (4.0 s for 10K tokens), where `--parallel 1` gave 29. Now a lane's state is allocated when a request first lands on it (`IE_QWEN35_LANES_EAGER=1` = at the load as before), the lane choice prefers an idle lane that is already allocated, and the prompt cache hands back what a filling lane takes (its budget re-fits to the cards' measured free memory). At those flags, served at temperature 1.0 / top_k 20: decode 17.4 / 17.5 / 17.5 → 20.7 / 28.7 / 29.5 on short prompts and 16.6 / 16.6 / 16.2 → 19.8 / 20.8 / 20.3 on a 9.8K-token conversation, whose turns 2 and 3 come from the cache in 0.75 / 0.61 s (were 4.0 s re-reads); a 17K prompt reads at 2,552 tok/s as before; two concurrent requests 17.1 / 16.5 each (as before). The engine's load log says what it allocates: `[27b-split-cache] lane N filled: the cache's budget a → b GB a card`.
+
+### What is still slow, and not checked
+
+- The 4,096-token pipeline chunk on Flash-Next (+6–10 % at 16–32K) changes the logits; opt-in until the differing kernel is found.
+- Flash-Next's draft head still takes 52 expert slots of the tail card at `--ctx 262000` (7–8 % of prefill there); a smaller bank or the head on the roomier card would recover it. Its rounds on this MoE cost ~2.6 plain steps for 4 rows; a verify that reuses the step's routed experts would raise the sampled gain above "about even".
+- The 27B's two concurrent lanes with rounds decode 17.1 / 16.5 each at the launch above, not the `--parallel 2` figure of 53 together; the round checkpoints are sized for every lane (1.7 GiB for 8 at K = 3) where a pool for the two that draft at once would be 0.4 GiB.
+- None of the other models changed code; their tokens are v0.2.29's.
+
 ## 🆕 New in v0.2.29
 
 Everything since [v0.2.28](https://github.com/Red-Weasel/machx-inference-engine/releases/tag/v0.2.28). Measured

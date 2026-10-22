@@ -14,6 +14,8 @@
 #include "ie/dtype.hpp"
 #include "ie/ops.hpp"
 #include "ie/prefill_gemm.hpp"
+
+#include <thread>
 #include "ie/quant_blocks.hpp"
 #include "ie/qwen4_hc.hpp"
 #include "ie/deepseek4_attn.hpp"
@@ -1790,6 +1792,54 @@ std::string Qwen4ExpModel::load_mtp(const GgufReader& mg,
         if (auto e2 = dequant_tensor_fp32(t, f32); !e2.empty()) return e2;
         const uint32_t K = uint32_t(t->shape[0]), N = uint32_t(t->shape[1]);
         const uint32_t E = uint32_t(t->shape[2]);
+        // 2026-10-22: Q8_0 SoA by default (IE_Q4E_MTP_EXPERTS=f16 = the F16 bank): per expert, each output row's K
+        // values in blocks of 32 with an fp16 scale (amax / 127), the natural [N][K] order the SoA GEMV reads. The F16
+        // bank cost the tail card 4.8 GiB = 81 expert slots at ctx 262000 (a ~10 % slower plain step); this is half.
+        static const bool q8_bank = [] { const char* v = std::getenv("IE_Q4E_MTP_EXPERTS"); return !(v && std::string(v) == "f16"); }();
+        if (q8_bank && K % 32 == 0) {
+            const uint32_t bpc = K / 32;
+            std::vector<int8_t> qs(uint64_t(E) * N * K);
+            std::vector<uint16_t> ds(uint64_t(E) * N * bpc);
+            const uint32_t nt = std::min<uint32_t>(16u, std::max<uint32_t>(1u, std::thread::hardware_concurrency() / 2));
+            std::vector<std::thread> ts;
+            for (uint32_t wk = 0; wk < nt; ++wk) ts.emplace_back([&, wk] {
+                for (uint32_t ex = wk; ex < E; ex += nt) {
+                    const float* src = f32.data() + uint64_t(ex) * K * N;
+                    int8_t* qd = qs.data() + uint64_t(ex) * N * K;
+                    uint16_t* dd = ds.data() + uint64_t(ex) * N * bpc;
+                    for (uint64_t nn = 0; nn < N; ++nn)
+                        for (uint32_t b = 0; b < bpc; ++b) {
+                            const float* x = src + nn * K + uint64_t(b) * 32;
+                            float amax = 0.f;
+                            for (uint32_t i = 0; i < 32; ++i) amax = std::max(amax, std::fabs(x[i]));
+                            const sycl::half dh = sycl::half(amax / 127.f);
+                            const float d2 = float(dh), inv = d2 > 0.f ? 1.f / d2 : 0.f;
+                            dd[nn * bpc + b] = sycl::bit_cast<uint16_t>(dh);
+                            int8_t* o = qd + nn * K + uint64_t(b) * 32;
+                            for (uint32_t i = 0; i < 32; ++i) {
+                                const int v = int(std::lrintf(x[i] * inv));
+                                o[i] = int8_t(std::max(-127, std::min(127, v)));
+                            }
+                        }
+                }
+            });
+            for (auto& th : ts) th.join();
+            void* dq = alloc_->malloc(qs.size());
+            void* dsc = alloc_->malloc(ds.size() * 2);
+            if (!dq || !dsc) return "mtp: q8 bank malloc";
+            q.memcpy(dq, qs.data(), qs.size());
+            q.memcpy(dsc, ds.data(), ds.size() * 2);
+            q.wait();
+            owned_.push_back(dq); owned_.push_back(dsc);
+            bv.q8 = static_cast<const int8_t*>(dq);
+            bv.q8d = static_cast<const uint16_t*>(dsc);
+            bv.f16 = nullptr; bv.raw = nullptr;
+            bv.dt = DType::kQ8_0;
+            bv.K = K; bv.N = N;
+            bv.slice_bytes = uint64_t(N) * K + uint64_t(N) * bpc * 2;
+            dev_bytes_ += qs.size() + ds.size() * 2;
+            return {};
+        }
         std::vector<sycl::half> h16(f32.size());
         for (uint32_t ex = 0; ex < E; ++ex) {
             const float* src = f32.data() + uint64_t(ex) * K * N;
@@ -1868,7 +1918,7 @@ std::string Qwen4ExpModel::logits_rows(uint32_t T, sycl::half* out) {
 // [start_pos, start_pos+T). Reuses the model's scratch buffers (never live at
 // the same time as a backbone forward) and the same op kernels; the expert
 // bank is DEVICE-resident F16, so the MoE loop reads slices directly.
-std::string Qwen4ExpModel::mtp_layer_fwd(uint32_t T, uint32_t start_pos) {
+std::string Qwen4ExpModel::mtp_layer_fwd(uint32_t T, uint32_t start_pos, bool kv_only) {
     sycl::queue& q = alloc_->queue();
     const Qwen4ExpLayer& w = mtp_.lw;
     const uint32_t H = cfg_.hidden, HD = cfg_.head_dim;
@@ -1977,6 +2027,7 @@ std::string Qwen4ExpModel::mtp_layer_fwd(uint32_t T, uint32_t start_pos) {
         }
     }
     mtp_.kv.set_length(0, start_pos + T);
+    if (kv_only) return {};   // ingest: everything below only makes this row's layer output, which nothing reads
     sigmoid_gate(q, attn_out_, agate_, attn_out_, uint64_t(T) * NQ);
     proj(attn_out_, w.attn_output, blockout_, NQ, H);
     qwen4_hc_combine(q, mtp_wide_, blockout_, inj_, T, H, cfg_.hc_count);
@@ -2001,13 +2052,20 @@ std::string Qwen4ExpModel::mtp_layer_fwd(uint32_t T, uint32_t start_pos) {
                               cfg_.n_experts, cfg_.n_experts_used, tk);
             const sycl::half* x = mixed_ + uint64_t(t) * H;
             for (const auto& [ex, wgt] : tk) {
-                const sycl::half* gp = w.gate_bv.f16 + uint64_t(ex) * H * EF;
-                const sycl::half* up = w.up_bv.f16 + uint64_t(ex) * H * EF;
-                const sycl::half* dp = w.down_bv.f16 + uint64_t(ex) * EF * H;
-                gemv_fp16(q, x, gp, moe_g_, H, EF);
-                gemv_fp16(q, x, up, moe_u_, H, EF);
-                swiglu(q, moe_g_, moe_u_, moe_h_, EF);
-                gemv_fp16(q, moe_h_, dp, moe_y_, EF, H);
+                if (w.gate_bv.q8) {   // the Q8_0 SoA bank (2026-10-22): gate / up [EF][H], down [H][EF]
+                    gemv_q8_0_soa_f16_g(q, x, w.gate_bv.q8 + uint64_t(ex) * EF * H, w.gate_bv.q8d + uint64_t(ex) * EF * (H / 32), moe_g_, H, EF);
+                    gemv_q8_0_soa_f16_g(q, x, w.up_bv.q8 + uint64_t(ex) * EF * H, w.up_bv.q8d + uint64_t(ex) * EF * (H / 32), moe_u_, H, EF);
+                    swiglu(q, moe_g_, moe_u_, moe_h_, EF);
+                    gemv_q8_0_soa_f16_g(q, moe_h_, w.down_bv.q8 + uint64_t(ex) * H * EF, w.down_bv.q8d + uint64_t(ex) * H * (EF / 32), moe_y_, EF, H);
+                } else {
+                    const sycl::half* gp = w.gate_bv.f16 + uint64_t(ex) * H * EF;
+                    const sycl::half* up = w.up_bv.f16 + uint64_t(ex) * H * EF;
+                    const sycl::half* dp = w.down_bv.f16 + uint64_t(ex) * EF * H;
+                    gemv_fp16(q, x, gp, moe_g_, H, EF);
+                    gemv_fp16(q, x, up, moe_u_, H, EF);
+                    swiglu(q, moe_g_, moe_u_, moe_h_, EF);
+                    gemv_fp16(q, moe_h_, dp, moe_y_, EF, H);
+                }
                 axpy_f16_to_f32(q, moe_accT_ + uint64_t(t) * H, moe_y_, wgt, H);
             }
             gemv_fp16(q, x, w.ffn_gate_shexp, sh_g_, H, SEF);
@@ -2062,7 +2120,7 @@ std::string Qwen4ExpModel::mtp_ingest(const int32_t* tokens_host, uint32_t T,
     }
     mtp_fuse_add(q, mtp_x16_, mtp_e16_, mtp_wide_, nr, H, hc);
     const uint32_t first_pos = nc ? mtp_carry_pos_ : start_pos;
-    if (auto e = mtp_layer_fwd(nr, first_pos); !e.empty()) return e;
+    if (auto e = mtp_layer_fwd(nr, first_pos, /*kv_only=*/std::getenv("IE_Q4E_MTP_INGEST_FULL") == nullptr); !e.empty()) return e;
     // Carry the chunk's last row for the next chunk / the draft step.
     q.memcpy(mtp_carry_, wide_ + uint64_t(T - 1) * hc * H,
              uint64_t(hc) * H * 4).wait();
@@ -2072,12 +2130,15 @@ std::string Qwen4ExpModel::mtp_ingest(const int32_t* tokens_host, uint32_t T,
 }
 
 std::string Qwen4ExpModel::mtp_draft(int32_t t_next, uint32_t pos, uint32_t K,
-                                     int32_t* draft) {
+                                     int32_t* draft,
+                                     const std::function<int32_t(sycl::half*, uint32_t)>* pick, uint32_t* n_drafted) {
     if (!mtp_.loaded || !mtp_have_carry_) return "mtp: no context";
     sycl::queue& q = alloc_->queue();
     const uint32_t H = cfg_.hidden, hc = cfg_.hc_count;
     const float eps = cfg_.rms_eps;
     int32_t tok = t_next;
+    uint32_t drafted = 0;
+    if (n_drafted) *n_drafted = 0;
     // Draft step k runs the MTP layer at row position (carry_pos + k).
     for (uint32_t k = 0; k < K; ++k) {
         if (k == 0)
@@ -2112,24 +2173,37 @@ std::string Qwen4ExpModel::mtp_draft(int32_t t_next, uint32_t pos, uint32_t K,
                 const char* e = std::getenv("IE_Q4E_DRAFT_VCAP");
                 return e ? uint32_t(std::atoi(e)) : 0u;
             }();
-            const uint32_t nv = vcap && vcap < cfg_.vocab ? vcap : cfg_.vocab;
+            const uint32_t nv = (vcap && vcap < cfg_.vocab && !pick) ? vcap : cfg_.vocab;
             gemv_fp16_ld(q, mixed_, lm_head, cfg_.vocab, logits_, H, nv);
-            sample_argmax(q, logits_, d_tokens_ + (max_chunk_ - 1), nv);
             int32_t am = 0;
-            q.memcpy(&am, d_tokens_ + (max_chunk_ - 1), sizeof(int32_t)).wait();
+            if (pick) am = (*pick)(logits_, k);
+            else {
+                sample_argmax(q, logits_, d_tokens_ + (max_chunk_ - 1), nv);
+                q.memcpy(&am, d_tokens_ + (max_chunk_ - 1), sizeof(int32_t)).wait();
+            }
+            if (am == -2) break;   // the gate: no more rows this round
+            if (am < 0) return "mtp draft: the pick failed";
             draft[k] = am;
             tok = am;
+            ++drafted;
             continue;
         }
         // Device argmax + 4-byte D2H (was a 500 KB full-vocab D2H + host
         // scan per step). Draft-only: a tie-break difference vs the host
         // reference argmax can only change a PROPOSAL, never the output.
         int32_t am = 0;
-        sample_argmax(q, logits_, d_tokens_ + (max_chunk_ - 1), cfg_.vocab);
-        q.memcpy(&am, d_tokens_ + (max_chunk_ - 1), sizeof(int32_t)).wait();
+        if (pick) am = (*pick)(logits_, k);
+        else {
+            sample_argmax(q, logits_, d_tokens_ + (max_chunk_ - 1), cfg_.vocab);
+            q.memcpy(&am, d_tokens_ + (max_chunk_ - 1), sizeof(int32_t)).wait();
+        }
+        if (am == -2) break;   // the gate: no more rows this round
+        if (am < 0) return "mtp draft: the pick failed";
         draft[k] = am;
         tok = am;
+        ++drafted;
     }
+    if (n_drafted) *n_drafted = drafted;
     // Rewind the speculative MTP rows: the verify forward re-ingests the
     // accepted positions properly (position-indexed caches overwrite).
     mtp_.kv.set_length(0, mtp_carry_pos_);
@@ -2676,6 +2750,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             uq.memcpy(dst + ec.down_off, srcp(w.down_bv), w.down_bv.slice_bytes);
         }
         ec.last_use[uint32_t(sl)] = ++ecache_clock_;
+        if (uint32_t(sl) < pf_pin_mask_.size() && pf_pin_mask_[uint32_t(sl)]) ec.last_use[uint32_t(sl)] = UINT64_MAX - 1;
         return static_cast<uint8_t*>(ec.base) + uint64_t(sl) * ec.slot_bytes;
     };
     auto ensure_slot = [&](uint32_t e) -> uint8_t* {
@@ -3678,13 +3753,56 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             const bool q8p = w.gate_bv.raw != nullptr;
             q.memset(moe_accT_, 0, uint64_t(T) * H * sizeof(float));
             // One host->device shot for all token index/weight lists.
-            struct EJob { uint32_t e, off, n; uint8_t* slot; };
+            struct EJob { uint32_t e, off, n; uint8_t* slot; uint8_t grp = 2; };   // grp: 0 resident, 1 pinned, 2 miss
             std::vector<EJob> jobs2;
             uint32_t off = 0;
             for (uint32_t e = 0; e < cfg_.n_experts; ++e) {
                 if (by_e[e].empty()) continue;
                 jobs2.push_back({e, off, uint32_t(by_e[e].size()), nullptr});
                 off += uint32_t(by_e[e].size());
+            }
+            // 2026-10-22: scan-resistant prefill residency, IE_Q4E_PF_RING = R slots (default 96; 0 = the LRU as before). A
+            // 2048-token chunk routes ~every expert of a layer, and the LRU over e-ascending waves then evicts each
+            // resident expert just before its turn (a cyclic scan larger than the cache: ~0 % hits, every chunk uploads
+            // the whole bank). With a ring: the experts resident at the pass's start keep their slots for the pass (at
+            // most usable - R of them, the most recently used; last_use pinned, ensure_slot_on keeps the pin on a hit),
+            // every miss streams through the other R slots, and a wave holds <= R / 2 unpinned jobs, so its refills
+            // still land only on slots read by waves <= i - 2 (the cq fence below). Job order: the unpinned residents
+            // first (hits, consumed before the ring evicts them), the pinned block (hits, no uploads, any wave size),
+            // then the misses. The per-token reduce keeps its e-ascending cell order, so the output is the e-ascending
+            // pass's bit for bit. Only the grouped path (which restores the stamps) runs it. Measured 2026-10-22
+            // (UD-Q4_K_XL, two cards, ctx 40000, unique 2K / 8K / 16K / 32K prompts, ie-prompt-bench): R = 0 461 / 677 /
+            // 712 / 725 tok/s, R = 64 562 / 897 / 952 / 956, R = 96 628 / 978 / 1031 / 1006, R = 128 575 / 914 / 977 /
+            // 985; greedy text and the 4096-token PPL identical to R = 0.
+            // Unset = 96 slots, at most 5/8 of the usable ones (96 was the best of 64 / 96 / 128 at 257 slots AND at 157,
+            // where 3/8 of the slots = 58 measured 1 % slower; a tiny cache keeps 3/8 pinned); IE_Q4E_PF_RING=N = N, 0 = off.
+            static const uint32_t pf_ring_env = [] {
+                const char* v = std::getenv("IE_Q4E_PF_RING"); return v ? uint32_t(std::max(0, std::atoi(v))) : UINT32_MAX; }();
+            const uint32_t pf_ring_want = pf_ring_env == UINT32_MAX ? std::max(16u, std::min(96u, ecache_usable_ * 5u / 8u)) : pf_ring_env;
+            const bool pf_f16ok = (H % 128 == 0) && (EF % 128 == 0);
+            const bool pf_grouped = std::getenv("IE_Q4E_NO_PREFILL_GROUPED") == nullptr &&
+                                    (q8p || pf_f16ok) && (w.down_bv.raw != nullptr || pf_f16ok);
+            const uint32_t pf_ring = (pf_ring_want && pf_grouped && T >= 64 && ecache_usable_ > 32)
+                ? std::min(std::max(pf_ring_want, 16u), ecache_usable_) : 0u;
+            std::vector<uint32_t> pf_pinned;
+            if (pf_ring) {
+                if (pf_pin_mask_.size() < ecache_slots_) pf_pin_mask_.assign(ecache_slots_, 0);
+                const uint32_t keep_max = ecache_usable_ - pf_ring;
+                std::vector<std::pair<uint64_t, size_t>> res;   // (last_use, job) of the routed experts already resident
+                for (size_t ji = 0; ji < jobs2.size(); ++ji) {
+                    const int32_t sl = ec.slot_of[jobs2[ji].e];
+                    if (sl >= 0) { res.push_back({ec.last_use[uint32_t(sl)], ji}); jobs2[ji].grp = 0; }
+                }
+                std::sort(res.begin(), res.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+                if (res.size() > keep_max) res.resize(keep_max);
+                for (const auto& [stamp, ji] : res) {
+                    const uint32_t sl = uint32_t(ec.slot_of[jobs2[ji].e]);
+                    jobs2[ji].grp = 1;
+                    pf_pinned.push_back(sl);
+                    pf_pin_mask_[sl] = 1;
+                    ec.last_use[sl] = UINT64_MAX - 1;   // (UINT64_MAX = a quarantined slot)
+                }
+                std::stable_sort(jobs2.begin(), jobs2.end(), [](const EJob& a, const EJob& b) { return a.grp < b.grp; });
             }
             off = 0;
             for (auto& jb : jobs2) {
@@ -3735,14 +3853,19 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 // the per-expert path's (same experts, same LRU, same order).
                 {
                     std::vector<uint32_t> nk(T, 0);
-                    uint32_t c2 = 0;
-                    for (uint32_t e = 0; e < cfg_.n_experts; ++e)
+                    // a token's cells stay e-ascending (the reduce order) whatever order the jobs run in: the cell is
+                    // the job's row offset plus the pair's index (== the old running counter when jobs2 is e-ascending)
+                    std::vector<uint32_t> off_of_e(cfg_.n_experts, 0);
+                    for (const auto& jb : jobs2) off_of_e[jb.e] = jb.off;
+                    for (uint32_t e = 0; e < cfg_.n_experts; ++e) {
+                        uint32_t j2 = 0;
                         for (const auto& pr : by_e[e]) {
                             const uint32_t t2 = uint32_t(pr.first);
                             h_cells_[uint64_t(t2) * cfg_.n_experts_used + nk[t2]] =
-                                int32_t(c2);
-                            ++nk[t2]; ++c2;
+                                int32_t(off_of_e[e] + j2);
+                            ++nk[t2]; ++j2;
                         }
+                    }
                     for (uint32_t t2 = 0; t2 < T; ++t2)
                         h_cells_[uint64_t(T) * cfg_.n_experts_used + t2] =
                             int32_t(nk[t2]);
@@ -3789,15 +3912,16 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 static const bool no_copyq =
                     std::getenv("IE_Q4E_NO_COPYQ") != nullptr;
                 const bool prefetch = !no_copyq && copyq_ != nullptr;
-                const uint32_t wave_max = prefetch
-                    ? std::max(1u, ecache_usable_ / 2) : ecache_usable_;
+                const uint32_t wave_max = pf_ring ? std::max(1u, pf_ring / 2)
+                    : prefetch ? std::max(1u, ecache_usable_ / 2) : ecache_usable_;
                 sycl::queue& cq = prefetch ? *copyq_ : q;
                 sycl::event qfence, kdone[2];
                 if (prefetch) qfence = q.ext_oneapi_submit_barrier();
                 uint32_t J = 0, wi = 0;
                 for (size_t wj0 = 0; wj0 < jobs2.size(); ) {
-                    const size_t wj1 =
-                        std::min(jobs2.size(), wj0 + size_t(wave_max));
+                    size_t wj1 = wj0;   // (pinned jobs are free: no refill can land on their slots)
+                    for (uint32_t np = 0; wj1 < jobs2.size() && (jobs2[wj1].grp == 1 || np < wave_max); ++wj1)
+                        if (jobs2[wj1].grp != 1) ++np;
                     const uint32_t J0 = J;
                     const uint32_t row0 = jobs2[wj0].off;
                     const uint32_t row1 = jobs2[wj1 - 1].off + jobs2[wj1 - 1].n;
@@ -3881,6 +4005,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                     ++wi;
                     wj0 = wj1;
                 }
+                for (uint32_t sl : pf_pinned) { pf_pin_mask_[sl] = 0; ec.last_use[sl] = ++ecache_clock_; }   // used this pass
                 {
                     const int32_t* cells = moe_cells_;
                     const int32_t* nk = moe_cells_ + uint64_t(T) * cfg_.n_experts_used;

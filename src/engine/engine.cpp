@@ -33,6 +33,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <random>
 #include <fstream>
 #include <iterator>
 #include <vector>
@@ -153,6 +154,16 @@ struct Q4eBundle {
         return best;
     }
     void look_reset() {
+        look_stats();
+        Look& s = look;
+        s.rounds = s.drafted = s.hits = s.redo = s.plain = s.resyncs = s.cuts = 0; s.cur_on = false; s.cut = false;
+        s.why_blocked = s.why_nomatch = s.why_short = 0;
+        s.miss_tok.clear(); s.ms_round = s.ms_redo = s.ms_plain = 0;
+        s.n_rows = s.next = 0; s.streak = s.blocked = 0; s.block_len = s.block0; s.grow = s.probe;
+    }
+    // IE_Q4E_LOOKUP_STATS=1: the lookup's and the head's counters of the request so far, then cleared (at a request's end
+    // and at the next one's start, whichever first prints)
+    void look_stats() {
         Look& s = look;
         if (std::getenv("IE_Q4E_LOOKUP_STATS") && (s.rounds || s.plain))
             std::fprintf(stderr, "[qwen4exp LOOKUP] rounds=%llu drafted=%llu accepted=%llu re-run after a miss=%llu plain steps=%llu "
@@ -161,18 +172,20 @@ struct Q4eBundle {
                          (unsigned long long)s.redo, (unsigned long long)s.plain,
                          double(s.rounds + s.hits + s.plain) / double(s.rounds + s.redo + s.plain), s.ms_round, s.ms_redo, s.ms_plain,
                          (unsigned long long)s.resyncs);
-        if (std::getenv("IE_Q4E_LOOKUP_STATS") && spec.rounds)
-            std::fprintf(stderr, "[qwen4exp SPEC] draft rounds=%llu, rows answered without a forward=%llu (%.2f tokens a round)\n",
-                         (unsigned long long)spec.rounds, (unsigned long long)spec.hits, double(spec.rounds + spec.hits) / double(spec.rounds));
-        spec.rounds = spec.hits = 0;
+        if (std::getenv("IE_Q4E_LOOKUP_STATS") && (spec.rounds || spec.off_total))
+            std::fprintf(stderr, "[qwen4exp SPEC] draft rounds=%llu, rows answered without a forward=%llu (%.2f tokens a round; %s drafts%s); "
+                                 "guard: plain step %.1f ms, steps with rounds off %llu\n",
+                         (unsigned long long)spec.rounds, (unsigned long long)spec.hits,
+                         spec.rounds ? double(spec.rounds + spec.hits) / double(spec.rounds) : 0.0,
+                         ss.on ? "sampled" : "argmax", ss.on ? (" at q temperature x " + std::to_string(ss.qtemp)).c_str() : "",
+                         spec.step_n ? spec.step_ms / double(std::min<uint32_t>(spec.step_n, 64)) : 0.0, (unsigned long long)spec.off_total);
+        spec.rounds = spec.hits = 0; spec.off_total = spec.on_total = 0;
         if (std::getenv("IE_Q4E_LOOKUP_STATS") && s.plain)
             std::fprintf(stderr, "[qwen4exp LOOKUP] drafts cut at a listed change: %llu (%zu listed); plain steps: %llu no repeat, %llu blocked, "
                          "%llu draft too short\n", (unsigned long long)s.cuts, s.miss_tok.size(), (unsigned long long)s.why_nomatch,
                          (unsigned long long)s.why_blocked, (unsigned long long)s.why_short);
-        s.rounds = s.drafted = s.hits = s.redo = s.plain = s.resyncs = s.cuts = 0; s.cur_on = false; s.cut = false;
+        s.rounds = s.drafted = s.hits = s.redo = s.plain = s.resyncs = s.cuts = 0;
         s.why_blocked = s.why_nomatch = s.why_short = 0;
-        s.miss_tok.clear(); s.ms_round = s.ms_redo = s.ms_plain = 0;
-        s.n_rows = s.next = 0; s.streak = s.blocked = 0; s.block_len = s.block0; s.grow = s.probe;
     }
     std::string look_flush() {
         Look& s = look;
@@ -220,7 +233,8 @@ struct Q4eBundle {
         const uint64_t row_bytes = uint64_t(s.V) * sizeof(sycl::half);
         if (spec.n) {   // P4 B63: a draft round's rows
             if (spec.next < spec.n && pos == spec.base + spec.next && token == spec.batch[spec.next]) {
-                qt.memcpy(logits_host, s.d_all + uint64_t(spec.next) * s.V, row_bytes).wait();
+                if (ss.on && spec.next + 1 < spec.n) ss_onehot(logits_host, ss.out[spec.next]);   // the row's decided outcome
+                else qt.memcpy(logits_host, s.d_all + uint64_t(spec.next) * s.V, row_bytes).wait();   // the last row: the engine samples
                 ++spec.next; ++spec.hits;
                 if (spec.next == spec.n) return spec_resolve();
                 return {};
@@ -277,16 +291,26 @@ struct Q4eBundle {
         if (d.size() < 2) d.clear();
         if (d.empty()) { if (had) ++s.why_short; else if (s.blocked) ++s.why_blocked; else ++s.why_nomatch; }
         const auto t0 = std::chrono::steady_clock::now();
-        if (d.empty() && mtp_on && mtp_ok && mtp_to == pos && pos != 0 && pos + mtp_k + 1 <= max_pos && mtp_k + 1 <= s.rows) {
+        if (d.empty() && mtp_on && mtp_ok && ss.rounds_ok && spec_rounds_now() && mtp_to == pos && pos != 0 &&
+            pos + mtp_k + 1 <= max_pos && mtp_k + 1 <= s.rows) {
             std::string m = spec_round(token, pos, logits_host);   // P4 B63: no repeat to copy: the head drafts
+            if (m.empty() && spec.n == 0) {   // the gate drafted nothing: a plain step
+                ++s.plain;
+                m = fwd(&token, 1, pos);
+                if (m.empty()) qt.memcpy(logits_host, tail().logits(), row_bytes).wait();
+                spec_note_step(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            } else spec.last_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             s.ms_plain += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
             return m;
         }
         if (d.empty()) {
             ++s.plain;
+            if (mtp_on && spec.off) ++spec.off_total;
             std::string m = fwd(&token, 1, pos);
             if (m.empty()) qt.memcpy(logits_host, tail().logits(), row_bytes).wait();
-            s.ms_plain += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+            if (mtp_on) spec_note_step(ms);
+            s.ms_plain += ms;
             return m;
         }
         const uint32_t Vr = 1 + uint32_t(d.size());
@@ -332,9 +356,12 @@ struct Q4eBundle {
         namespace fs = std::filesystem;
         if (path.empty()) if (const char* v = std::getenv("IE_Q4E_MTP_HEAD")) path = v;
         (void)model_path;
-        // Only on an explicit path. Measured 2026-10-05 (UD-Q4_K_XL, both cards): decode 28.7 / 28.3 -> 30.8 / 33.7 tok/s
-        // greedy (2.7-3.0 tokens a round, but a 4-row verify costs two plain steps), no gain at temperature 0.7, prefill
-        // 502 -> 412 tok/s (the head ingests every chunk) and ~4.7 GiB less expert cache on the tail card: not a default.
+        // The path comes from the load (--spec-head / IE_Q4E_MTP_HEAD / the first mtp*.gguf beside the model; 2026-10-22 the
+        // default at one lane). History: measured 2026-10-05 as opt-in (UD-Q4_K_XL, both cards): decode 28.7 / 28.3 -> 30.8 /
+        // 33.7 tok/s greedy, no gain at temperature 0.7, prefill 502 -> 412 tok/s (the head ingested every chunk through its
+        // whole layer; since 2026-10-22 the ingest stops after the attention half, mtp_layer_fwd kv_only) and ~4.7 GiB less
+        // expert cache on the tail card. Re-measured 2026-10-22 (ie-prompt-bench, greedy, K = 3): 35.6 -> 38.9 tok/s on short
+        // prompts, 26.4 -> 31.4 at 8-64K of context, the tokens plain decoding's (ie-qwen4exp-spec2 gate).
         if (path.empty()) return {};
         if (auto e = mtp_g.open(path); !e.empty()) return "mtp head " + path + ": " + e;
         if (auto e = tail().load_mtp(mtp_g, split ? &main_g : nullptr); !e.empty()) return "mtp head: " + e;
@@ -365,12 +392,134 @@ struct Q4eBundle {
     }
     // A draft round in flight: rows [0, n) of batch at `base`, verified with the exact kernels (spec-verify mode: each row
     // is the T = 1 step's bytes, each stage checkpoints its state after every row); `next` rows were followed.
-    struct Spec { std::vector<int32_t> batch; uint32_t base = 0, n = 0, next = 0; uint64_t rounds = 0, hits = 0; } spec;
+    struct Spec {
+        std::vector<int32_t> batch; uint32_t base = 0, n = 0, next = 0; uint64_t rounds = 0, hits = 0;
+        // 2026-10-22: the adaptive guard (IE_Q4E_MTP_ADAPT=0 = off). A round pays only when its tokens outnumber its cost
+        // in plain steps (on this MoE a 4-row verify streams ~27 distinct experts against a step's 10: a round costs
+        // ~2.6 steps served; at the owner's sampler prose gave 2.25-2.6 tokens a round, maths 3.4). So each request
+        // starts with kProbe plain steps (their time is the yardstick), then rounds; after kWin rounds, when their
+        // tokens x step time < their time, rounds stop for kOff plain steps and are probed again.
+        static constexpr uint32_t kProbe = 4, kWin = 6, kOff = 48;
+        double win_ms[kWin] = {}; uint32_t win_tok[kWin] = {}; uint32_t win_n = 0, win_i = 0;
+        double step_ms = 0; uint32_t step_n = 0;
+        double last_ms = 0;
+        uint32_t probe = kProbe, off_steps = 0; bool off = false;
+        uint64_t off_total = 0, on_total = 0;   // rounds skipped / run (stats)
+        void reset() { win_n = win_i = 0; step_ms = 0; step_n = 0; probe = kProbe; off_steps = 0; off = false; }
+    } spec;
+    static bool spec_adapt() { static const bool on = [] { const char* v = std::getenv("IE_Q4E_MTP_ADAPT"); return !(v && *v == '0'); }(); return on; }
+    void spec_note_step(double ms) {   // a plain step's time (the yardstick), the probe and the off-period count down
+        Spec& s = spec;
+        if (s.step_n < 64) { s.step_ms += ms; ++s.step_n; } else s.step_ms += (ms - s.step_ms / s.step_n);   // mean of 64, then an EMA of the same weight
+        if (s.probe) --s.probe;
+        if (s.off && s.off_steps && --s.off_steps == 0) { s.off = false; s.win_n = s.win_i = 0; }
+    }
+    void spec_note_round(uint32_t tokens) {   // a resolved round: its tokens against its time
+        Spec& s = spec;
+        s.win_ms[s.win_i] = s.last_ms; s.win_tok[s.win_i] = tokens; s.win_i = (s.win_i + 1) % Spec::kWin;
+        if (s.win_n < Spec::kWin) ++s.win_n;
+        ++s.on_total;
+        if (!spec_adapt() || s.win_n < Spec::kWin || s.step_n < Spec::kProbe) return;
+        double ms = 0, tok = 0;
+        for (uint32_t i = 0; i < Spec::kWin; ++i) { ms += s.win_ms[i]; tok += s.win_tok[i]; }
+        const double step = s.step_ms / double(std::min<uint32_t>(s.step_n, 64));
+        if (tok * step < ms) { s.off = true; s.off_steps = Spec::kOff; s.win_n = s.win_i = 0; }
+    }
+    bool spec_rounds_now() const { return !spec_adapt() || (!spec.off && spec.probe == 0); }
+    // 2026-10-22: sampled rounds, exact for any temperature / top-k / top-p / min-p (speculative sampling, Leviathan et
+    // al. 2023). Draft k is DRAWN from the head's own sampler-cut distribution q_k (not its argmax); each verify row j's
+    // target distribution p_j is cut the same way (sampler_candidates = the GPU sampler's candidates and probabilities,
+    // without its draw); draft j + 1 is kept with probability min(1, p_j(d) / q(d)) and a rejection draws from
+    // (p_j - q)+ renormalised: every row's outcome has the plain sampler's distribution (not plain decoding's token for
+    // a given seed: the draws differ). The outcomes reach the engine's sampler as one-hot logits, which any cut picks.
+    // Penalties change p after the fact, so with one on the rounds stay off; a greedy request (temperature 0 or top_k 1)
+    // takes the argmax drafts and the compare path. The acceptance is sum_x min(p, q) instead of p(argmax q): measured
+    // 2026-10-22 at the owner's temperature 1.0 / top_k 20 / top_p 0.95 the argmax drafts LOST (31.0 -> 26.1 tok/s).
+    struct SpecSampler {
+        bool on = false, rounds_ok = true;
+        float qtemp = 1.f;               // IE_Q4E_MTP_QTEMP: the drafts' cut uses temperature x qtemp (any proposal is exact)
+        float qmin = 0.5f;               // IE_Q4E_MTP_QMIN: stop drafting at a row whose top candidate is below this (0 = off;
+                                         // served at the owner's sampler, guard on: off 28.2, 0.3 29.7, 0.5 30.2 tok/s median)
+        SamplingParams sp;
+        std::mt19937_64 rng{0x5EED5EEDull};
+        uint32_t V = 0;
+        sycl::half* scratch = nullptr;   // [V] device: the candidate kernel's row (it tombstones)
+        int32_t* d_idx = nullptr; float* d_p = nullptr; uint32_t* d_n = nullptr;   // [1024], [1024], [1] device
+        struct Dist { std::vector<int32_t> ids; std::vector<double> p; };
+        std::vector<Dist> q;             // q[k]: draft k + 1's distribution
+        std::vector<int32_t> out;        // the outcomes of rows 0 .. K-1
+    } ss;
+    void ss_setup(const SamplingParams& sp) {
+        ss.sp = sp;
+        const bool greedy = sp.temperature <= 0.f || sp.top_k == 1;
+        const bool penalties = sp.repeat_penalty != 1.f || sp.presence_penalty != 0.f || sp.frequency_penalty != 0.f;
+        const bool env_off = [] { const char* v = std::getenv("IE_Q4E_MTP_SAMPLED"); return v && *v == '0'; }();   // = the compare path
+        ss.on = mtp_on && !greedy && !penalties && !env_off;
+        ss.rounds_ok = greedy || ss.on;
+        ss.qtemp = [] { const char* v = std::getenv("IE_Q4E_MTP_QTEMP"); const float f = v ? float(std::atof(v)) : 1.f;
+                        return f > 0.f ? f : 1.f; }();
+        ss.qmin = [] { const char* v = std::getenv("IE_Q4E_MTP_QMIN"); const float f = v ? float(std::atof(v)) : 0.5f;
+                       return f > 0.f && f < 1.f ? f : 0.f; }();
+        ss.rng.seed(sp.seed ? sp.seed : uint64_t(std::chrono::steady_clock::now().time_since_epoch().count()));
+    }
+    std::string ss_init() {
+        if (ss.scratch) return {};
+        sycl::queue& qt = tail().queue();
+        ss.V = look.V;
+        ss.scratch = sycl::malloc_device<sycl::half>(ss.V, qt);
+        ss.d_idx = sycl::malloc_device<int32_t>(1024, qt);
+        ss.d_p = sycl::malloc_device<float>(1024, qt);
+        ss.d_n = sycl::malloc_device<uint32_t>(1, qt);
+        if (!ss.scratch || !ss.d_idx || !ss.d_p || !ss.d_n) { ss_free(); return "sampled rounds: device alloc failed"; }
+        return {};
+    }
+    void ss_free() {
+        sycl::queue& qt = tail().queue();
+        if (ss.scratch) sycl::free(ss.scratch, qt);
+        if (ss.d_idx) sycl::free(ss.d_idx, qt);
+        if (ss.d_p) sycl::free(ss.d_p, qt);
+        if (ss.d_n) sycl::free(ss.d_n, qt);
+        ss.scratch = nullptr; ss.d_idx = nullptr; ss.d_p = nullptr; ss.d_n = nullptr;
+    }
+    // the sampler's candidates of a device logits row, renormalised, in its extraction order
+    std::string ss_dist(const sycl::half* row_dev, SpecSampler::Dist& d, float temp_scale = 1.f) {
+        sycl::queue& qt = tail().queue();
+        qt.memcpy(ss.scratch, row_dev, uint64_t(ss.V) * sizeof(sycl::half));
+        sampler_candidates(qt, ss.scratch, ss.d_idx, ss.d_p, ss.d_n, ss.V, ss.sp.temperature * temp_scale, ss.sp.top_k, ss.sp.top_p, ss.sp.min_p);
+        uint32_t n = 0;
+        qt.memcpy(&n, ss.d_n, sizeof(uint32_t)).wait();
+        n = std::min<uint32_t>(n, 1024u);
+        if (n == 0) return "sampled rounds: a row kept no candidate";
+        std::vector<float> pf(n);
+        d.ids.resize(n); d.p.resize(n);
+        qt.memcpy(d.ids.data(), ss.d_idx, n * sizeof(int32_t));
+        qt.memcpy(pf.data(), ss.d_p, n * sizeof(float));
+        qt.wait();
+        double z = 0; for (float v : pf) z += v;
+        for (uint32_t i = 0; i < n; ++i) d.p[i] = z > 0 ? double(pf[i]) / z : 1.0 / n;
+        return {};
+    }
+    static double ss_prob(const SpecSampler::Dist& d, int32_t id) {
+        for (size_t i = 0; i < d.ids.size(); ++i) if (d.ids[i] == id) return d.p[i];
+        return 0.0;
+    }
+    int32_t ss_draw(const std::vector<int32_t>& ids, const std::vector<double>& p) {
+        double z = 0; for (double v : p) z += v;
+        const double r = std::uniform_real_distribution<double>(0.0, 1.0)(ss.rng) * z;
+        double c = 0;
+        for (size_t i = 0; i < ids.size(); ++i) { c += p[i]; if (p[i] > 0 && c > r) return ids[i]; }
+        return ids.back();
+    }
+    void ss_onehot(sycl::half* logits_host, int32_t id) {   // any sampler cut picks `id`
+        std::fill(logits_host, logits_host + ss.V, sycl::half(-10000.f));
+        if (id >= 0 && uint32_t(id) < ss.V) logits_host[id] = sycl::half(10000.f);
+    }
     std::string spec_resolve() {   // adopt the followed rows on both stages, ingest them into the head
         Spec& s = spec;
         if (!s.n) return {};
         const uint32_t acc = s.next;
         s.n = s.next = 0;
+        spec_note_round(acc);   // (the round gave `acc` tokens: the first row's and the drafts followed)
         std::string m = A.commit_verify(acc);
         if (m.empty() && split) m = B.commit_verify(acc);
         if (!m.empty()) return "spec commit: " + m;
@@ -381,20 +530,51 @@ struct Q4eBundle {
     std::string spec_round(int32_t token, uint32_t pos, sycl::half* logits_host) {
         Spec& s = spec;
         const uint32_t K = mtp_k;
+        uint32_t Kd = K;   // the rows drafted (the gate may stop early)
         s.batch.assign(K + 1, 0);
         s.batch[0] = token;
-        if (auto e = tail().mtp_draft(token, pos, K, s.batch.data() + 1); !e.empty()) return "draft: " + e;
+        if (ss.on) {   // sampled rounds: the drafts are drawn from the head's sampler-cut distributions (kept for the verify)
+            if (auto e = ss_init(); !e.empty()) return e;
+            ss.q.assign(K, {});
+            const std::function<int32_t(sycl::half*, uint32_t)> pick = [this](sycl::half* lg, uint32_t k) -> int32_t {
+                if (!ss_dist(lg, ss.q[k], ss.qtemp).empty() || ss.q[k].ids.empty()) return -1;
+                if (k >= 1 && ss.qmin > 0.f && ss.q[k].p[0] < double(ss.qmin)) return -2;   // the gate: an unsure row ends the draft
+                return ss_draw(ss.q[k].ids, ss.q[k].p);
+            };
+            if (auto e = tail().mtp_draft(token, pos, K, s.batch.data() + 1, &pick, &Kd); !e.empty()) return "draft: " + e;
+        } else if (auto e = tail().mtp_draft(token, pos, K, s.batch.data() + 1); !e.empty()) return "draft: " + e;
+        if (Kd == 0) { s.n = 0; return {}; }   // (the caller takes the plain step)
+        s.batch.resize(Kd + 1);
         A.set_spec_verify(true); if (split) B.set_spec_verify(true);
         std::string m;
         if (split) {
-            m = A.forward_range(s.batch.data(), K + 1, pos, nullptr, wide.data(), nullptr);
-            if (m.empty()) m = B.forward_range(s.batch.data(), K + 1, pos, p2p ? nullptr : wide.data(), nullptr, nullptr, p2p);
-        } else m = A.forward(s.batch.data(), K + 1, pos, nullptr);
+            m = A.forward_range(s.batch.data(), Kd + 1, pos, nullptr, wide.data(), nullptr);
+            if (m.empty()) m = B.forward_range(s.batch.data(), Kd + 1, pos, p2p ? nullptr : wide.data(), nullptr, nullptr, p2p);
+        } else m = A.forward(s.batch.data(), Kd + 1, pos, nullptr);
         A.set_spec_verify(false); if (split) B.set_spec_verify(false);
-        if (m.empty()) m = tail().logits_rows(K + 1, look.d_all);
+        if (m.empty()) m = tail().logits_rows(Kd + 1, look.d_all);
         if (!m.empty()) return "spec verify: " + m;
-        tail().queue().memcpy(logits_host, look.d_all, uint64_t(look.V) * sizeof(sycl::half)).wait();
-        s.base = pos; s.n = K + 1; s.next = 1; ++s.rounds;
+        if (ss.on) {   // decide every row now: accept draft j + 1 against row j's target cut, else draw the residual
+            ss.out.assign(Kd, -1);
+            for (uint32_t j = 0; j < Kd; ++j) {
+                SpecSampler::Dist pj;
+                if (auto e = ss_dist(look.d_all + uint64_t(j) * look.V, pj); !e.empty()) return e;
+                const int32_t d = s.batch[j + 1];
+                const double pd = ss_prob(pj, d), qd = ss_prob(ss.q[j], d);
+                const double u = std::uniform_real_distribution<double>(0.0, 1.0)(ss.rng);
+                if (qd > 0 && (pd >= qd || u < pd / qd)) { ss.out[j] = d; continue; }
+                std::vector<int32_t> rid; std::vector<double> rp;   // (p - q)+, never holds d
+                for (size_t i = 0; i < pj.ids.size(); ++i) {
+                    const double r = pj.p[i] - ss_prob(ss.q[j], pj.ids[i]);
+                    if (r > 0) { rid.push_back(pj.ids[i]); rp.push_back(r); }
+                }
+                if (rid.empty()) { ss.out[j] = d; continue; }   // (p == q on p's support up to rounding: keeping d is the limit)
+                ss.out[j] = ss_draw(rid, rp);
+                break;   // the rows after a rejection are moot
+            }
+            ss_onehot(logits_host, ss.out[0]);
+        } else tail().queue().memcpy(logits_host, look.d_all, uint64_t(look.V) * sizeof(sycl::half)).wait();
+        s.base = pos; s.n = Kd + 1; s.next = 1; ++s.rounds;
         return {};
     }
     // Chunk-PIPELINED prefill over the split (run2's certified overlap: A
@@ -405,7 +585,16 @@ struct Q4eBundle {
     // (the serial path's big-chunk default trades misses for no overlap).
     // Caller owns the pos==0 reset semantics (mirrors fwd()).
     std::string fwd_pipelined(const int32_t* t, uint32_t count, uint32_t pos) {
-        constexpr uint32_t PC = 2048;
+        // 2026-10-22: IE_Q4E_PIPE_CHUNK=N (1024..4096) = the pipeline's chunk; the default stays 2048 (the run2-certified
+        // shape). 4096 for a prompt of 8192+ tokens measured 1018 -> 1078 tok/s at 16K and 1012 -> 1112 at 32K with the
+        // expert ring (equal at 8K), but it is NOT the same arithmetic: ie-qwen4exp-ppl over 8192 tokens gave 1.0841
+        // through 2048-token chunks and 1.0854 through 4096 (+1.4 % NLL), and a 32K prompt's greedy text changed. Where
+        // the 4096 path diverges (the attention / DeltaNet chunk kernels) is open: an opt-in until it is understood.
+        static const uint32_t pc_env = [] {
+            const char* v = std::getenv("IE_Q4E_PIPE_CHUNK"); const int n = v ? std::atoi(v) : 0;
+            return n ? uint32_t(std::min(4096, std::max(1024, n))) : 0u; }();
+        const uint32_t PC = pc_env ? pc_env : 2048u;
+        (void)count;
         if (!split || count <= PC) return "q4e pipeline: not applicable";
         // P2P + pipelining now coexist via B's double wide banks: A pushes
         // chunk k into bank k&1 while B reads chunk k-1 from the other bank.
@@ -490,6 +679,7 @@ struct Q4eBundle {
     ~Q4eBundle() {
         if (serve) serve->shutdown();   // the pipe's stage threads and the serial worker end before the models go
         serve.reset();
+        ss_free();     // (2026-10-22: the sampled rounds' device scratch, likewise)
         look_free();   // (P4 B56: on the tail stage's queue, before the models go)
         lad_a.clear(); lad_b.clear();   // (P4 B62: pinned host memory of the stages' queues)
         lanes.reset();
@@ -2023,10 +2213,31 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         if (auto m = b->A.load(e->alloc_, e->gguf_, b->cfg, 0, 0, hi); !m.empty()) {
             err = "qwen4exp A: " + m; e->q4e_.reset(); return nullptr;
         }
-        // P4 B63: --spec at one lane loads the MTP draft head onto the tail stage, before that stage sizes its expert cache
-        const bool q4e_mtp = opts.spec && n_lanes == 1 && ![] { const char* v = std::getenv("IE_Q4E_MTP"); return v && *v == '0'; }();
+        // P4 B63: --spec at one lane loads the MTP draft head onto the tail stage, before that stage sizes its expert cache.
+        // 2026-10-22: the head is the DEFAULT at one request lane. The file: --spec-head, else IE_Q4E_MTP_HEAD, else the first
+        // mtp*.gguf beside the model (the gemma4 convention; scripts/fetch_mtp_head.py + scripts/mtp_to_gguf.py make it from the
+        // official checkpoint). A found head turns --spec on (the lookup drafts and the head's rounds; every row is verified
+        // with the exact kernels, the sampler runs on each row's own logits, so the tokens are plain decoding's at any
+        // temperature) with --spec-k 3 unless given (the certified K; K = 5 gave different tokens, B63). IE_Q4E_MTP=0 = off.
+        const bool q4e_mtp_off = [] { const char* v = std::getenv("IE_Q4E_MTP"); return v && *v == '0'; }();
+        std::string q4e_head = opts.spec_head;
+        if (q4e_head.empty()) if (const char* v = std::getenv("IE_Q4E_MTP_HEAD")) q4e_head = v;
+        if (q4e_head.empty() && n_lanes == 1 && !q4e_mtp_off) {
+            namespace fs = std::filesystem;
+            std::error_code ec;
+            for (fs::directory_iterator it(fs::path(gguf_path).parent_path(), ec), end; !ec && it != end; ++it) {
+                const std::string fn = it->path().filename().string();
+                if (fn.rfind("mtp", 0) == 0 && fn.size() > 5 && fn.substr(fn.size() - 5) == ".gguf") { q4e_head = it->path().string(); break; }
+            }
+        }
+        if (!q4e_head.empty() && n_lanes == 1 && !q4e_mtp_off && !opts.spec) {
+            opts.spec = e->opts_.spec = true;
+            std::fprintf(stderr, "[qwen4exp] --spec on: the MTP draft head %s is beside the model (IE_Q4E_MTP=0 = off)\n", q4e_head.c_str());
+        }
+        const uint32_t q4e_k = opts.spec_k_set ? opts.spec_k : 3u;
+        const bool q4e_mtp = opts.spec && n_lanes == 1 && !q4e_mtp_off;
         if (q4e_mtp && !b->split)
-            if (auto m = b->mtp_load(gguf_path, opts.spec_head, e->gguf_, opts.spec_k); !m.empty())
+            if (auto m = b->mtp_load(gguf_path, q4e_head, e->gguf_, q4e_k); !m.empty())
                 std::fprintf(stderr, "[qwen4exp] %s -- lookup drafts only\n", m.c_str());
         if (auto m = b->A.init_runtime(opts.max_ctx, chunk, n_lanes, lane_ctx); !m.empty()) {
             err = "qwen4exp A runtime: " + m; e->q4e_.reset(); return nullptr;
@@ -2044,7 +2255,7 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                 err = "qwen4exp B: " + m; e->q4e_.reset(); return nullptr;
             }
             if (q4e_mtp)
-                if (auto m = b->mtp_load(gguf_path, opts.spec_head, e->gguf_, opts.spec_k); !m.empty())
+                if (auto m = b->mtp_load(gguf_path, q4e_head, e->gguf_, q4e_k); !m.empty())
                     std::fprintf(stderr, "[qwen4exp] %s -- lookup drafts only\n", m.c_str());
             if (auto m = b->B.init_runtime(opts.max_ctx, chunk, n_lanes, lane_ctx); !m.empty()) {
                 err = "qwen4exp B runtime: " + m; e->q4e_.reset(); return nullptr;
@@ -4155,6 +4366,20 @@ public:
     }
 
     const char* tag() const override { return "q27 lanes"; }
+    // (2026-10-22: lazy lanes. Lane 0 is the serial-turn lane with the whole --ctx: not "warm" for the choice, or every single
+    // request would land on it and a second request on a pipe lane could not overlap with it -- measured 33 tok/s for the
+    // pair against ~53 for two pipe lanes; it is still the lane for a prompt beyond the pipe lanes' context.)
+    bool lane_warm(uint32_t lane) const override { return lane != 0 && m_.lane_ready(lane); }
+    // the smallest free memory over the cards, now (0 when a card does not report it)
+    uint64_t free_vram_min() const {
+        uint64_t mn = UINT64_MAX;
+        for (uint32_t d = 0; d < m_.n_devices(); ++d) {
+            const sycl::device dv = m_.fleet()->dev(d).device();
+            if (!dv.has(sycl::aspect::ext_intel_free_memory)) return 0;
+            mn = std::min(mn, uint64_t(dv.get_info<sycl::ext::intel::info::device::free_memory>()));
+        }
+        return mn == UINT64_MAX ? 0 : mn;
+    }
     uint32_t n_lanes() const override { return m_.n_lanes(); }
     // the engine's rule: a prompt must be below ctx - 8, and the reply fits in ctx - 8 - prompt
     uint32_t lane_cap(uint32_t lane) const override { const uint32_t c = m_.lane_ctx(lane); return c > 8 ? c - 8 : 0; }
@@ -4166,6 +4391,17 @@ public:
 
     std::string prefix_prepare(uint32_t lane, const LanesRequest& rq, uint32_t& reused, std::string& source) override {
         source.clear();   // (--parallel 1 reports no cache source on this arch)
+        {   // 2026-10-22: a lazy lane's state on its first request; it takes its VRAM back from the prompt cache, which
+            // sized itself with the lanes idle (an eager-sized cache beside a filling lane paged the cards: 4 s stalls)
+            const bool had = m_.lane_ready(lane);
+            if (auto e = m_.lane_ensure(lane); !e.empty()) return e;
+            if (!had && cache_) {   // (under the serve's lock, like every cache_ use of this class)
+                const uint64_t before = cache_->config().max_dev_bytes;
+                cache_->fit_budget(free_vram_min(), uint64_t(2) << 30);
+                std::fprintf(stderr, "[27b-split-cache] lane %u filled: the cache's budget %.2f -> %.2f GB a card (what the cards hold "
+                                     "for it plus their free memory less 2 GiB)\n", lane, before / 1e9, cache_->config().max_dev_bytes / 1e9);
+            }
+        }
         m_.select_lane(lane);
         forget_round(lane);   // (2026-10-21: the lane's next MTP round waits for a step of this sequence)
         if (rq.vision) {   // 2026-10-21: the request's images on its lane; no restore (pad ids cannot key the cache)
@@ -4566,6 +4802,18 @@ std::string Engine::q27_lanes_init() {
                                  "input) while at most %u lane(s) decode; GiB a lane: %s "
                                  "(IE_QWEN35_LANES_MTP=0 = off, IE_QWEN35_LANES_MTP_MAX = the lanes)\n",
                          m.lane_mtp_rows(), m.lane_mtp_rows() - 1, so.draft_max, per_card.c_str());
+            if (prompt_cache_on_) {   // 2026-10-22: the rounds' buffers come out of what the prompt cache sized itself on
+                uint64_t fmin = UINT64_MAX;
+                for (uint32_t d = 0; d < m.n_devices(); ++d) {
+                    const sycl::device dv = m.fleet()->dev(d).device();
+                    if (!dv.has(sycl::aspect::ext_intel_free_memory)) { fmin = 0; break; }
+                    fmin = std::min(fmin, uint64_t(dv.get_info<sycl::ext::intel::info::device::free_memory>()));
+                }
+                const uint64_t before = fleet_cache_.config().max_dev_bytes;
+                fleet_cache_.fit_budget(fmin == UINT64_MAX ? 0 : fmin, uint64_t(2) << 30);
+                std::fprintf(stderr, "[27b-split-cache] the MTP rounds are allocated: the cache's budget %.2f -> %.2f GB a card\n",
+                             before / 1e9, fleet_cache_.config().max_dev_bytes / 1e9);
+            }
         }
     } else if (spec_) std::fprintf(stderr, "[qwen35split] lanes MTP OFF (%s)\n", m.mtp_loaded() ? "IE_QWEN35_LANES_MTP=0" : "no MTP head");
     q27_ = std::make_unique<Q35mLanes>();
@@ -5903,6 +6151,8 @@ GenerateResult Engine::generate(const std::string& prompt,
         else {
             q4e_->look_reset();
             q4e_->look_context(ids.data(), pos);
+            q4e_->ss_setup(sp);   // (2026-10-22: sampled rounds at this request's sampler)
+            q4e_->spec.reset();   // (the adaptive guard starts each request with its probe steps)
             q4e_look_step_ = true;
         }
     }

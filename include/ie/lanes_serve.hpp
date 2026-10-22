@@ -93,27 +93,32 @@ using LanesTokenFn = std::function<bool(std::string_view)>;   // the server's ca
 // One lane as the choice sees it: owned or idle, holding a conversation or empty, its capacity (the prompt must be below it; the
 // reply fits in cap - prompt), the prompt positions its OWN state serves, the end of the last prompt it holds (0: none), its
 // last release (larger = more recent).
-struct LanesLaneView { bool idle = false, occupied = false; uint32_t cap = 0, match = 0, last_end = 0; uint64_t tick = 0; };
+struct LanesLaneView { bool idle = false, occupied = false; uint32_t cap = 0, match = 0, last_end = 0; uint64_t tick = 0;
+                       bool warm = true; };   // 2026-10-22: its state is allocated (a lazy lane's is not until its first request)
 
 // The lane for a prompt, among the IDLE lanes it fits (prompt < cap) -- V4.1 B6b's ds41_choose_lane (MiMo B4's rule, ba287bd,
 // with V4.1's continuation preference; host-tested in tests/unit/ds41_serve_rules_test.cpp), verbatim:
 //   1. the lanes that leave the reply room first: cap - prompt >= min(budget, cap / 4);
 //   2. then the lane whose own state serves the most of the prompt, when that is at least `min_tokens` or reaches the lane's
-//      last prompt end; then an empty lane; then the smallest capacity; then the least recently released; then the lower index.
+//      last prompt end; then (2026-10-22) a lane whose state is already allocated over one that would allocate on this request
+//      (the 27B's lazy lanes: a new conversation re-uses a warm idle lane instead of touching a cold one, so the cards hold
+//      the lanes in use, not every lane ever used); then an empty lane; then the smallest capacity; then the least recently
+//      released; then the lower index.
 // budget 0 = unlimited. -1 = no idle lane fits the prompt.
 inline int lanes_choose_lane(const std::vector<LanesLaneView>& lanes, uint32_t prompt, uint32_t budget, uint32_t min_tokens) {
     const uint32_t want = budget ? budget : UINT32_MAX;
     int best = -1;
-    uint64_t bk[6] = {};
+    uint64_t bk[7] = {};
     for (size_t i = 0; i < lanes.size(); ++i) {
         const LanesLaneView& l = lanes[i];
         if (!l.idle || l.cap <= prompt) continue;
         const bool roomy = l.cap - prompt >= std::min(want, l.cap / 4);
         const bool big = l.match >= min_tokens || (l.last_end && l.match >= l.last_end);
-        const uint64_t k[6] = {roomy ? 0u : 1u, big ? 0u : 1u, big ? uint64_t(~l.match) : 0u, l.occupied ? 1u : 0u, l.cap, l.tick};
+        const uint64_t k[7] = {roomy ? 0u : 1u, big ? 0u : 1u, big ? uint64_t(~l.match) : 0u, l.warm ? 0u : 1u, l.occupied ? 1u : 0u,
+                               l.cap, l.tick};
         bool less = best < 0;
-        for (int j = 0; j < 6 && !less; ++j) { if (k[j] != bk[j]) { less = k[j] < bk[j]; break; } }
-        if (less) { best = int(i); for (int j = 0; j < 6; ++j) bk[j] = k[j]; }
+        for (int j = 0; j < 7 && !less; ++j) { if (k[j] != bk[j]) { less = k[j] < bk[j]; break; } }
+        if (less) { best = int(i); for (int j = 0; j < 7; ++j) bk[j] = k[j]; }
     }
     return best;
 }
@@ -160,6 +165,7 @@ public:
     virtual uint32_t own_match(uint32_t lane, std::span<const int32_t> ids) const = 0;
     virtual bool occupied(uint32_t lane) const = 0;
     virtual uint32_t last_end(uint32_t lane) const = 0;         // the end of the last prompt the lane holds (0: none)
+    virtual bool lane_warm(uint32_t lane) const { (void)lane; return true; }   // 2026-10-22: its state is allocated (lazy lanes)
     virtual uint32_t min_match_tokens() const { return 1024; }  // a smaller own match does not beat an empty lane (V4.1: min_slot_tokens)
     // the serial turn: select the lane and serve what its cache can ([0, reused)); reused == 0 leaves the lane reset (a new
     // sequence). `source` names what served it ("" = cache off).

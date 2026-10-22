@@ -37,6 +37,7 @@
 
 #include <sycl/sycl.hpp>
 #include <cstdint>
+#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -256,6 +257,10 @@ public:
     // with the same sampler and seed (up to the verify rows' rounding: --spec's near-tie note).
     //   init_lane_mtp(V)   V = rows a round (2..16) for every lane; after init_lanes, with the MTP head loaded.
     std::string init_lane_mtp(uint32_t V);
+    // 2026-10-22: allocate lane `lane`'s KV / DeltaNet state (+ its round checkpoints) if it has none yet; the lanes'
+    // serve calls it when a request lands on the lane. lane_ready: it has them (lane 0 always).
+    std::string lane_ensure(uint32_t lane);
+    bool        lane_ready(uint32_t lane) const;
     uint32_t    lane_mtp_rows() const noexcept { return lmtp_V_; }
     uint64_t    lane_mtp_bytes(uint32_t dev) const;   // what one lane's round state takes on card dev (init_lane_mtp's sum / lanes)
     // out = the V - 1 drafts, or empty when the lane has no hidden for position pos - 1 (a restore, a reset, the lane
@@ -503,9 +508,15 @@ private:
         bool     have_h = false;
         uint32_t h_pos = 0;
         uint32_t base = 0, rows = 0;                 // the round that landed: rows at base..
+        bool     ready = false;                      // 2026-10-22: ck / kvsnap built (a lazy lane builds them when it fills)
     };
     std::vector<LaneMtp> lmtp_;
     uint32_t lmtp_V_ = 0;
+    // 2026-10-22: a lane's KV / DeltaNet state (and its round checkpoints) are allocated when a request first lands on it
+    // (lane_ensure, from the lanes' prefix_prepare), not at the load; IE_QWEN35_LANES_EAGER=1 = at the load as before.
+    std::mutex lanes_mu_;
+    bool       lanes_lazy_ = true;
+    std::string lane_mtp_alloc(uint32_t lane);
     std::vector<uint64_t> lmtp_bytes_;              // [dev] the sum over the lanes
     // the head card leaves row `row` of ws_[head].x (the final residual, before output_norm) as the lane's hidden of `pos`
     void lane_keep_hidden(uint32_t lane, uint32_t row, uint32_t pos);

@@ -247,4 +247,72 @@ sycl::event sample_softmax_topk_topp(sycl::queue& q,
     });
 }
 
+// 2026-10-22: the sampler's candidates WITHOUT its draw -- the ids in sample_softmax_topk_topp's extraction order
+// (descending logit, the lowest index among exact ties) with p_i = exp((l_i - lmax) / T) / Z over the whole vocabulary,
+// cut exactly as it cuts (top_k, the top-p mass, the min-p floor, K_CAP = 1024), and their count in *n_out. `logits` is
+// mutated (tombstoned): hand it a scratch copy. Temperature must be > 0. The winner's logit comes from the reduce key,
+// not from a re-read of `logits` (the owner lane tombstones it in the same round). Flash-Next's sampled MTP rounds draw
+// from and compare these on the host (engine.cpp Q4eBundle::SpecSampler).
+sycl::event sampler_candidates(sycl::queue& q, sycl::half* logits, int32_t* idx_out, float* p_out, uint32_t* n_out,
+                               uint32_t vocab, float temperature, uint32_t top_k, float top_p, float min_p,
+                               const std::vector<sycl::event>& deps) {
+    constexpr uint32_t WG = 512, K_CAP = 1024;
+    const uint32_t k_eff = (top_k > 0 && top_k < K_CAP) ? top_k : K_CAP;
+    const float temp = temperature > 0.f ? temperature : 1.f;
+    return ie::ps(q, "sampler_candidates", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        sycl::local_accessor<int32_t, 1> ctl(1, h);
+        h.parallel_for(sycl::nd_range<1>(WG, WG), [=](sycl::nd_item<1> it) {
+            const uint32_t lid = uint32_t(it.get_local_id(0));
+            auto grp = it.get_group();
+            auto fkey = [](float v) {
+                const uint32_t b = sycl::bit_cast<uint32_t>(v);
+                return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+            };
+            auto funkey = [](uint32_t k) {
+                const uint32_t b = (k & 0x80000000u) ? (k & 0x7FFFFFFFu) : ~k;
+                return sycl::bit_cast<float>(b);
+            };
+            float lmax = -std::numeric_limits<float>::infinity();
+            for (uint32_t i = lid; i < vocab; i += WG) lmax = sycl::fmax(lmax, float(logits[i]));
+            lmax = sycl::reduce_over_group(grp, lmax, sycl::maximum<float>());
+            const float inv_temp = 1.0f / temp;
+            float z = 0.f;
+            for (uint32_t i = lid; i < vocab; i += WG) z += sycl::native::exp((float(logits[i]) - lmax) * inv_temp);
+            z = sycl::reduce_over_group(grp, z, sycl::plus<float>());
+            const float invZ = 1.0f / z;
+            const float l_floor = (min_p > 0.f) ? lmax + temp * sycl::log(min_p) : -std::numeric_limits<float>::infinity();
+            auto rescan = [&](float& v, int32_t& vi) {
+                v = -std::numeric_limits<float>::infinity(); vi = -1;
+                for (uint32_t i = lid; i < vocab; i += WG) {
+                    const float xv = float(logits[i]);
+                    if (xv >= l_floor && xv > v) { v = xv; vi = int32_t(i); }
+                }
+            };
+            float lv; int32_t li;
+            rescan(lv, li);
+            uint32_t n_keep = 0;
+            float cum = 0.f;   // lane 0's
+            for (uint32_t kk = 0; kk < k_eff; ++kk) {
+                const uint64_t my_key = (li >= 0) ? ((uint64_t(fkey(lv)) << 32) | (0xFFFFFFFFu - uint32_t(li))) : 0ull;
+                const uint64_t win = sycl::reduce_over_group(grp, my_key, sycl::maximum<uint64_t>());
+                if (win == 0ull) break;
+                const int32_t win_i = int32_t(0xFFFFFFFFu - uint32_t(win & 0xFFFFFFFFu));
+                if (lid == 0) {
+                    const float wl = funkey(uint32_t(win >> 32));
+                    const float p = sycl::native::exp((wl - lmax) * inv_temp) * invZ;
+                    idx_out[n_keep] = win_i; p_out[n_keep] = p;
+                    cum += p;
+                    ctl[0] = (top_p < 1.0f && cum >= top_p) ? 0 : 1;
+                }
+                if (uint32_t(win_i) % WG == lid) { logits[win_i] = sycl::half(-65504.0f); rescan(lv, li); }
+                n_keep += 1;
+                sycl::group_barrier(grp);
+                if (ctl[0] == 0) break;
+            }
+            if (lid == 0) *n_out = n_keep;
+        });
+    });
+}
+
 }  // namespace ie

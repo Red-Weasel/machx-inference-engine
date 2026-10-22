@@ -105,6 +105,46 @@ FleetPrefixCache::Node* FleetPrefixCache::lru_endpoint(const Node* exclude) cons
     return lru;
 }
 
+// 2026-10-22: a request lane that fills, or the MTP rounds that start, take their VRAM back from the cache (the 27B at
+// --parallel N: the lanes allocate on their first request, so the cache sized itself on the cards with the lanes idle)
+uint64_t FleetPrefixCache::held_bytes_max() const {
+    uint64_t mx = 0;
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+        uint64_t used = 0;
+        for (const Node* ep : endpoints_) {
+            if (dev < ep->kv.size() && ep->kv[dev]) used += fpc_kv_bytes(ep->kv[dev]->config());
+            if (dev < ep->dn.size() && ep->dn[dev]) used += fpc_dn_bytes(*ep->dn[dev]);
+        }
+        mx = std::max(mx, used);
+    }
+    return mx;
+}
+
+void FleetPrefixCache::fit_budget(uint64_t free_min, uint64_t headroom) {
+    const uint64_t fits = held_bytes_max() + (free_min > headroom ? free_min - headroom : 0);
+    shrink_budget(pcfg_.max_dev_bytes > fits ? pcfg_.max_dev_bytes - fits : 0);
+}
+
+void FleetPrefixCache::shrink_budget(uint64_t bytes) {
+    pcfg_.max_dev_bytes = pcfg_.max_dev_bytes > bytes ? pcfg_.max_dev_bytes - bytes : 0;
+    auto over = [&] {
+        for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+            uint64_t used = 0;
+            for (const Node* ep : endpoints_) {
+                if (dev < ep->kv.size() && ep->kv[dev]) used += fpc_kv_bytes(ep->kv[dev]->config());
+                if (dev < ep->dn.size() && ep->dn[dev]) used += fpc_dn_bytes(*ep->dn[dev]);
+            }
+            if (used > pcfg_.max_dev_bytes) return true;
+        }
+        return false;
+    };
+    while (over()) {
+        Node* victim = lru_endpoint(nullptr);
+        if (!victim) break;
+        evict_endpoint(victim);
+    }
+}
+
 void FleetPrefixCache::evict_endpoint(Node* n) {
     if (!n || !n->is_endpoint) return;
     n->kv.clear();

@@ -1484,6 +1484,12 @@ sycl::event sample_softmax_topk_topp(sycl::queue& q,
                                      float top_p, float min_p,
                                      uint64_t rng_state,
                                      const std::vector<sycl::event>& deps = {});
+// 2026-10-22: sample_softmax_topk_topp's candidates without its draw: ids (its extraction order) and p_i (over the whole
+// vocabulary, not renormalised) into idx_out / p_out [1024], their count in *n_out. `logits` is tombstoned (a scratch
+// copy); temperature > 0. For speculative sampling on the host (Flash-Next's MTP rounds).
+sycl::event sampler_candidates(sycl::queue& q, sycl::half* logits, int32_t* idx_out, float* p_out, uint32_t* n_out,
+                               uint32_t vocab, float temperature, uint32_t top_k, float top_p, float min_p,
+                               const std::vector<sycl::event>& deps = {});
 
 // =====================================================================
 // MoE ops (research/06_moe_math.md)

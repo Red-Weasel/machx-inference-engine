@@ -139,6 +139,10 @@ struct Qwen4ExpLayer {
         const uint8_t*    raw = nullptr;   // host mmap, native path (else null)
         DType             dt  = DType::kCount;
         const sycl::half* f16 = nullptr;   // host F16 fallback (else null)
+        // 2026-10-22: the draft head's experts as device Q8_0 SoA (gemv_q8_0_soa_f16_g's layout: per expert qs [N][K],
+        // d [N][K/32]); half the F16 bank's VRAM, the draft is a proposal so the output is untouched
+        const int8_t*     q8  = nullptr;
+        const uint16_t*   q8d = nullptr;
         uint64_t slice_bytes = 0;          // per-expert bytes of the ACTIVE repr
         uint32_t K = 0, N = 0;
     };
@@ -386,7 +390,11 @@ public:
     std::string mtp_ingest(const int32_t* tokens_host, uint32_t T, uint32_t start_pos);
     // Draft K tokens greedily from the current state (after a forward whose
     // sampled next token is t_next at position pos). Fills draft[0..K).
-    std::string mtp_draft(int32_t t_next, uint32_t pos, uint32_t K, int32_t* draft);
+    // pick (2026-10-22, sampled rounds): called with the head's logits row (device, [vocab], this stage's queue) for
+    // draft k instead of the argmax; returns the drafted token (< 0 = failed). It must not free or keep the row.
+    // A pick returning -2 stops the draft before that row (a confidence gate); *n_drafted = the rows drafted (K without).
+    std::string mtp_draft(int32_t t_next, uint32_t pos, uint32_t K, int32_t* draft,
+                          const std::function<int32_t(sycl::half*, uint32_t)>* pick = nullptr, uint32_t* n_drafted = nullptr);
     // P4 B63: the main state was rewound (a restart, a rollback): the head's one-row carry is no longer the row before
     // the next ingest. Its KV and indexer rows are positional and rewind themselves at the next ingest.
     void mtp_rewind() noexcept { mtp_have_carry_ = false; }
@@ -548,7 +556,9 @@ private:
     float*      mtp_carry_ = nullptr;     // [4, 2560] prev chunk's last wide row
     uint32_t    mtp_carry_pos_ = 0;
     bool        mtp_have_carry_ = false;
-    std::string mtp_layer_fwd(uint32_t T, uint32_t start_pos);
+    // kv_only: stop after the attention half (the head's K/V, indexer keys and block keys are written; the FFN output
+    // is not): what mtp_ingest needs. mtp_draft reads only the carry row, never an ingested row's output.
+    std::string mtp_layer_fwd(uint32_t T, uint32_t start_pos, bool kv_only = false);
     PleHistory ple_hist_{};
     float*   ple_conv_state_ = nullptr;   // [9, 10240] f32
     float*   ple_ws_ = nullptr;
@@ -607,6 +617,8 @@ private:
         std::vector<uint64_t> last_use;       // [C] LRU stamps
     };
     std::vector<ECache> ecache_;
+    // 2026-10-22: slots pinned for one prefill pass (IE_Q4E_PF_RING): a hit keeps the pin stamp instead of the clock
+    std::vector<uint8_t> pf_pin_mask_;
     uint64_t ecache_clock_ = 0;
     uint32_t ecache_slots_ = 0;
     // P4 B49: slots a layer can really use -- ecache_slots_ minus the most slots any layer of this stage lost to the

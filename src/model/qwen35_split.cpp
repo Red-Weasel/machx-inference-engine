@@ -1868,29 +1868,20 @@ std::string Qwen35SplitModel::init_lanes(uint32_t n_lanes, uint32_t lane_ctx, ui
     lane_ctx_ = lane_ctx;
     lane_kv_.resize(n_lanes - 1);
     lane_dn_.resize(n_lanes - 1);
-    for (uint32_t l = 0; l + 1 < n_lanes; ++l) {
-        lane_kv_[l].resize(n_dev_);
-        lane_dn_[l].resize(n_dev_);
-        for (uint32_t dev = 0; dev < n_dev_; ++dev) {
-            uint64_t got = 0;
-            if (kv_[dev].ready()) {
-                KvCacheConfig kc = kv_[dev].config();
-                kc.max_ctx = lane_ctx;
-                if (auto m = lane_kv_[l][dev].init(fleet_->dev(dev), kc); !m.empty())
-                    return "lane " + std::to_string(l + 1) + " kv card " + std::to_string(dev) + ": " + m;
-                got += 2 * lane_kv_[l][dev].bytes_per_layer() * kc.n_layers_full;
-            }
-            if (dn_[dev].ready()) {
-                auto& d = lane_dn_[l][dev];
-                if (auto m = d.init(fleet_->dev(dev), dn_[dev].config()); !m.empty())
-                    return "lane " + std::to_string(l + 1) + " deltanet card " + std::to_string(dev) + ": " + m;
-                got += d.config().n_layers_linear * (d.state_elems_per_layer() * sizeof(float) + d.conv_elems_per_layer() * sizeof(sycl::half));
-            }
-            if (got != lane_bytes_[dev])
-                return "request lanes: internal: card " + std::to_string(dev) + " allocated " + std::to_string(got) +
-                       " bytes per lane, the arithmetic says " + std::to_string(lane_bytes_[dev]);
-        }
-    }
+    for (uint32_t l = 0; l + 1 < n_lanes; ++l) { lane_kv_[l].resize(n_dev_); lane_dn_[l].resize(n_dev_); }
+    // 2026-10-22: a lane's KV and DeltaNet state are allocated when a request first lands on it (lane_ensure, from the
+    // lanes' prefix_prepare), not at the load. At the owner's launch (Q8_0, --ctx 222222 --parallel 8 --slot-ctx 60000)
+    // the seven idle lanes took 13.3 GiB a card at the load, the MTP rounds were then refused on "32 MiB free" and the
+    // prompt cache got 0 GB: the 27B decoded plain (17.5 tok/s against 29 with the rounds) and re-read every turn (4 s).
+    // Now the rounds and the cache size themselves on what is free while the lanes are idle; a lane that fills later
+    // allocates as asked (the lanes' own policy, P4 B60). IE_QWEN35_LANES_EAGER=1 = every lane at the load, as before.
+    lanes_lazy_ = ![] { const char* v = std::getenv("IE_QWEN35_LANES_EAGER"); return v && *v == '1'; }();
+    if (lanes_lazy_)
+        std::fprintf(stderr, "[qwen35split] lanes 1..%u allocate on their first request (%.3f GiB a lane on card 0; "
+                             "IE_QWEN35_LANES_EAGER=1 = at the load)\n", n_lanes - 1, lane_bytes_[0] / 1073741824.0);
+    else
+        for (uint32_t l = 1; l < n_lanes; ++l)
+            if (auto m = lane_ensure(l); !m.empty()) return m;
     auto& hd = fleet_->dev(plan_.head_dev);
     lane_logits_ = static_cast<sycl::half*>(hd.malloc(uint64_t(cfg_.dense.vocab) * sizeof(sycl::half)));
     if (!lane_logits_) return "request lanes: logits buffer alloc failed";
@@ -1915,6 +1906,67 @@ std::string Qwen35SplitModel::init_lanes(uint32_t n_lanes, uint32_t lane_ctx, ui
         rows_table_[dev] = t;
     }
     lane_vis_.assign(this->n_lanes(), VisStage{});   // (sized once: the stage threads read other lanes' entries)
+    return {};
+}
+
+bool Qwen35SplitModel::lane_ready(uint32_t lane) const {
+    if (lane == 0) return true;
+    if (lane > lane_kv_.size()) return false;
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+        if (kv_[dev].ready() && !lane_kv_[lane - 1][dev].ready()) return false;
+        if (dn_[dev].ready() && !lane_dn_[lane - 1][dev].ready()) return false;
+    }
+    return true;
+}
+
+std::string Qwen35SplitModel::lane_ensure(uint32_t lane) {
+    if (lane == 0) return {};
+    if (lane > lane_kv_.size()) return "lane " + std::to_string(lane) + ": no such request lane";
+    std::lock_guard<std::mutex> g(lanes_mu_);
+    if (lane_ready(lane)) return {};
+    const uint32_t l = lane - 1;
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+        uint64_t got = 0;
+        if (kv_[dev].ready()) {
+            if (!lane_kv_[l][dev].ready()) {
+                KvCacheConfig kc = kv_[dev].config();
+                kc.max_ctx = lane_ctx_;
+                if (auto m = lane_kv_[l][dev].init(fleet_->dev(dev), kc); !m.empty())
+                    return "lane " + std::to_string(lane) + " kv card " + std::to_string(dev) + ": " + m;
+            }
+            got += 2 * lane_kv_[l][dev].bytes_per_layer() * kv_[dev].config().n_layers_full;
+        }
+        if (dn_[dev].ready()) {
+            auto& d = lane_dn_[l][dev];
+            if (!d.ready())
+                if (auto m = d.init(fleet_->dev(dev), dn_[dev].config()); !m.empty())
+                    return "lane " + std::to_string(lane) + " deltanet card " + std::to_string(dev) + ": " + m;
+            got += d.config().n_layers_linear * (d.state_elems_per_layer() * sizeof(float) + d.conv_elems_per_layer() * sizeof(sycl::half));
+        }
+        if (got != lane_bytes_[dev])
+            return "request lanes: internal: card " + std::to_string(dev) + " allocated " + std::to_string(got) +
+                   " bytes for lane " + std::to_string(lane) + ", the arithmetic says " + std::to_string(lane_bytes_[dev]);
+    }
+    if (auto m = lane_mtp_alloc(lane); !m.empty()) return m;
+    if (lanes_lazy_) std::fprintf(stderr, "[qwen35split] lane %u allocated on its first request\n", lane);
+    return {};
+}
+
+// the lane's round checkpoints and KV-length snapshots (what init_lane_mtp built for every lane at once before the lanes
+// were lazy): idempotent, nothing to do while the rounds are off or the lane has no state yet
+std::string Qwen35SplitModel::lane_mtp_alloc(uint32_t lane) {
+    if (!lmtp_V_ || lane >= lmtp_.size()) return {};
+    LaneMtp& m = lmtp_[lane];
+    if (m.ready) return {};
+    if (m.ck.size() != n_dev_) m.ck.resize(n_dev_);
+    if (m.kvsnap.size() != n_dev_) m.kvsnap.assign(n_dev_, {});
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+        if (lane_dn(lane, dev).ready())
+            if (auto e = m.ck[dev].init(fleet_->dev(dev), lane_dn(lane, dev), lmtp_V_); !e.empty())
+                return "MTP rounds: lane " + std::to_string(lane) + " checkpoints on card " + std::to_string(dev) + ": " + e;
+        if (lane_kv(lane, dev).ready()) m.kvsnap[dev].assign(lane_kv(lane, dev).config().n_layers_full, 0);
+    }
+    m.ready = true;
     return {};
 }
 
@@ -2152,28 +2204,22 @@ std::string Qwen35SplitModel::init_lane_mtp(uint32_t V) {
     }
     lmtp_.clear();
     lmtp_.resize(n);   // (never resized again: the checkpoints free their own storage)
+    lmtp_V_ = V;       // (lane_mtp_alloc reads it; a lazy lane builds its checkpoints when it fills)
     auto& ha = fleet_->dev(hd);
     for (uint32_t lane = 0; lane < n; ++lane) {
         LaneMtp& m = lmtp_[lane];
         m.ck.resize(n_dev_);
         m.kvsnap.assign(n_dev_, {});
-        for (uint32_t dev = 0; dev < n_dev_; ++dev) {
-            if (lane_dn(lane, dev).ready())
-                if (auto e = m.ck[dev].init(fleet_->dev(dev), lane_dn(lane, dev), V); !e.empty()) {
-                    lmtp_.clear();
-                    return "MTP rounds: lane " + std::to_string(lane) + " checkpoints on card " + std::to_string(dev) + ": " + e;
-                }
-            if (lane_kv(lane, dev).ready()) m.kvsnap[dev].assign(lane_kv(lane, dev).config().n_layers_full, 0);
-        }
+        if (lane_ready(lane))
+            if (auto e = lane_mtp_alloc(lane); !e.empty()) { lmtp_.clear(); lmtp_V_ = 0; return e; }
         m.d_all  = static_cast<sycl::half*>(ha.malloc(uint64_t(V) * vocab * sizeof(sycl::half)));
         m.d_hid  = static_cast<sycl::half*>(ha.malloc(uint64_t(V) * H * sizeof(sycl::half)));
         m.h_last = static_cast<sycl::half*>(ha.malloc(uint64_t(H) * sizeof(sycl::half)));
         for (void* p : {static_cast<void*>(m.d_all), static_cast<void*>(m.d_hid), static_cast<void*>(m.h_last)})
             if (p) owned_[hd].push_back(p);
-        if (!m.d_all || !m.d_hid || !m.h_last) { lmtp_.clear(); return "MTP rounds: lane " + std::to_string(lane) + " buffers alloc failed"; }
+        if (!m.d_all || !m.d_hid || !m.h_last) { lmtp_.clear(); lmtp_V_ = 0; return "MTP rounds: lane " + std::to_string(lane) + " buffers alloc failed"; }
     }
     lmtp_bytes_ = need;
-    lmtp_V_ = V;
     return {};
 }
 
