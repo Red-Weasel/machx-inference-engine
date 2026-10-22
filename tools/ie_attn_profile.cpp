@@ -38,6 +38,7 @@
 #define BLU "\033[34m"
 
 static volatile bool g_stop = false;
+static bool g_xmx = false;   // P4 B70: --mode xmx = full_attention_fa2_decode_xmx straight (the 27B/35B decode kernel at hd 256)
 static void on_signal(int) { g_stop = true; }
 
 // ── tiny helpers ──────────────────────────────────────────────────────────────
@@ -192,7 +193,13 @@ static AvgResult run_sweep(sycl::queue& q,
         ie::AttnProfileData prof;
 
         for (uint32_t layer = 0; layer < n_layers && !g_stop; ++layer) {
-            if (!use_int8) {
+            if (!use_int8 && g_xmx) {
+                ie::full_attention_fa2_decode_xmx(q, q_buf, k_buf, v_buf,
+                                                  k_cache, v_cache, y_buf, parts,
+                                                  pos, n_q_heads, n_kv_heads,
+                                                  head_dim, max_ctx, {},
+                                                  measuring ? &prof : nullptr);
+            } else if (!use_int8) {
                 ie::full_attention_fa2_decode(q, q_buf, k_buf, v_buf,
                                               k_cache, v_cache, y_buf, parts,
                                               pos, n_q_heads, n_kv_heads,
@@ -345,6 +352,7 @@ int main(int argc, char** argv) {
             const char* m = argv[++i];
             do_fp16 = (strstr(m, "fp16") || !strcmp(m, "both"));
             do_int8 = (strstr(m, "int8") || !strcmp(m, "both"));
+            if (strstr(m, "xmx")) { g_xmx = true; do_fp16 = true; do_int8 = false; }   // (rows print as "fp16")
         }
     }
 
@@ -375,7 +383,8 @@ int main(int argc, char** argv) {
     size_t cache_sz  = size_t(n_kv_heads) * max_ctx * head_dim;
     size_t scales_sz = size_t(n_kv_heads) * max_ctx;
     // partials: worst-case super_chunks × q_heads × (head_dim+2)
-    size_t n_super_max = (size_t(max_ctx) / 64 / 8 + 2);
+    // (P4 B70: the XMX kernel carries up to kFa2XmxTargetSubgroups = 512 partials a kv head; the fp16 one max_ctx/64/8)
+    size_t n_super_max = std::max<size_t>(size_t(max_ctx) / 64 / 8 + 2, 512 + 2);
     size_t parts_sz    = n_super_max * n_q_heads * (head_dim + 2);
 
     auto* q_buf   = sycl::malloc_device<sycl::half>(q_sz,    q);

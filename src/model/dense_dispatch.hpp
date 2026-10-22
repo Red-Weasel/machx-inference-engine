@@ -53,6 +53,20 @@ sycl::event residual_add_rms_norm_fused(sycl::queue& q,
                                         uint32_t n_rows, uint32_t hidden,
                                         float eps,
                                         const std::vector<sycl::event>& deps = {});
+// P4 B70: residual_add + rms_norm_f32w in one launch, bit for bit (src/ops/elementwise.cpp)
+sycl::event residual_add_rms_norm_exact(sycl::queue& q, sycl::half* ws_x, const sycl::half* ws_block, const float* w_norm,
+                                        sycl::half* ws_normed, uint32_t n_rows, uint32_t hidden, float eps,
+                                        const std::vector<sycl::event>& deps = {});
+// P4 B70: the three norms above + quantize_q8_1 of the normed rows into out_q8 (block_q8_1x [n_rows * hidden / 32]), one
+// launch, the same bits as the norm then quantize_q8_1 (hidden % 32 == 0, 512 < hidden <= 8192)
+sycl::event rms_norm_f32w_quant_q8_1(sycl::queue& q, const sycl::half* x, const float* w, sycl::half* y, void* out_q8,
+                                     uint32_t n_rows, uint32_t hidden, float eps, const std::vector<sycl::event>& deps = {});
+sycl::event residual_add_rms_norm_exact_quant_q8_1(sycl::queue& q, sycl::half* ws_x, const sycl::half* ws_block, const float* w_norm,
+                                                   sycl::half* ws_normed, void* out_q8, uint32_t n_rows, uint32_t hidden, float eps,
+                                                   const std::vector<sycl::event>& deps = {});
+sycl::event residual_add_rms_norm_fused_quant_q8_1(sycl::queue& q, sycl::half* ws_x, const sycl::half* ws_block, const float* w_norm,
+                                                   sycl::half* ws_normed, void* out_q8, uint32_t n_rows, uint32_t hidden, float eps,
+                                                   const std::vector<sycl::event>& deps = {});
 
 namespace dense {
 

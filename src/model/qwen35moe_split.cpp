@@ -850,14 +850,20 @@ bool Qwen35MoeSplitModel::dn_scan_on() {
 }
 
 sycl::event Qwen35MoeSplitModel::sgemv(uint32_t dev, const sycl::half* A, const SplitW& w,
-                                       sycl::half* out, uint32_t K, uint32_t N, uint32_t T) {
+                                       sycl::half* out, uint32_t K, uint32_t N, uint32_t T, const void* pre_q8) {
     auto& alloc = fleet_->dev(dev);
     auto& q = alloc.queue();
-    if (w.kq.lo && T == 1) return kq_gemv(dev, act_q8_[dev], A, w, out, K, N, 1);   // P4 B21
+    if (act_src_.size() != n_dev_) act_src_.assign(n_dev_, nullptr);
+    if (w.kq.lo && T == 1) {   // P4 B21
+        sycl::event e = kq_gemv(dev, act_q8_[dev], A, w, out, K, N, 1, pre_q8);
+        if (!pre_q8) act_src_[dev] = A;
+        return e;
+    }
     if (!w.int_dot()) return dense::gemv_q_T(q, A, w.fp, out, K, N, T);
     if (T == 1) {
-        DPE(dev, kQuant, quantize_q8_1(q, A, act_q8_[dev], K));
-        sycl::event e = gemv_q8_0_soa_q8_sel(q, act_q8_[dev], w.q8_qs, w.q8_d, out, K, N);
+        const void* act = pre_q8;   // P4 B70: the caller's quantization of A, or this call's
+        if (!act) { DPE(dev, kQuant, quantize_q8_1(q, A, act_q8_[dev], K)); act = act_q8_[dev]; act_src_[dev] = A; }
+        sycl::event e = gemv_q8_0_soa_q8_sel(q, act, w.q8_qs, w.q8_d, out, K, N);
         if (g_dp35.active()) g_dp35.tag(dev, e, DecodeProf::kGemv);
         return e;
     }
@@ -1116,12 +1122,26 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
         ~PadGuard() { f = false; }
     } pad_guard(sgemv_pad_);
 
+    // P4 B70: a layer's residual add (x += moe_y) is folded into the NEXT layer's norm on this card (one launch, the same
+    // bits: residual_add_rms_norm_exact); the card's last layer adds it after the loop
+    bool pending = false;
     for (uint32_t L = 0; L < n_layers; ++L) {
         if (plan_.dev_of_layer[L] != dev) continue;
         if (aborting(T)) return;   // P4 B33: the engine is stopping -- no new layer (the caller drains the queue)
         const LayerW& w_l = layers_[L];
         double _ta = 0.0; if (dbg_timing) { q.wait(); _ta = now_ms(); }
-        DPE(dev, kNorm, rms_norm_f32w(q, w.x, w_l.attn_norm, w.x_normed, T, H, eps));
+        if (act_src_.size() != n_dev_) act_src_.assign(n_dev_, nullptr);
+        act_src_[dev] = nullptr;   // P4 B70: the norm below rewrites x_normed
+        // P4 B70: at T = 1 the norm quantizes its row into act_q8_ too (the projections' int-dot activation) and the
+        // post-attention norm into x_q8 (the MoE's): two quantize launches a layer fewer, the same blocks
+        const bool nq = T == 1 && H % 32 == 0 && H > 512 && H <= 8192 && act_q8_[dev] != nullptr && w.x_q8 != nullptr;
+        if (pending) {
+            if (nq) DPE(dev, kNorm, residual_add_rms_norm_exact_quant_q8_1(q, w.x, w.moe_y, w_l.attn_norm, w.x_normed, act_q8_[dev], T, H, eps));
+            else DPE(dev, kNorm, residual_add_rms_norm_exact(q, w.x, w.moe_y, w_l.attn_norm, w.x_normed, T, H, eps));
+            pending = false;
+        } else if (nq) DPE(dev, kNorm, rms_norm_f32w_quant_q8_1(q, w.x, w_l.attn_norm, w.x_normed, act_q8_[dev], T, H, eps));
+        else DPE(dev, kNorm, rms_norm_f32w(q, w.x, w_l.attn_norm, w.x_normed, T, H, eps));
+        if (nq) act_src_[dev] = w.x_normed;
 
         if (w_l.is_linear) {
             const uint32_t SKH = cfg_.ssm_n_k_heads;          // 16
@@ -1133,16 +1153,24 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
             const uint32_t rep = SVH / SKH;                   // 2 (16→32) — crown TILE
             const float qscale = 1.0f / sycl::sqrt(float(SHD));
 
-            sgemv(dev, w.x_normed, w_l.attn_qkv, w.dn_qkv, H, conv_ch, T);
+            sgemv(dev, w.x_normed, w_l.attn_qkv, w.dn_qkv, H, conv_ch, T,   // P4 B70: the norm's quantization of the row
+                  (T == 1 && act_src_[dev] == w.x_normed) ? act_q8_[dev] : nullptr);
             sycl::half* conv_state = dn_at(dev).conv_state_ptr() +
                 uint64_t(dn_local_[L]) * dn_at(dev).conv_elems_per_layer();
             DPE(dev, kDnConv, depthwise_conv1d_causal(q, w.dn_qkv, w_l.ssm_conv1d_fp16, conv_state,
                                     w.dn_conv, T, conv_ch, cfg_.ssm_conv_kernel));
+            if (T == 1 && SHD == 128 && (SKH == 16 || SKH == 24) && rep == 2) {
+                // P4 B70: the decode step's split + L2 norms + tiled repeats in ONE launch (dn_qkv_split_norm_fused, the
+                // single-card crown's since v1.4): on the B70 its per-head sum is l2_norm_scale's (the same lane order and
+                // fma chain), the tiled copies are repeat_interleave_heads', the V cast is cast_qkv_split's -- the same bits
+                DPE(dev, kDnMisc, dn_qkv_split_norm_fused(q, w.dn_conv, w.dn_qrep, w.dn_krep, w.dn_vpre, T, SKH, SHD, qscale, 1e-6f));
+            } else {
             DPE(dev, kDnMisc, cast_qkv_split_fp16_to_fp32(q, w.dn_conv, w.dn_qpre, w.dn_kpre, w.dn_vpre, T, kw, SI));
             DPE(dev, kDnMisc, l2_norm_scale(q, w.dn_qpre, w.dn_qpre, T * SKH, SHD, qscale, 1e-6f));
             DPE(dev, kDnMisc, l2_norm_scale(q, w.dn_kpre, w.dn_kpre, T * SKH, SHD, 1.0f,   1e-6f));
             DPE(dev, kDnMisc, repeat_interleave_heads(q, w.dn_qpre, w.dn_qrep, T, SKH, SHD, rep));
             DPE(dev, kDnMisc, repeat_interleave_heads(q, w.dn_kpre, w.dn_krep, T, SKH, SHD, rep));
+            }
             const uint32_t SVHp = ((SVH + 63u) / 64u) * 64u;
             if (T == 1 && w_l.ssm_alpha.dt == DType::kF16 && w_l.ssm_beta.dt == DType::kF16) {
                 // P4 B22: both [H, 64] F16 projections in ONE launch; per (row, mat) the T = 1 gemv_fp16 body verbatim
@@ -1153,10 +1181,15 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
             DPE(dev, kGemvSmall, dense::gemv_q_T(q, w.x_normed, w_l.ssm_alpha, w.dn_alpha64, H, SVHp, T));
             DPE(dev, kGemvSmall, dense::gemv_q_T(q, w.x_normed, w_l.ssm_beta,  w.dn_beta64,  H, SVHp, T));
             }
+            if (T == 1) {   // P4 B70: one row -- its first SVH of the SVHp padded columns ARE the row: no copies
+                DPE(dev, kDnMisc, compute_g_beta_h16(q, w.dn_alpha64, w.dn_beta64, w_l.ssm_a, w_l.ssm_dt_bias,
+                                   w.dn_g, w.dn_beta, 1, SVH));
+            } else {
             DPE(dev, kDnMisc, extract_cols(q, w.dn_alpha64, w.dn_alpha_h, T, SVH, SVHp));
             DPE(dev, kDnMisc, extract_cols(q, w.dn_beta64,  w.dn_beta_h,  T, SVH, SVHp));
             DPE(dev, kDnMisc, compute_g_beta_h16(q, w.dn_alpha_h, w.dn_beta_h, w_l.ssm_a, w_l.ssm_dt_bias,
                                w.dn_g, w.dn_beta, T, SVH));
+            }
             float* state_layer = dn_at(dev).state_ptr() +
                 uint64_t(dn_local_[L]) * dn_at(dev).state_elems_per_layer();
             if (dn_scan_on() && (T >= kAttnGemmMinT || (look_rows_[dev] && T > 1)) && SHD == 128)   // P4 B49 (B53: a lookup round)
@@ -1164,14 +1197,20 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
             else
             DPE(dev, kDnRec, deltanet_recurrence(q, w.dn_qrep, w.dn_krep, w.dn_vpre, w.dn_g, w.dn_beta,
                                 state_layer, w.dn_out, /*B=*/1, T, SVH, SHD, SHD));
-            sgemv(dev, w.x_normed, w_l.attn_gate, w.dn_z, H, SI, T);
+            // P4 B70: attn_qkv's quantization of x_normed (nothing rewrote it since) serves the gate projection too
+            sgemv(dev, w.x_normed, w_l.attn_gate, w.dn_z, H, SI, T,
+                  (T == 1 && act_src_.size() == n_dev_ && act_src_[dev] == w.x_normed) ? act_q8_[dev] : nullptr);
             DPE(dev, kDnMisc, gated_rms_norm(q, w.dn_out, w.dn_z, w_l.ssm_norm_fp16, w.dn_qkv, T * SVH, SHD, eps));
             sgemv(dev, w.dn_qkv, w_l.ssm_out, w.attn_block, SI, H, T);
         } else {
-            sgemv(dev, w.x_normed, w_l.attn_q, w.qg, H, N_qg, T);
+            sgemv(dev, w.x_normed, w_l.attn_q, w.qg, H, N_qg, T,   // P4 B70: the norm's quantization of the row
+                  (T == 1 && act_src_[dev] == w.x_normed) ? act_q8_[dev] : nullptr);
             DPE(dev, kAttnPre, split_q_gate_per_head(q, w.qg, w.q, w.gate, T, cfg_.n_q_heads, HD));
-            sgemv(dev, w.x_normed, w_l.attn_k, w.k, H, N_kv, T);
-            sgemv(dev, w.x_normed, w_l.attn_v, w.v, H, N_kv, T);
+            {   // P4 B70: k and v read the q projection's quantization of x_normed
+                const void* xq = (T == 1 && act_src_.size() == n_dev_ && act_src_[dev] == w.x_normed) ? act_q8_[dev] : nullptr;
+                sgemv(dev, w.x_normed, w_l.attn_k, w.k, H, N_kv, T, xq);
+                sgemv(dev, w.x_normed, w_l.attn_v, w.v, H, N_kv, T, xq);
+            }
             DPE(dev, kAttnPre, rms_norm_f32w(q, w.q, w_l.attn_q_norm, w.q, T * cfg_.n_q_heads,  HD, eps));
             DPE(dev, kAttnPre, rms_norm_f32w(q, w.k, w_l.attn_k_norm, w.k, T * cfg_.n_kv_heads, HD, eps));
             if (mrope) {   // P4 B45 vision: the 3-stream M-RoPE (== rope_partial when the streams are equal)
@@ -1246,7 +1285,11 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
         }
 
         // residual + post-attn norm → MoE.
-        DPE(dev, kNorm, residual_add_rms_norm_fused(q, w.x, w.attn_block, w_l.post_attn_norm, w.x_normed, T, H, eps));
+        // P4 B70: at T = 1 this norm quantizes the MoE's activation (x_q8) in the same launch
+        bool xq8_pre = false;
+        if (nq) { DPE(dev, kNorm, residual_add_rms_norm_fused_quant_q8_1(q, w.x, w.attn_block, w_l.post_attn_norm, w.x_normed, w.x_q8, T, H, eps)); xq8_pre = true; }
+        else DPE(dev, kNorm, residual_add_rms_norm_fused(q, w.x, w.attn_block, w_l.post_attn_norm, w.x_normed, T, H, eps));
+        act_src_[dev] = nullptr;   // x_normed is rewritten
         if (dbg_timing) { q.wait(); t_attn += now_ms() - _ta; _ta = now_ms(); }
         if (std::getenv("IE_MOE_DBG")) { std::fprintf(stderr,"[L%u T%u dev%u attn-done is_lin=%d]\n",L,T,dev,(int)w_l.is_linear); q.wait(); }
 
@@ -1254,7 +1297,12 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
         // router → quantize x → gate_up_silu_q8 → quantize h → down_q8 → reduce.
         // topk_idx/topk_w stay on device; the grouped kernels read the expert id
         // per token-slot from device memory. ----
-        DPE(dev, kRouter, moe_router(q, w.x_normed, w_l.ffn_gate_inp, w.topk_idx, w.topk_w, T, H, E, Kt));
+        // P4 B70: at T = 1 the shared-expert gate's serial chain (shexp_gate_serial's, bit for bit) runs as one extra
+        // work-group of the router's dot launch, under the 256 expert dots instead of as its own ~14 us kernel after the
+        // shared expert (its input x_normed is final here; dn_g is free: the recurrence consumed it before the MoE)
+        const bool gate_in_router = T == 1 && w_l.ffn_gate_inp_shexp != nullptr && w.dn_g != nullptr && E == 256 && Kt == 8;
+        DPE(dev, kRouter, moe_router(q, w.x_normed, w_l.ffn_gate_inp, w.topk_idx, w.topk_w, T, H, E, Kt, {},
+                                     gate_in_router ? w_l.ffn_gate_inp_shexp : nullptr, gate_in_router ? w.dn_g : nullptr));
         if (std::getenv("IE_MOE_DBG") && dev > 0) {   // card-1 router input + topk sanity
             std::vector<sycl::half> _xn(H);
             fleet_->dev(dev).d2h(_xn.data(), w.x_normed, H * sizeof(sycl::half));
@@ -1277,6 +1325,7 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
         // the crown moe_decode_*_q4k kernels are single-token (no T arg).
         const bool moe_c32 = w_l.exp_gate.c32.lo != nullptr;   // P4 B21: Q6_K / Q5_K experts
         const bool moe_native = !moe_c32 && w_l.exp_gate.dtype != DType::kQ8_0;
+        bool xq8_ok = false;   // P4 B70: x_q8 holds this layer's x_normed quantized (the decode routes below) -> the shared expert reads it
         if (T > 1 && (!no_prefill_gemm || moe_native)) {
             const uint32_t TOTAL = T * Kt;
             // Pull topk to host (the only blocking read), counting-sort by expert,
@@ -1354,7 +1403,8 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
         // T·H elements at once is identical to a per-row loop but a SINGLE enqueue
         // (the per-row loop overran the device command queue → DEVICE_LOST).
         if (moe_c32) {   // P4 B21: the per-slot c32 kernels (the rows path runs the same ones)
-            DPE(dev, kQuant, quantize_q8_1(q, w.x_normed, static_cast<block_q8_1x*>(w.x_q8), uint32_t(T) * H));
+            if (!xq8_pre) DPE(dev, kQuant, quantize_q8_1(q, w.x_normed, static_cast<block_q8_1x*>(w.x_q8), uint32_t(T) * H));
+            xq8_ok = true;
             DPE(dev, kMoe, moe_gate_up_silu_c32(q, w.x_q8, w_l.exp_gate.c32, w_l.exp_up.c32, w.topk_idx, w.moe_hp, T, Kt, H, EFF));
             DPE(dev, kQuant, quantize_q8_1(q, w.moe_hp, static_cast<block_q8_1x*>(w.h_q8), uint32_t(T) * Kt * EFF));
             DPE(dev, kMoe, moe_down_c32(q, w.h_q8, w_l.exp_down.c32, w.topk_idx, w.topk_w, w.moe_yp, T, Kt, EFF, H));
@@ -1375,7 +1425,8 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
                                     w.moe_y, H, EFF, Kt,
                                     w_l.exp_down.expert_stride_bytes, w_l.exp_down.soa);
         } else {
-        DPE(dev, kQuant, quantize_q8_1(q, w.x_normed, static_cast<block_q8_1x*>(w.x_q8), uint32_t(T) * H));
+        if (!xq8_pre) DPE(dev, kQuant, quantize_q8_1(q, w.x_normed, static_cast<block_q8_1x*>(w.x_q8), uint32_t(T) * H));
+        xq8_ok = true;
         DPE(dev, kMoe, moe_gate_up_silu_q8(q, w.x_q8, w_l.exp_gate.qs, w_l.exp_gate.d,
                             w_l.exp_up.qs, w_l.exp_up.d, w_l.exp_gate.qs_stride,
                             w_l.exp_gate.d_stride, w.topk_idx, w.moe_hp, T, Kt, H, EFF));
@@ -1387,27 +1438,38 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
         }
         // shared expert (always-on, sigmoid-gated).
         if (w_l.ffn_gate_inp_shexp) {
-            sgemv(dev, w.x_normed, w_l.sh_gate, w.gate_o, H, EFF, T);
-            sgemv(dev, w.x_normed, w_l.sh_up,   w.up_o,   H, EFF, T);
+            {   // P4 B70: the MoE route's quantization of x_normed (x_q8) serves the shared expert's gate and up
+                const void* xq8 = (T == 1 && xq8_ok) ? w.x_q8 : nullptr;
+                sgemv(dev, w.x_normed, w_l.sh_gate, w.gate_o, H, EFF, T, xq8);
+                sgemv(dev, w.x_normed, w_l.sh_up,   w.up_o,   H, EFF, T, xq8);
+            }
+            if (T == 1 && EFF % 32 == 0 && (w_l.sh_down.int_dot() || w_l.sh_down.kq.lo)) {
+                // P4 B70: the SiLU product and sh_down's activation quantize in one launch (the same bits)
+                DPE(dev, kElem, swiglu_quant_q8_1(q, w.gate_o, w.up_o, w.ffn_h, act_q8_[dev], EFF));
+                sgemv(dev, w.ffn_h, w_l.sh_down, w.eo, EFF, H, T, act_q8_[dev]);
+            } else {
             DPE(dev, kElem, swiglu(q, w.gate_o, w.up_o, w.ffn_h, uint64_t(T) * EFF));
             sgemv(dev, w.ffn_h, w_l.sh_down, w.eo, EFF, H, T);
+            }
             // shared-expert gate g[t]=sigmoid(ffn_gate_inp_shexp · x_normed[t]);
             // moe_y += eo*g. [VERIFY gate semantics vs qwen36.cpp:1775-1829.]
             {
                 float* dng = w.dn_g; const float* gw = w_l.ffn_gate_inp_shexp;
                 const sycl::half* xn = w.x_normed; const sycl::half* eo = w.eo;
                 sycl::half* my = w.moe_y; const uint32_t HH = H;
-                DPE(dev, kShexpGate, shexp_gate_serial(q, xn, gw, dng, T, HH));   // P4 B22
+                // P4 B70: at T = 1 the router launch computed the gate (the same serial chain, moe_router's extra work-group)
+                if (!gate_in_router) DPE(dev, kShexpGate, shexp_gate_serial(q, xn, gw, dng, T, HH));   // P4 B22
                 DPE(dev, kElem, q.parallel_for(sycl::range<1>(uint64_t(T) * HH), [=](sycl::id<1> i) {
                     const uint32_t t = uint32_t(uint64_t(i) / HH);
                     my[i] = sycl::half(float(my[i]) + float(eo[i]) * dng[t]);
                 }));
             }
         }
-        DPE(dev, kElem, residual_add(q, w.x, w.moe_y, w.x, uint64_t(T) * H));
+        pending = true;   // P4 B70: x += moe_y goes with the next layer's norm (or after the loop)
         if (dbg_timing) { q.wait(); t_moe += now_ms() - _ta; }
         if (std::getenv("IE_MOE_DBG")) { std::fprintf(stderr,"[L%u T%u dev%u moe-done]\n",L,T,dev); q.wait(); }
     }
+    if (pending) DPE(dev, kElem, residual_add(q, w.x, w.moe_y, w.x, uint64_t(T) * H));
 }
 
 // Final norm + lm_head of the last row into d_logits (device, head_dev); returns when it is written.
@@ -1813,18 +1875,25 @@ std::string Qwen35MoeSplitModel::rows_off_reason() const {
 }
 
 sycl::event Qwen35MoeSplitModel::srows(uint32_t dev, const sycl::half* A, const SplitW& w, sycl::half* out, uint32_t K,
-                                       uint32_t N, uint32_t G) {
-    if (w.kq.lo) return kq_gemv(dev, act_rows_[dev], A, w, out, K, N, G);   // P4 B21
+                                       uint32_t N, uint32_t G, const void* pre_q8) {
+    if (act_rows_src_.size() != n_dev_) act_rows_src_.assign(n_dev_, nullptr);
+    if (w.kq.lo) {   // P4 B21
+        sycl::event e = kq_gemv(dev, act_rows_[dev], A, w, out, K, N, G, pre_q8);
+        if (!pre_q8) act_rows_src_[dev] = A;
+        return e;
+    }
     auto& q = fleet_->dev(dev).queue();
-    quantize_q8_1(q, A, act_rows_[dev], G * K);
-    return gemv_q8_0_soa_q8_batched_sel(q, act_rows_[dev], w.q8_qs, w.q8_d, out, K, N, G);
+    const void* act = pre_q8;   // P4 B70: the caller's quantization of the G rows, or this call's
+    if (!act) { quantize_q8_1(q, A, act_rows_[dev], G * K); act = act_rows_[dev]; act_rows_src_[dev] = A; }
+    return gemv_q8_0_soa_q8_batched_sel(q, act, w.q8_qs, w.q8_d, out, K, N, G);
 }
 
 // P4 B21: the c32 GEMV over T rows of A (one kernel template for T = 1 and the G rows: a row's value does not depend on T)
 sycl::event Qwen35MoeSplitModel::kq_gemv(uint32_t dev, void* act, const sycl::half* A, const SplitW& w, sycl::half* out,
-                                         uint32_t K, uint32_t N, uint32_t T) {
+                                         uint32_t K, uint32_t N, uint32_t T, const void* pre_q8) {
     auto& q = fleet_->dev(dev).queue();
-    DPE(dev, kQuant, quantize_q8_1(q, A, act, T * K));
+    if (pre_q8) act = const_cast<void*>(pre_q8);   // P4 B70: already quantized by the caller (read only)
+    else DPE(dev, kQuant, quantize_q8_1(q, A, act, T * K));
     sycl::event e;
     if (w.kq.kind == 6)
         e = gemv_q6k_c32_q8(q, act, w.kq.lo, static_cast<const uint8_t*>(w.kq.hi), static_cast<const int8_t*>(w.kq.sc),
@@ -1858,6 +1927,7 @@ void Qwen35MoeSplitModel::run_layers_rows(uint32_t dev, std::span<const uint32_t
     // its own lane's cache, so the bytes are the loop's; each layer runs from the plan with its KV slot.
     FaDecodeRowsPlan rows_plan;
     bool rows_on = false;
+    bool pending = false;   // P4 B70: as run_layers: a layer's x += moe_y rides with the next layer's norm
     if (q35::rows_attn() && dev < rows_partials_.size() && rows_partials_[dev] && rows_table_[dev]) {
         FaDecodeRow rows[kMaxRows];
         for (uint32_t i = 0; i < G; ++i) {
@@ -1882,7 +1952,18 @@ void Qwen35MoeSplitModel::run_layers_rows(uint32_t dev, std::span<const uint32_t
     for (uint32_t L = 0; L < cfg_.n_layers; ++L) {
         if (plan_.dev_of_layer[L] != dev) continue;
         const LayerW& w_l = layers_[L];
-        rms_norm_f32w(q, w.x, w_l.attn_norm, w.x_normed, G, H, eps);
+        if (act_rows_src_.size() != n_dev_) act_rows_src_.assign(n_dev_, nullptr);
+        act_rows_src_[dev] = nullptr;   // P4 B70: the norm rewrites x_normed
+        // P4 B70: the norm quantizes the G rows into act_rows_ (the projections' activation); the post-attention norm
+        // into x_q8 (the MoE's): two quantize launches a layer fewer, the same blocks
+        const bool nq = H % 32 == 0 && H > 512 && H <= 8192 && act_rows_[dev] != nullptr && w.x_q8 != nullptr;
+        if (pending) {
+            if (nq) residual_add_rms_norm_exact_quant_q8_1(q, w.x, w.moe_y, w_l.attn_norm, w.x_normed, act_rows_[dev], G, H, eps);
+            else residual_add_rms_norm_exact(q, w.x, w.moe_y, w_l.attn_norm, w.x_normed, G, H, eps);
+            pending = false;
+        } else if (nq) rms_norm_f32w_quant_q8_1(q, w.x, w_l.attn_norm, w.x_normed, act_rows_[dev], G, H, eps);
+        else rms_norm_f32w(q, w.x, w_l.attn_norm, w.x_normed, G, H, eps);
+        if (nq) act_rows_src_[dev] = w.x_normed;
         if (w_l.is_linear) {
             const uint32_t SKH = cfg_.ssm_n_k_heads;
             const uint32_t SVH = cfg_.ssm_n_v_heads;
@@ -1895,18 +1976,24 @@ void Qwen35MoeSplitModel::run_layers_rows(uint32_t dev, std::span<const uint32_t
             const float qscale = 1.0f / sycl::sqrt(float(SHD));
             const uint32_t SVHp = ((SVH + 63u) / 64u) * 64u;
 
-            srows(dev, w.x_normed, w_l.attn_qkv, w.dn_qkv, H, conv_ch, G);
+            srows(dev, w.x_normed, w_l.attn_qkv, w.dn_qkv, H, conv_ch, G,   // P4 B70: the norm's quantization of the rows
+                  act_rows_src_[dev] == w.x_normed ? act_rows_[dev] : nullptr);
             for (uint32_t i = 0; i < G; ++i) {
                 DeltaNetState& d = lane_dn(lanes[i], dev);
                 sycl::half* conv_state = d.conv_state_ptr() + uint64_t(dn_local_[L]) * d.conv_elems_per_layer();
                 depthwise_conv1d_causal(q, w.dn_qkv + uint64_t(i) * conv_ch, w_l.ssm_conv1d_fp16, conv_state,
                                         w.dn_conv + uint64_t(i) * conv_ch, 1, conv_ch, cfg_.ssm_conv_kernel);
             }
+            if (SHD == 128 && (SKH == 16 || SKH == 24) && rep == 2 && G <= 256) {
+                // P4 B70: as run_layers' T = 1 step: the split + L2 norms + tiled repeats of the G rows in one launch
+                dn_qkv_split_norm_fused(q, w.dn_conv, w.dn_qrep, w.dn_krep, w.dn_vpre, G, SKH, SHD, qscale, 1e-6f);
+            } else {
             cast_qkv_split_fp16_to_fp32(q, w.dn_conv, w.dn_qpre, w.dn_kpre, w.dn_vpre, G, kw, SI);
             l2_norm_scale(q, w.dn_qpre, w.dn_qpre, G * SKH, SHD, qscale, 1e-6f);
             l2_norm_scale(q, w.dn_kpre, w.dn_kpre, G * SKH, SHD, 1.0f,   1e-6f);
             repeat_interleave_heads(q, w.dn_qpre, w.dn_qrep, G, SKH, SHD, rep);
             repeat_interleave_heads(q, w.dn_kpre, w.dn_krep, G, SKH, SHD, rep);
+            }
             // alpha/beta per ROW: the G-row F16 route is another kernel (oneDNN / XMX gemm), not the T == 1 gemv
             if (w_l.ssm_alpha.dt == DType::kF16 && w_l.ssm_beta.dt == DType::kF16) {
                 // P4 B22: every row and both mats in ONE launch, the T = 1 decode's kernel (gemv_fp16_rows_dual)
@@ -1927,14 +2014,19 @@ void Qwen35MoeSplitModel::run_layers_rows(uint32_t dev, std::span<const uint32_t
                                     w.dn_g + uint64_t(i) * SVH, w.dn_beta + uint64_t(i) * SVH, state_layer,
                                     w.dn_out + uint64_t(i) * Vd, /*B=*/1, /*T=*/1, SVH, SHD, SHD);
             }
-            srows(dev, w.x_normed, w_l.attn_gate, w.dn_z, H, SI, G);
+            srows(dev, w.x_normed, w_l.attn_gate, w.dn_z, H, SI, G,   // P4 B70: attn_qkv's quantization of the rows
+                  (act_rows_src_.size() == n_dev_ && act_rows_src_[dev] == w.x_normed) ? act_rows_[dev] : nullptr);
             gated_rms_norm(q, w.dn_out, w.dn_z, w_l.ssm_norm_fp16, w.dn_qkv, G * SVH, SHD, eps);
             srows(dev, w.dn_qkv, w_l.ssm_out, w.attn_block, SI, H, G);
         } else {
-            srows(dev, w.x_normed, w_l.attn_q, w.qg, H, N_qg, G);
+            srows(dev, w.x_normed, w_l.attn_q, w.qg, H, N_qg, G,   // P4 B70: the norm's quantization of the rows
+                  act_rows_src_[dev] == w.x_normed ? act_rows_[dev] : nullptr);
             split_q_gate_per_head(q, w.qg, w.q, w.gate, G, cfg_.n_q_heads, HD);
-            srows(dev, w.x_normed, w_l.attn_k, w.k, H, N_kv, G);
-            srows(dev, w.x_normed, w_l.attn_v, w.v, H, N_kv, G);
+            {   // P4 B70: k and v read the q projection's quantization of the rows
+                const void* xq = (act_rows_src_.size() == n_dev_ && act_rows_src_[dev] == w.x_normed) ? act_rows_[dev] : nullptr;
+                srows(dev, w.x_normed, w_l.attn_k, w.k, H, N_kv, G, xq);
+                srows(dev, w.x_normed, w_l.attn_v, w.v, H, N_kv, G, xq);
+            }
             rms_norm_f32w(q, w.q, w_l.attn_q_norm, w.q, G * cfg_.n_q_heads,  HD, eps);
             rms_norm_f32w(q, w.k, w_l.attn_k_norm, w.k, G * cfg_.n_kv_heads, HD, eps);
             rope_partial(q, w.q, w.positions, w.q, G, cfg_.n_q_heads,  HD, rope_n, cfg_.rope_theta);   // row i at pos0[i]
@@ -1963,11 +2055,15 @@ void Qwen35MoeSplitModel::run_layers_rows(uint32_t dev, std::span<const uint32_t
             sigmoid_gate(q, w.attn_out, w.gate, w.attn_out, uint64_t(G) * N_q);
             srows(dev, w.attn_out, w_l.attn_output, w.attn_block, N_q, H, G);
         }
-        residual_add_rms_norm_fused(q, w.x, w.attn_block, w_l.post_attn_norm, w.x_normed, G, H, eps);
+        // P4 B70: this norm quantizes the MoE's G-row activation (x_q8) in the same launch
+        bool xq8_pre = false;
+        if (nq) { residual_add_rms_norm_fused_quant_q8_1(q, w.x, w.attn_block, w_l.post_attn_norm, w.x_normed, w.x_q8, G, H, eps); xq8_pre = true; }
+        else residual_add_rms_norm_fused(q, w.x, w.attn_block, w_l.post_attn_norm, w.x_normed, G, H, eps);
+        act_rows_src_[dev] = nullptr;   // x_normed is rewritten
 
         // MoE: always the Q8_0 decode chain over the G rows (never the prefill expert-GEMM branch)
         moe_router_rows(q, w.x_normed, w_l.ffn_gate_inp, w.topk_idx, w.topk_w, G, H, E, Kt);   // == the T == 1 router per row
-        quantize_q8_1(q, w.x_normed, static_cast<block_q8_1x*>(w.x_q8), uint32_t(G) * H);
+        if (!xq8_pre) quantize_q8_1(q, w.x_normed, static_cast<block_q8_1x*>(w.x_q8), uint32_t(G) * H);   // (P4 B70: the norm's)
         if (w_l.exp_gate.c32.lo) {   // P4 B21: the same per-slot c32 kernels as the T == 1 decode
             moe_gate_up_silu_c32(q, w.x_q8, w_l.exp_gate.c32, w_l.exp_up.c32, w.topk_idx, w.moe_hp, G, Kt, H, EFF);
             quantize_q8_1(q, w.moe_hp, static_cast<block_q8_1x*>(w.h_q8), uint32_t(G) * Kt * EFF);
@@ -1982,10 +2078,11 @@ void Qwen35MoeSplitModel::run_layers_rows(uint32_t dev, std::span<const uint32_t
         }
         moe_reduce_q8(q, w.moe_yp, w.moe_y, G, Kt, H);
         if (w_l.ffn_gate_inp_shexp) {
-            srows(dev, w.x_normed, w_l.sh_gate, w.gate_o, H, EFF, G);
-            srows(dev, w.x_normed, w_l.sh_up,   w.up_o,   H, EFF, G);
-            swiglu(q, w.gate_o, w.up_o, w.ffn_h, uint64_t(G) * EFF);
-            srows(dev, w.ffn_h, w_l.sh_down, w.eo, EFF, H, G);
+            srows(dev, w.x_normed, w_l.sh_gate, w.gate_o, H, EFF, G, w.x_q8);   // P4 B70: the MoE route's x_q8 (G rows)
+            srows(dev, w.x_normed, w_l.sh_up,   w.up_o,   H, EFF, G, w.x_q8);
+            // P4 B70: the SiLU product and sh_down's activation quantize (G rows) in one launch (the same bits)
+            swiglu_quant_q8_1(q, w.gate_o, w.up_o, w.ffn_h, act_rows_[dev], G * EFF);
+            srows(dev, w.ffn_h, w_l.sh_down, w.eo, EFF, H, G, act_rows_[dev]);
             {   // run_layers' shared-expert gate, verbatim (row-wise)
                 float* dng = w.dn_g; const float* gw = w_l.ffn_gate_inp_shexp;
                 const sycl::half* xn = w.x_normed; const sycl::half* eo = w.eo;
@@ -1997,8 +2094,9 @@ void Qwen35MoeSplitModel::run_layers_rows(uint32_t dev, std::span<const uint32_t
                 });
             }
         }
-        residual_add(q, w.x, w.moe_y, w.x, uint64_t(G) * H);
+        pending = true;   // P4 B70: x += moe_y goes with the next layer's norm (or after the loop)
     }
+    if (pending) residual_add(q, w.x, w.moe_y, w.x, uint64_t(G) * H);
 }
 
 std::string Qwen35MoeSplitModel::forward_stage_rows(uint32_t dev, std::span<const uint32_t> lanes, const int32_t* ids,

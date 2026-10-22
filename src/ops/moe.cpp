@@ -25,7 +25,8 @@ sycl::event moe_router(sycl::queue& q,
                        int32_t* topk_idx, sycl::half* topk_w,
                        uint32_t n_tokens, uint32_t hidden,
                        uint32_t n_experts, uint32_t k,
-                       const std::vector<sycl::event>& deps) {
+                       const std::vector<sycl::event>& deps,
+                       const float* sh_gate_w, float* sh_gate_out) {
     if (n_experts != 256 || k != 8) {
         // Phase 6 v1: only the Qwen3.6 router shape.
         return ie::ps(q, "moe_router", [&](sycl::handler& h) { h.depends_on(deps); h.single_task([](){}); });
@@ -56,14 +57,51 @@ sycl::event moe_router(sycl::queue& q,
             if (!slot) slot = sycl::malloc_device<float>(256, q);
             logits_buf = slot;
         }
+        // P4 B70: one extra work-group (e == 256) when the caller wants the shared-expert gate too: its first sub-group
+        // walks the crown's shexp_gate_serial chain (the same loads, shuffles and serial fp32 adds, so the same bits)
+        // while the 256 dots stream the router matrix; the other three sub-groups return.
+        const bool with_gate = sh_gate_w != nullptr && sh_gate_out != nullptr;
         ie::ps(q, "moe_router_dot", [&](sycl::handler& h) {
             h.depends_on(deps);
             constexpr uint32_t LWG = 64;
-            h.parallel_for(sycl::nd_range<1>(256 * LWG, LWG),
+            h.parallel_for(sycl::nd_range<1>(uint64_t(256 + (with_gate ? 1 : 0)) * LWG, LWG),
                            [=, lb = logits_buf](sycl::nd_item<1> it)
                                [[sycl::reqd_sub_group_size(16)]] {
                 const uint32_t e   = uint32_t(it.get_group(0));
                 const uint32_t lid = uint32_t(it.get_local_id(0));
+                if (e == 256) {
+#pragma clang fp reassociate(off)
+                    if (lid >= 16) return;
+                    constexpr uint32_t SG = 16, PER = 8, STEP = SG * PER;   // 128 elements a round, 8 per lane
+                    auto sg = it.get_sub_group();
+                    const sycl::half* xt = x;
+                    const float* gw = sh_gate_w;
+                    const uint32_t HH = hidden;
+                    const uint32_t full = HH / STEP * STEP;
+                    float gv[PER], xv[PER];
+                    if (full) {
+#pragma unroll
+                        for (uint32_t i = 0; i < PER; ++i) { gv[i] = gw[lid * PER + i]; xv[i] = float(xt[lid * PER + i]); }
+                    }
+                    float gg = 0.f;
+                    for (uint32_t h0 = 0; h0 < full; h0 += STEP) {
+                        float gn[PER], xnx[PER];
+                        const uint32_t hn = h0 + STEP < full ? h0 + STEP : h0;   // prefetch the next round (last round: a harmless reload)
+#pragma unroll
+                        for (uint32_t i = 0; i < PER; ++i) { gn[i] = gw[hn + lid * PER + i]; xnx[i] = float(xt[hn + lid * PER + i]); }
+#pragma unroll
+                        for (uint32_t j = 0; j < STEP; ++j) {
+                            const float a = sycl::select_from_group(sg, gv[j % PER], j / PER);
+                            const float b = sycl::select_from_group(sg, xv[j % PER], j / PER);
+                            gg += a * b;
+                        }
+#pragma unroll
+                        for (uint32_t i = 0; i < PER; ++i) { gv[i] = gn[i]; xv[i] = xnx[i]; }
+                    }
+                    for (uint32_t hh = full; hh < HH; ++hh) gg += gw[hh] * float(xt[hh]);   // tail (H % 128), same serial order
+                    if (lid == 0) sh_gate_out[0] = 1.f / (1.f + sycl::exp(-gg));
+                    return;
+                }
                 const auto* wv4 = reinterpret_cast<const sycl::vec<float, 4>*>(
                     W_gate + uint64_t(e) * hidden);
                 const auto* xv4 = reinterpret_cast<const sycl::vec<sycl::half, 4>*>(x);

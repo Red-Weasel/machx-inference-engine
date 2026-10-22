@@ -314,6 +314,145 @@ sycl::event residual_add_rms_norm_fused(sycl::queue& q,
     });
 }
 
+// P4 B70: residual_add + rms_norm_f32w in ONE launch with their bits: the sum is clamped and rounded to fp16 as
+// residual_add stores it, and the norm reads that stored value through rms_norm_f32w's hidden > 512 loop (WG 256, SG 16,
+// stride-WG partials, one group reduce), so x and x_normed equal the two launches' outputs. hidden <= 512 (the WG 32
+// variant) keeps the two launches.
+sycl::event residual_add_rms_norm_exact(sycl::queue& q, sycl::half* ws_x, const sycl::half* ws_block, const float* w_norm,
+                                        sycl::half* ws_normed, uint32_t n_rows, uint32_t hidden, float eps,
+                                        const std::vector<sycl::event>& deps) {
+    if (hidden <= 512) {
+        residual_add(q, ws_x, ws_block, ws_x, uint64_t(n_rows) * hidden, deps);
+        return rms_norm_f32w(q, ws_x, w_norm, ws_normed, n_rows, hidden, eps);
+    }
+    constexpr int WG_SIZE = 256;
+    constexpr int SG_SIZE = 16;
+    return ie::ps(q, "res_rms_exact", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(n_rows * WG_SIZE, WG_SIZE),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const uint32_t row = uint32_t(it.get_group(0));
+            const uint32_t lid = uint32_t(it.get_local_id(0));
+            sycl::half*       xr = ws_x      + row * hidden;
+            const sycl::half* br = ws_block  + row * hidden;
+            sycl::half*       nr = ws_normed + row * hidden;
+            float sum = 0.f;
+            for (uint32_t i = lid; i < hidden; i += WG_SIZE) {
+                float s = float(xr[i]) + float(br[i]);
+                s = sycl::fmin(sycl::fmax(s, -65504.0f), 65504.0f);
+                const sycl::half xh = sycl::half(s);
+                xr[i] = xh;
+                const float v = float(xh);
+                sum += v * v;
+            }
+            sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+            const float rsqrt = sycl::native::rsqrt(sum / float(hidden) + eps);
+            for (uint32_t i = lid; i < hidden; i += WG_SIZE) {
+                const float v = float(xr[i]) * rsqrt * w_norm[i];
+                nr[i] = sycl::half(v);
+            }
+        });
+    });
+}
+
+// P4 B70: a norm and quantize_q8_1 of its output in ONE launch with their bits. Phase 1 is the norm's own loop (mode 0:
+// rms_norm_f32w's hidden > 512 kernel; mode 1: residual_add_rms_norm_exact; mode 2: residual_add_rms_norm_fused) with
+// the fp16 store of the row; phase 2 reads that stored row back and runs quantize_q8_1's block math -- the block's amax
+// and its int32 sum are exact in any order, the rest is per element, so the blocks equal quantize_q8_1's over the row.
+// hidden % 32 == 0, 512 < hidden <= 8192 (one work-group a row).
+namespace {
+template <int kMode>
+sycl::event norm_quant_impl(sycl::queue& q, sycl::half* x, const sycl::half* block, const float* w, sycl::half* y,
+                            void* out_q8, uint32_t n_rows, uint32_t hidden, float eps, const std::vector<sycl::event>& deps) {
+    constexpr int WG_SIZE = 256;
+    constexpr int SG_SIZE = 16;
+    auto* out = static_cast<block_q8_1x*>(out_q8);
+    return ie::ps(q, kMode == 0 ? "rms_quant" : kMode == 1 ? "res_rms_exact_quant" : "res_rms_fused_quant", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(n_rows * WG_SIZE, WG_SIZE),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const uint32_t row = uint32_t(it.get_group(0));
+            const uint32_t lid = uint32_t(it.get_local_id(0));
+            sycl::half*       xr = x + row * hidden;
+            const sycl::half* br = block ? block + row * hidden : nullptr;
+            sycl::half*       yr = y + row * hidden;
+            float sum = 0.f;
+            for (uint32_t i = lid; i < hidden; i += WG_SIZE) {
+                float v;
+                if constexpr (kMode == 1) {
+                    float s = float(xr[i]) + float(br[i]);
+                    s = sycl::fmin(sycl::fmax(s, -65504.0f), 65504.0f);
+                    const sycl::half xh = sycl::half(s);
+                    xr[i] = xh;
+                    v = float(xh);
+                } else if constexpr (kMode == 2) {
+                    v = float(xr[i]) + float(br[i]);
+                    xr[i] = sycl::half(v);
+                } else {
+                    v = float(xr[i]);
+                }
+                sum += v * v;
+            }
+            sum = sycl::reduce_over_group(it.get_group(), sum, sycl::plus<float>());
+            const float rsqrt = sycl::native::rsqrt(sum / float(hidden) + eps);
+            for (uint32_t i = lid; i < hidden; i += WG_SIZE) {
+                const float v = float(xr[i]) * rsqrt * w[i];
+                yr[i] = sycl::half(v);
+            }
+            sycl::group_barrier(it.get_group());
+            // phase 2: quantize_q8_1's blocks of 32 over the stored row: 8 consecutive elements a lane, 4 lanes a block
+            // (the four sit together in one sub-group: two xor shuffles give the block's max and its int32 sum)
+            const uint32_t n_blocks = hidden / 32;
+            auto sg = it.get_sub_group();
+            for (uint32_t b0 = 0; b0 < n_blocks; b0 += WG_SIZE / 4) {
+                const uint32_t b  = b0 + lid / 4;
+                const uint32_t e0 = (lid % 4) * 8;
+                const bool ok = b < n_blocks;
+                float v[8]; float am = 0.f;
+                if (ok) {
+#pragma unroll
+                    for (uint32_t e = 0; e < 8; ++e) { v[e] = float(yr[b * 32 + e0 + e]); am = sycl::fmax(am, sycl::fabs(v[e])); }
+                }
+                am = sycl::fmax(am, sycl::permute_group_by_xor(sg, am, 1));
+                am = sycl::fmax(am, sycl::permute_group_by_xor(sg, am, 2));
+                const float d   = am / 127.0f;
+                const float inv = (am > 0.f) ? 127.0f / am : 0.f;
+                int32_t qs = 0;
+                if (ok) {
+#pragma unroll
+                    for (uint32_t e = 0; e < 8; ++e) {
+                        const int32_t qi = int32_t(sycl::round(v[e] * inv));
+                        out[uint64_t(row) * n_blocks + b].qs[e0 + e] = int8_t(qi);
+                        qs += qi;
+                    }
+                }
+                qs += sycl::permute_group_by_xor(sg, qs, 1);
+                qs += sycl::permute_group_by_xor(sg, qs, 2);
+                if (ok && (lid % 4) == 0) {
+                    out[uint64_t(row) * n_blocks + b].d = d;
+                    out[uint64_t(row) * n_blocks + b].s = d * float(qs);
+                }
+            }
+        });
+    });
+}
+}  // namespace
+
+sycl::event rms_norm_f32w_quant_q8_1(sycl::queue& q, const sycl::half* x, const float* w, sycl::half* y, void* out_q8,
+                                     uint32_t n_rows, uint32_t hidden, float eps, const std::vector<sycl::event>& deps) {
+    return norm_quant_impl<0>(q, const_cast<sycl::half*>(x), nullptr, w, y, out_q8, n_rows, hidden, eps, deps);
+}
+sycl::event residual_add_rms_norm_exact_quant_q8_1(sycl::queue& q, sycl::half* ws_x, const sycl::half* ws_block, const float* w_norm,
+                                                   sycl::half* ws_normed, void* out_q8, uint32_t n_rows, uint32_t hidden, float eps,
+                                                   const std::vector<sycl::event>& deps) {
+    return norm_quant_impl<1>(q, ws_x, ws_block, w_norm, ws_normed, out_q8, n_rows, hidden, eps, deps);
+}
+sycl::event residual_add_rms_norm_fused_quant_q8_1(sycl::queue& q, sycl::half* ws_x, const sycl::half* ws_block, const float* w_norm,
+                                                   sycl::half* ws_normed, void* out_q8, uint32_t n_rows, uint32_t hidden, float eps,
+                                                   const std::vector<sycl::event>& deps) {
+    return norm_quant_impl<2>(q, ws_x, ws_block, w_norm, ws_normed, out_q8, n_rows, hidden, eps, deps);
+}
+
 sycl::event cast_fp16_to_fp32(sycl::queue& q, const sycl::half* x, float* y, uint64_t n,
                               const std::vector<sycl::event>& deps) {
     return ie::ps(q, "cast_f16_f32", [&](sycl::handler& h) {

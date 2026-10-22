@@ -395,6 +395,9 @@ sycl::event quantize_q8_1(sycl::queue& q,
                           const sycl::half* x, void* out_q8,
                           uint32_t K,
                           const std::vector<sycl::event>& deps = {});
+// P4 B70: swiglu + quantize_q8_1 in one launch, bit for bit (y_half may be null; n % 32 == 0)
+sycl::event swiglu_quant_q8_1(sycl::queue& q, const sycl::half* gate, const sycl::half* up, sycl::half* y_half, void* out_q8,
+                              uint32_t n, const std::vector<sycl::event>& deps = {});
 // Prefill-crown: fp16 [K] -> block_q8_1s stream (48 B blocks with split
 // half-sums s0/s1).  Feeds the int-dot MoE prefill kernels (IE_MOE_Q8).
 sycl::event quantize_q8_1s(sycl::queue& q,
@@ -1506,12 +1509,16 @@ sycl::event sampler_candidates(sycl::queue& q, sycl::half* logits, int32_t* idx_
 //   topk_w     : [n_tokens, k]                 FP16  (renormalized)
 //
 // Phase 6 v1 supports only n_experts=256 and k=8.
+// P4 B70 (n_tokens == 1 only): with sh_gate_w / sh_gate_out set, the dot launch carries one extra work-group that writes
+// sh_gate_out[0] = sigmoid(sum_h sh_gate_w[h] * x[h]) in the serial fp32 order of the crown's shexp_gate_serial (bit for
+// bit the same value), so the shared-expert gate costs no launch of its own.
 sycl::event moe_router(sycl::queue& q,
                        const sycl::half* x, const float* W_gate,
                        int32_t* topk_idx, sycl::half* topk_w,
                        uint32_t n_tokens, uint32_t hidden,
                        uint32_t n_experts, uint32_t k,
-                       const std::vector<sycl::event>& deps = {});
+                       const std::vector<sycl::event>& deps = {},
+                       const float* sh_gate_w = nullptr, float* sh_gate_out = nullptr);
 
 // P4 B14: moe_router's T == 1 route for 1..16 rows at once: row r's ids / weights == moe_router(x + r * hidden, ..., 1, ...)'s
 // bit for bit (the fused T > 1 kernel sums in another order). 256 experts, top-8 only (throws otherwise).

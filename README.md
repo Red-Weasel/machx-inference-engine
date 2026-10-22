@@ -19,6 +19,7 @@
 
 **Latest**
 
+- **v0.2.31, October 22 — Qwen3.8-35B-A3B decodes 5–6 % faster, byte-identically:** the decode step's 705 kernel launches a card are now ~460 (one quantize per activation, the shared-expert gate inside the router launch, the DeltaNet prepare in one kernel, the residual folded into the next norm, SiLU fused with its quantize), with the same tokens. In `ie serve` at ctx 262144 with 6 lanes: one request **85.4 → 90.6 tok/s**, a 9.8K conversation 80.0 → 83.7, a 17K document 73.8 → 77.2, three at once 69.7 → 71.7 each; prompt reading unchanged. [Details](#new-in-v0231)
 - **v0.2.30, October 22 — Flash-Next reads 35–45 % faster and its draft head is on by default; the 27B's lanes no longer starve its rounds and cache:** in `ie serve` on two cards at `--ctx 262000`, [Flash-Next](#new-in-v0230) reads a 9.8K-token conversation to its first token in **13.0 s** (was 16.7) and a 17.3K-token document in **21.1 s** (was 26.9); the bench reads unique text at **589 / 897 / 946 / 945 tok/s** at 2K / 8K / 16K / 32K (was 466 / 666 / 698 / 711), output byte-identical. The MTP draft head loads by itself when `mtp-head.gguf` sits beside the model (greedy decode +9–19 %, tokens identical; a sampled request gets speculative sampling and the rounds pause while they do not pay). The Qwen3.8-27B at `--parallel 8 --slot-ctx 60000` decodes **17.5 → 28.7 tok/s** and answers later turns from the prompt cache in **0.6–0.75 s** (were 4 s re-reads): its idle lanes had taken the VRAM the rounds and the cache needed. [Details](#new-in-v0230)
 - **v0.2.28, October 21 — DeepSeek-V4.1's October 17 weights, faster tensor parallel, 27B Q8_0 drafts:** the [1017 update of DeepSeek-V4.1-Flash](#new-in-v0228) runs unchanged (perplexity 1.538 vs 1.517 for the September weights), and the disk prompt cache and the NVMe expert file now record the weight files they were made from. Tensor parallel (`IE_DS41_TP=1`) reads a 23.6K-token prompt at **325–352 tok/s** (was 280–288). The 27B's `--spec` lanes check three rows on Q8_0: one request **30.6 tok/s** (27.4), two at once 53.1 together (49.0), the same replies. GLM-5.3-Flash no longer refuses a conversation whose earlier reply was cut inside a tool call.
 - **v0.2.27, October 21 — Qwen3.8-27B: MTP on the request lanes, Q4, pictures on the lanes; DeepSeek-V4.1 on more than two cards:** with `--spec --parallel N` the [27B's request lanes](#new-in-v0227) draft with its MTP head: one request writes **38 tok/s** at Q4_K_M (27.2 plain) and **27.4** at Q8_0 (17.4), two at once 63.1 together (51.8), with the same replies. The 27B's Q4_K_M decodes 27.5 tok/s on two cards (22.8) and 27.8 on one (19.1). Pictures work on the request lanes of the 27B and the 35B-A3B class, a VRAM leak of about 100 MiB a card per request is fixed, and DeepSeek-V4.1-Flash runs on more than two cards, with opt-in tensor parallel (`IE_DS41_TP=1`: 17.2 tok/s decode on two B70s against 14.6). [Details](#new-in-v0227)
@@ -79,10 +80,10 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 </tr>
 <tr>
 <td width="48" align="center" valign="middle"><img src="docs/images/logo-qwen.png" width="36" height="36" alt="Qwen"></td>
-<td align="left" valign="middle" nowrap><b>Qwen3.8-35B-A3B</b><br><sub>MoE · measured Oct 4–5<br>16 lanes · 15-agent replay in 77 s</sub></td>
+<td align="left" valign="middle" nowrap><b>Qwen3.8-35B-A3B</b><br><sub>MoE · measured Oct 4–22<br>16 lanes · 15-agent replay in 77 s</sub></td>
 <td align="left" valign="middle" nowrap>Q8_0 GGUF</td>
 <td align="left" valign="middle" nowrap><b>2,896</b> <sub>2.4K</sub><br><b>2,808</b> <sub>10.7K</sub></td>
-<td align="left" valign="middle" nowrap><b>78.2</b> <sub>at 2.4K</sub><br><b>72.5</b> <sub>at 10.7K</sub></td>
+<td align="left" valign="middle" nowrap><b>89.2</b> <sub>at 2K</sub><br><b>83.8</b> <sub>at 9.8K</sub></td>
 </tr>
 <tr>
 <td width="48" align="center" valign="middle"><img src="docs/images/logo-qwen.png" width="36" height="36" alt="Qwen"></td>
@@ -136,7 +137,8 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 
 **Qwen3.8-35B-A3B** · Q8_0 GGUF, split over both cards; measured on community fine-tunes (October 4–5: the Qwen3.8-35B-A3B Distill; earlier rows: a Qwen3.6-35B-A3B fine-tune, where this README says "35B-A3B class")
 - **Prefill:** 2,896 / 2,808 tok/s at 2.4K / 10.7K tokens (October 4, v0.2.13; it was 1,816 / 1,256). One request, cold prompt: 2K in 1.28 s (October 2), 8K in 5.96 s, 32K in 48.4 s (October 1, before v0.2.13).
-- **Decode:** 78.2 / 72.5 tok/s plain at 2.4K / 10.7K tokens (October 4–5); 85.7 on a short prompt (October 1); 60.9 at a 33K-token prompt (September 30). One card, Q5_K_M: 87.2 / 82.9 (October 5).
+- **Decode (v0.2.31, October 22):** served at ctx 262144 with 6 lanes, temperature 0.6: 90.6 tok/s on short prompts, 83.7 / 82.9 / 78.7 over the three turns of a 9.8K-token conversation, 77.2 at a 17.3K-token document, 71.7 each with three requests at once (v0.2.30: 85.4; 80.0 / 79.5 / 75.0; 73.8; 69.7), the same tokens; `ie-prompt-bench` (greedy, prompt cache off) at 2K / 9.8K / 17K / 32K-token prompts 84.4 / 78.9 / 73.4 / 60.5 → 89.2 / 83.8 / 77.2 / 62.8, prefill unchanged at 2,465 / 2,677 / 2,643 / 2,219. [Details](#new-in-v0231)
+- **Decode (earlier):** 78.2 / 72.5 tok/s plain at 2.4K / 10.7K tokens (October 4–5); 85.7 on a short prompt (October 1); 60.9 at a 33K-token prompt (September 30). One card, Q5_K_M: 87.2 / 82.9 (October 5).
 - **Serving:** up to 16 requests at once, the lane count picked at load: 16 at 414.1 tok/s together, 25.9 each (October 1); the 15-agent replay takes 77.1–77.2 s (October 4; 116.1 s before v0.2.13); a file edit takes 24.3 s plain and 7.1 s with `--spec`; XML tool calls and reasoning in the OpenAI fields; native Q6_K / Q5_K; image input with `--mmproj`, on every request lane since v0.2.27.
 
 **Qwen3.8-Flash-Next** · UD-Q4_K_XL GGUF (104 GB)
@@ -180,6 +182,34 @@ class ([New in v0.2.6](#new-in-v026)).
 ---
 
 <a id="new-in-v0229"></a>
+## 🆕 New in v0.2.31
+
+### Qwen3.8-35B-A3B decodes 5–6 % faster, byte-identically
+
+At `ie serve --ctx 262144 --parallel 6 --slot-ctx 40000` the 35B-A3B's request lanes and prompt cache were already in good shape (0.41 GiB a lane, 4.8 GiB of snapshots a card), so the work went to the decode step: 12.4 ms a token, of which 10.4 ms GPU-busy in **705 kernel launches a card**, the expert and dense weight streams near the memory roofline and about 1.7 ms a card in small kernels at the launch floor. Five changes bring the launches to ~460 a card with the same tokens — the greedy texts of one lane and of three concurrent lanes equal v0.2.30's byte for byte:
+
+- one `quantize_q8_1` per activation: each norm quantizes its own row in the same launch (`rms_norm_f32w_quant_q8_1`, `residual_add_rms_norm_{exact,fused}_quant_q8_1`), and the projections and the MoE read it (`pre_q8` on the dense GEMV routes; the q projection's quantization serves k and v, the qkv projection's the DeltaNet gate, the MoE's the shared expert);
+- the shared-expert gate's serial chain runs as an extra work-group of the router's dot launch (`moe_router`'s `sh_gate_w` / `sh_gate_out`), not as its own ~14 µs kernel;
+- the DeltaNet prepare (split, two L2 norms, two tiled repeats) is one launch, `dn_qkv_split_norm_fused` (its B70 kernel is `l2_128`'s lane order and fma chain), on the single-lane and the rows path; the padded alpha/beta row is read in place;
+- `x += moe_y` rides with the next layer's norm (`residual_add_rms_norm_exact`: `residual_add`'s clamp and fp16 rounding, then `rms_norm_f32w`'s loop);
+- the SiLU product and `sh_down`'s activation quantize are one launch (`swiglu_quant_q8_1`).
+
+| `ie serve`, two B70s, ctx 262144, 6 lanes, temperature 0.6 | v0.2.30 | v0.2.31 |
+|---|---|---|
+| one request, short prompts | 85.4 tok/s | **90.6** |
+| a 9.8K-token conversation, turns 1 / 2 / 3 (TTFT 3.6 / 0.4 / 0.3 s) | 80.0 / 79.5 / 75.0 | **83.7 / 82.9 / 78.7** |
+| a 17.3K-token document (TTFT 5.3 s) | 73.8 | **77.2** |
+| three requests at once, each | 69.7 | **71.7** |
+| `ie-qwen35moe-bench`, 8.3K context | 80.7 | **85.3** |
+| `ie-prompt-bench` (greedy, prompt cache off), prompts of 2K / 9.8K / 17K / 32K tokens | 84.4 / 78.9 / 73.4 / 60.5 | **89.2 / 83.8 / 77.2 / 62.8** |
+
+Prompt reading is unchanged (the prefill path keeps every kernel: 2,465 / 2,677 / 2,643 / 2,219 tok/s at those four prompts on both builds). The per-token profile (`IE_DECODE_PROF=1 IE_QUEUE_PROFILING=1`) after the third set: 705 → 491 launches a card, GPU-busy 4.72 / 5.65 → 4.34 / 5.18 ms, the idle gaps between kernels down to ~0.06 ms a card. The MTP head in the GGUF is not used on this model: a 4-row verify re-reads up to four times the experts, so a round costs ~1.8 steps for ~2.1 tokens.
+
+### What is still slow
+- The XMX decode attention's partial pass: one sub-group per 64-key chunk with the running output in local memory, ~0.16 ms a layer at 8K (about 17 % of the card's bandwidth), growing with context — at a 32K-token prompt this release gains only 4 % (60.5 → 62.8) because the attention owns the step there. A register-resident rewrite that keeps the bits is next.
+- For one request the two cards still take turns (4.3 + 5.2 ms a token); expert-parallel across both is the larger lever.
+- `ie-attn-profile` gained `--mode xmx` (the 27B/35B decode kernel at head_dim 256); its partials scratch is now sized for that kernel — the old sizing overran under it and could take the card down at 32K.
+
 ## 🆕 New in v0.2.30
 
 ### Flash-Next reads 35–45 % faster, byte-identically

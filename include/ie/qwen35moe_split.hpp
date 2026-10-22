@@ -300,6 +300,10 @@ private:
     std::vector<uint32_t>           kv_local_;
     std::vector<uint64_t>           dev_bytes_;
     std::vector<void*>       act_q8_;       // [dev] block_q8_1x [Kmax/32]
+    // P4 B70: the A whose quantization act_q8_[dev] holds (set by sgemv when it quantizes; cleared at every layer): the
+    // projections of one layer that read the same activation reuse one quantize_q8_1 (the same input gives the same
+    // blocks, so the results are bit-identical; 65 launches a card a token fewer on the crown's Q8_0 decode)
+    std::vector<const sycl::half*> act_src_;
     std::vector<sycl::half*> prefill_bt_;    // [dev] fp16 [K*N]max dequant scratch
     std::vector<uint64_t>    prefill_bt_cap_;
     // P4 B49 (the 27B split's B48 levers): the kb-major scale plane of the Q8_0 weight in flight; sgemv_pad_ is set
@@ -344,6 +348,7 @@ private:
     KvCache&       lane_kv(uint32_t lane, uint32_t dev) { return lane ? lane_kv_[lane - 1][dev] : kv_[dev]; }
     DeltaNetState& lane_dn(uint32_t lane, uint32_t dev) { return lane ? lane_dn_[lane - 1][dev] : dn_[dev]; }
     std::vector<void*> act_rows_;
+    std::vector<const sycl::half*> act_rows_src_;   // P4 B70: as act_src_, for srows (G rows)
     sycl::half*        rows_logits_ = nullptr;
     // P4 B26: the rows step's decode-attention partials (kMaxRows slices of rows_partials_floats_) and its per-group row
     // table (kFaDecodeRowsTableBytes), per card with a KV cache (full_attention_fa2_decode_rows; init_lanes allocates
@@ -353,10 +358,13 @@ private:
     uint64_t            rows_partials_floats_ = 0;
     void        run_layers_rows(uint32_t dev, std::span<const uint32_t> lanes, const uint32_t* pos0);
     // the rows path's dense projection: quantize_q8_1 over G x K + gemv_q8_0_soa_q8_batched (forward_slots' forced route)
-    sycl::event srows(uint32_t dev, const sycl::half* A, const SplitW& w, sycl::half* out, uint32_t K, uint32_t N, uint32_t G);
-    // P4 B21: quantize T rows of A into `act` and run the c32 GEMV (T = 1 decode / G rows)
+    // (P4 B70: pre_q8 = A's G rows already quantized by quantize_q8_1 -- the quantize is skipped)
+    sycl::event srows(uint32_t dev, const sycl::half* A, const SplitW& w, sycl::half* out, uint32_t K, uint32_t N, uint32_t G,
+                      const void* pre_q8 = nullptr);
+    // P4 B21: quantize T rows of A into `act` and run the c32 GEMV (T = 1 decode / G rows); P4 B70: pre_q8 set = the rows
+    // are already quantized there (the quantize is skipped, `act` is not written)
     sycl::event kq_gemv(uint32_t dev, void* act, const sycl::half* A, const SplitW& w, sycl::half* out, uint32_t K, uint32_t N,
-                        uint32_t T);
+                        uint32_t T, const void* pre_q8 = nullptr);
 
     // forward()'s pieces (kept in its order): the embedding into card embed_dev's x, one card's layers, the head.
     // (start_pos: the splice's piece position, P4 B45; v: whose images -- the --parallel 1 staging or a lane's)
@@ -390,8 +398,9 @@ private:
     bool look_rows_[2] = {false, false};   // per card: the lanes' stages run on two threads
 
     // Q8_0-SoA aware GEMV (decode int-dot / prefill dequant+gemm / non-Q8 fallback).
+    // (P4 B70: pre_q8 = A already quantized by quantize_q8_1, T = 1 only -- the int-dot routes skip their quantize)
     sycl::event sgemv(uint32_t dev, const sycl::half* A, const SplitW& w,
-                      sycl::half* out, uint32_t K, uint32_t N, uint32_t T);
+                      sycl::half* out, uint32_t K, uint32_t N, uint32_t T, const void* pre_q8 = nullptr);
     // Per-expert Q8_0 int-dot GEMV against ExpertsW slice e (decode/prefill).
     sycl::event egemv(uint32_t dev, const sycl::half* A, const ExpertsW& w, uint32_t e,
                       sycl::half* out, uint32_t T);

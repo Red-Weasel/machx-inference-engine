@@ -115,6 +115,42 @@ sycl::event quantize_q8_1(sycl::queue& q,
     });
 }
 
+// P4 B70: swiglu + quantize_q8_1 in ONE launch with their bits: y = half(SiLU(gate) * up) as swiglu stores it (written
+// to y_half when given), and the block's amax / scale / rounding are quantize_q8_1's over that fp16 value. n % 32 == 0.
+sycl::event swiglu_quant_q8_1(sycl::queue& q, const sycl::half* gate, const sycl::half* up, sycl::half* y_half, void* out_q8,
+                              uint32_t n, const std::vector<sycl::event>& deps) {
+    const uint32_t n_blocks = n / 32;
+    auto* out = static_cast<block_q8_1x*>(out_q8);
+    return ie::ps(q, "swiglu_quant_q8_1", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(uint64_t(n_blocks) * 32, 32),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(32)]] {
+            const uint32_t b    = uint32_t(it.get_group(0));
+            const uint32_t lane = uint32_t(it.get_local_id(0));
+            auto sg = it.get_sub_group();
+            const uint32_t i = b * 32 + lane;
+            const float g = float(gate[i]);
+            const float u = float(up[i]);
+            const float s = g / (1.f + sycl::native::exp(-g));   // SiLU(gate), swiglu's
+            const sycl::half yh = sycl::half(s * u);
+            if (y_half) y_half[i] = yh;
+            const float v = float(yh);
+            const float amax = sycl::reduce_over_group(
+                sg, sycl::fabs(v), sycl::maximum<float>());
+            const float d   = amax / 127.0f;
+            const float inv = (amax > 0.f) ? 127.0f / amax : 0.f;
+            const int32_t qi = int32_t(sycl::round(v * inv));
+            out[b].qs[lane] = int8_t(qi);
+            const int32_t qsum = sycl::reduce_over_group(
+                sg, qi, sycl::plus<int32_t>());
+            if (lane == 0) {
+                out[b].d = d;
+                out[b].s = d * float(qsum);
+            }
+        });
+    });
+}
+
 // ===========================================================================
 // REORDERED Q4_K decode (llama-SYCL's layout — the 52%-BW trick, 2026-06-25).
 // llama de-interleaves the AoS block_q4_K array into 3 GLOBAL contiguous regions
