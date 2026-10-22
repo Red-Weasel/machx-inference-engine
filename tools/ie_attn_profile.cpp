@@ -39,6 +39,7 @@
 
 static volatile bool g_stop = false;
 static bool g_xmx = false;   // P4 B70: --mode xmx = full_attention_fa2_decode_xmx straight (the 27B/35B decode kernel at hd 256)
+static std::string g_dump;   // P4 B70: --dump-y FILE appends the output vector after every context's sweep (a bit-exactness check across runs)
 static void on_signal(int) { g_stop = true; }
 
 // ── tiny helpers ──────────────────────────────────────────────────────────────
@@ -348,6 +349,7 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--q-heads")    && i + 1 < argc) { n_q_heads  = uint32_t(atoi(argv[++i])); }
         else if (!strcmp(argv[i], "--kv-heads")   && i + 1 < argc) { n_kv_heads = uint32_t(atoi(argv[++i])); }
         else if (!strcmp(argv[i], "--head-dim")   && i + 1 < argc) { head_dim   = uint32_t(atoi(argv[++i])); }
+        else if (!strcmp(argv[i], "--dump-y") && i + 1 < argc) { g_dump = argv[++i]; }
         else if (!strcmp(argv[i], "--mode") && i + 1 < argc) {
             const char* m = argv[++i];
             do_fp16 = (strstr(m, "fp16") || !strcmp(m, "both"));
@@ -442,6 +444,11 @@ int main(int argc, char** argv) {
                                n_q_heads, n_kv_heads, head_dim, max_ctx, 0.0);
             fp16_par_avg = r.partial_ms;
             all_results.push_back(r);
+            if (!g_dump.empty()) {   // P4 B70: the last step's output vector, appended raw (compare md5 across runs)
+                std::vector<sycl::half> hy(q_sz);
+                q.memcpy(hy.data(), y_buf, q_sz * sizeof(sycl::half)).wait();
+                if (FILE* f = fopen(g_dump.c_str(), "ab")) { fwrite(hy.data(), sizeof(sycl::half), hy.size(), f); fclose(f); }
+            }
         }
         if (do_int8 && !g_stop) {
             auto r = run_sweep(q, ctx, true, n_warmup, n_steps, n_layers,

@@ -19,6 +19,7 @@
 
 **Latest**
 
+- **v0.2.32, October 22 — the XMX decode attention keeps its output in registers:** the kernel the Qwen3.8-27B and the 35B-A3B class run from 4K context now uses one 32-lane work-group of two sub-groups per 64-key chunk (the scores and the softmax once, the next block's scores computed under this block's softmax, each sub-group's half of the output in registers), with the same bits. On the 35B-A3B: a 9.8K conversation **83.7 → 86.5 tok/s**, a 17K document 77.2 → 82.0, greedy decode at a 32K-token prompt 62.8 → 69.8 (+11 %); prompt reading unchanged. [Details](#new-in-v0232)
 - **v0.2.31, October 22 — Qwen3.8-35B-A3B decodes 5–6 % faster, byte-identically:** the decode step's 705 kernel launches a card are now ~460 (one quantize per activation, the shared-expert gate inside the router launch, the DeltaNet prepare in one kernel, the residual folded into the next norm, SiLU fused with its quantize), with the same tokens. In `ie serve` at ctx 262144 with 6 lanes: one request **85.4 → 90.6 tok/s**, a 9.8K conversation 80.0 → 83.7, a 17K document 73.8 → 77.2, three at once 69.7 → 71.7 each; prompt reading unchanged. [Details](#new-in-v0231)
 - **v0.2.30, October 22 — Flash-Next reads 35–45 % faster and its draft head is on by default; the 27B's lanes no longer starve its rounds and cache:** in `ie serve` on two cards at `--ctx 262000`, [Flash-Next](#new-in-v0230) reads a 9.8K-token conversation to its first token in **13.0 s** (was 16.7) and a 17.3K-token document in **21.1 s** (was 26.9); the bench reads unique text at **589 / 897 / 946 / 945 tok/s** at 2K / 8K / 16K / 32K (was 466 / 666 / 698 / 711), output byte-identical. The MTP draft head loads by itself when `mtp-head.gguf` sits beside the model (greedy decode +9–19 %, tokens identical; a sampled request gets speculative sampling and the rounds pause while they do not pay). The Qwen3.8-27B at `--parallel 8 --slot-ctx 60000` decodes **17.5 → 28.7 tok/s** and answers later turns from the prompt cache in **0.6–0.75 s** (were 4 s re-reads): its idle lanes had taken the VRAM the rounds and the cache needed. [Details](#new-in-v0230)
 - **v0.2.28, October 21 — DeepSeek-V4.1's October 17 weights, faster tensor parallel, 27B Q8_0 drafts:** the [1017 update of DeepSeek-V4.1-Flash](#new-in-v0228) runs unchanged (perplexity 1.538 vs 1.517 for the September weights), and the disk prompt cache and the NVMe expert file now record the weight files they were made from. Tensor parallel (`IE_DS41_TP=1`) reads a 23.6K-token prompt at **325–352 tok/s** (was 280–288). The 27B's `--spec` lanes check three rows on Q8_0: one request **30.6 tok/s** (27.4), two at once 53.1 together (49.0), the same replies. GLM-5.3-Flash no longer refuses a conversation whose earlier reply was cut inside a tool call.
@@ -83,7 +84,7 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 <td align="left" valign="middle" nowrap><b>Qwen3.8-35B-A3B</b><br><sub>MoE · measured Oct 4–22<br>16 lanes · 15-agent replay in 77 s</sub></td>
 <td align="left" valign="middle" nowrap>Q8_0 GGUF</td>
 <td align="left" valign="middle" nowrap><b>2,896</b> <sub>2.4K</sub><br><b>2,808</b> <sub>10.7K</sub></td>
-<td align="left" valign="middle" nowrap><b>89.2</b> <sub>at 2K</sub><br><b>83.8</b> <sub>at 9.8K</sub></td>
+<td align="left" valign="middle" nowrap><b>89.0</b> <sub>at 2K</sub><br><b>86.6</b> <sub>at 9.8K</sub></td>
 </tr>
 <tr>
 <td width="48" align="center" valign="middle"><img src="docs/images/logo-qwen.png" width="36" height="36" alt="Qwen"></td>
@@ -137,6 +138,7 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 
 **Qwen3.8-35B-A3B** · Q8_0 GGUF, split over both cards; measured on community fine-tunes (October 4–5: the Qwen3.8-35B-A3B Distill; earlier rows: a Qwen3.6-35B-A3B fine-tune, where this README says "35B-A3B class")
 - **Prefill:** 2,896 / 2,808 tok/s at 2.4K / 10.7K tokens (October 4, v0.2.13; it was 1,816 / 1,256). One request, cold prompt: 2K in 1.28 s (October 2), 8K in 5.96 s, 32K in 48.4 s (October 1, before v0.2.13).
+- **Decode (v0.2.32, October 22):** the XMX decode attention rewritten with the same bits: served at ctx 262144 with 6 lanes a 9.8K-token conversation 86.5 / 86.1 / 83.3 tok/s over three turns (v0.2.31: 83.7 / 82.9 / 78.7), a 17.3K-token document 82.0 (77.2); `ie-prompt-bench` greedy at 2K / 9.8K / 17K / 32K-token prompts 89.0 / 86.6 / 82.4 / 69.8 (89.2 / 83.8 / 77.2 / 62.8); prefill unchanged. [Details](#new-in-v0232)
 - **Decode (v0.2.31, October 22):** served at ctx 262144 with 6 lanes, temperature 0.6: 90.6 tok/s on short prompts, 83.7 / 82.9 / 78.7 over the three turns of a 9.8K-token conversation, 77.2 at a 17.3K-token document, 71.7 each with three requests at once (v0.2.30: 85.4; 80.0 / 79.5 / 75.0; 73.8; 69.7), the same tokens; `ie-prompt-bench` (greedy, prompt cache off) at 2K / 9.8K / 17K / 32K-token prompts 84.4 / 78.9 / 73.4 / 60.5 → 89.2 / 83.8 / 77.2 / 62.8, prefill unchanged at 2,465 / 2,677 / 2,643 / 2,219. [Details](#new-in-v0231)
 - **Decode (earlier):** 78.2 / 72.5 tok/s plain at 2.4K / 10.7K tokens (October 4–5); 85.7 on a short prompt (October 1); 60.9 at a 33K-token prompt (September 30). One card, Q5_K_M: 87.2 / 82.9 (October 5).
 - **Serving:** up to 16 requests at once, the lane count picked at load: 16 at 414.1 tok/s together, 25.9 each (October 1); the 15-agent replay takes 77.1–77.2 s (October 4; 116.1 s before v0.2.13); a file edit takes 24.3 s plain and 7.1 s with `--spec`; XML tool calls and reasoning in the OpenAI fields; native Q6_K / Q5_K; image input with `--mmproj`, on every request lane since v0.2.27.
@@ -182,6 +184,30 @@ class ([New in v0.2.6](#new-in-v026)).
 ---
 
 <a id="new-in-v0229"></a>
+## 🆕 New in v0.2.32
+
+### The XMX decode attention keeps its output in registers, with the same bits
+
+`full_attention_fa2_decode_xmx` — the decode attention the Qwen3.8-27B and the 35B-A3B class run from 4K context (head_dim 256) — ran one 16-lane work-group per (KV head, 64-key chunk) with the running output in local memory: every 16-key block loaded, multiplied and stored all 16 output tiles through SLM, and the 16 K-tile loads, the 8-lane softmax and the 16 P·V tiles ran one after the other. Latency-bound, about 0.12 ms a layer at 8K for 17 MB of KV. The new kernel (`IE_FA2_XMX_V2=3`, the default) uses one 32-lane work-group of two sub-groups per chunk: sub-group 0 computes the scores and the row softmax once, sub-group 1 computes the next block's scores meanwhile (into the other of two score buffers), and both accumulate their half of the output columns in `joint_matrix` registers; the FA-2 rescale goes through SLM only on the blocks where a row's max moved, the same multiply on the same values. Every fp32 operation on every output element is the old kernel's in the old kernel's order, so the bits are the same.
+
+Gates on the 35B-A3B: the standalone outputs (`ie-attn-profile --mode xmx --dump-y`) byte-identical to the old kernel's at 4K–32K; the engine's greedy texts byte-identical on one lane and on three concurrent lanes; the 128-token greedy continuations of 2K / 8K / 16K / 32K-token prompts byte-identical (the ones that run this kernel).
+
+| 35B-A3B Q8_0, two B70s | v0.2.31 | v0.2.32 |
+|---|---|---|
+| `ie serve` ctx 262144, 6 lanes: a 9.8K-token conversation, turns 1 / 2 / 3 | 83.7 / 82.9 / 78.7 | **86.5 / 86.1 / 83.3** |
+| the same, a 17.3K-token document | 77.2 | **82.0** |
+| `ie-prompt-bench` (greedy, prompt cache off), prompts of 2K / 9.8K / 17K / 32K tokens | 89.2 / 83.8 / 77.2 / 62.8 | **89.0 / 86.6 / 82.4 / 69.8** |
+| `ie-qwen35moe-bench`, 8.3K context | 85.3 | **88.2** |
+| three requests at once, short prompts | 71.7 | 71.7 |
+
+The gain grows with context (+3 % at 10K, +7 % at 17K, +11 % at 32K); prompt reading is unchanged. Standalone, the partial pass at the 35B shape takes 0.07 / 0.10 / 0.25 ms a layer at 8K / 16K / 32K against 0.12 / 0.15 / 0.34 (−35–40 %). Two intermediate variants stay in the code for the A/B: `IE_FA2_XMX_V2=1` (two 16-lane work-groups per chunk with the scores and the softmax computed by both — bit-identical but slower in the engine, 83.7 → 78.9 at 9.8K: the duplicated K reads cost more than the SLM traffic saved) and `=2` (the new kernel without the pipelining); `=0` is the old kernel. The 27B uses the same kernel at head_dim 256; it was byte-checked standalone, not timed in the engine.
+
+`ie-attn-profile` gained `--dump-y FILE` (the output vector after every context's sweep, the byte check) beside `--mode xmx`; time it with `--layers 10` — one short kernel a step lets the GPU's clock drift and the numbers do not repeat.
+
+### What is still slow
+- For one request the two cards still take turns (4.3 + 5.2 ms a token); expert-parallel across both is the larger lever.
+- The router's two kernels (1.3 ms a token on the 35B-A3B), the rows path's per-lane DeltaNet conv and recurrence launches, and this kernel's combine pass.
+
 ## 🆕 New in v0.2.31
 
 ### Qwen3.8-35B-A3B decodes 5–6 % faster, byte-identically

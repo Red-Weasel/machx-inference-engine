@@ -1180,6 +1180,18 @@ static inline uint32_t fa2_xmx_n_super(uint32_t ctx_len, uint32_t n_kv_heads) {
     return (n_chunks + per_wg - 1) / per_wg;
 }
 
+// P4 B70: the XMX partial pass variants (below in full_attention_fa2_decode_xmx), the same bits each: 0 = v1 (the running
+// output in SLM, one 16-lane work-group per chunk), 1 = v2 (two 16-lane work-groups per chunk, each half of the output
+// columns in registers, S and the softmax computed by both), 2 = v3 (one 32-lane work-group of two sub-groups per chunk:
+// sub-group 0 computes S and the softmax once, both accumulate their half in registers), 3 = v4 (v3 with sub-group 1
+// computing the next block's S under sub-group 0's softmax; the default). IE_FA2_XMX_V2=0|1|2|3. Sustained standalone
+// partial pass at the 35B shape (16 q / 2 kv heads, hd 256), ms a layer at 8K / 16K / 32K: v1 0.12 / 0.15 / 0.34, v2
+// 0.14 / 0.22 / 0.38 (slower in the engine too), v3 0.08 / 0.12 / 0.27, v4 0.07 / 0.10 / 0.25.
+static inline int fa2_xmx_variant() {
+    static const int v = [] { const char* s = std::getenv("IE_FA2_XMX_V2"); if (!s || !*s) return 3; const int n = std::atoi(s); return n < 0 ? 0 : n > 3 ? 3 : n; }();
+    return v;
+}
+
 sycl::event full_attention_fa2_decode_xmx(sycl::queue& q,
                                           const sycl::half* q_in,
                                           const sycl::half* k_in,
@@ -1250,7 +1262,9 @@ sycl::event full_attention_fa2_decode_xmx(sycl::queue& q,
 
     // 2. Partial pass on XMX: one subgroup (== one WG of 16 lanes) per
     //    (kv_head, super_chunk).
-    auto partial_evt = ie::ps(q, "fa2_xmx_partial", [&](sycl::handler& h) {
+    sycl::event partial_evt;
+    const int xv = (ND % 2 != 0 || ND > 16) ? 0 : fa2_xmx_variant();
+    if (xv == 0) partial_evt = ie::ps(q, "fa2_xmx_partial", [&](sycl::handler& h) {
         h.depends_on(append_evt);
         sycl::local_accessor<fp16, 1>  Q_slm(TM * hd, h);      // [8 × hd] zero-padded rows
         sycl::local_accessor<float, 1> O_slm(TM * hd, h);      // [8 × hd] running output
@@ -1380,6 +1394,455 @@ sycl::event full_attention_fa2_decode_xmx(sycl::queue& q,
                 const uint64_t base = (uint64_t(super) * n_q + my_q) * (uint64_t(hd) + 2);
                 partials_scratch[base + 0] = m_slm[lane];
                 partials_scratch[base + 1] = l_slm[lane];
+            }
+        });
+    });
+    else if (xv == 1) partial_evt = ie::ps(q, "fa2_xmx_partial_v2", [&](sycl::handler& h) {
+        // P4 B70: v1's math with the running output in REGISTERS. Two work-groups (one sub-group of 16 lanes each)
+        // per (kv_head, super_chunk): both compute S = Q K^T and the row softmax of every block (the same code on the
+        // same values), and each accumulates its own half of the hd columns (ND / 2 tiles) in joint_matrix
+        // accumulators, so a block costs no O load / store through SLM. The alpha rescale (the blocks where a row's
+        // max moved: the first ones) goes through SLM for this half's tiles only -- v1's multiply on v1's values --
+        // and the partials are written per half. Every fp32 operation on every output element is v1's, in v1's
+        // order: the same bits (gated: the engine's greedy texts).
+        h.depends_on(append_evt);
+        sycl::local_accessor<fp16, 1>  Q_slm(TM * hd, h);      // [8 × hd] zero-padded rows
+        sycl::local_accessor<float, 1> O_slm(TM * hd, h);      // staging: the rescale, the write-out (this half's columns)
+        sycl::local_accessor<float, 1> S_slm(TM * KB, h);      // [8 × 16] scores
+        sycl::local_accessor<fp16, 1>  P_slm(TM * KB, h);      // [8 × 16] softmax weights
+        sycl::local_accessor<float, 1> m_slm(TM, h), l_slm(TM, h), a_slm(TM, h);
+        const float scale = 1.0f / sycl::sqrt(float(head_dim));
+        const uint32_t n_q = n_q_heads;
+        const uint32_t ND2 = ND / 2;                           // tiles a half (<= 8)
+        h.parallel_for(sycl::nd_range<1>(uint64_t(n_kv_heads) * n_super * 2 * SG_SIZE, SG_SIZE),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const uint32_t g2    = uint32_t(it.get_group(0));
+            const uint32_t half  = g2 % 2;
+            const uint32_t g     = g2 / 2;
+            const uint32_t kv    = g / n_super;
+            const uint32_t super = g % n_super;
+            const uint32_t lane  = uint32_t(it.get_local_id(0));
+            auto sg = it.get_sub_group();
+            auto Qp  = Q_slm.get_multi_ptr<sycl::access::decorated::no>();
+            auto Op  = O_slm.get_multi_ptr<sycl::access::decorated::no>();
+            auto Sp  = S_slm.get_multi_ptr<sycl::access::decorated::no>();
+            auto Pp  = P_slm.get_multi_ptr<sycl::access::decorated::no>();
+            for (uint32_t i8 = lane; i8 < TM * hd / 8; i8 += SG_SIZE) {
+                const uint32_t i = i8 * 8, r = i / hd, d = i % hd;
+                sycl::vec<fp16, 8> v(fp16(0));
+                if (r < gqa)
+                    v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                       sycl::access::decorated::no>(
+                                  q_in + uint64_t(kv * gqa + r) * hd + d));
+                v.store(0, Qp + i);
+            }
+            if (lane < TM) { m_slm[lane] = -std::numeric_limits<float>::infinity(); l_slm[lane] = 0.f; }
+            sycl::group_barrier(it.get_group());
+
+            const uint32_t col0 = half * ND2 * TN;             // this half's first column
+            const uint32_t colw = ND2 * TN;                    // its width
+            mat::joint_matrix<sycl::sub_group, float, mat::use::accumulator, TM, TN> acc[8];
+#pragma unroll
+            for (uint32_t t = 0; t < 8; ++t) if (t < ND2) mat::joint_matrix_fill(sg, acc[t], 0.0f);
+
+            const uint32_t blk0 = super * blocks_per_super;
+            const uint32_t blk1 = sycl::min(blk0 + blocks_per_super, n_blocks);
+            const fp16* Kbase = k_cache + uint64_t(kv) * max_ctx * hd;
+            const fp16* Vbase = v_cache + uint64_t(kv) * max_ctx * hd;
+            for (uint32_t b = blk0; b < blk1; ++b) {
+                const uint32_t key0 = b * KB;
+                const uint32_t klen = sycl::min(KB, ctx_len - key0);
+                // (a) S = Q · K^T (v1's)
+                mat::joint_matrix<sycl::sub_group, float, mat::use::accumulator, TM, TN> S;
+                mat::joint_matrix_fill(sg, S, 0.0f);
+                for (uint32_t kk = 0; kk < hd; kk += TK) {
+                    mat::joint_matrix<sycl::sub_group, fp16, mat::use::a, TM, TK, mat::layout::row_major> a_tile;
+                    mat::joint_matrix<sycl::sub_group, fp16, mat::use::b, TK, TN, mat::layout::col_major> b_tile;
+                    mat::joint_matrix_load(sg, a_tile, Qp + kk, /*stride=*/hd);
+                    mat::joint_matrix_load(sg, b_tile,
+                        sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                 sycl::access::decorated::no>(Kbase + uint64_t(key0) * hd + kk),
+                        /*stride=*/hd);
+                    mat::joint_matrix_mad(sg, S, a_tile, b_tile, S);
+                }
+                mat::joint_matrix_store(sg, S, Sp, /*stride=*/KB, mat::layout::row_major);
+                sycl::group_barrier(it.get_group());
+                // (b) online softmax (v1's)
+                if (lane < TM) {
+                    const uint32_t r = lane;
+                    const float m_old = m_slm[r];
+                    float row_m = m_old;
+                    for (uint32_t c = 0; c < KB; ++c) {
+                        const float sv = (r < gqa && c < klen) ? S_slm[r * KB + c] * scale
+                                                               : -std::numeric_limits<float>::infinity();
+                        S_slm[r * KB + c] = sv;
+                        row_m = sycl::fmax(row_m, sv);
+                    }
+                    const float alpha = (m_old == -std::numeric_limits<float>::infinity())
+                                        ? 0.f : sycl::native::exp(m_old - row_m);
+                    float row_l = 0.f;
+                    for (uint32_t c = 0; c < KB; ++c) {
+                        const float sv = S_slm[r * KB + c];
+                        const float e = (sv == -std::numeric_limits<float>::infinity())
+                                        ? 0.f : sycl::native::exp(sv - row_m);
+                        const fp16 p = fp16(e);
+                        P_slm[r * KB + c] = p;
+                        row_l += float(p);
+                    }
+                    l_slm[r] = l_slm[r] * alpha + row_l;
+                    m_slm[r] = row_m;
+                    a_slm[r] = (r < gqa) ? alpha : 1.0f;
+                }
+                sycl::group_barrier(it.get_group());
+                // (c) the FA-2 rescale, v1's multiply on v1's values, through SLM for this half's tiles only
+                {
+                    bool rescale = false;
+                    for (uint32_t r = 0; r < TM; ++r) rescale |= (a_slm[r] != 1.0f);
+                    if (rescale) {
+#pragma unroll
+                        for (uint32_t t = 0; t < 8; ++t) if (t < ND2)
+                            mat::joint_matrix_store(sg, acc[t], Op + col0 + t * TN, /*stride=*/hd, mat::layout::row_major);
+                        sycl::group_barrier(it.get_group());
+                        for (uint32_t i = lane; i < TM * colw; i += SG_SIZE) {
+                            const uint32_t r = i / colw, d = col0 + i % colw;
+                            O_slm[r * hd + d] *= a_slm[r];
+                        }
+                        sycl::group_barrier(it.get_group());
+#pragma unroll
+                        for (uint32_t t = 0; t < 8; ++t) if (t < ND2)
+                            mat::joint_matrix_load(sg, acc[t], Op + col0 + t * TN, /*stride=*/hd, mat::layout::row_major);
+                    }
+                }
+                // (d) O[half] += P · V[half] in registers
+#pragma unroll
+                for (uint32_t t = 0; t < 8; ++t) if (t < ND2) {
+                    mat::joint_matrix<sycl::sub_group, fp16, mat::use::a, TM, TK, mat::layout::row_major> p_tile;
+                    mat::joint_matrix<sycl::sub_group, fp16, mat::use::b, TK, TN, mat::layout::row_major> v_tile;
+                    mat::joint_matrix_load(sg, p_tile, Pp, /*stride=*/KB);
+                    mat::joint_matrix_load(sg, v_tile,
+                        sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                 sycl::access::decorated::no>(Vbase + uint64_t(key0) * hd + col0 + t * TN),
+                        /*stride=*/hd);
+                    mat::joint_matrix_mad(sg, acc[t], p_tile, v_tile, acc[t]);
+                }
+                sycl::group_barrier(it.get_group());   // S/P SLM reuse next block
+            }
+            // the write-out: this half's tiles through SLM, then its columns of the partials
+#pragma unroll
+            for (uint32_t t = 0; t < 8; ++t) if (t < ND2)
+                mat::joint_matrix_store(sg, acc[t], Op + col0 + t * TN, /*stride=*/hd, mat::layout::row_major);
+            sycl::group_barrier(it.get_group());
+            for (uint32_t i = lane; i < gqa * colw; i += SG_SIZE) {
+                const uint32_t r = i / colw, d = col0 + i % colw;
+                const uint32_t my_q = kv * gqa + r;
+                const uint64_t base = (uint64_t(super) * n_q + my_q) * (uint64_t(hd) + 2);
+                partials_scratch[base + 2 + d] = O_slm[r * hd + d];
+            }
+            if (half == 0 && lane < gqa) {
+                const uint32_t my_q = kv * gqa + lane;
+                const uint64_t base = (uint64_t(super) * n_q + my_q) * (uint64_t(hd) + 2);
+                partials_scratch[base + 0] = m_slm[lane];
+                partials_scratch[base + 1] = l_slm[lane];
+            }
+        });
+    });
+    else if (xv == 2) partial_evt = ie::ps(q, "fa2_xmx_partial_v3", [&](sycl::handler& h) {
+        // P4 B70 v3: v2's register-resident output with ONE work-group of two sub-groups (32 lanes) per (kv_head,
+        // super_chunk): sub-group 0 computes S = Q K^T and the row softmax once per block (no duplicated K reads or
+        // exponentials; sub-group 1 waits at the barrier), then both accumulate their half of the hd columns (ND / 2
+        // tiles each) in joint_matrix accumulators. The rescale goes through SLM for both halves (v1's multiply on
+        // v1's values, all 32 lanes), the write-out per half. Every fp32 operation on every output element is v1's,
+        // in v1's order: the same bits.
+        h.depends_on(append_evt);
+        sycl::local_accessor<fp16, 1>  Q_slm(TM * hd, h);      // [8 × hd] zero-padded rows
+        sycl::local_accessor<float, 1> O_slm(TM * hd, h);      // staging: the rescale, the write-out
+        sycl::local_accessor<float, 1> S_slm(TM * KB, h);      // [8 × 16] scores
+        sycl::local_accessor<fp16, 1>  P_slm(TM * KB, h);      // [8 × 16] softmax weights
+        sycl::local_accessor<float, 1> m_slm(TM, h), l_slm(TM, h), a_slm(TM, h);
+        const float scale = 1.0f / sycl::sqrt(float(head_dim));
+        const uint32_t n_q = n_q_heads;
+        const uint32_t ND2 = ND / 2;                           // tiles a half (<= 8)
+        constexpr uint32_t WG2 = 2 * SG_SIZE;
+        h.parallel_for(sycl::nd_range<1>(uint64_t(n_kv_heads) * n_super * WG2, WG2),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const uint32_t g     = uint32_t(it.get_group(0));
+            const uint32_t kv    = g / n_super;
+            const uint32_t super = g % n_super;
+            const uint32_t wlane = uint32_t(it.get_local_id(0));   // 0..31
+            const uint32_t half  = wlane / SG_SIZE;
+            const uint32_t lane  = wlane % SG_SIZE;
+            auto sg = it.get_sub_group();
+            auto Qp  = Q_slm.get_multi_ptr<sycl::access::decorated::no>();
+            auto Op  = O_slm.get_multi_ptr<sycl::access::decorated::no>();
+            auto Sp  = S_slm.get_multi_ptr<sycl::access::decorated::no>();
+            auto Pp  = P_slm.get_multi_ptr<sycl::access::decorated::no>();
+            for (uint32_t i8 = wlane; i8 < TM * hd / 8; i8 += WG2) {
+                const uint32_t i = i8 * 8, r = i / hd, d = i % hd;
+                sycl::vec<fp16, 8> v(fp16(0));
+                if (r < gqa)
+                    v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                       sycl::access::decorated::no>(
+                                  q_in + uint64_t(kv * gqa + r) * hd + d));
+                v.store(0, Qp + i);
+            }
+            if (wlane < TM) { m_slm[wlane] = -std::numeric_limits<float>::infinity(); l_slm[wlane] = 0.f; }
+            sycl::group_barrier(it.get_group());
+
+            const uint32_t col0 = half * ND2 * TN;             // this sub-group's first column
+            const uint32_t colw = ND2 * TN;                    // its width
+            mat::joint_matrix<sycl::sub_group, float, mat::use::accumulator, TM, TN> acc[8];
+#pragma unroll
+            for (uint32_t t = 0; t < 8; ++t) if (t < ND2) mat::joint_matrix_fill(sg, acc[t], 0.0f);
+
+            const uint32_t blk0 = super * blocks_per_super;
+            const uint32_t blk1 = sycl::min(blk0 + blocks_per_super, n_blocks);
+            const fp16* Kbase = k_cache + uint64_t(kv) * max_ctx * hd;
+            const fp16* Vbase = v_cache + uint64_t(kv) * max_ctx * hd;
+            for (uint32_t b = blk0; b < blk1; ++b) {
+                const uint32_t key0 = b * KB;
+                const uint32_t klen = sycl::min(KB, ctx_len - key0);
+                // (a) S = Q · K^T (v1's), sub-group 0
+                if (half == 0) {
+                    mat::joint_matrix<sycl::sub_group, float, mat::use::accumulator, TM, TN> S;
+                    mat::joint_matrix_fill(sg, S, 0.0f);
+                    for (uint32_t kk = 0; kk < hd; kk += TK) {
+                        mat::joint_matrix<sycl::sub_group, fp16, mat::use::a, TM, TK, mat::layout::row_major> a_tile;
+                        mat::joint_matrix<sycl::sub_group, fp16, mat::use::b, TK, TN, mat::layout::col_major> b_tile;
+                        mat::joint_matrix_load(sg, a_tile, Qp + kk, /*stride=*/hd);
+                        mat::joint_matrix_load(sg, b_tile,
+                            sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                     sycl::access::decorated::no>(Kbase + uint64_t(key0) * hd + kk),
+                            /*stride=*/hd);
+                        mat::joint_matrix_mad(sg, S, a_tile, b_tile, S);
+                    }
+                    mat::joint_matrix_store(sg, S, Sp, /*stride=*/KB, mat::layout::row_major);
+                }
+                sycl::group_barrier(it.get_group());
+                // (b) online softmax (v1's), lanes 0..7 of sub-group 0
+                if (wlane < TM) {
+                    const uint32_t r = wlane;
+                    const float m_old = m_slm[r];
+                    float row_m = m_old;
+                    for (uint32_t c = 0; c < KB; ++c) {
+                        const float sv = (r < gqa && c < klen) ? S_slm[r * KB + c] * scale
+                                                               : -std::numeric_limits<float>::infinity();
+                        S_slm[r * KB + c] = sv;
+                        row_m = sycl::fmax(row_m, sv);
+                    }
+                    const float alpha = (m_old == -std::numeric_limits<float>::infinity())
+                                        ? 0.f : sycl::native::exp(m_old - row_m);
+                    float row_l = 0.f;
+                    for (uint32_t c = 0; c < KB; ++c) {
+                        const float sv = S_slm[r * KB + c];
+                        const float e = (sv == -std::numeric_limits<float>::infinity())
+                                        ? 0.f : sycl::native::exp(sv - row_m);
+                        const fp16 p = fp16(e);
+                        P_slm[r * KB + c] = p;
+                        row_l += float(p);
+                    }
+                    l_slm[r] = l_slm[r] * alpha + row_l;
+                    m_slm[r] = row_m;
+                    a_slm[r] = (r < gqa) ? alpha : 1.0f;
+                }
+                sycl::group_barrier(it.get_group());
+                // (c) the FA-2 rescale, v1's multiply on v1's values, through SLM (both halves)
+                {
+                    bool rescale = false;
+                    for (uint32_t r = 0; r < TM; ++r) rescale |= (a_slm[r] != 1.0f);
+                    if (rescale) {
+#pragma unroll
+                        for (uint32_t t = 0; t < 8; ++t) if (t < ND2)
+                            mat::joint_matrix_store(sg, acc[t], Op + col0 + t * TN, /*stride=*/hd, mat::layout::row_major);
+                        sycl::group_barrier(it.get_group());
+                        for (uint32_t i = wlane; i < TM * hd; i += WG2) O_slm[i] *= a_slm[i / hd];
+                        sycl::group_barrier(it.get_group());
+#pragma unroll
+                        for (uint32_t t = 0; t < 8; ++t) if (t < ND2)
+                            mat::joint_matrix_load(sg, acc[t], Op + col0 + t * TN, /*stride=*/hd, mat::layout::row_major);
+                    }
+                }
+                // (d) O[half] += P · V[half] in registers, both sub-groups
+#pragma unroll
+                for (uint32_t t = 0; t < 8; ++t) if (t < ND2) {
+                    mat::joint_matrix<sycl::sub_group, fp16, mat::use::a, TM, TK, mat::layout::row_major> p_tile;
+                    mat::joint_matrix<sycl::sub_group, fp16, mat::use::b, TK, TN, mat::layout::row_major> v_tile;
+                    mat::joint_matrix_load(sg, p_tile, Pp, /*stride=*/KB);
+                    mat::joint_matrix_load(sg, v_tile,
+                        sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                 sycl::access::decorated::no>(Vbase + uint64_t(key0) * hd + col0 + t * TN),
+                        /*stride=*/hd);
+                    mat::joint_matrix_mad(sg, acc[t], p_tile, v_tile, acc[t]);
+                }
+                sycl::group_barrier(it.get_group());   // S/P SLM reuse next block
+            }
+            // the write-out: both halves' tiles through SLM, then the partials (all 32 lanes)
+#pragma unroll
+            for (uint32_t t = 0; t < 8; ++t) if (t < ND2)
+                mat::joint_matrix_store(sg, acc[t], Op + col0 + t * TN, /*stride=*/hd, mat::layout::row_major);
+            sycl::group_barrier(it.get_group());
+            for (uint32_t i = wlane; i < gqa * hd; i += WG2) {
+                const uint32_t r = i / hd, d = i % hd;
+                const uint32_t my_q = kv * gqa + r;
+                const uint64_t base = (uint64_t(super) * n_q + my_q) * (uint64_t(hd) + 2);
+                partials_scratch[base + 2 + d] = O_slm[i];
+            }
+            if (wlane < gqa) {
+                const uint32_t my_q = kv * gqa + wlane;
+                const uint64_t base = (uint64_t(super) * n_q + my_q) * (uint64_t(hd) + 2);
+                partials_scratch[base + 0] = m_slm[wlane];
+                partials_scratch[base + 1] = l_slm[wlane];
+            }
+        });
+    });
+    else partial_evt = ie::ps(q, "fa2_xmx_partial_v4", [&](sycl::handler& h) {
+        // P4 B70 v4: v3 with the two sub-groups pipelined. While sub-group 0 runs block b's softmax, sub-group 1
+        // computes block b+1's S into the other of two score buffers (the same joint_matrix ops on the same operands,
+        // so the same S); then both accumulate block b's P·V for their half of the columns in registers. Every fp32
+        // operation on every output element is v1's, in v1's order: the same bits.
+        h.depends_on(append_evt);
+        sycl::local_accessor<fp16, 1>  Q_slm(TM * hd, h);      // [8 × hd] zero-padded rows
+        sycl::local_accessor<float, 1> O_slm(TM * hd, h);      // staging: the rescale, the write-out
+        sycl::local_accessor<float, 1> S_slm(2 * TM * KB, h);  // two [8 × 16] score buffers (ping-pong)
+        sycl::local_accessor<fp16, 1>  P_slm(TM * KB, h);      // [8 × 16] softmax weights
+        sycl::local_accessor<float, 1> m_slm(TM, h), l_slm(TM, h), a_slm(TM, h);
+        const float scale = 1.0f / sycl::sqrt(float(head_dim));
+        const uint32_t n_q = n_q_heads;
+        const uint32_t ND2 = ND / 2;                           // tiles a half (<= 8)
+        constexpr uint32_t WG2 = 2 * SG_SIZE;
+        constexpr uint32_t SB = TM * KB;                       // one score buffer
+        h.parallel_for(sycl::nd_range<1>(uint64_t(n_kv_heads) * n_super * WG2, WG2),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const uint32_t g     = uint32_t(it.get_group(0));
+            const uint32_t kv    = g / n_super;
+            const uint32_t super = g % n_super;
+            const uint32_t wlane = uint32_t(it.get_local_id(0));   // 0..31
+            const uint32_t half  = wlane / SG_SIZE;
+            const uint32_t lane  = wlane % SG_SIZE;
+            auto sg = it.get_sub_group();
+            auto Qp  = Q_slm.get_multi_ptr<sycl::access::decorated::no>();
+            auto Op  = O_slm.get_multi_ptr<sycl::access::decorated::no>();
+            auto Sp  = S_slm.get_multi_ptr<sycl::access::decorated::no>();
+            auto Pp  = P_slm.get_multi_ptr<sycl::access::decorated::no>();
+            for (uint32_t i8 = wlane; i8 < TM * hd / 8; i8 += WG2) {
+                const uint32_t i = i8 * 8, r = i / hd, d = i % hd;
+                sycl::vec<fp16, 8> v(fp16(0));
+                if (r < gqa)
+                    v.load(0, sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                       sycl::access::decorated::no>(
+                                  q_in + uint64_t(kv * gqa + r) * hd + d));
+                v.store(0, Qp + i);
+            }
+            if (wlane < TM) { m_slm[wlane] = -std::numeric_limits<float>::infinity(); l_slm[wlane] = 0.f; }
+            sycl::group_barrier(it.get_group());
+
+            const uint32_t col0 = half * ND2 * TN;             // this sub-group's first column
+            mat::joint_matrix<sycl::sub_group, float, mat::use::accumulator, TM, TN> acc[8];
+#pragma unroll
+            for (uint32_t t = 0; t < 8; ++t) if (t < ND2) mat::joint_matrix_fill(sg, acc[t], 0.0f);
+
+            const uint32_t blk0 = super * blocks_per_super;
+            const uint32_t blk1 = sycl::min(blk0 + blocks_per_super, n_blocks);
+            const fp16* Kbase = k_cache + uint64_t(kv) * max_ctx * hd;
+            const fp16* Vbase = v_cache + uint64_t(kv) * max_ctx * hd;
+            // S = Q · K_b^T (v1's) into score buffer `par`, by whichever sub-group calls it
+            auto compute_S = [&](uint32_t b, uint32_t par) {
+                const uint32_t k0 = b * KB;
+                mat::joint_matrix<sycl::sub_group, float, mat::use::accumulator, TM, TN> S;
+                mat::joint_matrix_fill(sg, S, 0.0f);
+                for (uint32_t kk = 0; kk < hd; kk += TK) {
+                    mat::joint_matrix<sycl::sub_group, fp16, mat::use::a, TM, TK, mat::layout::row_major> a_tile;
+                    mat::joint_matrix<sycl::sub_group, fp16, mat::use::b, TK, TN, mat::layout::col_major> b_tile;
+                    mat::joint_matrix_load(sg, a_tile, Qp + kk, /*stride=*/hd);
+                    mat::joint_matrix_load(sg, b_tile,
+                        sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                 sycl::access::decorated::no>(Kbase + uint64_t(k0) * hd + kk),
+                        /*stride=*/hd);
+                    mat::joint_matrix_mad(sg, S, a_tile, b_tile, S);
+                }
+                mat::joint_matrix_store(sg, S, Sp + par * SB, /*stride=*/KB, mat::layout::row_major);
+            };
+            if (half == 0 && blk0 < blk1) compute_S(blk0, 0);
+            sycl::group_barrier(it.get_group());
+            for (uint32_t b = blk0; b < blk1; ++b) {
+                const uint32_t par  = (b - blk0) & 1u;
+                const uint32_t key0 = b * KB;
+                const uint32_t klen = sycl::min(KB, ctx_len - key0);
+                // (a') sub-group 1: the NEXT block's S into the other buffer, under this block's softmax
+                if (half == 1 && b + 1 < blk1) compute_S(b + 1, par ^ 1u);
+                // (b) online softmax (v1's), lanes 0..7 of sub-group 0, on buffer `par`
+                if (wlane < TM) {
+                    const uint32_t r = wlane;
+                    float* Sr = &S_slm[par * SB + r * KB];
+                    const float m_old = m_slm[r];
+                    float row_m = m_old;
+                    for (uint32_t c = 0; c < KB; ++c) {
+                        const float sv = (r < gqa && c < klen) ? Sr[c] * scale
+                                                               : -std::numeric_limits<float>::infinity();
+                        Sr[c] = sv;
+                        row_m = sycl::fmax(row_m, sv);
+                    }
+                    const float alpha = (m_old == -std::numeric_limits<float>::infinity())
+                                        ? 0.f : sycl::native::exp(m_old - row_m);
+                    float row_l = 0.f;
+                    for (uint32_t c = 0; c < KB; ++c) {
+                        const float sv = Sr[c];
+                        const float e = (sv == -std::numeric_limits<float>::infinity())
+                                        ? 0.f : sycl::native::exp(sv - row_m);
+                        const fp16 p = fp16(e);
+                        P_slm[r * KB + c] = p;
+                        row_l += float(p);
+                    }
+                    l_slm[r] = l_slm[r] * alpha + row_l;
+                    m_slm[r] = row_m;
+                    a_slm[r] = (r < gqa) ? alpha : 1.0f;
+                }
+                sycl::group_barrier(it.get_group());
+                // (c) the FA-2 rescale, v1's multiply on v1's values, through SLM (both halves)
+                {
+                    bool rescale = false;
+                    for (uint32_t r = 0; r < TM; ++r) rescale |= (a_slm[r] != 1.0f);
+                    if (rescale) {
+#pragma unroll
+                        for (uint32_t t = 0; t < 8; ++t) if (t < ND2)
+                            mat::joint_matrix_store(sg, acc[t], Op + col0 + t * TN, /*stride=*/hd, mat::layout::row_major);
+                        sycl::group_barrier(it.get_group());
+                        for (uint32_t i = wlane; i < TM * hd; i += WG2) O_slm[i] *= a_slm[i / hd];
+                        sycl::group_barrier(it.get_group());
+#pragma unroll
+                        for (uint32_t t = 0; t < 8; ++t) if (t < ND2)
+                            mat::joint_matrix_load(sg, acc[t], Op + col0 + t * TN, /*stride=*/hd, mat::layout::row_major);
+                    }
+                }
+                // (d) O[half] += P · V[half] in registers, both sub-groups
+#pragma unroll
+                for (uint32_t t = 0; t < 8; ++t) if (t < ND2) {
+                    mat::joint_matrix<sycl::sub_group, fp16, mat::use::a, TM, TK, mat::layout::row_major> p_tile;
+                    mat::joint_matrix<sycl::sub_group, fp16, mat::use::b, TK, TN, mat::layout::row_major> v_tile;
+                    mat::joint_matrix_load(sg, p_tile, Pp, /*stride=*/KB);
+                    mat::joint_matrix_load(sg, v_tile,
+                        sycl::address_space_cast<sycl::access::address_space::global_space,
+                                                 sycl::access::decorated::no>(Vbase + uint64_t(key0) * hd + col0 + t * TN),
+                        /*stride=*/hd);
+                    mat::joint_matrix_mad(sg, acc[t], p_tile, v_tile, acc[t]);
+                }
+                sycl::group_barrier(it.get_group());   // P reuse next block; the next S buffer is complete
+            }
+            // the write-out: both halves' tiles through SLM, then the partials (all 32 lanes)
+#pragma unroll
+            for (uint32_t t = 0; t < 8; ++t) if (t < ND2)
+                mat::joint_matrix_store(sg, acc[t], Op + col0 + t * TN, /*stride=*/hd, mat::layout::row_major);
+            sycl::group_barrier(it.get_group());
+            for (uint32_t i = wlane; i < gqa * hd; i += WG2) {
+                const uint32_t r = i / hd, d = i % hd;
+                const uint32_t my_q = kv * gqa + r;
+                const uint64_t base = (uint64_t(super) * n_q + my_q) * (uint64_t(hd) + 2);
+                partials_scratch[base + 2 + d] = O_slm[i];
+            }
+            if (wlane < gqa) {
+                const uint32_t my_q = kv * gqa + wlane;
+                const uint64_t base = (uint64_t(super) * n_q + my_q) * (uint64_t(hd) + 2);
+                partials_scratch[base + 0] = m_slm[wlane];
+                partials_scratch[base + 1] = l_slm[wlane];
             }
         });
     });
