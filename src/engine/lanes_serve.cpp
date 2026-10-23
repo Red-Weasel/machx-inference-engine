@@ -658,11 +658,13 @@ bool LanesServe::draft_try(Lane& l, uint32_t li) {
         draft_said_ = true;
         return false;
     }
-    if (d.size() + 1 != V) return false;   // (no hidden for pos - 1 yet: this plain step leaves one)
+    // (2026-10-23: a draft may be SHORTER than V - 1 rows -- Flash-Next's confidence gate stops it at an unsure row -- and
+    // the round runs with the rows it has; empty = no hidden for pos - 1 yet, or no round now: this plain step)
+    if (d.empty() || d.size() + 1 > V) return false;
     l.draft_ids.assign(1, l.next);
     l.draft_ids.insert(l.draft_ids.end(), d.begin(), d.end());
-    l.draft_n = V; l.draft_base = l.pos;
-    ++draft_rounds_; draft_drafted_ += V - 1;
+    l.draft_n = uint32_t(d.size() + 1); l.draft_base = l.pos;
+    ++draft_rounds_; draft_drafted_ += uint32_t(d.size());
     return true;
 }
 

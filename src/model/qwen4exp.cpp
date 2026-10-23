@@ -1160,8 +1160,6 @@ std::string Qwen4ExpModel::prepare_bank_views() {
 std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
                                         uint32_t lanes, uint32_t lane_ctx) {
     if (!alloc_) return "qwen4exp runtime: load() first";
-    if (lanes > 1 && mtp_.loaded)
-        return "qwen4exp runtime: request lanes are refused with the MTP head (spec decode)";
     max_ctx_ = max_ctx; max_chunk_ = max_chunk;
     const uint32_t H = cfg_.hidden, MT = max_chunk;
     const uint32_t D = cfg_.hc_count * H;                     // 10240
@@ -1189,6 +1187,7 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
     auto ai = [&](uint64_t n) { void* p = alloc_->malloc(n * 4); owned_.push_back(p); return static_cast<int32_t*>(p); };
 
     d_tokens_ = ai(MT); d_pos_ = ai(MT); d_pos3_ = ai(uint64_t(3) * MT);
+    d_rpos_ = ai(kMaxRows);   // (2026-10-23: the rows path's rope positions)
     emb_   = ah(uint64_t(MT) * H);
     wide_  = af(uint64_t(MT) * D);
     wide_bank0_ = wide_;
@@ -1281,7 +1280,14 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
     for (int32_t l : cfg_.ple_layers)
         if (uint32_t(l) >= layer_lo_ && uint32_t(l) < layer_hi_) own_ple = true;
     // P4 B8 request lanes 1..lanes-1: allocated here, before the expert cache, and taken out of its budget below.
+    // 2026-10-23: LAZY by default (IE_Q4E_LAZY_LANES=0 = eager, the P4 B8 load): nothing is allocated here, the cache takes
+    // the one-lane budget, and lane_ensure wakes a lane on its first request by giving lane_slots_ slots a layer back
+    // (ecache_shrink). The admission rule below is checked for the lanes that will wake.
     uint64_t lanes_total = 0;
+    lane_ready_.assign(std::max(1u, lanes), 0);
+    lane_ready_[0] = 1;
+    lanes_lazy_ = false;
+    lane_slots_ = mtp_lane0_slots_ = 0;
     if (lanes > 1) {
         const uint32_t lctx = lane_ctx ? std::min(lane_ctx, max_ctx) : max_ctx;
         Q4eLaneShape sh;
@@ -1292,42 +1298,22 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
         sh.conv_channels = CC; sh.conv_kernel = cfg_.ssm_conv_kernel;
         sh.ple_conv_floats = (cfg_.has_ple() && own_ple) ? uint64_t(kPleStateRows) * kPleSI : 0;
         lane_bytes_ = q4e_lane_bytes(sh, lctx);
-        lanes_total = lane_bytes_ * (lanes - 1);
+        lane_lctx_ = lctx; lane_nf_ = uint32_t(nf); lane_nl_ = uint32_t(nl); lane_cc_ = CC; lane_ple_floats_ = sh.ple_conv_floats;
+        mtp_lane_bytes_ = mtp_.loaded ? mtp_lane_bytes(lctx) : 0;
         lanes_.resize(lanes);
-        uint64_t got = 0;   // what the extra lanes' allocations add up to, checked against the arithmetic
-        for (uint32_t i = 1; i < lanes; ++i) {
-            LaneState& s = lanes_[i];
-            const std::string who = "qwen4exp lane " + std::to_string(i);
-            s.max_ctx = lctx;
-            KvCacheConfig lkc{uint32_t(nf), cfg_.n_kv_heads, lctx, cfg_.head_dim, false};
-            if (auto e = s.kv.init(*alloc_, lkc); !e.empty()) return who + " kv: " + e;
-            if (auto e = s.dn.init(*alloc_, dc); !e.empty()) return who + " dn: " + e;
-            const uint64_t se = s.dn.state_elems_per_layer() * uint64_t(nl);
-            const uint64_t ce = s.dn.conv_elems_per_layer() * uint64_t(nl);
-            got += 2 * s.kv.bytes_per_layer() * uint64_t(nf) + se * 4 + ce * 2;
-            if (cfg_.indexer_top_k) {
-                s.idx_kcache = ah(uint64_t(nf) * lctx * cfg_.indexer_head_dim);
-                s.blk_keys   = af(uint64_t(nf) * (lctx / 4) * cfg_.indexer_head_dim);
-                s.blk_done.assign(uint32_t(nf), 0);
-                if (!s.idx_kcache || !s.blk_keys) return who + ": indexer alloc failed";
-                got += uint64_t(nf) * lctx * cfg_.indexer_head_dim * 2 +
-                       uint64_t(nf) * (lctx / 4) * cfg_.indexer_head_dim * 4;
-            }
-            s.snap_dn_state = af(se);
-            s.snap_dn_conv  = ah(ce);
-            if (!s.snap_dn_state || !s.snap_dn_conv) return who + ": snapshot alloc failed";
-            got += se * 4 + ce * 2;
-            if (sh.ple_conv_floats) {
-                s.ple_conv_state = af(sh.ple_conv_floats);
-                s.snap_ple_conv  = af(sh.ple_conv_floats);
-                if (!s.ple_conv_state || !s.snap_ple_conv) return who + ": ple alloc failed";
-                got += 2 * sh.ple_conv_floats * 4;
+        for (uint32_t i = 1; i < lanes; ++i) lanes_[i].max_ctx = lctx;
+        lanes_lazy_ = [] { const char* v = std::getenv("IE_Q4E_LAZY_LANES"); return !(v && *v == '0'); }();
+        if (!lanes_lazy_) {
+            lanes_total = (lane_bytes_ + mtp_lane_bytes_) * (lanes - 1);
+            for (uint32_t i = 1; i < lanes; ++i) {
+                if (auto e = lane_alloc(i); !e.empty()) return e;
+                if (mtp_.loaded) if (auto e = mtp_lane_alloc(i); !e.empty()) return e;
+                lane_ready_[i] = 1;
             }
         }
-        if (got != lanes_total)
-            return "qwen4exp lanes: allocated " + std::to_string(got) + " B, the arithmetic says " +
-                   std::to_string(lanes_total) + " B";
     }
+    // 2026-10-23: the spec-verify checkpoint slabs before the cache is sized (the lanes' MTP rounds verify on both stages)
+    if (want_verify_) if (auto e = vck_alloc(cfg_.has_ple() && own_ple); !e.empty()) return e;
     {   // MoE VRAM expert cache: C slots/layer within IE_Q4E_ECACHE_GB
         // (default 10 GiB). C is derived from the summed per-layer slot sizes.
         uint64_t sum_slot = 0;
@@ -1389,6 +1375,12 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
             if (!refusal.empty()) return refusal;
             budget = left;
         }
+        if (lanes_lazy_ && lanes_.size() > 1) {   // 2026-10-23: the lanes that will wake must still leave kQ4eLaneMinSlots
+            uint64_t left = 0;
+            const std::string refusal = q4e_lanes_cache_fit(budget, lane_bytes_ + mtp_lane_bytes_, uint32_t(lanes_.size() - 1),
+                                                            lanes_[1].max_ctx, sum_slot, left);
+            if (!refusal.empty()) return refusal;
+        }
         if (const char* e = std::getenv("IE_Q4E_ECACHE_GB"))
             if (int v = std::atoi(e); v > 0) {
                 // CLAMP to the adaptive fit: an override above what the card
@@ -1426,6 +1418,15 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
         std::fprintf(stderr, "[qwen4exp] expert cache: %u slots/layer, %.2f GiB\n",
                      ecache_slots_,
                      double(ecache_slots_) * sum_slot / 1073741824.0);
+        if (lanes_lazy_ && lanes_.size() > 1) {   // 2026-10-23: what a wake gives back (one slot of slack for the allocator)
+            lane_slots_ = uint32_t((lane_bytes_ + mtp_lane_bytes_ + sum_slot - 1) / sum_slot) + 1;
+            mtp_lane0_slots_ = mtp_.loaded ? uint32_t((mtp_lane_bytes(max_ctx) + sum_slot - 1) / sum_slot) + 1 : 0;
+            const std::string l0 = mtp_lane0_slots_ ? ", lane 0's head state from " + std::to_string(mtp_lane0_slots_) : std::string();
+            std::fprintf(stderr, "[qwen4exp] lazy lanes: %zu extra lane(s) of %.3f GiB at ctx %u wake on their first request, each from "
+                                 "%u expert slots a layer%s; the cache once all are awake: %u slots/layer (IE_Q4E_LAZY_LANES=0 = at "
+                                 "the load)\n", lanes_.size() - 1, (lane_bytes_ + mtp_lane_bytes_) / 1073741824.0, lanes_[1].max_ctx,
+                         lane_slots_, l0.c_str(), ecache_slots_floor());
+        }
         copyq_ = std::make_unique<sycl::queue>(
             alloc_->queue().get_context(), alloc_->queue().get_device(),
             sycl::property_list{sycl::property::queue::in_order{}});
@@ -1441,111 +1442,7 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
         // probe stays in the caches); word 0 of each page rewritten by the COPY ENGINE and verified by the EUs -- the
         // pair the fills (copyq_) and the kernels use. A page that fails, and the page whose tag it shows, lose their
         // slots: last_use = UINT64_MAX, which no victim scan takes.
-        if (!std::getenv("IE_Q4E_NO_ALIAS_TEST")) {
-            sycl::queue& qq = alloc_->queue();
-            constexpr uint64_t PG = 2ull << 20;
-            constexpr uint64_t WPP = PG / 8;            // words per 2 MiB page
-            constexpr uint64_t kCeMark = 0xFFFFFF;      // word 0's copy-engine tag
-            constexpr uint32_t kMaxRep = 64;
-            struct Alloc { uint32_t L; uint64_t words, tag0, npages; };
-            std::vector<Alloc> als;
-            uint64_t tag_base = 1, total_words = 0;
-            for (uint32_t L2 = layer_lo_; L2 < layer_hi_; ++L2) {
-                const uint64_t nw = uint64_t(ecache_slots_) * ecache_[L2].slot_bytes / 8;
-                const uint64_t np = (nw + WPP - 1) / WPP;
-                als.push_back({L2, nw, tag_base, np});
-                tag_base += np;
-                total_words += nw;
-            }
-            uint32_t* rep  = static_cast<uint32_t*>(alloc_->malloc(4));
-            uint64_t* repv = static_cast<uint64_t*>(alloc_->malloc(uint64_t(kMaxRep) * 2 * 8));
-            if (rep && repv) {
-                const auto at0 = std::chrono::steady_clock::now();
-                qq.memset(rep, 0, 4).wait();
-                for (const Alloc& a : als) {          // pass 1: tag every word
-                    uint64_t* p = reinterpret_cast<uint64_t*>(ecache_[a.L].base);
-                    const uint64_t t0 = a.tag0;
-                    qq.parallel_for<class Q4eAliasTagK>(sycl::range<1>(a.words), [=](sycl::id<1> id) {
-                        const uint64_t i = id[0];
-                        p[i] = ((t0 + i / WPP) << 24) | (i % WPP);
-                    });
-                }
-                qq.wait();
-                std::vector<uint64_t> ce(tag_base);   // pass 1b: the copy engine rewrites word 0 of every page
-                for (const Alloc& a : als) {
-                    uint8_t* b = static_cast<uint8_t*>(ecache_[a.L].base);
-                    for (uint64_t k = 0; k < a.npages; ++k) {
-                        ce[a.tag0 + k - 1] = ((a.tag0 + k) << 24) | kCeMark;
-                        copyq_->memcpy(b + k * PG, &ce[a.tag0 + k - 1], 8);
-                    }
-                }
-                copyq_->wait();
-                for (const Alloc& a : als) {          // pass 2: verify with the EUs
-                    const uint64_t* p = reinterpret_cast<const uint64_t*>(ecache_[a.L].base);
-                    const uint64_t t0 = a.tag0;
-                    uint32_t* rp = rep; uint64_t* rv = repv;
-                    qq.parallel_for<class Q4eAliasChkK>(sycl::range<1>(a.words), [=](sycl::id<1> id) {
-                        const uint64_t i = id[0];
-                        const uint64_t w = i % WPP;
-                        const uint64_t want = ((t0 + i / WPP) << 24) | (w ? w : kCeMark);
-                        const uint64_t got = p[i];
-                        if (got == want) return;
-                        sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device> c(*rp);
-                        const uint32_t k = c.fetch_add(1u);
-                        if (k < kMaxRep) { rv[2 * k] = t0 + i / WPP; rv[2 * k + 1] = got; }
-                    });
-                }
-                qq.wait();
-                uint32_t nrep = 0;
-                std::vector<uint64_t> hv2(uint64_t(kMaxRep) * 2, 0);
-                qq.memcpy(&nrep, rep, 4).wait();
-                qq.memcpy(hv2.data(), repv, uint64_t(kMaxRep) * 2 * 8).wait();
-                std::vector<std::vector<uint8_t>> bad(cfg_.n_layers);
-                for (const Alloc& a : als) bad[a.L].assign(ecache_slots_, 0);
-                // a page's slots: the one it starts in and, when it straddles a boundary, the next
-                auto mark = [&](uint64_t t, uint32_t& L3, uint64_t& off) {
-                    for (const Alloc& a : als)
-                        if (t >= a.tag0 && t < a.tag0 + a.npages) {
-                            L3 = a.L; off = (t - a.tag0) * PG;
-                            const uint64_t sb = ecache_[a.L].slot_bytes;
-                            const uint64_t s0 = off / sb, s1 = (off + PG - 1) / sb;
-                            for (uint64_t sl = s0; sl <= s1 && sl < ecache_slots_; ++sl) bad[a.L][sl] = 1;
-                            return true;
-                        }
-                    return false;
-                };
-                std::vector<uint64_t> seen;
-                for (uint32_t k = 0; k < std::min<uint32_t>(nrep, kMaxRep); ++k) {
-                    const uint64_t t = hv2[2 * k], got = hv2[2 * k + 1];
-                    if (std::find(seen.begin(), seen.end(), t) != seen.end()) continue;
-                    seen.push_back(t);
-                    uint32_t L3 = 0, L4 = 0; uint64_t off = 0, off4 = 0;
-                    if (!mark(t, L3, off)) continue;
-                    if (mark(got >> 24, L4, off4))
-                        std::fprintf(stderr, "[qwen4exp] VRAM PAGE ALIAS: layer %u cache +%llu reads what was written to layer %u "
-                                     "cache +%llu -- their slots are quarantined\n", L3, (unsigned long long)off, L4,
-                                     (unsigned long long)off4);
-                    else
-                        std::fprintf(stderr, "[qwen4exp] VRAM PAGE FAULTY: layer %u cache +%llu read back 0x%llx -- its slots are "
-                                     "quarantined\n", L3, (unsigned long long)off, (unsigned long long)got);
-                }
-                uint32_t quarantined = 0, worst = 0;
-                for (const Alloc& a : als) {
-                    uint32_t nb = 0;
-                    for (uint32_t sl = 0; sl < ecache_slots_; ++sl)
-                        if (bad[a.L][sl]) { ecache_[a.L].last_use[sl] = UINT64_MAX; ++nb; }
-                    quarantined += nb;
-                    worst = std::max(worst, nb);
-                }
-                ecache_usable_ = ecache_slots_ > worst ? ecache_slots_ - worst : 1u;
-                std::fprintf(stderr, "[qwen4exp] vram alias test: %.2f GiB in %.2f s, %u bad words, %zu bad pages, %u slots "
-                             "quarantined (%u usable a layer)\n", double(total_words) * 8.0 / 1073741824.0,
-                             std::chrono::duration<double>(std::chrono::steady_clock::now() - at0).count(),
-                             nrep, seen.size(), quarantined, ecache_usable_);
-            }
-            if (rep) alloc_->free(rep);
-            if (repv) alloc_->free(repv);
-        }
+        ecache_alias_test();
     }
     if (cfg_.has_ple() && own_ple) {
         e16_ = ah(uint64_t(MT) * H);
@@ -1582,14 +1479,12 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
         if (!rows_logits_) return "qwen4exp runtime: rows logits alloc failed";
     }
     if (mtp_.loaded) {
-        KvCacheConfig mkc{1u, cfg_.n_kv_heads, max_ctx, cfg_.head_dim, false};
-        if (auto e = mtp_.kv.init(*alloc_, mkc); !e.empty()) return "mtp kv: " + e;
-        mtp_.idx_kcache = ah(uint64_t(max_ctx) * cfg_.indexer_head_dim);
-        mtp_.blk_keys   = af(uint64_t(max_ctx / 4) * cfg_.indexer_head_dim);
         mtp_wide_  = af(uint64_t(MT) * cfg_.hc_count * H);
         mtp_x16_   = ah(uint64_t(MT) * cfg_.hc_count * H);
         mtp_e16_   = ah(uint64_t(MT) * H);
-        mtp_carry_ = af(uint64_t(cfg_.hc_count) * H);
+        // 2026-10-23: lane 0's head state (its KV at the whole --ctx) is lazy with lazy lanes: lane_ensure(0) takes it out
+        // of the expert cache; one lane (and the eager load) allocates it here as before
+        if (!lanes_lazy_) if (auto e = mtp_lane_alloc(0); !e.empty()) return e;
     }
     gemm_c_     = af(uint64_t(MT) * 12288);
     // T>16 dense-Q8 prefill: dequant-once scratch for the largest dense mat
@@ -1643,11 +1538,121 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
     sgateT_ = ah(MT);
     reset_state();
     for (uint32_t i = 1; i < uint32_t(lanes_.size()); ++i) {   // every extra lane starts as a fresh sequence
+        if (!lane_ready(i)) continue;   // (2026-10-23: a lazy lane is made, selected and reset by lane_ensure)
         if (auto e = select_lane(i); !e.empty()) return e;
         reset_state();
     }
     if (auto e = select_lane(0); !e.empty()) return e;
     return {};
+}
+
+// 2026-10-23: the P4 B49 page-alias self-test over this stage's cache buffers (init_runtime, and again after
+// ecache_shrink reallocated them: the alias moves with the allocation layout).
+void Qwen4ExpModel::ecache_alias_test() {
+    if (std::getenv("IE_Q4E_NO_ALIAS_TEST")) return;
+    sycl::queue& qq = alloc_->queue();
+    constexpr uint64_t PG = 2ull << 20;
+    constexpr uint64_t WPP = PG / 8;            // words per 2 MiB page
+    constexpr uint64_t kCeMark = 0xFFFFFF;      // word 0's copy-engine tag
+    constexpr uint32_t kMaxRep = 64;
+    struct Alloc { uint32_t L; uint64_t words, tag0, npages; };
+    std::vector<Alloc> als;
+    uint64_t tag_base = 1, total_words = 0;
+    for (uint32_t L2 = layer_lo_; L2 < layer_hi_; ++L2) {
+        const uint64_t nw = uint64_t(ecache_slots_) * ecache_[L2].slot_bytes / 8;
+        const uint64_t np = (nw + WPP - 1) / WPP;
+        als.push_back({L2, nw, tag_base, np});
+        tag_base += np;
+        total_words += nw;
+    }
+    uint32_t* rep  = static_cast<uint32_t*>(alloc_->malloc(4));
+    uint64_t* repv = static_cast<uint64_t*>(alloc_->malloc(uint64_t(kMaxRep) * 2 * 8));
+    if (rep && repv) {
+        const auto at0 = std::chrono::steady_clock::now();
+        qq.memset(rep, 0, 4).wait();
+        for (const Alloc& a : als) {          // pass 1: tag every word
+            uint64_t* p = reinterpret_cast<uint64_t*>(ecache_[a.L].base);
+            const uint64_t t0 = a.tag0;
+            qq.parallel_for<class Q4eAliasTagK>(sycl::range<1>(a.words), [=](sycl::id<1> id) {
+                const uint64_t i = id[0];
+                p[i] = ((t0 + i / WPP) << 24) | (i % WPP);
+            });
+        }
+        qq.wait();
+        std::vector<uint64_t> ce(tag_base);   // pass 1b: the copy engine rewrites word 0 of every page
+        for (const Alloc& a : als) {
+            uint8_t* b = static_cast<uint8_t*>(ecache_[a.L].base);
+            for (uint64_t k = 0; k < a.npages; ++k) {
+                ce[a.tag0 + k - 1] = ((a.tag0 + k) << 24) | kCeMark;
+                copyq_->memcpy(b + k * PG, &ce[a.tag0 + k - 1], 8);
+            }
+        }
+        copyq_->wait();
+        for (const Alloc& a : als) {          // pass 2: verify with the EUs
+            const uint64_t* p = reinterpret_cast<const uint64_t*>(ecache_[a.L].base);
+            const uint64_t t0 = a.tag0;
+            uint32_t* rp = rep; uint64_t* rv = repv;
+            qq.parallel_for<class Q4eAliasChkK>(sycl::range<1>(a.words), [=](sycl::id<1> id) {
+                const uint64_t i = id[0];
+                const uint64_t w = i % WPP;
+                const uint64_t want = ((t0 + i / WPP) << 24) | (w ? w : kCeMark);
+                const uint64_t got = p[i];
+                if (got == want) return;
+                sycl::atomic_ref<uint32_t, sycl::memory_order::relaxed, sycl::memory_scope::device> c(*rp);
+                const uint32_t k = c.fetch_add(1u);
+                if (k < kMaxRep) { rv[2 * k] = t0 + i / WPP; rv[2 * k + 1] = got; }
+            });
+        }
+        qq.wait();
+        uint32_t nrep = 0;
+        std::vector<uint64_t> hv2(uint64_t(kMaxRep) * 2, 0);
+        qq.memcpy(&nrep, rep, 4).wait();
+        qq.memcpy(hv2.data(), repv, uint64_t(kMaxRep) * 2 * 8).wait();
+        std::vector<std::vector<uint8_t>> bad(cfg_.n_layers);
+        for (const Alloc& a : als) bad[a.L].assign(ecache_slots_, 0);
+        // a page's slots: the one it starts in and, when it straddles a boundary, the next
+        auto mark = [&](uint64_t t, uint32_t& L3, uint64_t& off) {
+            for (const Alloc& a : als)
+                if (t >= a.tag0 && t < a.tag0 + a.npages) {
+                    L3 = a.L; off = (t - a.tag0) * PG;
+                    const uint64_t sb = ecache_[a.L].slot_bytes;
+                    const uint64_t s0 = off / sb, s1 = (off + PG - 1) / sb;
+                    for (uint64_t sl = s0; sl <= s1 && sl < ecache_slots_; ++sl) bad[a.L][sl] = 1;
+                    return true;
+                }
+            return false;
+        };
+        std::vector<uint64_t> seen;
+        for (uint32_t k = 0; k < std::min<uint32_t>(nrep, kMaxRep); ++k) {
+            const uint64_t t = hv2[2 * k], got = hv2[2 * k + 1];
+            if (std::find(seen.begin(), seen.end(), t) != seen.end()) continue;
+            seen.push_back(t);
+            uint32_t L3 = 0, L4 = 0; uint64_t off = 0, off4 = 0;
+            if (!mark(t, L3, off)) continue;
+            if (mark(got >> 24, L4, off4))
+                std::fprintf(stderr, "[qwen4exp] VRAM PAGE ALIAS: layer %u cache +%llu reads what was written to layer %u "
+                             "cache +%llu -- their slots are quarantined\n", L3, (unsigned long long)off, L4,
+                             (unsigned long long)off4);
+            else
+                std::fprintf(stderr, "[qwen4exp] VRAM PAGE FAULTY: layer %u cache +%llu read back 0x%llx -- its slots are "
+                             "quarantined\n", L3, (unsigned long long)off, (unsigned long long)got);
+        }
+        uint32_t quarantined = 0, worst = 0;
+        for (const Alloc& a : als) {
+            uint32_t nb = 0;
+            for (uint32_t sl = 0; sl < ecache_slots_; ++sl)
+                if (bad[a.L][sl]) { ecache_[a.L].last_use[sl] = UINT64_MAX; ++nb; }
+            quarantined += nb;
+            worst = std::max(worst, nb);
+        }
+        ecache_usable_ = ecache_slots_ > worst ? ecache_slots_ - worst : 1u;
+        std::fprintf(stderr, "[qwen4exp] vram alias test: %.2f GiB in %.2f s, %u bad words, %zu bad pages, %u slots "
+                     "quarantined (%u usable a layer)\n", double(total_words) * 8.0 / 1073741824.0,
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - at0).count(),
+                     nrep, seen.size(), quarantined, ecache_usable_);
+    }
+    if (rep) alloc_->free(rep);
+    if (repv) alloc_->free(repv);
 }
 
 void Qwen4ExpModel::swap_live(LaneState& s) noexcept {
@@ -1671,6 +1676,14 @@ void Qwen4ExpModel::swap_live(LaneState& s) noexcept {
     swap(mrope_n_, s.mrope_n);
     swap(mrope_delta_, s.mrope_delta);
     swap(max_ctx_, s.max_ctx);
+    // 2026-10-23: the lane's MTP head state (lazy; mtp_lane_alloc)
+    swap(mtp_.kv, s.mtp_kv);
+    swap(mtp_.idx_kcache, s.mtp_idx_kcache);
+    swap(mtp_.blk_keys, s.mtp_blk_keys);
+    swap(mtp_.blk_done, s.mtp_blk_done);
+    swap(mtp_carry_, s.mtp_carry);
+    swap(mtp_carry_pos_, s.mtp_carry_pos);
+    swap(mtp_have_carry_, s.mtp_have_carry);
 }
 
 std::string Qwen4ExpModel::select_lane(uint32_t lane) {
@@ -1678,6 +1691,8 @@ std::string Qwen4ExpModel::select_lane(uint32_t lane) {
     if (lane >= lanes_.size())
         return "qwen4exp select_lane: lane " + std::to_string(lane) + " of " + std::to_string(n_lanes());
     if (spec_verify_) return "qwen4exp select_lane: refused in spec-verify mode";
+    if (lane < lane_ready_.size() && !lane_ready_[lane])   // 2026-10-23: a lazy lane's state is made by lane_ensure first
+        return "qwen4exp select_lane: lane " + std::to_string(lane) + " is not allocated yet (lane_ensure)";
     // Park the live lane in its slot (which held the placeholder), then take the target's state out of its slot.
     swap_live(lanes_[lane_]);
     swap_live(lanes_[lane]);
@@ -1688,6 +1703,210 @@ std::string Qwen4ExpModel::select_lane(uint32_t lane) {
 uint32_t Qwen4ExpModel::lane_ctx(uint32_t lane) const noexcept {
     if (lane == lane_) return max_ctx_;
     return lane < lanes_.size() ? lanes_[lane].max_ctx : 0;
+}
+
+// ---- 2026-10-23: lazy lanes, and the head's state per lane -------------------------------------------------------------
+
+uint64_t Qwen4ExpModel::mtp_lane_bytes(uint32_t ctx) const noexcept {
+    if (!mtp_.loaded) return 0;
+    const uint64_t kv  = 2ull * cfg_.n_kv_heads * uint64_t(ctx) * cfg_.head_dim * 2;   // one full-attention layer's K and V
+    const uint64_t idx = uint64_t(ctx) * cfg_.indexer_head_dim * 2 + uint64_t(ctx / 4) * cfg_.indexer_head_dim * 4;
+    return kv + idx + uint64_t(cfg_.hc_count) * cfg_.hidden * 4;                        // + the carry row
+}
+
+// The parked slot of lane `lane` (1..N-1, not live) gets its buffers: the P4 B8 allocation, one lane at a time; the
+// arithmetic of q4e_lane_bytes (what the load admitted) is checked against what was allocated.
+std::string Qwen4ExpModel::lane_alloc(uint32_t lane) {
+    if (lane == 0 || lane >= lanes_.size()) return "qwen4exp lane_alloc: lane " + std::to_string(lane);
+    if (lane == lane_) return "qwen4exp lane_alloc: lane " + std::to_string(lane) + " is live";
+    auto af = [&](uint64_t n) { void* p = alloc_->malloc(n * 4); owned_.push_back(p); return static_cast<float*>(p); };
+    auto ah = [&](uint64_t n) { void* p = alloc_->malloc(n * 2); owned_.push_back(p); return static_cast<sycl::half*>(p); };
+    LaneState& s = lanes_[lane];
+    const std::string who = "qwen4exp lane " + std::to_string(lane);
+    const uint32_t nf = lane_nf_, nl = lane_nl_, lctx = lane_lctx_;
+    s.max_ctx = lctx;
+    uint64_t got = 0;
+    KvCacheConfig lkc{nf, cfg_.n_kv_heads, lctx, cfg_.head_dim, false};
+    if (auto e = s.kv.init(*alloc_, lkc); !e.empty()) return who + " kv: " + e;
+    DeltaNetStateConfig dc{nl, cfg_.ssm_v_heads, cfg_.ssm_state, cfg_.ssm_state, lane_cc_, cfg_.ssm_conv_kernel};
+    if (auto e = s.dn.init(*alloc_, dc); !e.empty()) return who + " dn: " + e;
+    const uint64_t se = s.dn.state_elems_per_layer() * uint64_t(nl);
+    const uint64_t ce = s.dn.conv_elems_per_layer() * uint64_t(nl);
+    got += 2 * s.kv.bytes_per_layer() * uint64_t(nf) + se * 4 + ce * 2;
+    if (cfg_.indexer_top_k) {
+        s.idx_kcache = ah(uint64_t(nf) * lctx * cfg_.indexer_head_dim);
+        s.blk_keys   = af(uint64_t(nf) * (lctx / 4) * cfg_.indexer_head_dim);
+        s.blk_done.assign(nf, 0);
+        if (!s.idx_kcache || !s.blk_keys) return who + ": indexer alloc failed";
+        got += uint64_t(nf) * lctx * cfg_.indexer_head_dim * 2 + uint64_t(nf) * (lctx / 4) * cfg_.indexer_head_dim * 4;
+    }
+    s.snap_dn_state = af(se);
+    s.snap_dn_conv  = ah(ce);
+    if (!s.snap_dn_state || !s.snap_dn_conv) return who + ": snapshot alloc failed";
+    got += se * 4 + ce * 2;
+    if (lane_ple_floats_) {
+        s.ple_conv_state = af(lane_ple_floats_);
+        s.snap_ple_conv  = af(lane_ple_floats_);
+        if (!s.ple_conv_state || !s.snap_ple_conv) return who + ": ple alloc failed";
+        got += 2 * lane_ple_floats_ * 4;
+    }
+    if (got != lane_bytes_)
+        return who + ": allocated " + std::to_string(got) + " B, the arithmetic says " + std::to_string(lane_bytes_) + " B";
+    return {};
+}
+
+// The lane's MTP head state (its KV and indexer caches at the lane's context, the carry row): the live members when
+// `lane` is live (lane 0 at the load), else its parked slot.
+std::string Qwen4ExpModel::mtp_lane_alloc(uint32_t lane) {
+    if (!mtp_.loaded) return {};
+    if (lane >= n_lanes()) return "qwen4exp mtp_lane_alloc: lane " + std::to_string(lane);
+    const bool live = lane == lane_;
+    const uint32_t ctx = live ? max_ctx_ : lanes_[lane].max_ctx;
+    KvCache&     kv  = live ? mtp_.kv : lanes_[lane].mtp_kv;
+    sycl::half*& idx = live ? mtp_.idx_kcache : lanes_[lane].mtp_idx_kcache;
+    float*&      blk = live ? mtp_.blk_keys : lanes_[lane].mtp_blk_keys;
+    float*&      car = live ? mtp_carry_ : lanes_[lane].mtp_carry;
+    if (kv.ready()) return {};
+    auto af = [&](uint64_t n) { void* p = alloc_->malloc(n * 4); owned_.push_back(p); return static_cast<float*>(p); };
+    auto ah = [&](uint64_t n) { void* p = alloc_->malloc(n * 2); owned_.push_back(p); return static_cast<sycl::half*>(p); };
+    KvCacheConfig mkc{1u, cfg_.n_kv_heads, ctx, cfg_.head_dim, false};
+    if (auto e = kv.init(*alloc_, mkc); !e.empty()) return "mtp kv: " + e;
+    idx = ah(uint64_t(ctx) * cfg_.indexer_head_dim);
+    blk = af(uint64_t(ctx / 4) * cfg_.indexer_head_dim);
+    car = af(uint64_t(cfg_.hc_count) * cfg_.hidden);
+    if (!idx || !blk || !car) return "mtp lane state alloc failed";
+    if (live) { mtp_.blk_done = 0; mtp_have_carry_ = false; }
+    else { lanes_[lane].mtp_blk_done = 0; lanes_[lane].mtp_have_carry = false; }
+    return {};
+}
+
+uint32_t Qwen4ExpModel::ecache_slots_floor() const noexcept {
+    uint32_t s = ecache_slots_;
+    if (lanes_lazy_) {
+        for (uint32_t i = 1; i < lanes_.size(); ++i)
+            if (i < lane_ready_.size() && !lane_ready_[i]) s = s > lane_slots_ ? s - lane_slots_ : 0;
+        if (mtp_.loaded && !(lane_ == 0 ? mtp_.kv.ready() : lanes_[0].mtp_kv.ready()))
+            s = s > mtp_lane0_slots_ ? s - mtp_lane0_slots_ : 0;
+    }
+    return std::max(1u, s);
+}
+
+uint32_t Qwen4ExpModel::rows_max_floor() const noexcept {
+    const uint32_t lost = ecache_slots_ - ecache_usable_;   // (the quarantined worst case, as of now)
+    const uint32_t f = ecache_slots_floor();
+    return q4e_rows_max_group(f > lost ? f - lost : 1u, cfg_.n_experts_used);
+}
+
+std::string Qwen4ExpModel::lane_ensure(uint32_t lane) {
+    const uint32_t n = n_lanes();
+    if (lane >= n) return "qwen4exp lane_ensure: lane " + std::to_string(lane) + " of " + std::to_string(n);
+    if (spec_verify_) return "qwen4exp lane_ensure: refused in spec-verify mode";
+    const bool head0 = lane == 0 && mtp_.loaded && lanes_lazy_ && !(lane_ == 0 ? mtp_.kv.ready() : lanes_[0].mtp_kv.ready());
+    if (lane_ready(lane) && !head0) return {};
+    const auto t0 = std::chrono::steady_clock::now();
+    const uint32_t d = lane == 0 ? mtp_lane0_slots_ : lane_slots_;
+    const uint32_t before = ecache_slots_;
+    if (lane == 0) {
+        if (auto e = ecache_shrink(d); !e.empty()) return e;
+        if (auto e = mtp_lane_alloc(0); !e.empty()) return e;
+    } else {
+        if (lane == lane_) if (auto e = select_lane(0); !e.empty()) return e;   // (lane 0 is always ready)
+        if (auto e = ecache_shrink(d); !e.empty()) return e;
+        if (auto e = lane_alloc(lane); !e.empty()) return e;
+        if (mtp_.loaded) if (auto e = mtp_lane_alloc(lane); !e.empty()) return e;
+        lane_ready_[lane] = 1;
+        if (auto e = select_lane(lane); !e.empty()) return e;
+        reset_state();   // a fresh sequence: the DeltaNet state zeroed, the head's record empty
+    }
+    std::fprintf(stderr, "[qwen4exp] lane %u awake%s: the expert cache gave back %u slots a layer (%u -> %u, %u usable), %.0f ms\n",
+                 lane, lane == 0 ? " (its head state)" : "", d, before, ecache_slots_, ecache_usable_,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    return {};
+}
+
+// d slots a layer back to the device: every layer's cache buffer is freed and a smaller one made in its place, EMPTY
+// (the residents stream back in through the next steps' misses: a few hundred MB a card, a once-per-lane event), then
+// the page-alias self-test runs over the new buffers as it did at the load (the alias moves with the layout). The
+// residents cannot be carried over: the test tags every word of every buffer (a first version compacted them into the
+// new buffers and then tested -- every expert came out as tag words, every reply empty). No step may be in flight on
+// this stage (the lanes' serial turn drains the pipe).
+std::string Qwen4ExpModel::ecache_shrink(uint32_t d) {
+    if (d == 0) return {};
+    if (ecache_slots_ < d + kQ4eLaneMinSlots / 2)
+        return "qwen4exp ecache_shrink: " + std::to_string(ecache_slots_) + " slots a layer cannot give " + std::to_string(d);
+    sycl::queue& q = alloc_->queue();
+    try { q.wait(); if (copyq_) copyq_->wait(); } catch (const sycl::exception& x) { return x.what(); }
+    const uint32_t C = ecache_slots_, N = C - d;
+    const auto t0 = std::chrono::steady_clock::now();
+    uint32_t residents = 0;
+    for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
+        ECache& ec = ecache_[L];
+        if (!ec.base) continue;
+        for (int32_t e : ec.expert_in) residents += e >= 0;
+        if (auto it = std::find(owned_.begin(), owned_.end(), ec.base); it != owned_.end()) owned_.erase(it);
+        alloc_->free(ec.base);
+        ec.base = alloc_->malloc(uint64_t(N) * ec.slot_bytes);
+        if (!ec.base) return "qwen4exp ecache_shrink: layer " + std::to_string(L) + ": the smaller cache buffer failed";
+        owned_.push_back(ec.base);
+        std::fill(ec.slot_of.begin(), ec.slot_of.end(), int16_t(-1));
+        ec.expert_in.assign(N, -1);
+        ec.last_use.assign(N, 0);
+    }
+    ecache_slots_ = N;
+    ecache_usable_ = N;
+    pf_pin_mask_.clear();
+    ecache_alias_test();   // (quarantines over the new buffers; sets ecache_usable_)
+    std::fprintf(stderr, "[qwen4exp] expert cache: %u -> %u slots/layer, %u residents dropped (they stream back in); %.0f ms with the "
+                         "alias test\n", C, N, residents,
+                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    return {};
+}
+
+std::string Qwen4ExpModel::vck_alloc(bool ple) {
+    if (vck_cap_ >= 8) return {};
+    constexpr uint32_t CAP = 8;
+    const uint64_t se_all = dn_.state_elems_per_layer() * dn_.config().n_layers_linear;
+    const uint64_t ce_all = dn_.conv_elems_per_layer() * dn_.config().n_layers_linear;
+    vck_dn_state_ = static_cast<float*>(alloc_->malloc(uint64_t(CAP) * se_all * sizeof(float)));
+    vck_dn_conv_  = static_cast<sycl::half*>(alloc_->malloc(uint64_t(CAP) * ce_all * sizeof(sycl::half)));
+    if (!vck_dn_state_ || !vck_dn_conv_) return "qwen4exp: verify checkpoint alloc failed";
+    owned_.push_back(vck_dn_state_);
+    owned_.push_back(vck_dn_conv_);
+    if (ple) {
+        vck_ple_conv_ = static_cast<float*>(alloc_->malloc(uint64_t(CAP) * kPleStateRows * kPleSI * sizeof(float)));
+        if (!vck_ple_conv_) return "qwen4exp: verify ple ckpt alloc failed";
+        owned_.push_back(vck_ple_conv_);
+    }
+    vck_cap_ = CAP;
+    return {};
+}
+
+std::string Qwen4ExpModel::mtp_ingest_row(int32_t token, uint32_t pos, uint32_t row) {
+    if (!mtp_lane_ready()) return "mtp: the lane has no head state (lane_ensure)";
+    sycl::queue& q = alloc_->queue();
+    const uint32_t H = cfg_.hidden, hc = cfg_.hc_count;
+    const float eps = cfg_.rms_eps;
+    const float* wrow = wide_ + uint64_t(row) * hc * H;
+    if (!mtp_have_carry_) {   // nothing to pair the row with yet: it becomes the carry
+        q.memcpy(mtp_carry_, wrow, uint64_t(hc) * H * 4).wait();
+        mtp_carry_pos_ = pos; mtp_have_carry_ = true;
+        return {};
+    }
+    // the carry (position carry_pos) paired with `token` (the token at carry_pos + 1): mtp_ingest's T = 1 step
+    q.memcpy(mtp_wide_, mtp_carry_, uint64_t(hc) * H * 4).wait();
+    mtp_group_norm_f16(q, mtp_wide_, mtp_.pre_fc_norm_hidden, mtp_x16_, 1, H, hc, eps);
+    gemm_fp16(q, mtp_x16_, mtp_.fc_hidden, gemm_c_, hc, H, H);
+    cast_fp32_to_fp16(q, gemm_c_, mtp_x16_, uint64_t(hc) * H);
+    q.memcpy(d_tokens_, &token, sizeof(int32_t)).wait();
+    gather_embed_rows(q, token_embd, d_tokens_, emb_, 1, H);
+    rms_norm_f32w(q, emb_, mtp_.pre_fc_norm_embed, emb_, 1, H, eps);
+    gemm_fp16(q, emb_, mtp_.fc_embed, gemm_c_, 1, H, H);
+    cast_fp32_to_fp16(q, gemm_c_, mtp_e16_, uint64_t(H));
+    mtp_fuse_add(q, mtp_x16_, mtp_e16_, mtp_wide_, 1, H, hc);
+    if (auto e = mtp_layer_fwd(1, mtp_carry_pos_, /*kv_only=*/std::getenv("IE_Q4E_MTP_INGEST_FULL") == nullptr); !e.empty()) return e;
+    q.memcpy(mtp_carry_, wrow, uint64_t(hc) * H * 4).wait();
+    mtp_carry_pos_ = pos; mtp_have_carry_ = true;
+    return {};
 }
 
 std::string Qwen4ExpModel::load_mtp(const GgufReader& mg,
@@ -2084,6 +2303,7 @@ std::string Qwen4ExpModel::mtp_layer_fwd(uint32_t T, uint32_t start_pos, bool kv
 std::string Qwen4ExpModel::mtp_ingest(const int32_t* tokens_host, uint32_t T,
                                       uint32_t start_pos) {
     if (!mtp_.loaded || T == 0) return {};
+    if (!mtp_.kv.ready()) return "mtp: the lane has no head state (lane_ensure)";   // (2026-10-23: lazy lanes)
     sycl::queue& q = alloc_->queue();
     const uint32_t H = cfg_.hidden, hc = cfg_.hc_count;
     const float eps = cfg_.rms_eps;
@@ -2133,6 +2353,7 @@ std::string Qwen4ExpModel::mtp_draft(int32_t t_next, uint32_t pos, uint32_t K,
                                      int32_t* draft,
                                      const std::function<int32_t(sycl::half*, uint32_t)>* pick, uint32_t* n_drafted) {
     if (!mtp_.loaded || !mtp_have_carry_) return "mtp: no context";
+    if (!mtp_.kv.ready()) return "mtp: the lane has no head state (lane_ensure)";   // (2026-10-23: lazy lanes)
     sycl::queue& q = alloc_->queue();
     const uint32_t H = cfg_.hidden, hc = cfg_.hc_count;
     const float eps = cfg_.rms_eps;
@@ -4273,30 +4494,10 @@ std::string Qwen4ExpModel::forward_range(const int32_t* tokens_host, uint32_t T,
                              vck_T_ + T <= 16;
         const uint32_t need = extends ? vck_T_ + T : T;
         if (need > 8) return "qwen4exp: verify T beyond checkpoint cap 8";
-        if (vck_cap_ < 8) {
-            // One fixed 8-slab allocation (covers K<=7): a grow-realloc
-            // would strand the append case's earlier rows.
-            constexpr uint32_t CAP = 8;
-            const uint64_t se_all = dn_.state_elems_per_layer() *
-                                    dn_.config().n_layers_linear;
-            const uint64_t ce_all = dn_.conv_elems_per_layer() *
-                                    dn_.config().n_layers_linear;
-            vck_dn_state_ = static_cast<float*>(
-                alloc_->malloc(uint64_t(CAP) * se_all * sizeof(float)));
-            vck_dn_conv_ = static_cast<sycl::half*>(
-                alloc_->malloc(uint64_t(CAP) * ce_all * sizeof(sycl::half)));
-            if (!vck_dn_state_ || !vck_dn_conv_)
-                return "qwen4exp: verify checkpoint alloc failed";
-            owned_.push_back(vck_dn_state_);
-            owned_.push_back(vck_dn_conv_);
-            if (ple_conv_state_) {
-                vck_ple_conv_ = static_cast<float*>(alloc_->malloc(
-                    uint64_t(CAP) * kPleStateRows * kPleSI * sizeof(float)));
-                if (!vck_ple_conv_) return "qwen4exp: verify ple ckpt alloc failed";
-                owned_.push_back(vck_ple_conv_);
-            }
-            vck_cap_ = CAP;
-        }
+        // One fixed 8-slab allocation (covers K<=7): a grow-realloc would strand the append case's earlier rows
+        // (2026-10-23: vck_alloc; init_runtime makes them up front when set_verify_rows asked, before the cache is sized)
+        if (vck_cap_ < 8)
+            if (auto e = vck_alloc(ple_conv_state_ != nullptr); !e.empty()) return e;
         if (extends) {
             vck_base_ = vck_T_;
             vck_T_ += T;
@@ -4380,11 +4581,13 @@ Qwen4ExpModel::LaneRef Qwen4ExpModel::lane_ref(uint32_t lane) noexcept {
         r.kv = &kv_; r.dn = &dn_; r.idx_kcache = idx_kcache_; r.blk_keys = blk_keys_; r.blk_done = &blk_done_;
         r.ple_conv = ple_conv_state_; r.ple_hist = &ple_hist_; r.max_ctx = max_ctx_;
         r.vision = mrope_n_ != 0 || !vis_spans_.empty();
+        r.mrope_delta = mrope_delta_; r.mrope_n = mrope_n_;
     } else {
         LaneState& s = lanes_[lane];
         r.kv = &s.kv; r.dn = &s.dn; r.idx_kcache = s.idx_kcache; r.blk_keys = s.blk_keys; r.blk_done = &s.blk_done;
         r.ple_conv = s.ple_conv_state; r.ple_hist = &s.ple_hist; r.max_ctx = s.max_ctx;
         r.vision = s.mrope_n != 0 || !s.vis_spans.empty();
+        r.mrope_delta = s.mrope_delta; r.mrope_n = s.mrope_n;
     }
     return r;
 }
@@ -4409,7 +4612,8 @@ std::string Qwen4ExpModel::rows_off_reason() const {
     r.slots_per_layer = ecache_slots_;
     r.top_k = cfg_.n_experts_used;
     std::string why = q4e_rows_route_refusal(r);
-    if (why.empty() && mtp_.loaded) why = "the MTP head";
+    // (2026-10-23: the MTP head no longer refuses the rows: its state is per lane and forward_rows never touches it; the
+    // lanes' rounds run on the per-lane pipe path in spec-verify mode, which forward_rows refuses below)
     if (why.empty() && layer_hi_ == cfg_.n_layers && !rows_logits_) why = "no rows logits buffer";
     if (why.empty() && max_chunk_ < kMaxRows) why = "the workspaces hold " + std::to_string(max_chunk_) + " rows";
     return why;
@@ -4439,15 +4643,23 @@ std::string Qwen4ExpModel::forward_rows(const uint32_t* lanes, const int32_t* id
         if (pos[i] + 1 > lr[i].max_ctx)
             return who + "lane " + std::to_string(lanes[i]) + ": ctx " + std::to_string(pos[i] + 1) + " > max_ctx " +
                    std::to_string(lr[i].max_ctx);
-        if (lr[i].vision) return who + "lane " + std::to_string(lanes[i]) + " has vision staging";
+        // (2026-10-23: a lane with images is fine here: its decode rows rope at pos + delta on all streams, which is what
+        // forward_range's rope_imrope3 computes once the streams are equal -- bit-equal to rope_partial; a prompt position
+        // (below its M-RoPE table) is not: it never reaches a rows step)
+        if (lr[i].vision && pos[i] < lr[i].mrope_n)
+            return who + "lane " + std::to_string(lanes[i]) + " at a prompt position of its image table";
     }
     sycl::queue& q = alloc_->queue();
     const uint32_t H = cfg_.hidden, D = cfg_.hc_count * H;
     if (ids) q.memcpy(d_tokens_, ids, G * sizeof(int32_t));
     {
-        int32_t p[kMaxRows];
-        for (uint32_t i = 0; i < G; ++i) p[i] = int32_t(pos[i]);
-        q.memcpy(d_pos_, p, G * sizeof(int32_t)).wait();
+        int32_t p[kMaxRows], rp[kMaxRows];
+        for (uint32_t i = 0; i < G; ++i) {
+            p[i] = int32_t(pos[i]);                                                 // (linear: the QSA mask / top-k)
+            rp[i] = lr[i].vision ? int32_t(pos[i]) + lr[i].mrope_delta : int32_t(pos[i]);   // (the rope: + the lane's delta)
+        }
+        q.memcpy(d_pos_, p, G * sizeof(int32_t));
+        q.memcpy(d_rpos_, rp, G * sizeof(int32_t)).wait();
     }
     if (wide_in_host) {
         q.memcpy(wide_, wide_in_host, uint64_t(G) * D * sizeof(float)).wait();
@@ -4579,8 +4791,8 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
         split_q_gate_per_head(q, qg_, aq_, agate_, G, cfg_.n_q_heads, HD);
         rms_norm_f32w(q, aq_, w.attn_q_norm, aq_, G * cfg_.n_q_heads, HD, eps);
         rms_norm_f32w(q, ak_, w.attn_k_norm, ak_, G * cfg_.n_kv_heads, HD, eps);
-        rope_partial(q, aq_, d_pos_, aq_, G, cfg_.n_q_heads, HD, cfg_.rope_dim, cfg_.rope_theta);
-        rope_partial(q, ak_, d_pos_, ak_, G, cfg_.n_kv_heads, HD, cfg_.rope_dim, cfg_.rope_theta);
+        rope_partial(q, aq_, d_rpos_, aq_, G, cfg_.n_q_heads, HD, cfg_.rope_dim, cfg_.rope_theta);
+        rope_partial(q, ak_, d_rpos_, ak_, G, cfg_.n_kv_heads, HD, cfg_.rope_dim, cfg_.rope_theta);
         const uint32_t li = uint32_t(full_idx_[L]);
         const uint32_t dense_ok = q4e_dense_ok_override() ? q4e_dense_ok_override() : cfg_.indexer_top_k ? cfg_.indexer_top_k + 3 : UINT32_MAX;
         const uint32_t IHD = cfg_.indexer_head_dim;
@@ -4589,7 +4801,7 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
             f16_rows(mixed_, H, w.idx_q_proj, idx_q_, IQW);
             f16_rows(mixed_, H, w.idx_k_proj, idx_kraw_, IHD);
             rms_norm_f32w(q, idx_q_, w.idx_q_norm, idx_q_, G * cfg_.indexer_n_heads, IHD, eps);
-            rope_partial(q, idx_q_, d_pos_, idx_q_, G, cfg_.indexer_n_heads, IHD, cfg_.rope_dim, cfg_.rope_theta);
+            rope_partial(q, idx_q_, d_rpos_, idx_q_, G, cfg_.indexer_n_heads, IHD, cfg_.rope_dim, cfg_.rope_theta);
             for (uint32_t i = 0; i < G; ++i) {   // the lane's raw key at its position, its complete blocks pooled once
                 const uint32_t mc = lr[i].max_ctx;
                 q.memcpy(lr[i].idx_kcache + (uint64_t(li) * mc + pos[i]) * IHD, idx_kraw_ + uint64_t(i) * IHD,

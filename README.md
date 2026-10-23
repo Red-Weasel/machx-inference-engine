@@ -19,6 +19,7 @@
 
 **Latest**
 
+- **v0.2.33, October 23 — Flash-Next's request lanes take pictures, wake on demand, and run the draft head with `--spec`:** at `ie serve --parallel 4` an image prompt was refused and the three idle lanes took 20 % of the expert cache at the load; now a request's images are staged on its lane (the replies byte-identical to one lane's, alone or in a decoding group), a lane's VRAM is allocated on its first request (**224 / 227** resident experts a layer on the cards with one conversation, were 179 / 193), and `--spec` — Dream's speculation toggle — runs the MTP draft head's rounds on a lane decoding alone. At `--ctx 262000 --parallel 4 --slot-ctx 75000`, temperature 1.0: a 9.8K-token conversation **27.3 / 26.1 / 25.4 → 28.3 / 27.2 / 26.5 tok/s** over three turns, with `--spec` **29.5 / 28.0 / 27.2**; a 17.3K document 26.3 → 26.9, with `--spec` **30.0**; the tokens the same. [Details](#new-in-v0233)
 - **v0.2.32, October 22 — the XMX decode attention keeps its output in registers:** the kernel the Qwen3.8-27B and the 35B-A3B class run from 4K context now uses one 32-lane work-group of two sub-groups per 64-key chunk (the scores and the softmax once, the next block's scores computed under this block's softmax, each sub-group's half of the output in registers), with the same bits. On the 35B-A3B: a 9.8K conversation **83.7 → 86.5 tok/s**, a 17K document 77.2 → 82.0, greedy decode at a 32K-token prompt 62.8 → 69.8 (+11 %); prompt reading unchanged. [Details](#new-in-v0232)
 - **v0.2.31, October 22 — Qwen3.8-35B-A3B decodes 5–6 % faster, byte-identically:** the decode step's 705 kernel launches a card are now ~460 (one quantize per activation, the shared-expert gate inside the router launch, the DeltaNet prepare in one kernel, the residual folded into the next norm, SiLU fused with its quantize), with the same tokens. In `ie serve` at ctx 262144 with 6 lanes: one request **85.4 → 90.6 tok/s**, a 9.8K conversation 80.0 → 83.7, a 17K document 73.8 → 77.2, three at once 69.7 → 71.7 each; prompt reading unchanged. [Details](#new-in-v0231)
 - **v0.2.30, October 22 — Flash-Next reads 35–45 % faster and its draft head is on by default; the 27B's lanes no longer starve its rounds and cache:** in `ie serve` on two cards at `--ctx 262000`, [Flash-Next](#new-in-v0230) reads a 9.8K-token conversation to its first token in **13.0 s** (was 16.7) and a 17.3K-token document in **21.1 s** (was 26.9); the bench reads unique text at **589 / 897 / 946 / 945 tok/s** at 2K / 8K / 16K / 32K (was 466 / 666 / 698 / 711), output byte-identical. The MTP draft head loads by itself when `mtp-head.gguf` sits beside the model (greedy decode +9–19 %, tokens identical; a sampled request gets speculative sampling and the rounds pause while they do not pay). The Qwen3.8-27B at `--parallel 8 --slot-ctx 60000` decodes **17.5 → 28.7 tok/s** and answers later turns from the prompt cache in **0.6–0.75 s** (were 4 s re-reads): its idle lanes had taken the VRAM the rounds and the cache needed. [Details](#new-in-v0230)
@@ -40,6 +41,8 @@ Intel Arc is a genuinely capable AI GPU that inference tooling has mostly ignore
 ---
 
 ## ⚡ What people run on it
+
+<sub>Per-model launch settings, the sampler each model is served with, and the figures measured there: [docs/MODEL_SETTINGS.md](docs/MODEL_SETTINGS.md).</sub>
 
 One video model and seven language models, each run on **two Arc Pro B70 cards** (64 GB VRAM), with host RAM holding the
 experts that do not fit. Dates, workloads and methods are in [Benchmarks](#benchmarks); every date is 2026.
@@ -144,6 +147,7 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 - **Serving:** up to 16 requests at once, the lane count picked at load: 16 at 414.1 tok/s together, 25.9 each (October 1); the 15-agent replay takes 77.1–77.2 s (October 4; 116.1 s before v0.2.13); a file edit takes 24.3 s plain and 7.1 s with `--spec`; XML tool calls and reasoning in the OpenAI fields; native Q6_K / Q5_K; image input with `--mmproj`, on every request lane since v0.2.27.
 
 **Qwen3.8-Flash-Next** · UD-Q4_K_XL GGUF (104 GB)
+- **Lanes (v0.2.33, October 23):** pictures on all request lanes (replies byte-identical to one lane's); a lane's VRAM is allocated on its first request, so one conversation keeps 224 / 227 resident experts a layer on the cards (were 179 / 193 with three idle lanes); the MTP draft head's rounds run on a lane decoding alone with `--spec` (Dream's speculation toggle). At `--ctx 262000 --parallel 4 --slot-ctx 75000`, temperature 1.0: a 9.8K-token conversation 27.3 / 26.1 / 25.4 → 28.3 / 27.2 / 26.5 tok/s over three turns, with `--spec` 29.5 / 28.0 / 27.2; a 17.3K-token document 26.3 → 26.9, with `--spec` 30.0. [Details](#new-in-v0233)
 - **Prefill:** 628 / 978 / 1,031 / 1,006 tok/s on unique 2K / 8K / 16K / 32K-token prompts at `--ctx 40000` (bench, October 22, v0.2.30; it was 461 / 677 / 712 / 725) and 589 / 897 / 946 / 945 at `--ctx 262000`; served at that context a 9.8K-token conversation reaches its first token in 13.0 s (was 16.7) and a 17.3K-token document in 21.1 s (was 26.9). The expert cache kept re-uploading the whole bank every chunk (`IE_Q4E_PF_RING`, default 96 slots; 0 = the old behaviour); output byte-identical (greedy text and a 4,096-token perplexity to every digit). Earlier figures: 470 new text / 688 repeated prompt (October 4).
 - **Decode:** the MTP draft head loads by itself from `mtp-head.gguf` beside the model (`scripts/fetch_mtp_head.py` + `scripts/mtp_to_gguf.py` make it from the official checkpoint; `IE_Q4E_MTP=0` = off): greedy 35.6 → 38.9 tok/s on short prompts and 26.4 → 31.4 at 8–64K of context, tokens identical to plain decoding; a sampled request (temperature 1.0, top_k 20) gets speculative sampling — the plain sampler's distribution — at 30–33 tok/s where plain gives 31 (the rounds pause by themselves while they do not pay). Its prefill cost is ~1 % (was 17 %) and its experts load as a Q8_0 bank. `--spec` alone = the lookup drafts (40.7 on a copy prompt, 26.9 plain).
 - **Serving:** native vision; up to 16 requests at once (two at 59.0–62.6 tok/s together, ×1.94–2.06; 16 at 118.4 with row batching and 128.0 at `--ctx 8192`); a file edit takes 68.7 s plain and 30.7 s with `--spec`. Image prompts longer than 2,048 tokens are read with the image since v0.2.21 (v0.2.10 through v0.2.20 dropped it).
@@ -182,6 +186,34 @@ class ([New in v0.2.6](#new-in-v026)).
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
 
 ---
+
+## 🆕 New in v0.2.33
+
+### Flash-Next's request lanes: pictures on every lane, lanes that wake on demand, and the draft head's rounds with `--spec`
+
+At `ie serve --parallel 4` — the usual Flash-Next launch — three things were wrong with the request lanes. An image prompt was refused (`image inputs need --parallel 1`) although the 27B and the 35B-A3B class have taken pictures on their lanes since v0.2.27. The three idle lanes took 3 × 1.13 GiB a card at the load whether or not a second request ever came, so the expert cache held 179 / 193 resident experts a layer (cards 0 / 1) instead of 224 / 227. And the MTP draft head, the default at one lane since v0.2.30, was never loaded on the lanes: every turn was plain decoding at 23–26 tok/s.
+
+- **Pictures on all request lanes.** A request's images are encoded on its own thread and staged on its lane (its image rows and its M-RoPE table); the request stays out of the prompt cache (pad ids cannot key it); a decoding group may hold a lane with pictures — its rows rope at the lane's offset, the same arithmetic the one-lane path runs once the three streams are equal. The vision tower is placed at the load, before the expert caches are sized (on card 1, or on card 0 when the head's bank takes card 1), so no late allocation lands beside a full card; `/props` says `images on all N request lanes`. The greedy reply to a 1024-px photo is byte-identical at `--parallel 1` and on the lanes, alone and beside two text requests, and the text requests' replies are the one-lane path's.
+- **Lazy lanes.** A lane's VRAM is allocated on its first request and taken back from the expert cache then: every layer's cache buffer is remade smaller and the page-alias self-test runs again (about 0.3 s a card; the residents stream back in over the next few hundred tokens). One conversation at a time keeps 224 / 227 experts a layer on the cards; the chooser prefers a lane that is already awake, so a second conversation wakes one more. `IE_Q4E_LAZY_LANES=0` is the eager load.
+- **The draft head's rounds on the lanes, with `--spec`** (Dream's speculation toggle, offered for Flash-Next since v0.2.21): a lane decoding alone drafts with the head and verifies the drafts in one step — one lane's sampled rounds (speculative sampling, exact at any temperature; a greedy request compares), the tokens plain decoding's; the head's record is kept per lane. More lanes decoding share the cards in rows groups as before. It is opt-in on the lanes because the head's expert bank costs card 1 about 35 resident experts a layer, which three or four conversations decoding at once feel (−17 % in the table); one conversation gains. At one lane the head stays the default. `IE_Q4E_LANES_MTP=0` turns the rounds off with the head loaded; `IE_Q4E_LANES_MTP_MAX` lets more lanes round.
+
+| `ie serve`, two B70s, `--ctx 262000 --parallel 4 --slot-ctx 75000`, temperature 1.0 / top_k 20 / top_p 0.95 | v0.2.32 | v0.2.33 | v0.2.33 `--spec` |
+|---|---|---|---|
+| a 9.8K-token conversation, decode over turns 1 / 2 / 3 | 27.3 / 26.1 / 25.4 | **28.3 / 27.2 / 26.5** | **29.5 / 28.0 / 27.2** |
+| a 17.3K-token document | 26.3 | **26.9** | **30.0** |
+| short prompts, median of three | 29.6 | 30.4 | 30.0 |
+| three requests at once, 256 tokens each, lanes warm (time to finish) | 14.3 s | 14.5 s | 16.9 s |
+| four at once | 17.3 s | 18.1 s | 20.7 s |
+| resident experts a layer, cards 0 / 1, one lane awake | 179 / 193 | **208 / 210** | 191 / 162 |
+
+Gates: the greedy texts with the rounds on and off are byte-identical on one lane, in three- and four-lane groups and on an 8K prompt; a conversation's text is the same before and after another lane wakes; the one-lane lossless tool is unchanged (`ie-qwen4exp-spec2`: 44.2 tok/s, 2.12 tokens a round). The first request on a lane pays the wake (+0.5 s on a cold 9.8K first token). The rounds' acceptance at temperature 1.0 moves from run to run: an earlier run of the same code gave 29.8 / 32.7 / 27.1 on the conversation and 32.0 on the document.
+
+### What is still slow
+- The head's expert bank on card 1 (2.5 GB as Q8_0) is what the concurrent case pays; placing it on card 0 does not help (that card has less room to begin with). A Q4_K bank or a bank of the head's most-used experts would give 15–25 slots back.
+- On a lane with pictures the head drafts from the pad tokens' view of the prompt (its rope knows no images); the verify is exact, so the tokens are plain decoding's, and a picture description still went 120 tokens in 50 steps. A shared-prefix restore breaks the head's record for that request (plain steps until its next sequence).
+- The rows path still ingests each group row into its lane's head record when the head is loaded (not measurable in the table, but there).
+
+Other models: their code did not change; the shared lanes module accepts a draft shorter than the round (the 27B always drafts the full round).
 
 <a id="new-in-v0229"></a>
 ## 🆕 New in v0.2.32

@@ -633,8 +633,10 @@ private:
     // qwen4exp forward, defined in engine.cpp (Q4eBundle is incomplete here).
     sycl::event q4e_forward(sycl::queue& q, const int32_t* ids, uint32_t T, uint32_t pos);
     // P4 B8: Flash-Next at --parallel N > 1 on two cards -- the request on a lane of the shared lanes module (engine.cpp).
+    struct QvisPendingImage;
     GenerateResult q4e_generate_lanes(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token,
-                                      uint32_t cache_prefix_len, uint32_t shared_prefix_len = 0);
+                                      uint32_t cache_prefix_len, uint32_t shared_prefix_len = 0,
+                                      std::vector<QvisPendingImage>* imgs = nullptr);   // (2026-10-23: images on the lanes)
     // P4 B10: the crown split at --parallel N > 1 -- the lanes module over the model's request lanes (engine.cpp).
     std::string    q35m_lanes_init();
     // P4 B18: the 27B split at --parallel N > 1 -- the lanes module over Qwen35SplitModel's request lanes (engine.cpp,

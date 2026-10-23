@@ -137,8 +137,9 @@ inline std::string q4e_rows_route_refusal(const Q4eRowsRoute& r) {
 // Why a Flash-Next load refuses image requests, "" when it takes them: the per-request image staging is engine-global
 // (Engine members written before the generation gate), so --parallel > 1 -- request lanes or time-sliced -- refuses images.
 // Engine::vision_status_json (/props "vision") and Engine::chat's refusal both come from here, so they cannot disagree.
-inline std::string q4e_vision_refusal(uint32_t parallel) {
-    if (parallel > 1) return "image inputs need --parallel 1 (per-request image staging is engine-global, not slot-safe)";
+inline std::string q4e_vision_refusal(uint32_t parallel, bool lanes_images = false) {
+    // (2026-10-23: lanes_images = Flash-Next's request lanes stage each request's images on its lane, the tower placed at the load)
+    if (parallel > 1 && !lanes_images) return "image inputs need --parallel 1 (per-request image staging is engine-global, not slot-safe)";
     return {};
 }
 

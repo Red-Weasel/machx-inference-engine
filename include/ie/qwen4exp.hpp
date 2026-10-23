@@ -221,6 +221,22 @@ public:
     uint32_t lane() const noexcept { return lane_; }
     uint32_t lane_ctx(uint32_t lane) const noexcept;   // a lane's capacity (positions)
     uint64_t lane_bytes() const noexcept { return lane_bytes_; }   // ONE extra lane's device bytes here (0 with one lane)
+    // 2026-10-23: LAZY lanes (IE_Q4E_LAZY_LANES=0 = eager, as before). init_runtime allocates nothing for lanes 1..N-1 and
+    // the expert cache takes the one-lane budget (the eager load gave three idle lanes 20 % of the resident experts).
+    // lane_ensure(lane), from the lanes' serial turn (no step in flight on this stage), gives lane_slots() slots a layer
+    // back from the cache (ecache_shrink: a smaller buffer per layer, its most recently used slots compacted into it, the
+    // old one freed, the page-alias self-test again over the new buffers) and allocates the lane's state -- and its MTP
+    // head state when the head is loaded. Lane 0's head state (its KV at the whole --ctx) is lazy too. lane_ready: the
+    // lane has its state (lane 0 always). The admission rule (>= kQ4eLaneMinSlots a layer once every lane is awake) is
+    // checked at the load as before.
+    std::string lane_ensure(uint32_t lane);
+    bool        lane_ready(uint32_t lane) const noexcept { return lane < lane_ready_.size() ? lane_ready_[lane] != 0 : lane == 0; }
+    uint32_t    lane_slots() const noexcept { return lane_slots_; }
+    uint32_t    ecache_slots_floor() const noexcept;   // the slots a layer once every lane and lane 0's head state are awake
+    uint32_t    rows_max_floor() const noexcept;       // rows_max() at that floor: the lane pipe's group cap
+    // 2026-10-23: the spec-verify checkpoint slabs (forwards of up to 8 rows) allocated by init_runtime, before the expert
+    // cache is sized, instead of at the first verify forward (the lanes' MTP rounds verify on both stages)
+    void        set_verify_rows(uint32_t rows) noexcept { want_verify_ = rows > 0; }
     uint32_t ecache_slots() const noexcept { return ecache_slots_; }
     std::string forward(const int32_t* tokens_host, uint32_t T, uint32_t start_pos,
                         sycl::half* logits_out);
@@ -398,6 +414,13 @@ public:
     // P4 B63: the main state was rewound (a restart, a rollback): the head's one-row carry is no longer the row before
     // the next ingest. Its KV and indexer rows are positional and rewind themselves at the next ingest.
     void mtp_rewind() noexcept { mtp_have_carry_ = false; }
+    // 2026-10-23: the head's per-sequence state (its KV, its indexer caches, the carry) is PER LANE, swapped by
+    // select_lane like the rest of a lane's state and allocated by lane_ensure. mtp_lane_ready: the live lane has it.
+    bool     mtp_lane_ready() const noexcept { return mtp_.loaded && mtp_.kv.ready(); }
+    uint64_t mtp_lane_bytes(uint32_t ctx) const noexcept;   // one lane's head state at `ctx` positions
+    // A rows group's row `row` (forward_rows left its final wide row at wide_ + row * hc * H) as a T = 1 step of the live
+    // lane's head record: the carry pairs with `token`, then that row is the carry at `pos`.
+    std::string mtp_ingest_row(int32_t token, uint32_t pos, uint32_t row);
     // Logits for EVERY row of the last forward (verify step): mixed_ still
     // holds all T final-merge rows. out: device [T, vocab] f16.
     std::string logits_rows(uint32_t T, sycl::half* out);
@@ -565,6 +588,7 @@ private:
     // Workspaces (device USM; sized for max_chunk_ = MT tokens).
     int32_t* d_tokens_ = nullptr;         // [MT]
     int32_t* d_pos_    = nullptr;         // [MT]
+    int32_t* d_rpos_   = nullptr;         // [kMaxRows] a rows group's rope positions (2026-10-23: a lane with images: + its delta)
     int32_t* d_pos3_   = nullptr;         // [3, MT] imrope T/H/W streams (vision)
     sycl::half* emb_ = nullptr;           // [MT, H]
     // Vision splice + M-RoPE staging (set_vision / set_mrope; reset_state
@@ -711,11 +735,32 @@ private:
         uint32_t      mrope_n = 0;
         int32_t       mrope_delta = 0;
         uint32_t      max_ctx = 0;
+        // 2026-10-23: the lane's MTP head state (lazy), swapped with mtp_.kv / idx_kcache / blk_keys / blk_done and the carry
+        KvCache       mtp_kv;
+        sycl::half*   mtp_idx_kcache = nullptr;
+        float*        mtp_blk_keys = nullptr;
+        uint32_t      mtp_blk_done = 0;
+        float*        mtp_carry = nullptr;
+        uint32_t      mtp_carry_pos = 0;
+        bool          mtp_have_carry = false;
     };
     void swap_live(LaneState& s) noexcept;
     std::vector<LaneState> lanes_;
     uint32_t lane_ = 0;
     uint64_t lane_bytes_ = 0;
+    // 2026-10-23: lazy lanes (lane_ensure)
+    std::vector<uint8_t> lane_ready_;        // [lane] its state is allocated (lane 0 always)
+    bool     lanes_lazy_ = false;
+    uint32_t lane_slots_ = 0, mtp_lane0_slots_ = 0;   // slots a layer a wake gives back: an extra lane / lane 0's head state
+    uint64_t mtp_lane_bytes_ = 0;            // an extra lane's head state (0 without the head)
+    uint32_t lane_lctx_ = 0, lane_nf_ = 0, lane_nl_ = 0, lane_cc_ = 0;
+    uint64_t lane_ple_floats_ = 0;
+    bool     want_verify_ = false;
+    std::string lane_alloc(uint32_t lane);      // the lane's KV / indexer / DeltaNet / PLE / snapshot buffers (parked slot)
+    std::string mtp_lane_alloc(uint32_t lane);  // its head state (the live members when the lane is live)
+    std::string ecache_shrink(uint32_t d);      // d slots a layer back to the device (no step in flight)
+    void        ecache_alias_test();            // the VRAM page-alias self-test over this stage's cache buffers
+    std::string vck_alloc(bool ple);            // the spec-verify checkpoint slabs (ple: this stage owns the PLE block)
 
     // P4 B17 rows: a lane's state by index (the live members for the live lane, else its parked LaneState) -- no swap.
     struct LaneRef {
@@ -728,6 +773,8 @@ private:
         PleHistory*    ple_hist = nullptr;
         uint32_t       max_ctx = 0;
         bool           vision = false;   // mrope / vision spans staged
+        int32_t        mrope_delta = 0;  // 2026-10-23: a lane with images ropes its decode rows at (pos + delta)
+        uint32_t       mrope_n = 0;      //   (positions below mrope_n are the prompt's: a rows step never holds one)
     };
     LaneRef lane_ref(uint32_t lane) noexcept;
     void run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, const uint32_t* pos, const int32_t* ids);

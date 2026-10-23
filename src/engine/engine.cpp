@@ -49,6 +49,7 @@ struct Q4eBundle {
     Qwen4ExpModel   A, B;        // A: [0,24) or whole model; B: [24,48)
     bool            split = false;
     bool            p2p   = false;  // wide handoff pushes device-to-device
+    bool            vis_card0 = false;   // 2026-10-23: the vision tower on card 0 (the head's bank is on card 1); else card 1
     std::vector<float> wide_b;   // second parity buffer (pipelined prefill)
     std::vector<float> wide;     // pipeline handoff [chunk, 4, hidden]
     // Agent-turn prefix reuse via the engine's generic prompt-cache flow:
@@ -697,7 +698,7 @@ public:
     Q4eLanesModel(Q4eBundle& b, const Tokenizer& tok, const int32_t* stop_ids, const int32_t* tool_ids,
                   uint32_t pf_chunk, uint32_t n_lanes, bool rows = false, uint32_t max_group = 1, uint32_t group_cap = 0)
         : b_(b), tok_(tok), pf_chunk_(pf_chunk), pipeline_(std::getenv("IE_Q4E_NO_PIPELINE") == nullptr),
-          snap_(n_lanes), rows_(rows),
+          snap_(n_lanes), vis_(n_lanes, nullptr), rows_(rows),
           pipe_(make_pipe(this, b, n_lanes, q4e_plan_max_rows(pf_chunk, pipeline_), rows, max_group, group_cap)) {
         stop_[0] = tok.eos_token_id(); stop_[1] = stop_ids[0]; stop_[2] = stop_ids[1];
         tool_[0] = tool_ids[0]; tool_[1] = tool_ids[1];
@@ -741,6 +742,174 @@ public:
     }
     uint64_t host_bytes() const { return pipe_.host_bytes(); }
 
+    // ---- 2026-10-23: the MTP head's draft rounds on the lanes (LanesServe::Options::draft; the 27B's hooks) -------------
+    // A decoding lane alone on the cards: draft() runs the head on card 1 (the lane's done-callback thread) -- the sampled
+    // drafts of Q4eBundle::spec_round (exact speculative sampling at any temperature; penalties -> plain steps; a greedy
+    // request takes the argmax drafts and the compare path), the QMIN gate and the adaptive guard per lane; the round's
+    // K+1 rows run through the pipe as one step in spec-verify mode on each card (stage(): every row the T=1 step's bytes,
+    // the DeltaNet/PLE state checkpointed after every row), card 1 keeps every row's logits (rl_[lane]); sample_draft
+    // decides each row; draft_keep commits row kept-1's checkpoint on card 1 at once and marks card 0's commit PENDING
+    // (pend_a_), applied on card 0's stage thread before that card's next step or in the next serial turn -- no stage
+    // object is touched from another card's thread. The head's record per lane (hr_: the positions its KV covers) is fed
+    // by every step and prefill piece on card 1; a restore to a depth it covers rewinds it, a deeper one or a
+    // shared-prefix restore (the stash holds no head state) breaks it: plain steps until the lane's next sequence.
+    std::string init_draft(uint32_t K) {
+        sycl::queue& q = b_.B.queue();
+        const uint32_t n = n_lanes(), V = b_.cfg.vocab;
+        if (K < 1 || K > 7) return "MTP rounds: K " + std::to_string(K);
+        rl_.assign(n, nullptr);
+        for (uint32_t i = 0; i < n; ++i) {
+            rl_[i] = sycl::malloc_device<sycl::half>(uint64_t(K + 1) * V, q);
+            dev_.push_back(rl_[i]);
+            if (!rl_[i]) return "MTP rounds: round logits alloc failed";
+        }
+        dpicks_      = sycl::malloc_device<int32_t>(16, q);
+        dpicks_host_ = sycl::malloc_host<int32_t>(16, q);
+        ss_scratch_  = sycl::malloc_device<sycl::half>(V, q);
+        ss_idx_      = sycl::malloc_device<int32_t>(1024, q);
+        ss_p_        = sycl::malloc_device<float>(1024, q);
+        ss_n_        = sycl::malloc_device<uint32_t>(1, q);
+        dev_.insert(dev_.end(), {dpicks_, dpicks_host_, ss_scratch_, ss_idx_, ss_p_, ss_n_});
+        if (!dpicks_ || !dpicks_host_ || !ss_scratch_ || !ss_idx_ || !ss_p_ || !ss_n_) return "MTP rounds: scratch alloc failed";
+        round_.assign(n, {0u, 0u});
+        pend_a_.assign(n, 0u);
+        hr_.assign(n, {});
+        guard_.assign(n, {});
+        qd_.assign(n, {});
+        rids_.assign(n, {});
+        units_.assign(n, 0u);
+        ss_qtemp_ = [] { const char* v = std::getenv("IE_Q4E_MTP_QTEMP"); const float f = v ? float(std::atof(v)) : 1.f; return f > 0.f ? f : 1.f; }();
+        ss_qmin_  = [] { const char* v = std::getenv("IE_Q4E_MTP_QMIN"); const float f = v ? float(std::atof(v)) : 0.5f;
+                         return f > 0.f && f < 1.f ? f : 0.f; }();
+        draft_V_ = K + 1;
+        return {};
+    }
+    uint32_t draft_rows() const override { return draft_V_; }
+    // (2026-10-23: lazy lanes. Lane 0 is the whole --ctx lane: a prompt beyond the pipe lanes' context lands there.)
+    bool lane_warm(uint32_t lane) const override { return lane != 0 && b_.A.lane_ready(lane); }
+    std::string draft(uint32_t lane, int32_t next, uint32_t pos, const LanesSampling& sp, uint64_t seed,
+                      std::vector<int32_t>& out) override {
+        out.clear();
+        if (!draft_V_ || lane >= hr_.size()) return {};
+        Guard& g = guard_[lane];
+        {   // the unit that just ended (a plain step, or a round and its sampling) against the guard's yardstick
+            const auto now = std::chrono::steady_clock::now();
+            if (g.t_valid) {
+                const double ms = std::chrono::duration<double, std::milli>(now - g.t_last).count();
+                if (g.last_round) g.note_round(g.last_tokens, ms); else g.note_step(ms);
+            }
+            g.t_last = now; g.t_valid = true; g.last_round = false;
+        }
+        HeadRec& h = hr_[lane];
+        if (!h.ok || h.to != pos) return {};                 // the head's record does not reach the lane's position
+        const bool greedy = sp.temperature <= 0.f || sp.top_k == 1;
+        const bool penalties = sp.repeat_penalty != 1.f || sp.presence_penalty != 0.f || sp.frequency_penalty != 0.f;
+        static const bool env_off = [] { const char* v = std::getenv("IE_Q4E_MTP_SAMPLED"); return v && *v == '0'; }();
+        const bool sampled = !greedy && !penalties && !env_off;
+        if (!greedy && !sampled) return {};                  // penalties change p after the fact: plain steps
+        if (!g.rounds_now()) return {};
+        if (auto e = b_.B.select_lane(lane); !e.empty()) return e;
+        if (!b_.B.mtp_lane_ready()) return {};
+        const uint32_t K = draft_V_ - 1;
+        uint32_t Kd = K;
+        std::vector<int32_t> d(K, 0);
+        std::string e;
+        if (sampled) {   // the drafts drawn from the head's sampler-cut distributions (kept for the verify)
+            qd_[lane].assign(K, {});
+            std::mt19937_64 rng(seed ^ 0x5EED5EEDull);
+            const std::function<int32_t(sycl::half*, uint32_t)> pick = [&](sycl::half* lg, uint32_t k) -> int32_t {
+                if (!ss_dist(lg, sp, qd_[lane][k], ss_qtemp_).empty() || qd_[lane][k].ids.empty()) return -1;
+                if (k >= 1 && ss_qmin_ > 0.f && qd_[lane][k].p[0] < double(ss_qmin_)) return -2;   // the gate: an unsure row ends it
+                return ss_draw(rng, qd_[lane][k].ids, qd_[lane][k].p);
+            };
+            e = b_.B.mtp_draft(next, pos, K, d.data(), &pick, &Kd);
+        } else e = b_.B.mtp_draft(next, pos, K, d.data(), nullptr, &Kd);
+        if (!e.empty()) return e;
+        if (Kd == 0) return {};
+        out.assign(d.begin(), d.begin() + Kd);
+        g.sampled = sampled;
+        return {};
+    }
+    std::string pipe_submit_draft(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos0) override {
+        if (!draft_V_ || lane >= round_.size() || T < 2 || T > draft_V_) return "MTP rounds are off";
+        rids_[lane].assign(ids, ids + T);
+        { std::lock_guard<std::mutex> g(round_mu_); round_[lane] = {T, pos0}; }
+        std::string e = pipe_.submit(lane, ids, T, pos0);
+        if (!e.empty()) forget_round(lane);
+        return e;
+    }
+    std::string sample_draft(uint32_t lane, uint32_t rows, const LanesSampling& sp, std::span<const std::span<const int32_t>> windows,
+                             std::span<const uint64_t> seeds, std::span<int32_t> picks) override {
+        if (!draft_V_ || lane >= rl_.size() || rows < 2 || rows > draft_V_) return "sample_draft: " + std::to_string(rows) + " rows";
+        if (rids_[lane].size() != rows) return "sample_draft: the round has " + std::to_string(rids_[lane].size()) + " ids";
+        sycl::queue& q = b_.B.queue();
+        const uint32_t V = b_.cfg.vocab;
+        sycl::half* all = rl_[lane];
+        const Guard& g = guard_[lane];
+        try {
+            if (!g.sampled) {   // the compare path: the request's sampler on each row (penalties, then the cut)
+                for (uint32_t r = 0; r < rows; ++r) {
+                    sycl::half* lg = all + uint64_t(r) * V;
+                    if (!windows[r].empty()) {
+                        q.memcpy(recent_[lane], windows[r].data(), windows[r].size() * sizeof(int32_t));
+                        sampling_penalties(q, lg, V, recent_[lane], uint32_t(windows[r].size()), sp.repeat_penalty, sp.presence_penalty,
+                                           sp.frequency_penalty);
+                    }
+                    sample_softmax_topk_topp(q, lg, dpicks_ + r, V, sp.temperature, sp.top_k, sp.top_p, sp.min_p, seeds[r]);
+                }
+                q.memcpy(dpicks_host_, dpicks_, rows * sizeof(int32_t)).wait();
+                for (uint32_t r = 0; r < rows; ++r) picks[r] = dpicks_host_[r];
+                return {};
+            }
+            // exact speculative sampling: row j's target cut p_j against draft j+1's distribution q_j; accept with
+            // min(1, p/q), else draw the residual (p - q)+ and stop; the last row has no draft: the plain draw
+            const std::vector<SpecDist>& qd = qd_[lane];
+            for (uint32_t j = 0; j < rows; ++j) picks[j] = 0;
+            for (uint32_t j = 0; j + 1 < rows; ++j) {
+                SpecDist pj;
+                if (auto e = ss_dist(all + uint64_t(j) * V, sp, pj, 1.f); !e.empty()) return e;
+                if (j >= qd.size()) return "sample_draft: no draft distribution for row " + std::to_string(j);
+                std::mt19937_64 rng(seeds[j] ^ 0xA11CE5EEDull);
+                const int32_t dtok = rids_[lane][j + 1];
+                const double pd = ss_prob(pj, dtok), qdv = ss_prob(qd[j], dtok);
+                const double u = std::uniform_real_distribution<double>(0.0, 1.0)(rng);
+                if (qdv > 0 && (pd >= qdv || u < pd / qdv)) { picks[j] = dtok; continue; }
+                std::vector<int32_t> rid; std::vector<double> rp;   // (p - q)+, never holds the draft
+                for (size_t i = 0; i < pj.ids.size(); ++i) {
+                    const double r = pj.p[i] - ss_prob(qd[j], pj.ids[i]);
+                    if (r > 0) { rid.push_back(pj.ids[i]); rp.push_back(r); }
+                }
+                picks[j] = rid.empty() ? dtok : ss_draw(rng, rid, rp);   // (p == q on p's support up to rounding: keep d)
+                return {};   // the rows after a rejection are moot
+            }
+            {   // every draft followed: the last row's token is the plain sampler's draw
+                const uint32_t r = rows - 1;
+                sycl::half* lg = all + uint64_t(r) * V;
+                sample_softmax_topk_topp(q, lg, dpicks_ + r, V, sp.temperature, sp.top_k, sp.top_p, sp.min_p, seeds[r]);
+                q.memcpy(dpicks_host_ + r, dpicks_ + r, sizeof(int32_t)).wait();
+                picks[r] = dpicks_host_[r];
+            }
+        } catch (const sycl::exception& x) { return x.what(); }
+        return {};
+    }
+    std::string draft_keep(uint32_t lane, uint32_t rows, uint32_t kept, uint32_t pos0) override {
+        if (!draft_V_ || lane >= hr_.size() || kept == 0 || kept > rows) return "draft_keep: bad round";
+        if (auto e = b_.B.select_lane(lane); !e.empty()) return e;
+        if (auto e = b_.B.commit_verify(kept); !e.empty()) return "card 1: " + e;
+        { std::lock_guard<std::mutex> g(round_mu_); pend_a_[lane] = kept; }
+        // the head: the rows followed into its record (the verify's rows are still in card 1's wide buffer; the draft's
+        // first step already paired the carry with the round's first input, hence the rewind first: Q4eBundle::spec_resolve)
+        HeadRec& h = hr_[lane];
+        b_.B.mtp_rewind();
+        if (h.ok) {
+            if (auto e = b_.B.mtp_ingest(rids_[lane].data(), kept, pos0); e.empty()) h.to = pos0 + kept;
+            else h.ok = false;
+        }
+        Guard& g = guard_[lane];
+        g.last_round = true; g.last_tokens = kept;
+        return kept < rows ? pipe_.rewind_lane(lane, pos0 + kept) : std::string();
+    }
+
     const char* tag() const override { return "q4e lanes"; }
     uint32_t n_lanes() const override { return uint32_t(snap_.size()); }
     // the engine's rule: a prompt must be below ctx - 8, and the reply fits in ctx - 8 - prompt
@@ -751,7 +920,25 @@ public:
 
     std::string prefix_prepare(uint32_t lane, const LanesRequest& rq, uint32_t& reused, std::string& source) override {
         reused = 0;
+        // 2026-10-23: a lazy lane's state (and lane 0's head state) on its first request -- out of the expert cache
+        if (auto e = b_.A.lane_ensure(lane); !e.empty()) return e;
+        if (auto e = b_.B.lane_ensure(lane); !e.empty()) return e;
         if (auto e = select(lane); !e.empty()) return e;
+        if (draft_V_ && lane < guard_.size()) { guard_[lane].reset(); qd_[lane].clear(); forget_round(lane); }
+        if (lane < vis_.size()) vis_[lane] = rq.vision;   // (the request's images, for the pipe's pos-0 reset; null = text)
+        if (rq.vision) {   // 2026-10-23: the request's images on its lane (qvis_apply's staging, per lane): a new sequence, no
+                           // restore, snapshot or shared prefix (pad ids cannot key the cache). The head's rounds run on it too:
+                           // the head sees the pad tokens, not the picture (its rope knows no images), the verify is exact, and
+                           // a picture description still gave 120 tokens in 50 steps (gated byte-equal with and without --spec)
+            const LanesVision& v = *rq.vision;
+            source = "none";
+            b_.A.reset_state(); b_.B.reset_state();   // (drops the staging of an earlier image request too)
+            b_.A.drop_snapshot(); b_.B.drop_snapshot();
+            snap_[lane].clear();
+            head_sync(lane, 0);
+            if (auto e = stage_vision(b_.A, 0, v); !e.empty()) return e;   // (the serial turn's prefill runs on this staging)
+            return stage_vision(b_.B, 1, v);
+        }
         // --parallel 1's rule: restore only when the snapshot's tokens are a STRICT prefix of the prompt (all or nothing)
         const uint32_t D = q4e_snap_match(snap_[lane], *rq.ids);
         // P4 B15: a longer SHARED prefix (another lane's, from the host store) is copied in whole: KV rows, indexer caches,
@@ -766,6 +953,7 @@ public:
                 b_.A.drop_snapshot(); b_.B.drop_snapshot();
                 snap_[lane].clear();
                 b_.A.clear_vision(); b_.B.clear_vision();
+                if (lane < hr_.size()) hr_[lane] = {false, 0};   // (2026-10-23: the stash holds no head state: plain steps)
                 std::fprintf(stderr, "[q4e lanes] lane %u: shared prefix %u restored (%.1f ms)\n", lane, reused,
                              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
                 return {};
@@ -776,18 +964,21 @@ public:
             b_.A.reset_state(); b_.B.reset_state();
             b_.A.drop_snapshot(); b_.B.drop_snapshot();
             snap_[lane].clear();
+            head_sync(lane, 0);
             return {};
         }
         if (D > 0 && b_.A.snapshot_depth() == D) {
             if (auto e = b_.rest(); e.empty()) {
                 reused = D; source = "snapshot";
                 b_.A.clear_vision(); b_.B.clear_vision();
+                head_sync(lane, D);   // (2026-10-23: the head's record rewinds with the lane when it covers D)
                 return {};
             } else std::fprintf(stderr, "[q4e lanes] lane %u restore: %s\n", lane, e.c_str());
         }
         source = "none";
         b_.A.reset_state(); b_.B.reset_state();   // a new sequence (drops the lane's snapshot)
         snap_[lane].clear();
+        head_sync(lane, 0);
         return {};
     }
     // --parallel 1's prefill_to(snap_at), snapshot, prefill_to(T): the pipe's part ends at the snapshot boundary when one is due
@@ -803,7 +994,7 @@ public:
     // P4 B15: the lane's state at pos (== the shared-prefix boundary) into the host store, whole (Qwen4ExpModel::stash_slot into
     // pinned host memory), restorable into any lane. LRU within IE_Q4E_SHARED_PREFIX_GIB (default 2; 0 = no store).
     std::string mark(uint32_t lane, const LanesRequest& rq, uint32_t pos) override {
-        if (shared_cap_ == 0) return {};
+        if (shared_cap_ == 0 || rq.vision) return {};   // (2026-10-23: an image request's pad ids cannot key the store)
         const std::vector<int32_t> pref(rq.ids->begin(), rq.ids->begin() + pos);
         std::lock_guard<std::mutex> g(shared_mu_);
         for (auto& e : shared_) if (e->tokens == pref) { e->tick = ++shared_tick_; return {}; }   // (already stored)
@@ -843,13 +1034,13 @@ public:
                                const std::function<bool()>& stop, size_t& done) override {
         done = 0;
         if (auto e = select(lane); !e.empty()) return e;
-        return run_chunks(rq.ids->data(), chunks, stop, done);
+        return run_chunks(lane, rq.ids->data(), chunks, stop, done);
     }
     std::string prompt_end(uint32_t lane, const LanesRequest& rq, uint32_t Tp, uint32_t reused, bool kept) override {
         if (auto e = select(lane); !e.empty()) return e;
         const std::vector<int32_t>& ids = *rq.ids;
         const uint32_t T = uint32_t(ids.size());
-        if (rq.snap_at > reused && Tp == rq.snap_at) {   // --parallel 1's snapshot at the stable conversation depth
+        if (!rq.vision && rq.snap_at > reused && Tp == rq.snap_at) {   // --parallel 1's snapshot at the stable conversation depth
             if (auto e = b_.snap(Tp); e.empty()) snap_[lane].assign(ids.begin(), ids.begin() + Tp);
             else { snap_[lane].clear(); std::fprintf(stderr, "[q4e lanes] lane %u snapshot: %s\n", lane, e.c_str()); }
         }
@@ -857,7 +1048,7 @@ public:
             std::vector<LanesChunk> rest;
             q4e_plan_range(Tp, T, pf_chunk_, pipeline_, rest);
             size_t done = 0;
-            if (auto e = run_chunks(ids.data(), rest, {}, done); !e.empty()) return e;
+            if (auto e = run_chunks(lane, ids.data(), rest, {}, done); !e.empty()) return e;
             kept = false;
         }
         if (!kept) { lg_[lane] = b_.B.logits(); keep_logits(lane); }   // (the serial chunks' logits)
@@ -867,11 +1058,16 @@ public:
         // the pipe's record first (position 0, a failed step's mark cleared): it touches no device state, and it must happen
         // even when the model's reset below returns early or throws (the B9 gate's finding 1), or the lane stays unusable
         const std::string pe = pipe_.reset_lane(lane);
+        forget_round(lane);
+        { std::lock_guard<std::mutex> g(round_mu_); if (lane < pend_a_.size()) pend_a_[lane] = 0; }
+        if (lane < hr_.size()) hr_[lane] = {};
+        if (lane < vis_.size()) vis_[lane] = nullptr;
+        snap_[lane].clear();
+        if (!b_.A.lane_ready(lane)) return pe;   // (2026-10-23: a lazy lane that never woke holds nothing)
         try {
             if (auto e = select(lane); !e.empty()) return e;
             b_.A.reset_state(); b_.B.reset_state();
         } catch (const sycl::exception& x) { return x.what(); }
-        snap_[lane].clear();
         return pe;
     }
     int32_t sample(uint32_t lane, bool first, const LanesSampling& sp, std::span<const int32_t> window, uint64_t seed,
@@ -952,8 +1148,131 @@ private:
                         max_group, group_cap);
     }
     std::string select(uint32_t lane) {
+        if (auto e = apply_pending_a(); !e.empty()) return e;   // (2026-10-23: the serial turn, the pipe drained)
         if (auto e = b_.A.select_lane(lane); !e.empty()) return e;
         return b_.B.select_lane(lane);
+    }
+    // ---- 2026-10-23: the rounds' helpers --------------------------------------------------------------------------------
+    struct HeadRec { bool ok = true; uint32_t to = 0; };   // the lane's head record: its KV covers [0, to)
+    struct SpecDist { std::vector<int32_t> ids; std::vector<double> p; };
+    // Q4eBundle::Spec's adaptive guard, per lane (IE_Q4E_MTP_ADAPT=0 = off): kProbe plain steps give the yardstick, then
+    // rounds; after kWin rounds whose tokens x step time < their time, rounds stop for kOff plain steps and are probed again
+    struct Guard {
+        static constexpr uint32_t kProbe = 4, kWin = 6, kOff = 48;
+        double win_ms[kWin] = {}; uint32_t win_tok[kWin] = {}; uint32_t win_n = 0, win_i = 0;
+        double step_ms = 0; uint32_t step_n = 0;
+        uint32_t probe = kProbe, off_steps = 0; bool off = false;
+        std::chrono::steady_clock::time_point t_last{}; bool t_valid = false; uint32_t units_at = 0;
+        bool last_round = false; uint32_t last_tokens = 0;
+        bool sampled = false;
+        uint64_t rounds = 0, tokens = 0, off_total = 0;
+        static bool adapt() { static const bool on = [] { const char* v = std::getenv("IE_Q4E_MTP_ADAPT"); return !(v && *v == '0'); }(); return on; }
+        void reset() { win_n = win_i = 0; step_ms = 0; step_n = 0; probe = kProbe; off_steps = 0; off = false; t_valid = false; last_round = false; }
+        void note_step(double ms) {
+            if (step_n < 64) { step_ms += ms; ++step_n; } else step_ms += (ms - step_ms / step_n);
+            if (probe) --probe;
+            if (off && off_steps && --off_steps == 0) { off = false; win_n = win_i = 0; }
+        }
+        void note_round(uint32_t tok, double ms) {
+            ++rounds; tokens += tok;
+            win_ms[win_i] = ms; win_tok[win_i] = tok; win_i = (win_i + 1) % kWin;
+            if (win_n < kWin) ++win_n;
+            if (!adapt() || win_n < kWin || step_n < kProbe) return;
+            double tms = 0, ttok = 0;
+            for (uint32_t i = 0; i < kWin; ++i) { tms += win_ms[i]; ttok += win_tok[i]; }
+            const double step = step_ms / double(std::min<uint32_t>(step_n, 64));
+            if (ttok * step < tms) { off = true; off_steps = kOff; win_n = win_i = 0; ++off_total; }
+        }
+        bool rounds_now() const { return !adapt() || (!off && probe == 0); }
+    };
+    void forget_round(uint32_t lane) {
+        std::lock_guard<std::mutex> g(round_mu_);
+        if (lane < round_.size()) round_[lane] = {0u, 0u};
+    }
+    // 2026-10-23: a request's images on the live lane of stage `s` (qvis_apply's staging): the image rows on the head stage,
+    // the M-RoPE table on both
+    std::string stage_vision(Qwen4ExpModel& M, uint32_t s, const LanesVision& v) {
+        if (s == 0) {
+            const uint32_t H = b_.cfg.hidden;
+            size_t row = 0;
+            for (const auto& [t0, n] : v.spans) {
+                if (auto e = M.set_vision(v.rows.data() + row * H, t0, n); !e.empty()) return e;
+                row += n;
+            }
+        }
+        M.set_mrope(v.pos3.data(), uint32_t(v.pos3.size() / 3), v.delta);
+        return {};
+    }
+    // card 0's verify commits draft_keep left (card 0's stage thread before its next step, or the serial turn, pipe drained)
+    std::string apply_pending_a() {
+        if (!draft_V_) return {};
+        for (uint32_t l = 0; l < pend_a_.size(); ++l) {
+            uint32_t kept = 0;
+            { std::lock_guard<std::mutex> g(round_mu_); kept = pend_a_[l]; pend_a_[l] = 0; }
+            if (!kept) continue;
+            if (auto e = b_.A.select_lane(l); !e.empty()) return e;
+            if (auto e = b_.A.commit_verify(kept); !e.empty()) return "card 0: " + e;
+        }
+        return {};
+    }
+    // the head's record of `lane` (card 1's live lane) takes a step's / a prefill piece's rows (Q4eBundle::mtp_feed)
+    void head_feed(uint32_t lane, const int32_t* ids, uint32_t T, uint32_t pos) {
+        if (!draft_V_ || lane >= hr_.size()) return;
+        HeadRec& h = hr_[lane];
+        if (pos == 0) { h.ok = true; h.to = 0; }
+        if (!h.ok) return;
+        if (!b_.B.mtp_lane_ready() || pos > h.to) { h.ok = false; return; }
+        if (pos < h.to) b_.B.mtp_rewind();
+        if (auto e = b_.B.mtp_ingest(ids, T, pos); !e.empty()) { h.ok = false; return; }
+        h.to = pos + T;
+    }
+    void head_feed_row(uint32_t lane, int32_t id, uint32_t pos, uint32_t row) {   // a rows group's row (card 1's live lane = lane)
+        if (!draft_V_ || lane >= hr_.size()) return;
+        HeadRec& h = hr_[lane];
+        if (!h.ok) return;
+        if (!b_.B.mtp_lane_ready() || pos > h.to) { h.ok = false; return; }
+        if (pos < h.to) b_.B.mtp_rewind();
+        if (auto e = b_.B.mtp_ingest_row(id, pos, row); !e.empty()) { h.ok = false; return; }
+        h.to = pos + 1;
+    }
+    // the lane's state was set to `depth` by a restore (0 = a new sequence follows); card 1's live lane = lane
+    void head_sync(uint32_t lane, uint32_t depth) {
+        if (!draft_V_ || lane >= hr_.size()) return;
+        HeadRec& h = hr_[lane];
+        if (depth == 0) { h.ok = true; h.to = 0; b_.B.mtp_rewind(); return; }
+        if (!h.ok || depth > h.to) { h.ok = false; return; }
+        b_.B.mtp_rewind();
+        h.to = depth;
+    }
+    // the sampler's candidates of a device logits row on card 1, renormalised (Q4eBundle::ss_dist)
+    std::string ss_dist(const sycl::half* row_dev, const LanesSampling& sp, SpecDist& d, float temp_scale) {
+        sycl::queue& q = b_.B.queue();
+        const uint32_t V = b_.cfg.vocab;
+        q.memcpy(ss_scratch_, row_dev, uint64_t(V) * sizeof(sycl::half));
+        sampler_candidates(q, ss_scratch_, ss_idx_, ss_p_, ss_n_, V, sp.temperature * temp_scale, sp.top_k, sp.top_p, sp.min_p);
+        uint32_t n = 0;
+        q.memcpy(&n, ss_n_, sizeof(uint32_t)).wait();
+        n = std::min<uint32_t>(n, 1024u);
+        if (n == 0) return "sampled rounds: a row kept no candidate";
+        std::vector<float> pf(n);
+        d.ids.resize(n); d.p.resize(n);
+        q.memcpy(d.ids.data(), ss_idx_, n * sizeof(int32_t));
+        q.memcpy(pf.data(), ss_p_, n * sizeof(float));
+        q.wait();
+        double z = 0; for (float v : pf) z += v;
+        for (uint32_t i = 0; i < n; ++i) d.p[i] = z > 0 ? double(pf[i]) / z : 1.0 / n;
+        return {};
+    }
+    static double ss_prob(const SpecDist& d, int32_t id) {
+        for (size_t i = 0; i < d.ids.size(); ++i) if (d.ids[i] == id) return d.p[i];
+        return 0.0;
+    }
+    static int32_t ss_draw(std::mt19937_64& rng, const std::vector<int32_t>& ids, const std::vector<double>& p) {
+        double z = 0; for (double v : p) z += v;
+        const double r = std::uniform_real_distribution<double>(0.0, 1.0)(rng) * z;
+        double c = 0;
+        for (size_t i = 0; i < ids.size(); ++i) { c += p[i]; if (p[i] > 0 && c > r) return ids[i]; }
+        return ids.back();
     }
     // P4 B15: the shared-prefix store (host, pinned; see mark)
     struct SharedEntry {
@@ -987,14 +1306,47 @@ private:
     uint64_t shared_tick_ = 0;
     uint64_t shared_cap_ = shared_cap_env();
     // One stage of one lane's step (a stage thread; only this thread touches its stage object while the pipe runs).
+    // 2026-10-23: a step marked as the lane's MTP round runs in spec-verify mode (every row the T=1 step's bytes, the
+    // recurrent state checkpointed after every row); card 1 keeps every row's logits for sample_draft.
     std::string stage(uint32_t s, const Glm5LanePipe::Step& st) {
         Qwen4ExpModel& M = s == 0 ? b_.A : b_.B;
+        if (s == 0) if (auto e = apply_pending_a(); !e.empty()) return e;   // (a verify commit draft_keep left for card 0)
+        bool round = false;   // the lane's MTP round (its mark: the rows and the position it was submitted with)
+        if (draft_V_ && st.T >= 2) {
+            std::lock_guard<std::mutex> g(round_mu_);
+            round = st.lane < round_.size() && round_[st.lane].first == st.T && round_[st.lane].second == st.pos0;
+            if (round && s == 1) round_[st.lane] = {0u, 0u};
+        }
         if (auto e = M.select_lane(st.lane); !e.empty()) return e;
-        if (st.pos0 == 0) M.reset_state();   // a new sequence (the forward's pos 0 rule)
-        std::string e = s == 0 ? M.forward_range(st.ids, st.T, st.pos0, nullptr, st.wide, nullptr)
-                               : M.forward_range(st.ids, st.T, st.pos0, st.wide, nullptr, nullptr);
-        if (!e.empty()) { try { M.queue().wait(); } catch (...) {} }   // nothing of a failed step still reads the lane's buffers
-        else if (s == 1) lg_[st.lane] = M.logits();
+        if (st.pos0 == 0) {
+            M.reset_state();   // a new sequence (the forward's pos 0 rule)
+            // 2026-10-23: the reset wiped the lane's image staging (prefix_prepare's): re-arm it, as qvis_apply does after
+            // --parallel 1's reset (an image prompt whose pieces go through the pipe, beside other lanes)
+            if (st.lane < vis_.size() && vis_[st.lane])
+                if (auto e = stage_vision(M, s, *vis_[st.lane]); !e.empty()) return e;
+        }
+        if (round) M.set_spec_verify(true);
+        std::string e;
+        try {
+            e = s == 0 ? M.forward_range(st.ids, st.T, st.pos0, nullptr, st.wide, nullptr)
+                       : M.forward_range(st.ids, st.T, st.pos0, st.wide, nullptr, nullptr);
+        } catch (const std::exception& x) { e = x.what(); }
+        if (round) M.set_spec_verify(false);
+        if (!e.empty()) {   // nothing of a failed step still reads the lane's buffers
+            try { M.queue().wait(); } catch (...) {}
+            if (round) forget_round(st.lane);
+            return e;
+        }
+        if (s == 1) {
+            if (round) {
+                if (auto m = M.logits_rows(st.T, rl_[st.lane]); !m.empty()) { forget_round(st.lane); return "round logits: " + m; }
+                lg_[st.lane] = rl_[st.lane];
+            } else {
+                lg_[st.lane] = M.logits();
+                head_feed(st.lane, st.ids, st.T, st.pos0);   // (the head's record: a step or a prefill piece)
+            }
+            if (st.lane < units_.size()) ++units_[st.lane];
+        }
         return e;
     }
     // P4 B17: one card's part of a group's step (G >= 2 lanes, one row each); card 1 leaves row r's logits at
@@ -1003,6 +1355,7 @@ private:
         const uint32_t G = uint32_t(steps.size());
         if (G > Qwen4ExpModel::kMaxRows) return "stage_rows: " + std::to_string(G) + " rows";
         Qwen4ExpModel& M = s == 0 ? b_.A : b_.B;
+        if (s == 0) if (auto e = apply_pending_a(); !e.empty()) return e;   // (2026-10-23)
         uint32_t lanes[Qwen4ExpModel::kMaxRows], pos[Qwen4ExpModel::kMaxRows];
         int32_t ids[Qwen4ExpModel::kMaxRows];
         for (uint32_t r = 0; r < G; ++r) { lanes[r] = steps[r].lane; ids[r] = steps[r].ids[0]; pos[r] = steps[r].pos0; }
@@ -1011,13 +1364,21 @@ private:
             e = s == 0 ? M.forward_rows(lanes, ids, pos, G, nullptr, gwide) : M.forward_rows(lanes, ids, pos, G, gwide, nullptr);
         } catch (const std::exception& x) { e = x.what(); }   // (any throw, then the drain below)
         if (!e.empty()) { try { M.queue().wait(); } catch (...) {} }
-        else if (s == 1)
+        else if (s == 1) {
             for (uint32_t r = 0; r < G; ++r) lg_[lanes[r]] = M.rows_logits() + uint64_t(r) * b_.cfg.vocab;
+            if (draft_V_)   // 2026-10-23: each row into its lane's head record (its final wide row is still in wide_)
+                for (uint32_t r = 0; r < G; ++r) {
+                    if (lanes[r] < hr_.size() && hr_[lanes[r]].ok && M.select_lane(lanes[r]).empty())
+                        head_feed_row(lanes[r], ids[r], pos[r], r);
+                    if (lanes[r] < units_.size()) ++units_[lanes[r]];
+                }
+        }
         return e;
     }
     // Chunks on the selected lane, stage B of chunk k beside stage A of chunk k + 1 (Q4eBundle::fwd_pipelined's overlap:
     // the same launches, bit-identical to serial), `stop` asked before each chunk after the first.
-    std::string run_chunks(const int32_t* ids, std::span<const LanesChunk> ch, const std::function<bool()>& stop, size_t& done) {
+    std::string run_chunks(uint32_t lane, const int32_t* ids, std::span<const LanesChunk> ch, const std::function<bool()>& stop,
+                           size_t& done) {
         done = 0;
         float* wb2[2] = {b_.wide.data(), b_.wide_b.data()};
         std::future<std::string> bfut;
@@ -1033,8 +1394,11 @@ private:
                 ++done;
             }
             Qwen4ExpModel* Bp = &b_.B;
-            bfut = std::async(std::launch::async, [Bp, wb, n, p0]() {
-                return Bp->forward_range(nullptr, n, p0, wb, nullptr, nullptr);
+            const int32_t* bt = ids + p0;
+            bfut = std::async(std::launch::async, [this, Bp, wb, n, p0, bt, lane]() {
+                std::string e = Bp->forward_range(nullptr, n, p0, wb, nullptr, nullptr);
+                if (e.empty()) head_feed(lane, bt, n, p0);   // (2026-10-23: the head's record reads every chunk; B's thread)
+                return e;
             });
         }
         if (bfut.valid()) {
@@ -1050,6 +1414,7 @@ private:
     uint32_t pf_chunk_;
     bool pipeline_;
     std::vector<std::vector<int32_t>> snap_;   // per lane: the tokens of its prompt-cache snapshot (empty = none)
+    std::vector<const LanesVision*> vis_;      // 2026-10-23: per lane, the running request's images (null = text); the caller owns them
     bool rows_;
     CardPipe pipe_;
     int32_t stop_[3] = {-1, -1, -1};
@@ -1060,6 +1425,20 @@ private:
     int32_t* picks_dev_ = nullptr;         // [n_lanes] a group's picks (card 1; rows only)
     int32_t* picks_host_ = nullptr;        // [n_lanes] pinned host (rows only)
     std::vector<void*> dev_;
+    // 2026-10-23: the head's rounds on the lanes (init_draft)
+    uint32_t draft_V_ = 0;                 // rows a round (K + 1); 0 = off
+    std::vector<sycl::half*> rl_;          // [lane] a round's logits [draft_V_, vocab] on card 1
+    int32_t* dpicks_ = nullptr; int32_t* dpicks_host_ = nullptr;
+    sycl::half* ss_scratch_ = nullptr; int32_t* ss_idx_ = nullptr; float* ss_p_ = nullptr; uint32_t* ss_n_ = nullptr;
+    float ss_qtemp_ = 1.f, ss_qmin_ = 0.5f;
+    std::vector<std::pair<uint32_t, uint32_t>> round_;   // [lane] the round in the pipe: (rows, pos0); (0, 0) = none
+    std::vector<uint32_t> pend_a_;         // [lane] card 0's verify commit still to apply (rows kept; 0 = none)
+    std::mutex round_mu_;
+    std::vector<HeadRec> hr_;              // [lane] the head's record
+    std::vector<Guard> guard_;             // [lane]
+    std::vector<std::vector<SpecDist>> qd_;   // [lane][k] the drafts' distributions of the round in flight
+    std::vector<std::vector<int32_t>> rids_;  // [lane] the round's ids (its first input, then the drafts)
+    std::vector<uint32_t> units_;          // [lane] steps and rounds that landed on card 1 (its thread)
 };
 
 // P4 B10 (docs/lanes/LANES_SERVE.md): the crown split at --parallel N > 1 -- the shared lanes module over the
@@ -2219,10 +2598,11 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         // official checkpoint). A found head turns --spec on (the lookup drafts and the head's rounds; every row is verified
         // with the exact kernels, the sampler runs on each row's own logits, so the tokens are plain decoding's at any
         // temperature) with --spec-k 3 unless given (the certified K; K = 5 gave different tokens, B63). IE_Q4E_MTP=0 = off.
+        // 2026-10-23: at --parallel N > 1 too -- the head's rounds run on the request lanes (Q4eLanesModel's draft hooks)
         const bool q4e_mtp_off = [] { const char* v = std::getenv("IE_Q4E_MTP"); return v && *v == '0'; }();
         std::string q4e_head = opts.spec_head;
         if (q4e_head.empty()) if (const char* v = std::getenv("IE_Q4E_MTP_HEAD")) q4e_head = v;
-        if (q4e_head.empty() && n_lanes == 1 && !q4e_mtp_off) {
+        if (q4e_head.empty() && !q4e_mtp_off) {
             namespace fs = std::filesystem;
             std::error_code ec;
             for (fs::directory_iterator it(fs::path(gguf_path).parent_path(), ec), end; !ec && it != end; ++it) {
@@ -2230,15 +2610,30 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                 if (fn.rfind("mtp", 0) == 0 && fn.size() > 5 && fn.substr(fn.size() - 5) == ".gguf") { q4e_head = it->path().string(); break; }
             }
         }
-        if (!q4e_head.empty() && n_lanes == 1 && !q4e_mtp_off && !opts.spec) {
+        // 2026-10-23: the head is the DEFAULT at one request lane (v0.2.30); on the request lanes (--parallel > 1) it runs with
+        // --spec (Dream's speculation toggle): its rounds give one conversation +10-26 % but its expert bank costs card 1
+        // ~35 expert slots a layer, which three or four conversations decoding at once feel (-17 %) -- the owner's call per launch
+        if (!q4e_head.empty() && !q4e_mtp_off && !opts.spec && n_lanes == 1) {
             opts.spec = e->opts_.spec = true;
             std::fprintf(stderr, "[qwen4exp] --spec on: the MTP draft head %s is beside the model (IE_Q4E_MTP=0 = off)\n", q4e_head.c_str());
-        }
+        } else if (!q4e_head.empty() && !q4e_mtp_off && !opts.spec)
+            std::fprintf(stderr, "[qwen4exp] the MTP draft head %s is beside the model; --spec (Dream's speculation toggle) runs its rounds "
+                                 "on the %u request lanes (+10-26 %% for one conversation; its expert bank costs card 1 ~35 expert slots "
+                                 "a layer, -17 %% with 3-4 conversations decoding at once)\n", q4e_head.c_str(), n_lanes);
         const uint32_t q4e_k = opts.spec_k_set ? opts.spec_k : 3u;
-        const bool q4e_mtp = opts.spec && n_lanes == 1 && !q4e_mtp_off;
+        const bool q4e_mtp = opts.spec && !q4e_mtp_off;
         if (q4e_mtp && !b->split)
             if (auto m = b->mtp_load(gguf_path, q4e_head, e->gguf_, q4e_k); !m.empty())
                 std::fprintf(stderr, "[qwen4exp] %s -- lookup drafts only\n", m.c_str());
+        if (q4e_mtp && n_lanes > 1) b->A.set_verify_rows(8);   // (2026-10-23: the lanes' rounds verify on both stages)
+        // 2026-10-23: the request lanes take images, so the vision tower is placed NOW, before the expert caches are sized (a
+        // late 1.6 GB allocation beside a full card is what the 27B's lanes refuse): on card 0 when the head's bank will sit
+        // on card 1, else on card 1 (the tail stage's card, as at one lane). No mmproj found = images refused on the lanes.
+        if (n_lanes > 1 && b->split && !e->qvis_resolve_mmproj().empty()) {
+            b->vis_card0 = q4e_mtp;
+            if (b->vis_card0)
+                if (auto m = e->qvis_upload_tower(); !m.empty()) { err = "vision: " + m; e->q4e_.reset(); return nullptr; }
+        }
         if (auto m = b->A.init_runtime(opts.max_ctx, chunk, n_lanes, lane_ctx); !m.empty()) {
             err = "qwen4exp A runtime: " + m; e->q4e_.reset(); return nullptr;
         }
@@ -2257,6 +2652,9 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             if (q4e_mtp)
                 if (auto m = b->mtp_load(gguf_path, q4e_head, e->gguf_, q4e_k); !m.empty())
                     std::fprintf(stderr, "[qwen4exp] %s -- lookup drafts only\n", m.c_str());
+            if (q4e_mtp && n_lanes > 1) b->B.set_verify_rows(8);   // (2026-10-23)
+            if (n_lanes > 1 && !b->vis_card0 && !e->qvis_resolve_mmproj().empty())   // (2026-10-23: the tower on card 1, before its cache)
+                if (auto m = e->qvis_upload_tower(); !m.empty()) { err = "vision: " + m; e->q4e_.reset(); return nullptr; }
             if (auto m = b->B.init_runtime(opts.max_ctx, chunk, n_lanes, lane_ctx); !m.empty()) {
                 err = "qwen4exp B runtime: " + m; e->q4e_.reset(); return nullptr;
             }
@@ -2632,7 +3030,8 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         else if (std::string wb = b.B.rows_off_reason(); !wb.empty()) rows_why = "stage B: " + wb;
         const char* rv = std::getenv("IE_Q4E_ROWS");
         const bool rows = rows_why.empty() && !(rv && std::string(rv) == "0");
-        const uint32_t max_group = std::min(b.A.rows_max(), b.B.rows_max());
+        // (2026-10-23: at the slots the cache keeps once every lazy lane is awake, so a group's expert union always fits)
+        const uint32_t max_group = std::min(b.A.rows_max_floor(), b.B.rows_max_floor());
         uint32_t gcap = 0;
         if (const char* v = std::getenv("IE_Q4E_GROUP_LANES")) gcap = uint32_t(std::clamp(std::atoi(v), 0, int(max_group)));
         auto lm = std::make_unique<Q4eLanesModel>(b, e->tok_, e->stop_ids_, e->tool_call_ids_, e->opts_.prefill_chunk,
@@ -2651,6 +3050,28 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         LanesServe::Options so;
         if (const char* v = std::getenv("IE_Q4E_MIX_CHUNK")) so.mix_chunk = uint32_t(std::max(0, std::atoi(v)));
         if (const char* v = std::getenv("IE_Q4E_STEP_TRACE")) so.trace = *v == '1';
+        // 2026-10-23: the MTP head's rounds on the lanes (Q4eLanesModel::init_draft): a lane that decodes alone drafts with
+        // the head and verifies the drafts in one step (the sampled rounds of one lane, exact at any temperature); more
+        // decoding lanes share the cards in rows groups as before. IE_Q4E_LANES_MTP=0 = off, IE_Q4E_LANES_MTP_MAX = the lanes.
+        if (b.mtp_on && ![] { const char* v = std::getenv("IE_Q4E_LANES_MTP"); return v && *v == '0'; }()) {
+            if (auto m = lm->init_draft(b.mtp_k); !m.empty()) std::fprintf(stderr, "[qwen4exp] lanes MTP OFF: %s\n", m.c_str());
+            else {
+                so.draft = true;
+                so.draft_max = 1;
+                if (const char* v = std::getenv("IE_Q4E_LANES_MTP_MAX")) so.draft_max = uint32_t(std::clamp(std::atoi(v), 1, int(b.A.n_lanes())));
+                std::fprintf(stderr, "[qwen4exp] lanes MTP ON: rounds of %u rows (the head's %u drafts + the lane's next input) while at "
+                                     "most %u lane(s) decode; the head's state per lane %.0f MiB at ctx %u on card 1, lazy "
+                                     "(IE_Q4E_LANES_MTP=0 = off, IE_Q4E_LANES_MTP_MAX = the lanes)\n",
+                             b.mtp_k + 1, b.mtp_k, so.draft_max, b.B.mtp_lane_bytes(b.B.lane_ctx(1)) / 1048576.0, b.B.lane_ctx(1));
+            }
+        } else if (b.mtp_on) std::fprintf(stderr, "[qwen4exp] lanes MTP OFF (IE_Q4E_LANES_MTP=0)\n");
+        // 2026-10-23: images on the lanes (the tower placed at the load; Q4eLanesModel::prefix_prepare stages a request's)
+        if (e->qvis_tower_ && e->qvis_tower_->gpu_resident())
+            std::fprintf(stderr, "[vision] Flash-Next: images on all %u request lanes, tower resident on card %u (%s)\n", b.A.n_lanes(),
+                         b.vis_card0 ? 0u : 1u, e->qvis_mmproj_.c_str());
+        else
+            std::fprintf(stderr, "[vision] Flash-Next: images refused on the request lanes (no mmproj at the load: --mmproj, IE_MMPROJ, or "
+                                 "mmproj*.gguf beside the model)\n");
         b.lanes = std::move(lm);
         b.serve = std::make_unique<LanesServe>(*b.lanes, so);
     }
@@ -2753,7 +3174,7 @@ std::string Engine::qvis_resolve_mmproj() {
 }
 
 DeviceAllocator* Engine::qvis_alloc() {
-    if (q4e_) return q4e_->split ? &q4e_->a1 : &alloc_;   // Flash-Next: the tail stage's card
+    if (q4e_) return q4e_->split && !q4e_->vis_card0 ? &q4e_->a1 : &alloc_;   // Flash-Next: the tail stage's card (2026-10-23: card 0 beside the head's bank on card 1)
     if (qwen35_split_) return &fleet_.dev(qwen35_split_model_.head_dev());   // the 27B split: the head card (card 1)
     if (qwen35moe_split_) return &fleet_.dev(qwen35moe_split_model_.head_dev());   // the crown split: likewise (step 2)
     return nullptr;
@@ -2787,7 +3208,8 @@ std::string Engine::qvis_upload_tower() {
     if (auto e = qvis_tower_->upload_gpu(*va); !e.empty()) return "vision: " + e;
     const std::string where = qwen35_split_ ? "card " + std::to_string(qwen35_split_model_.head_dev())
                             : qwen35moe_split_ ? "card " + std::to_string(qwen35moe_split_model_.head_dev())
-                            : std::string(q4e_ && q4e_->split ? "the tail stage's card" : "the model's card");
+                            : std::string(q4e_ && q4e_->split ? (q4e_->vis_card0 ? "card 0 (the head's bank is on card 1)" : "the tail stage's card")
+                                                              : "the model's card");
     std::fprintf(stderr, "[vision] tower on %s: %.2f GiB weights + up to %.2f GiB encode scratch (%u-patch cap)\n", where.c_str(),
                  qvis_tower_->gpu_weight_bytes() / 1073741824.0,
                  qvis_tower_->gpu_scratch_bytes(kVisMaxPatches) / 1073741824.0, kVisMaxPatches);
@@ -6600,7 +7022,8 @@ uint32_t Engine::abort_all() {
 // --parallel 1 (the prompt's ids, the context refusal, the sampler's seed, the snapshot boundary), then the request runs on a
 // lane through the shared lanes module instead of the gate + time-slicing.
 GenerateResult Engine::q4e_generate_lanes(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token,
-                                          uint32_t cache_prefix_len, uint32_t shared_prefix_len) {
+                                          uint32_t cache_prefix_len, uint32_t shared_prefix_len,
+                                          std::vector<QvisPendingImage>* imgs) {
     GenerateResult res;
     const auto ids = tok_.encode(prompt, /*allow_special=*/true);
     res.prompt_tokens = uint32_t(ids.size());
@@ -6609,6 +7032,23 @@ GenerateResult Engine::q4e_generate_lanes(const std::string& prompt, const Sampl
     if (ids.empty()) { res.finish_reason = "length"; return res; }
     LanesRequest rq;
     rq.ids = &ids;
+    // 2026-10-23: the request's images (q35m_generate_lanes' rule): encoded now on this thread (the tower, under qvis_mu_),
+    // staged on the lane in its serial turn (Q4eLanesModel::prefix_prepare); the request stays out of the prompt cache
+    LanesVision vis;
+    if (imgs && !imgs->empty()) {
+        std::vector<uint64_t> hash;
+        const auto t0 = std::chrono::steady_clock::now();
+        if (auto e = qvis_encode(ids, *imgs, vis.rows, vis.spans, hash, vis.pos3, vis.delta); !e.empty()) {
+            res.finish_reason = "error: " + e;
+            return res;
+        }
+        rq.vision = &vis;
+        shared_prefix_len = 0;   // (no shared prefix; the cache cut stays: --parallel 1 prefills an image prompt in the same two
+                                 // pieces, so the bytes are its bytes -- the snapshot itself is skipped for an image request)
+        std::fprintf(stderr, "[vision] lanes: %zu image span(s), %zu prompt rows, decode rope delta %d (encoded in %.0f ms)\n",
+                     vis.spans.size(), vis.pos3.size() / 3, vis.delta,
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
     rq.sp.temperature = sp.temperature; rq.sp.top_k = sp.top_k; rq.sp.top_p = sp.top_p; rq.sp.min_p = sp.min_p;
     rq.sp.presence_penalty = sp.presence_penalty; rq.sp.frequency_penalty = sp.frequency_penalty;
     rq.sp.repeat_penalty = sp.repeat_penalty; rq.sp.repeat_window = sp.repeat_window;
@@ -6659,10 +7099,16 @@ std::string Engine::vision_status_json() const {
             reason = ds4_vision_refusal(ds4_vis_ != nullptr, opts_.parallel);
             ready = reason.empty();
             break;
-        case ModelArch::kQwen4Exp:   // not ready at --parallel > 1: Engine::chat refuses images there (the same rule)
-            reason = q4e_vision_refusal(opts_.parallel);
+        case ModelArch::kQwen4Exp: {   // 2026-10-23: on the request lanes too, when the tower was placed at the load (Engine::chat: the same rule)
+            const bool lanes_images = q4e_ && q4e_->serve && qvis_tower_ && qvis_tower_->gpu_resident();
+            reason = q4e_vision_refusal(opts_.parallel, lanes_images);
+            if (reason.empty() && q4e_ && q4e_->serve)
+                reason = "";   // (ready: images on all request lanes)
+            else if (!reason.empty() && q4e_ && q4e_->serve)
+                reason = "images refused on the request lanes: no mmproj was found at the load (--mmproj <mmproj-F16.gguf>, IE_MMPROJ, or mmproj*.gguf beside the model)";
             ready = reason.empty();
             break;
+        }
         case ModelArch::kQwen35Dense:   // P4 B45: the 27B's split with an mmproj at --parallel 1, or on its lanes (Engine::chat: the same rule)
             reason = q27_vision_refusal(qwen35_split_, !qvis_mmproj_.empty() /* resolved at load */, opts_.parallel,
                                         q27_ && q27_->serve, qvis_tower_ && qvis_tower_->gpu_resident());
@@ -6746,8 +7192,11 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
     // clobber each other's images. Refuse plainly instead of racing. The 27B
     // and crown splits' request lanes (2026-10-21) keep each request's images
     // in the request (lane_imgs below) and stage them on its lane.
-    const bool q27_lane_images = has_images && ((arch_ == ModelArch::kQwen35Dense && q27_ && q27_->serve) ||
-                                                 (arch_ == ModelArch::kQwen35Moe && q35m_ && q35m_->serve));
+    // 2026-10-23: Flash-Next's lanes too (Q4eLanesModel::prefix_prepare), when the tower was placed at the load
+    const bool q4e_lane_images = has_images && arch_ == ModelArch::kQwen4Exp && q4e_ && q4e_->serve && qvis_tower_ &&
+                                 qvis_tower_->gpu_resident();
+    const bool q27_lane_images = (has_images && ((arch_ == ModelArch::kQwen35Dense && q27_ && q27_->serve) ||
+                                                  (arch_ == ModelArch::kQwen35Moe && q35m_ && q35m_->serve))) || q4e_lane_images;
     std::vector<QvisPendingImage> lane_imgs;
     if (const std::string why = has_images && !q27_lane_images ? q4e_vision_refusal(opts_.parallel) : std::string(); !why.empty()) {
         GenerateResult res;
@@ -7070,7 +7519,9 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
     // P4 B36 (B): the prompt ends with a user query (not a tool result), so cache_prefix_len is that query's end -- the depth the
     // conversation's next query still shares after the template re-renders the turns between (the crown's lanes keep it)
     const bool query_last = !render_turns.empty() && render_turns.back().role == "user";
-    GenerateResult r = q27_lane_images
+    GenerateResult r = q4e_lane_images
+        ? q4e_generate_lanes(full, sp, on_token, cache_prefix_len, 0, &lane_imgs)   // (2026-10-23: Flash-Next's lanes; --parallel 1's cut, no cache)
+        : q27_lane_images
         ? q35m_generate_lanes(full, sp, on_token, cache_prefix_len, /*reply_cache=*/false, 0, false, &lane_imgs)
         : generate(full, sp, on_token, cache_prefix_len, /*reply_cache=*/!model_has_think, shared_prefix_len, query_last);
     // P4 B27 / B28: the XML tool calls; P4 B35: then, thinking on with a Qwen thinking template, the reasoning split off
