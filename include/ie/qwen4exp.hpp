@@ -139,6 +139,12 @@ struct Qwen4ExpLayer {
         const uint8_t*    raw = nullptr;   // host mmap, native path (else null)
         DType             dt  = DType::kCount;
         const sycl::half* f16 = nullptr;   // host F16 fallback (else null)
+        // Q8_0 banks on low-RAM hosts: raw mmap stays the ONLY host copy;
+        // the per-card F16 cache slices are built per-miss by
+        // ensure_slot_on (raw H2D + device dequant, cache_f16). slice_bytes
+        // is the F16 slice size; slice_raw_bytes the on-disk one.
+        const uint8_t*    q8raw = nullptr; // host mmap Q8_0 bank (else null)
+        uint64_t slice_raw_bytes = 0;      // per-expert on-disk Q8_0 bytes
         // 2026-10-22: the draft head's experts as device Q8_0 SoA (gemv_q8_0_soa_f16_g's layout: per expert qs [N][K],
         // d [N][K/32]); half the F16 bank's VRAM, the draft is a proposal so the output is untouched
         const int8_t*     q8  = nullptr;
@@ -147,6 +153,9 @@ struct Qwen4ExpLayer {
         uint32_t K = 0, N = 0;
     };
     BankView gate_bv, up_bv, down_bv;
+    // All three banks Q8_0 (q8raw): the cache slots hold F16 slices built
+    // on miss; the host never materializes the F16 banks.
+    bool cache_f16 = false;
 
     // -- PLE (spec 12; ple.layers blocks only, blk.1 on the real file) ------
     sycl::half* ple_key        = nullptr;  // [2560 -> 10240]
@@ -184,7 +193,8 @@ public:
     sycl::half* out_hc_up_t   = nullptr;  // [K, N] copies (prefill mix gemm)
     sycl::half* out_hc_down_t = nullptr;
     float*      out_hc_norm = nullptr;  // [10240]
-    const GgufTensorInfo* ple_table = nullptr;  // [160, 320001536] IQ4_NL, host
+    const GgufTensorInfo* ple_table = nullptr;  // [160, 320001536] host; IQ4_NL or Q8_0
+    DType ple_dt = DType::kIQ4_NL;              // the table's dtype (gather row layout)
     // P4 B49: the table is read at random, 16 rows a token, straight from the file mapping; cold, a row is a page fault
     // served from disk (measured 2026-10-04: ~130 us a row, 39 % of a first read of 7,933 tokens, 241 against 487
     // tok/s for a repeated prompt). The load starts one background pass that reads the whole table into the page
@@ -522,6 +532,12 @@ private:
 
     // Host F16 fallback storage for non-fast-path banks (kept alive here).
     std::vector<std::vector<sycl::half>> f16_banks_;
+    // cache_f16 mode: per-bank PINNED HOST scratch (max raw slice) — the
+    // convert kernel reads it over PCIe. A malloc_device scratch hit the
+    // driver's page-aliasing bug class (the one the VRAM self-test
+    // quarantines cache slots for); host USM sidesteps it entirely.
+    void*    q8_scratch_[3] = {nullptr, nullptr, nullptr};
+    uint64_t q8_scratch_bytes_ = 0;
 
     // Runtime state.
     KvCache       kv_;

@@ -207,6 +207,14 @@ std::string Qwen4ExpModel::load(DeviceAllocator& alloc, const GgufReader& g,
     if (cfg.has_ple() && own_ple) {
         ple_table = g.find_tensor("per_layer_token_embd.weight");
         if (!ple_table) return "qwen4exp load: missing per_layer_token_embd.weight";
+        // The gather's row layout follows the table's dtype. The converter
+        // writes IQ4_NL; community GGUFs (Unsloth Q8_0, UD-Q6_K_XL, ...) carry
+        // Q8_0. Anything else is refused rather than misread.
+        if (ple_table->dtype != DType::kIQ4_NL && ple_table->dtype != DType::kQ8_0)
+            return std::string("qwen4exp load: per_layer_token_embd.weight dtype ")
+                 + type_name(ple_table->dtype).data()
+                 + " not supported (want IQ4_NL or Q8_0)";
+        ple_dt = ple_table->dtype;
         host_bytes_ += ple_table->nbytes;
         placement_.push_back({std::string(ple_table->name), "host",
                               type_name(ple_table->dtype).data(), ple_table->nbytes});
@@ -1069,6 +1077,30 @@ static void ram_pin_warn(uint64_t nbytes) {
                          "IE_Q4E_NO_PIN_BANKS=1 reads the weights from disk instead)\n", double(nbytes) / 1073741824.0);
 }
 
+// Q8_0 raw slice -> F16 [K,N] (transposed), device-side (cache_f16 misses).
+// Bit-identical to the load-time F16 fallback: value = the block's f16 scale
+// times the int8, computed in fp32 and rounded to f16 once.
+static sycl::event q8_slice_dequant_kn(sycl::queue& q, const uint8_t* raw,
+                                       sycl::half* dst, uint32_t K, uint32_t N,
+                                       const std::vector<sycl::event>& deps = {}) {
+    const uint32_t bpr = K / 32;
+    return ie::ps(q, "q8_slice_dequant_kn", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(uint64_t(N) * K), [=](sycl::id<1> idx) {
+            const uint32_t k  = uint32_t(idx / N);   // k-major: coalesced dst
+            const uint32_t nn = uint32_t(idx % N);
+            const uint8_t* blk = raw + (uint64_t(nn) * bpr + k / 32) * 34;
+            const uint32_t hb = uint32_t(blk[0]) | (uint32_t(blk[1]) << 8);
+            sycl::half dh;
+            const uint16_t dhb = (uint16_t)hb;
+            __builtin_memcpy(&dh, &dhb, sizeof(dhb));
+            const float d = float(dh);
+            const auto qv = static_cast<int8_t>(blk[2 + k % 32]);
+            dst[(uint64_t)k * N + nn] = sycl::half(d * float(qv));
+        });
+    });
+}
+
 std::string Qwen4ExpModel::prepare_bank_views() {
     // Bank donor (replicated multi-GPU topologies): reuse another instance's
     // prepared views — pinned host USM is context-scoped, and the fleet's
@@ -1090,11 +1122,24 @@ std::string Qwen4ExpModel::prepare_bank_views() {
     // Fast paths stream the raw mmap; anything else pre-dequants to a host
     // F16 [E][K,N]-transposed copy for gemv_fp16 (the 2 Q5_K gate/up banks
     // and 5 Q8_0 down banks on the real UD file).
+    // 2026-10-27: an ALL-Q8_0 layer takes the q8raw path instead — the raw
+    // mmap stays the only host copy (the F16 banks would be 1.88x the file
+    // and swap-thrash a 128 GiB box) and ensure_slot_on builds each expert's
+    // F16 [K,N] cache slice per miss. Bit-identical values: same ref dequant,
+    // same transpose, same f16 round as the fallback below.
     auto view = [&](const GgufTensorInfo* t, bool is_down,
-                    Qwen4ExpLayer::BankView& bv) -> std::string {
+                    Qwen4ExpLayer::BankView& bv, bool q8raw_ok) -> std::string {
         const uint32_t K = uint32_t(t->shape[0]), N = uint32_t(t->shape[1]);
         const uint32_t E = uint32_t(t->shape[2]);
         bv.K = K; bv.N = N;
+        if (q8raw_ok && t->dtype == DType::kQ8_0) {
+            bv.raw = nullptr; bv.f16 = nullptr;
+            bv.q8raw = static_cast<const uint8_t*>(t->data);
+            bv.dt  = DType::kQ8_0;
+            bv.slice_bytes = uint64_t(K) * N * sizeof(sycl::half);
+            bv.slice_raw_bytes = t->nbytes / E;
+            return {};
+        }
         const bool fast = (!is_down && t->dtype == DType::kQ4_K) ||
                           ( is_down && t->dtype == DType::kQ5_1);
         // PINNED host copies by default: q.memcpy from mmap (non-USM) memory
@@ -1150,9 +1195,33 @@ std::string Qwen4ExpModel::prepare_bank_views() {
     };
     for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
         Qwen4ExpLayer& w = layers_[L];
-        if (auto e = view(w.gate_exps, false, w.gate_bv); !e.empty()) return e;
-        if (auto e = view(w.up_exps,   false, w.up_bv);   !e.empty()) return e;
-        if (auto e = view(w.down_exps, true,  w.down_bv); !e.empty()) return e;
+        const bool all_q8 = w.gate_exps && w.up_exps && w.down_exps &&
+            w.gate_exps->dtype == DType::kQ8_0 &&
+            w.up_exps->dtype   == DType::kQ8_0 &&
+            w.down_exps->dtype == DType::kQ8_0;
+        if (auto e = view(w.gate_exps, false, w.gate_bv, all_q8); !e.empty()) return e;
+        if (auto e = view(w.up_exps,   false, w.up_bv,   all_q8); !e.empty()) return e;
+        if (auto e = view(w.down_exps, true,  w.down_bv, all_q8); !e.empty()) return e;
+        w.cache_f16 = all_q8;
+    }
+    // One reusable staging slot for the per-miss Q8_0 -> F16 slice build.
+    uint64_t stage_max = 0;
+    for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
+        const Qwen4ExpLayer& w = layers_[L];
+        if (w.cache_f16)
+            stage_max = std::max(stage_max, w.gate_bv.slice_bytes +
+                                         w.up_bv.slice_bytes +
+                                         w.down_bv.slice_bytes);
+    }
+    if (stage_max) {
+        // per-bank pinned host scratch (max raw slice ≈ half the F16 slice)
+        const uint64_t raw_max = stage_max / 2 + 64;
+        for (auto& s : q8_scratch_) {
+            s = sycl::malloc_host(raw_max, alloc_->queue());
+            if (!s) return "qwen4exp: q8 scratch alloc failed";
+            owned_.push_back(s);
+        }
+        q8_scratch_bytes_ = raw_max;
     }
     return {};
 }
@@ -2961,6 +3030,92 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             ec.slot_of[e]   = int16_t(v);
             sl = int32_t(v);
             uint8_t* dst = static_cast<uint8_t*>(ec.base) + uint64_t(v) * ec.slot_bytes;
+            if (w.cache_f16) {
+                // Q8_0 banks (q8raw): copy this expert's three RAW slices into
+                // the per-bank pinned-host scratches (plain CPU memcpy) and
+                // dequant+transpose on device straight from host USM — the
+                // cache slots end up bit-identical to the load-time F16
+                // fallback. uq.wait() first: the scratches are reused only
+                // after the previous miss's convert kernels finished.
+                uq.wait();
+                std::memcpy(q8_scratch_[0], w.gate_bv.q8raw + uint64_t(e) * w.gate_bv.slice_raw_bytes,
+                            w.gate_bv.slice_raw_bytes);
+                std::memcpy(q8_scratch_[1], w.up_bv.q8raw + uint64_t(e) * w.up_bv.slice_raw_bytes,
+                            w.up_bv.slice_raw_bytes);
+                std::memcpy(q8_scratch_[2], w.down_bv.q8raw + uint64_t(e) * w.down_bv.slice_raw_bytes,
+                            w.down_bv.slice_raw_bytes);
+                q8_slice_dequant_kn(uq, static_cast<const uint8_t*>(q8_scratch_[0]),
+                    reinterpret_cast<sycl::half*>(dst + ec.gate_off), w.gate_bv.K, w.gate_bv.N);
+                q8_slice_dequant_kn(uq, static_cast<const uint8_t*>(q8_scratch_[1]),
+                    reinterpret_cast<sycl::half*>(dst + ec.up_off), w.up_bv.K, w.up_bv.N);
+                q8_slice_dequant_kn(uq, static_cast<const uint8_t*>(q8_scratch_[2]),
+                    reinterpret_cast<sycl::half*>(dst + ec.down_off), w.down_bv.K, w.down_bv.N);
+                static const bool dbg = std::getenv("IE_Q4E_Q8RAW_DEBUG") != nullptr;
+                static bool dbg_done = false;
+                if (dbg && !dbg_done) {
+                    dbg_done = true;
+                    uq.wait();
+                    // host reference for the gate slice of this expert
+                    const uint32_t K = w.gate_bv.K, N = w.gate_bv.N;
+                    const uint32_t bpr = K / 32;
+                    std::vector<sycl::half> ref(uint64_t(K) * N);
+                    std::vector<float> rowf(K);
+                    for (uint32_t nn = 0; nn < N; ++nn) {
+                        const uint8_t* row = w.gate_bv.q8raw +
+                            (uint64_t(e) * N + nn) * bpr * 34;
+                        ref::dequant_q8_0_buffer(row, K, rowf.data());
+                        for (uint32_t k = 0; k < K; ++k)
+                            ref[(uint64_t)k * N + nn] = sycl::half(rowf[k]);
+                    }
+                    std::vector<sycl::half> got(uint64_t(K) * N);
+                    q.memcpy(got.data(), dst + ec.gate_off,
+                             uint64_t(K) * N * 2).wait();
+                    size_t bad = SIZE_MAX; int badn = 0;
+                    for (size_t i = 0; i < got.size(); ++i)
+                        if (got[i] != ref[i]) { ++badn; if (bad == SIZE_MAX) bad = i; }
+                    std::fprintf(stderr,
+                        "[q8raw-debug] L=%u e=%u gate slice: %zu elems, %d mismatches, first=%zu "
+                        "(ref=%g got=%g)\n", L, e, got.size(), badn, bad,
+                        bad == SIZE_MAX ? 0.f : float(ref[bad]),
+                        bad == SIZE_MAX ? 0.f : float(got[bad]));
+                    std::fprintf(stderr, "[q8raw-debug] scratch[0..15]:");
+                    for (int i = 0; i < 16; ++i) std::fprintf(stderr, " %02x", ((uint8_t*)q8_scratch_[0])[i]);
+                    std::fprintf(stderr, "\n[q8raw-debug] q8raw+e*raw [0..15]:");
+                    for (int i = 0; i < 16; ++i)
+                        std::fprintf(stderr, " %02x", ((const uint8_t*)w.gate_bv.q8raw + uint64_t(e) * w.gate_bv.slice_raw_bytes)[i]);
+                    std::fprintf(stderr, "\n[q8raw-debug] got[0..7] bits:");
+                    for (int i = 0; i < 8; ++i) std::fprintf(stderr, " %04x", (unsigned)std::bit_cast<uint16_t>((uint16_t)got[i]));
+                    std::fprintf(stderr, "\n[q8raw-debug] ref[0..7] bits:");
+                    for (int i = 0; i < 8; ++i) std::fprintf(stderr, " %04x", (unsigned)std::bit_cast<uint16_t>((uint16_t)ref[i]));
+                    std::fprintf(stderr, "\n[q8raw-debug] scratch=%p q8raw=%p dst=%p ec.base=%p\n",
+                                 q8_scratch_[0], (const void*)w.gate_bv.q8raw, (void*)dst, ec.base);
+                    // (a) isolated round-trip of the convert kernel
+                    {
+                        std::vector<sycl::half> iso(uint64_t(K) * N);
+                        q8_slice_dequant_kn(q, static_cast<const uint8_t*>(q8_scratch_[0]),
+                            iso.data(), K, N);
+                        q.wait();
+                        size_t ib = SIZE_MAX; int ibn = 0;
+                        for (size_t i = 0; i < iso.size(); ++i)
+                            if (iso[i] != ref[i]) { ++ibn; if (ib == SIZE_MAX) ib = i; }
+                        std::fprintf(stderr, "[q8raw-debug] isolated kernel round-trip: %d mismatches, first=%zu\n",
+                                     ibn, ib);
+                    }
+                    // (b) plain memcpy into ec.base + readback (control)
+                    {
+                        q.memcpy(dst + ec.gate_off, ref.data(), uint64_t(K) * N * 2).wait();
+                        std::vector<sycl::half> got2(uint64_t(K) * N);
+                        q.memcpy(got2.data(), dst + ec.gate_off, uint64_t(K) * N * 2).wait();
+                        size_t mb = SIZE_MAX; int mbn = 0;
+                        for (size_t i = 0; i < got2.size(); ++i)
+                            if (got2[i] != ref[i]) { ++mbn; if (mb == SIZE_MAX) mb = i; }
+                        std::fprintf(stderr, "[q8raw-debug] memcpy control: %d mismatches, first=%zu "
+                                     "(ref=%g got2=%g)\n", mbn, mb,
+                                     mb == SIZE_MAX ? 0.f : float(ref[mb]),
+                                     mb == SIZE_MAX ? 0.f : float(got2[mb]));
+                    }
+                }
+            } else {
             auto srcp = [&](const Qwen4ExpLayer::BankView& bv) {
                 return bv.raw ? bv.raw + uint64_t(e) * bv.slice_bytes
                               : reinterpret_cast<const uint8_t*>(bv.f16) +
@@ -2969,6 +3124,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             uq.memcpy(dst + ec.gate_off, srcp(w.gate_bv), w.gate_bv.slice_bytes);
             uq.memcpy(dst + ec.up_off,   srcp(w.up_bv),   w.up_bv.slice_bytes);
             uq.memcpy(dst + ec.down_off, srcp(w.down_bv), w.down_bv.slice_bytes);
+            }
         }
         ec.last_use[uint32_t(sl)] = ++ecache_clock_;
         if (uint32_t(sl) < pf_pin_mask_.size() && pf_pin_mask_[uint32_t(sl)]) ec.last_use[uint32_t(sl)] = UINT64_MAX - 1;
@@ -3128,7 +3284,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 qwen4_ple_hash(pc, tokens_host, T, ple_hist_, rows.data());
             }
             std::vector<float> E(uint64_t(T) * H);
-            qwen4_ple_gather(ple_table->data, rows.data(), T, E.data());
+            qwen4_ple_gather(ple_table->data, ple_dt, rows.data(), T, E.data());
             std::vector<sycl::half> E16(E.size());
             for (size_t i = 0; i < E.size(); ++i) E16[i] = sycl::half(E[i]);
             q.memcpy(e16_, E16.data(), E16.size() * 2).wait();
@@ -4740,7 +4896,7 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
         std::vector<uint64_t> rows(uint64_t(G) * 16);
         for (uint32_t i = 0; i < G; ++i) qwen4_ple_hash(pc, ids + i, 1, *lr[i].ple_hist, rows.data() + uint64_t(i) * 16);
         std::vector<float> E(uint64_t(G) * H);
-        qwen4_ple_gather(ple_table->data, rows.data(), G, E.data());
+        qwen4_ple_gather(ple_table->data, ple_dt, rows.data(), G, E.data());
         std::vector<sycl::half> E16(E.size());
         for (size_t i = 0; i < E.size(); ++i) E16[i] = sycl::half(E[i]);
         q.memcpy(e16_, E16.data(), E16.size() * 2).wait();
@@ -4870,6 +5026,23 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
                 ec.slot_of[e]   = int16_t(v);
                 sl = int32_t(v);
                 uint8_t* dst = static_cast<uint8_t*>(ec.base) + uint64_t(v) * ec.slot_bytes;
+                if (w.cache_f16) {
+                    // Q8_0 banks (q8raw): per-miss device dequant into the
+                    // F16 cache slot — same as run_block's ensure_slot_on.
+                    uq.wait();
+                    std::memcpy(q8_scratch_[0], w.gate_bv.q8raw + uint64_t(e) * w.gate_bv.slice_raw_bytes,
+                                w.gate_bv.slice_raw_bytes);
+                    std::memcpy(q8_scratch_[1], w.up_bv.q8raw + uint64_t(e) * w.up_bv.slice_raw_bytes,
+                                w.up_bv.slice_raw_bytes);
+                    std::memcpy(q8_scratch_[2], w.down_bv.q8raw + uint64_t(e) * w.down_bv.slice_raw_bytes,
+                                w.down_bv.slice_raw_bytes);
+                    q8_slice_dequant_kn(uq, static_cast<const uint8_t*>(q8_scratch_[0]),
+                        reinterpret_cast<sycl::half*>(dst + ec.gate_off), w.gate_bv.K, w.gate_bv.N);
+                    q8_slice_dequant_kn(uq, static_cast<const uint8_t*>(q8_scratch_[1]),
+                        reinterpret_cast<sycl::half*>(dst + ec.up_off), w.up_bv.K, w.up_bv.N);
+                    q8_slice_dequant_kn(uq, static_cast<const uint8_t*>(q8_scratch_[2]),
+                        reinterpret_cast<sycl::half*>(dst + ec.down_off), w.down_bv.K, w.down_bv.N);
+                } else {
                 auto srcp = [&](const Qwen4ExpLayer::BankView& bv) {
                     return bv.raw ? bv.raw + uint64_t(e) * bv.slice_bytes
                                   : reinterpret_cast<const uint8_t*>(bv.f16) + uint64_t(e) * bv.slice_bytes;
@@ -4877,6 +5050,7 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
                 uq.memcpy(dst + ec.gate_off, srcp(w.gate_bv), w.gate_bv.slice_bytes);
                 uq.memcpy(dst + ec.up_off,   srcp(w.up_bv),   w.up_bv.slice_bytes);
                 uq.memcpy(dst + ec.down_off, srcp(w.down_bv), w.down_bv.slice_bytes);
+                }
             }
             ec.last_use[uint32_t(sl)] = ++ecache_clock_;
             return static_cast<uint8_t*>(ec.base) + uint64_t(sl) * ec.slot_bytes;
