@@ -105,12 +105,19 @@ bool gpu_p2p_shared_context(std::string_view name_filter,
                      std::string::npos))
                 gpus.push_back(d);
     }
-    if (gpus.size() > 2) gpus.resize(2);
+    // 0007: N-card rigs (the deep pipeline pushes the wide state D2D between
+    // ADJACENT stages' devices). Keep every matching GPU and enable peer
+    // access both ways for every ordered pair — gpu_p2p_available already
+    // answered the all-pairs question. Any refusal = host-staged transfers
+    // for the whole rig (the conservative fallback).
     if (gpus.size() < 2) return false;
     if (!gpu_p2p_available(gpus, "p2p-ctx")) return false;
     try {
-        gpus[0].ext_oneapi_enable_peer_access(gpus[1]);
-        gpus[1].ext_oneapi_enable_peer_access(gpus[0]);
+        for (size_t a = 0; a < gpus.size(); ++a)
+            for (size_t b = 0; b < gpus.size(); ++b) {
+                if (a == b) continue;
+                gpus[a].ext_oneapi_enable_peer_access(gpus[b]);
+            }
         ctx_out = std::make_unique<sycl::context>(gpus);
     } catch (const sycl::exception& e) {
         std::fprintf(stderr, "[p2p-ctx] enable/context failed: %s — "

@@ -39,6 +39,7 @@ add_library(ie_core
   ops/hadamard.cpp
   ops/gemv_q4_0.cpp
   ops/gemv_q5_1.cpp
+  ops/gemv_q8_0.cpp
   ops/gemv_q5k.cpp
   ops/gemv_iq_raw.cpp
   ops/gemv_fp16.cpp
