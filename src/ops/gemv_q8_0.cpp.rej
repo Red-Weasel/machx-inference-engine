@@ -1,0 +1,223 @@
+--- src/ops/gemv_q8_0.cpp	2026-10-27 19:45:49.182163171 +0000
++++ src/ops/gemv_q8_0.cpp	2026-10-27 21:02:27.138963693 +0000
+@@ -25,6 +25,7 @@
+ 
+ #include <sycl/sycl.hpp>
+ #include "ie/kernel_profiler.hpp"
++#include "ie/dp4a.hpp"
+ 
+ namespace ie {
+ 
+@@ -439,6 +440,131 @@
+     });
+ }
+ 
++// Batched-T gate/up over STAGED q8_1s activation rows (chunked prefill):
++// x_q8s_mega = T-row streams; per-row numerics identical to gemv_q8_0_q8s.
++
++// dp4a variant of the tiles kernel (2026-10-27): the naive body above gives
++// each lane 2 qs bytes of a 32-byte block, so every lane loads the whole
++// 34-byte block and does 2 scalar imuls per token. Here a subgroup pass
++// covers TWO Q8_0 blocks: lanes 0-7 own bytes [4l, 4l+4) of block p, lanes
++// 8-15 the same window of block p+1 — each weight byte loaded exactly once,
++// one dp4a_ss per lane per block, half the int ALU and dW loads. Per-lane
++// partial sums regroup (4 products vs 2), so fp rounding differs slightly
++// from the naive kernel — same gate, same tolerance class.
++sycl::event gemv_q8_0_q8s_grouped_tiles_dp4a(sycl::queue& q,
++                         const void* x_q8s_mega,
++                         const uint8_t* slot_base, uint64_t slot_bytes,
++                         uint64_t gate_off, uint64_t up_off,
++                         const int32_t* tile_jobs,
++                         sycl::half* g_out, sycl::half* u_out,
++                         uint32_t K, uint32_t N, uint32_t J,
++                         const std::vector<sycl::event>& deps) {
++    constexpr int SG_SIZE  = 16;
++    constexpr int N_PER_WG = 16;
++    constexpr int WG_ITEMS = N_PER_WG * SG_SIZE;       // 256
++    constexpr int T_MAX     = 16;
++
++    const auto* X8 = static_cast<const block_q8_1s*>(x_q8s_mega);
++    const uint32_t blocks_per_col = K / 32;
++    const uint32_t n_wgs = (N + N_PER_WG - 1) / N_PER_WG;
++
++    return ie::ps(q, "gemv_q8_0_q8s_gtile_dp4a", [&](sycl::handler& h) {
++        h.depends_on(deps);
++        h.parallel_for(sycl::nd_range<1>(uint64_t(J) * 2 * n_wgs * WG_ITEMS, WG_ITEMS),
++                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
++            const uint32_t lid   = uint32_t(it.get_local_id(0));
++            const uint32_t gid   = uint32_t(it.get_group(0));
++            const uint32_t j     = gid / (2 * n_wgs);
++            const uint32_t rem   = gid % (2 * n_wgs);
++            const bool     is_up = rem >= n_wgs;
++            const uint32_t wgid  = is_up ? rem - n_wgs : rem;
++            const uint32_t sg_id = lid / SG_SIZE;
++            const uint32_t lane  = lid % SG_SIZE;
++            const uint32_t n     = wgid * N_PER_WG + sg_id;
++            if (n >= N) return;
++
++            const uint32_t x0   = uint32_t(tile_jobs[j * 4 + 0]);
++            const uint32_t T    = uint32_t(tile_jobs[j * 4 + 1]);
++            const uint32_t slot = uint32_t(tile_jobs[j * 4 + 2]);
++            const uint32_t y0   = uint32_t(tile_jobs[j * 4 + 3]);
++            const block_q8_1s* Xj = X8 + uint64_t(x0) * blocks_per_col;
++            const auto* W = reinterpret_cast<const block_q8_0*>(
++                slot_base + uint64_t(slot) * slot_bytes +
++                (is_up ? up_off : gate_off));
++            sycl::half* y = (is_up ? u_out : g_out) + uint64_t(y0) * N;
++
++            const block_q8_0* col = &W[uint64_t(n) * blocks_per_col];
++            if (T < 8) {
++                // small tiles: the naive 2-byte lane mapping wins here
++                // (2.3x at T=1, ie-q8-0-kernel-bench) — same body verbatim.
++                float accS[T_MAX];
++                #pragma unroll
++                for (int t = 0; t < T_MAX; ++t) accS[t] = 0.f;
++                const int j0 = int(lane) * 2;
++                for (uint32_t b = 0; b < blocks_per_col; ++b) {
++                    const block_q8_0& wblk = col[b];
++                    const float dW = float(sycl::bit_cast<sycl::half>(wblk.d));
++                    #pragma unroll
++                    for (int t = 0; t < T_MAX; ++t) {
++                        if (uint32_t(t) >= T) break;
++                        const block_q8_1s& xb = Xj[uint64_t(t) * blocks_per_col + b];
++                        const int32_t dot = int32_t(xb.qs[j0])     * int32_t(wblk.qs[j0]) +
++                                            int32_t(xb.qs[j0 + 1]) * int32_t(wblk.qs[j0 + 1]);
++                        accS[t] += dW * xb.d * float(dot);
++                    }
++                }
++                #pragma unroll
++                for (int t = 0; t < T_MAX; ++t) {
++                    if (uint32_t(t) >= T) break;
++                    const float r = sycl::reduce_over_group(it.get_sub_group(), accS[t],
++                                                            sycl::plus<float>());
++                    if (lane == 0) y[uint64_t(t) * N + n] = sycl::half(r);
++                }
++                return;
++            }
++            const uint32_t s  = lane & 7u;          // byte window within a block
++            const uint32_t hb = lane >= 8u ? 1u : 0u; // which block of the pair
++            float acc[T_MAX];
++            #pragma unroll
++            for (int t = 0; t < T_MAX; ++t) acc[t] = 0.f;
++
++            uint32_t p = 0;
++            for (; p + 1 < blocks_per_col; p += 2) {
++                const uint32_t blk = p + hb;
++                const block_q8_0& wblk = col[blk];
++                const float dW = float(sycl::bit_cast<sycl::half>(wblk.d));
++                int32_t wq; __builtin_memcpy(&wq, wblk.qs + 4 * s, 4);
++                #pragma unroll
++                for (int t = 0; t < T_MAX; ++t) {
++                    if (uint32_t(t) >= T) break;
++                    const block_q8_1s& xb = Xj[uint64_t(t) * blocks_per_col + blk];
++                    int32_t xq; __builtin_memcpy(&xq, xb.qs + 4 * s, 4);
++                    acc[t] += dW * xb.d * float(ie::dp4a_ss(wq, xq, 0));
++                }
++            }
++            if (p < blocks_per_col && hb == 0) {          // odd tail, block pair incomplete
++                const block_q8_0& wblk = col[p];
++                const float dW = float(sycl::bit_cast<sycl::half>(wblk.d));
++                int32_t wq; __builtin_memcpy(&wq, wblk.qs + 4 * s, 4);
++                #pragma unroll
++                for (int t = 0; t < T_MAX; ++t) {
++                    if (uint32_t(t) >= T) break;
++                    const block_q8_1s& xb = Xj[uint64_t(t) * blocks_per_col + p];
++                    int32_t xq; __builtin_memcpy(&xq, xb.qs + 4 * s, 4);
++                    acc[t] += dW * xb.d * float(ie::dp4a_ss(wq, xq, 0));
++                }
++            }
++            #pragma unroll
++            for (int t = 0; t < T_MAX; ++t) {
++                if (uint32_t(t) >= T) break;
++                const float r = sycl::reduce_over_group(it.get_sub_group(), acc[t],
++                                                        sycl::plus<float>());
++                if (lane == 0) y[uint64_t(t) * N + n] = sycl::half(r);
++            }
++        });
++    });
++}
++
+ // Batched-T gate/up over STAGED q8_1x activation rows (chunked prefill):
+ // x_q8x = T contiguous block_q8_1x streams (row t at block offset t*(K/32));
+ // per-row numerics identical to gemv_q8_0_q8s. T <= 16.
+@@ -487,6 +613,80 @@
+                 }
+             }
+             #pragma unroll
++            for (int t = 0; t < T_MAX; ++t) {
++                if (uint32_t(t) >= T) break;
++                const float r = sycl::reduce_over_group(it.get_sub_group(), acc[t],
++                                                        sycl::plus<float>());
++                if (lane == 0) y[uint64_t(t) * N + n] = sycl::half(r);
++            }
++        });
++    });
++}
++
++// dp4a variant of gemv_q8_0_q8x_batched (0004): same lane remap — lanes 0-7
++// own bytes [4s, 4s+4) of block p, lanes 8-15 of block p+1; one dp4a_ss per
++// lane per block instead of two scalar imuls. 1.1-1.2x at the down shape
++// (K=1536 -> N=2048) for T >= 8; slightly different fp rounding.
++sycl::event gemv_q8_0_q8x_batched_dp4a(sycl::queue& q,
++                         const void* x_q8x, const void* W_packed,
++                         sycl::half* y,
++                         uint32_t K, uint32_t N, uint32_t T,
++                         const std::vector<sycl::event>& deps) {
++    constexpr int SG_SIZE  = 16;
++    constexpr int N_PER_WG = 16;
++    constexpr int WG_ITEMS = N_PER_WG * SG_SIZE;
++    constexpr int T_MAX     = 16;
++
++    const auto* W  = static_cast<const block_q8_0*>(W_packed);
++    const auto* X8 = static_cast<const block_q8_1x*>(x_q8x);
++    const uint32_t blocks_per_col = K / 32;
++    const uint32_t n_wgs = (N + N_PER_WG - 1) / N_PER_WG;
++
++    return ie::ps(q, "gemv_q8_0_q8x_T_dp4a", [&](sycl::handler& h) {
++        h.depends_on(deps);
++        h.parallel_for(sycl::nd_range<1>(uint64_t(n_wgs) * WG_ITEMS, WG_ITEMS),
++                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
++            const uint32_t lid   = uint32_t(it.get_local_id(0));
++            const uint32_t wgid  = uint32_t(it.get_group(0));
++            const uint32_t sg_id = lid / SG_SIZE;
++            const uint32_t lane  = lid % SG_SIZE;
++            const uint32_t n     = wgid * N_PER_WG + sg_id;
++            if (n >= N) return;
++
++            const uint32_t s  = lane & 7u;
++            const uint32_t hb = lane >= 8u ? 1u : 0u;
++            float acc[T_MAX];
++            #pragma unroll
++            for (int t = 0; t < T_MAX; ++t) acc[t] = 0.f;
++
++            const block_q8_0* col = &W[uint64_t(n) * blocks_per_col];
++            uint32_t p = 0;
++            for (; p + 1 < blocks_per_col; p += 2) {
++                const uint32_t blk = p + hb;
++                const block_q8_0& wblk = col[blk];
++                const float dW = float(sycl::bit_cast<sycl::half>(wblk.d));
++                int32_t wq; __builtin_memcpy(&wq, wblk.qs + 4 * s, 4);
++                #pragma unroll
++                for (int t = 0; t < T_MAX; ++t) {
++                    if (uint32_t(t) >= T) break;
++                    const block_q8_1x& xb = X8[uint64_t(t) * blocks_per_col + blk];
++                    int32_t xq; __builtin_memcpy(&xq, xb.qs + 4 * s, 4);
++                    acc[t] += dW * float(xb.d) * float(ie::dp4a_ss(wq, xq, 0));
++                }
++            }
++            if (p < blocks_per_col && hb == 0) {
++                const block_q8_0& wblk = col[p];
++                const float dW = float(sycl::bit_cast<sycl::half>(wblk.d));
++                int32_t wq; __builtin_memcpy(&wq, wblk.qs + 4 * s, 4);
++                #pragma unroll
++                for (int t = 0; t < T_MAX; ++t) {
++                    if (uint32_t(t) >= T) break;
++                    const block_q8_1x& xb = X8[uint64_t(t) * blocks_per_col + p];
++                    int32_t xq; __builtin_memcpy(&xq, xb.qs + 4 * s, 4);
++                    acc[t] += dW * float(xb.d) * float(ie::dp4a_ss(wq, xq, 0));
++                }
++            }
++            #pragma unroll
+             for (int t = 0; t < T_MAX; ++t) {
+                 if (uint32_t(t) >= T) break;
+                 const float r = sycl::reduce_over_group(it.get_sub_group(), acc[t],

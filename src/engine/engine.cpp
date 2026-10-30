@@ -792,7 +792,7 @@ struct Q4eBundle {
                             if (prev_b.valid())
                                 if (auto ee = prev_b.get(); !ee.empty()) return ee;
                             if (d2d) Bp->use_wide_bank(slot);
-                            if (e = Bp->forward_range(nullptr, bn, bpos, nullptr, nullptr, nullptr,
+                            if (e = Bp->forward_range(nullptr, bn, bpos, d2d ? nullptr : b2, nullptr, nullptr,
                                                       /*wide_in_device=*/d2d); !e.empty()) return e;
                             if (lb) (void)Bp->state_save(*lb, ld);   // (a failed copy leaves depth 0: the slot does not count)
                             if (feed) e = Bp->mtp_ingest(bt, bn, bpos);   // (P4 B63: the head reads every chunk)
@@ -808,7 +808,7 @@ struct Q4eBundle {
                             if (prev_b.valid())
                                 if (auto ee = prev_b.get(); !ee.empty()) return ee;
                             if (d2d) Bp->use_wide_bank(slot);
-                            if (e = Bp->forward_range(nullptr, bn, bpos, nullptr, nullptr, nullptr,
+                            if (e = Bp->forward_range(nullptr, bn, bpos, d2d ? nullptr : b1, nullptr, nullptr,
                                                       /*wide_in_device=*/d2d); !e.empty()) return e;
                             if (lb) (void)Bp->state_save(*lb, ld);
                             if (feed) e = Bp->mtp_ingest(bt, bn, bpos);

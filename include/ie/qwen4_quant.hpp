@@ -192,6 +192,111 @@ sycl::event gemv_q8_0_q8s_grouped_tiles_dp4a(sycl::queue& q,
                          uint32_t K, uint32_t N, uint32_t J,
                          const std::vector<sycl::event>& deps = {});
 
+// dp4a variant: lanes 0-7 own 4 bytes of block p, lanes 8-15 of block p+1 —
+// each weight byte read once, one dp4a_ss per lane per block. Slightly
+// different fp rounding than the naive tiles kernel (regrouped partials).
+sycl::event gemv_q8_0_q8s_grouped_tiles_dp4a(sycl::queue& q,
+                         const void* x_q8s_mega,
+                         const uint8_t* slot_base, uint64_t slot_bytes,
+                         uint64_t gate_off, uint64_t up_off,
+                         const int32_t* tile_jobs,
+                         sycl::half* g_out, sycl::half* u_out,
+                         uint32_t K, uint32_t N, uint32_t J,
+                         const std::vector<sycl::event>& deps = {});
+
+// Batched-T gate/up over STAGED q8_1x activation rows (chunked prefill):
+// x_q8x = T contiguous block_q8_1x streams (row t at block offset t*(K/32));
+// per-row numerics identical to gemv_q8_0_q8s. T <= 16.
+sycl::event gemv_q8_0_q8x_batched(sycl::queue& q,
+                         const void* x_q8x, const void* W_packed,
+                         sycl::half* y,
+                         uint32_t K, uint32_t N, uint32_t T,
+                         const std::vector<sycl::event>& deps = {});
+
+// dp4a variant of gemv_q8_0_q8x_batched (down projection): lanes 0-7 own
+// 4 bytes of block p, lanes 8-15 of p+1; one dp4a_ss per lane per block.
+sycl::event gemv_q8_0_q8x_batched_dp4a(sycl::queue& q,
+                         const void* x_q8x, const void* W_packed,
+                         sycl::half* y,
+                         uint32_t K, uint32_t N, uint32_t T,
+                         const std::vector<sycl::event>& deps = {});
+
+
+// ---------------------------------------------------------------------------
+// Q8_0 routed-expert banks (community GGUFs: Unsloth Q8_0, UD-Q6_K_XL).
+// Block = 32 elements, 34 bytes: fp16 scale d + 32 int8; w = d*q (symmetric).
+// The banks stream RAW from the host mmap through the expert cache; these
+// kernels dequant on the fly. Same lattice as the Q5_1 family (one subgroup
+// per output column, fp32 accumulate, subgroup-reduce, lane 0 writes).
+// ---------------------------------------------------------------------------
+
+// W8A16 GEMV: y[1,N] = A[1,K] @ W[K,N]; A f16 row-major. K % 32 == 0.
+sycl::event gemv_q8_0(sycl::queue& q,
+                      const sycl::half* A, const void* W_packed,
+                      sycl::half* y,
+                      uint32_t K, uint32_t N,
+                      const std::vector<sycl::event>& deps = {});
+
+// Grouped expert-pick variant (spec-verify MoE): jobs = [P x 3] int32
+// {vt, slot, ycell}; per (pick, column) the solo body runs verbatim.
+sycl::event gemv_q8_0_grouped(sycl::queue& q,
+                      const sycl::half* h_rows,
+                      const uint8_t* slot_base, uint64_t slot_bytes,
+                      uint64_t down_off,
+                      const int32_t* jobs,
+                      sycl::half* ystage, uint32_t y_stride,
+                      uint32_t K, uint32_t N, uint32_t P,
+                      const std::vector<sycl::event>& deps = {});
+
+// Grouped-tiles down-proj (prefill expert-major MoE): tile_jobs = [J x 4]
+// int32 {x_row0, rows, slot, y_row0} over the mega h-rows / y-rows buffers.
+sycl::event gemv_q8_0_grouped_tiles(sycl::queue& q,
+                      const sycl::half* h_mega,
+                      const uint8_t* slot_base, uint64_t slot_bytes,
+                      uint64_t down_off,
+                      const int32_t* tile_jobs,
+                      sycl::half* y_mega,
+                      uint32_t K, uint32_t N, uint32_t J,
+                      const std::vector<sycl::event>& deps = {});
+
+// Multi-row GEMM: y[M,N] = A[M,K] @ W[K,N] (chunked prefill down).
+sycl::event gemm_q8_0(sycl::queue& q,
+                      const sycl::half* A, const void* W_packed,
+                      sycl::half* y,
+                      uint32_t M, uint32_t K, uint32_t N,
+                      const std::vector<sycl::event>& deps = {});
+
+// W8A8 GEMV: x = block_q8_1s activations (quantize_q8_1s) — gate/up int-dot.
+// acc += dW * dX * idot per block per lane (fp32), subgroup-reduced; Q8_0 is
+// symmetric so the Q4_K min/sub-scale correction terms vanish.
+sycl::event gemv_q8_0_q8s(sycl::queue& q,
+                         const void* x_q8s, const void* W_packed,
+                         sycl::half* y, uint32_t K, uint32_t N,
+                         const std::vector<sycl::event>& deps = {});
+
+// Grouped dual gate/up over an expert-pick job list (spec-verify MoE):
+// jobs = [P x 3] int32 {vt, slot, ycell}; x row vt of the q8_1s mega stream.
+sycl::event gemv_q8_0_q8s_grouped_dual(sycl::queue& q,
+                         const void* x_q8s,
+                         const uint8_t* slot_base, uint64_t slot_bytes,
+                         uint64_t gate_off, uint64_t up_off,
+                         const int32_t* jobs,
+                         sycl::half* g_out, sycl::half* u_out,
+                         uint32_t K, uint32_t N, uint32_t P,
+                         const std::vector<sycl::event>& deps = {});
+
+// Grouped-tiles dual gate/up (prefill expert-major MoE + decode small_moe):
+// tile_jobs = [J x 4] int32 {x_row0, rows, slot, y_row0}; T <= 16 rows per
+// tile; x rows are consecutive q8_1s streams in the mega buffer.
+sycl::event gemv_q8_0_q8s_grouped_tiles(sycl::queue& q,
+                         const void* x_q8s_mega,
+                         const uint8_t* slot_base, uint64_t slot_bytes,
+                         uint64_t gate_off, uint64_t up_off,
+                         const int32_t* tile_jobs,
+                         sycl::half* g_out, sycl::half* u_out,
+                         uint32_t K, uint32_t N, uint32_t J,
+                         const std::vector<sycl::event>& deps = {});
+
 // Batched-T gate/up over STAGED q8_1x activation rows (chunked prefill):
 // x_q8x = T contiguous block_q8_1x streams (row t at block offset t*(K/32));
 // per-row numerics identical to gemv_q8_0_q8s. T <= 16.

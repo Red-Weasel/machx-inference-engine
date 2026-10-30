@@ -1174,12 +1174,14 @@ std::string Qwen4ExpModel::prepare_bank_views() {
     }
     // Pinned staging buffers for the Q8_0 raw-bank uploads (max raw slice;
     // three, one per bank — the copies and the H2D reuse them per miss).
+    // Sized over EVERY bank: all three banks upload through the staging
+    // scratch now (see the upload lambdas), any dtype.
     uint64_t stage_max = 0;
     for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
         const Qwen4ExpLayer& w = layers_[L];
-        if (w.gate_bv.dt == DType::kQ8_0)
-            stage_max = std::max(stage_max, std::max(w.gate_bv.slice_bytes,
-                                          std::max(w.up_bv.slice_bytes, w.down_bv.slice_bytes)));
+        stage_max = std::max(stage_max, std::max(w.gate_bv.slice_bytes,
+                                      std::max(w.up_bv.slice_bytes,
+                                               w.down_bv.slice_bytes)));
     }
     if (stage_max) {
         for (auto& st : q8_stage_) {
@@ -3002,18 +3004,15 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                                     uint64_t(e) * bv.slice_bytes;
             };
             const auto upload = [&](const Qwen4ExpLayer::BankView& bv, int bi, uint64_t off) {
-                if (bv.dt == DType::kQ8_0) {
-                    // Stage through pinned host memory, then DMA: the copy
-                    // engine cannot read the non-USM mmap safely under
-                    // page-cache pressure (bcs -ENOENT, 2026-10-27).
-                    std::memcpy(q8_stage_[bi], bv.raw + uint64_t(e) * bv.slice_bytes,
-                                bv.slice_bytes);
-                    uq.memcpy(dst + off, q8_stage_[bi], bv.slice_bytes);
-                } else {
-                    uq.memcpy(dst + off, srcp(bv), bv.slice_bytes);
-                }
+                // Stage EVERY upload through pinned host memory, then DMA: the
+                // copy engine cannot read the non-USM mmap safely under
+                // page-cache pressure (bcs -ENOENT, 2026-10-27; seen again
+                // 2026-10-30 on UD-Q4_K_XL, whose Q4_K/Q5_1 banks streamed
+                // directly — Q8_0-only gating covered the all-Q8_0 file only).
+                std::memcpy(q8_stage_[bi], srcp(bv), bv.slice_bytes);
+                uq.memcpy(dst + off, q8_stage_[bi], bv.slice_bytes);
             };
-            if (w.gate_bv.dt == DType::kQ8_0) uq.wait();   // scratch reuse guard
+            uq.wait();   // scratch reuse guard (every upload stages now)
             upload(w.gate_bv, 0, ec.gate_off);
             upload(w.up_bv,   1, ec.up_off);
             upload(w.down_bv, 2, ec.down_off);
@@ -5011,15 +5010,13 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
                                   : reinterpret_cast<const uint8_t*>(bv.f16) + uint64_t(e) * bv.slice_bytes;
                 };
                 const auto upload = [&](const Qwen4ExpLayer::BankView& bv, int bi, uint64_t off) {
-                    if (bv.dt == DType::kQ8_0) {
-                        std::memcpy(q8_stage_[bi], bv.raw + uint64_t(e) * bv.slice_bytes,
-                                    bv.slice_bytes);
-                        uq.memcpy(dst + off, q8_stage_[bi], bv.slice_bytes);
-                    } else {
-                        uq.memcpy(dst + off, srcp(bv), bv.slice_bytes);
-                    }
+                    // Stage EVERY upload through pinned host memory, then DMA
+                    // (see the ensure_slot site): the copy engine cannot read
+                    // the non-USM mmap safely under page-cache pressure.
+                    std::memcpy(q8_stage_[bi], srcp(bv), bv.slice_bytes);
+                    uq.memcpy(dst + off, q8_stage_[bi], bv.slice_bytes);
                 };
-                if (w.gate_bv.dt == DType::kQ8_0) uq.wait();   // scratch reuse guard
+                uq.wait();   // scratch reuse guard (every upload stages now)
                 upload(w.gate_bv, 0, ec.gate_off);
                 upload(w.up_bv,   1, ec.up_off);
                 upload(w.down_bv, 2, ec.down_off);

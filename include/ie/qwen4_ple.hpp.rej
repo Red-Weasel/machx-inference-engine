@@ -1,0 +1,38 @@
+--- include/ie/qwen4_ple.hpp
++++ include/ie/qwen4_ple.hpp
+@@ -14,6 +14,8 @@
+ 
+ #include <sycl/sycl.hpp>
+ 
++#include "ie/dtype.hpp"
++
+ #include <cstddef>
+ #include <cstdint>
+ #include <vector>
+@@ -30,6 +32,7 @@ inline constexpr uint32_t kPleConvK     = 4;      // ple.conv_kernel
+ inline constexpr uint32_t kPleConvDil   = 3;      // token-axis dilation
+ inline constexpr uint32_t kPleStateRows = 9;      // (K-1)*dil conv history columns
+ inline constexpr uint32_t kPleRowBytes  = 90;     // 160 IQ4_NL elems = 5 blocks * 18 B
++inline constexpr uint32_t kPleRowBytesQ8 = 170;   // 160 Q8_0 elems  = 5 blocks * 34 B
+ 
+ // Hash constants, passed in by the caller (read from GGUF metadata; the gate
+ // uses the spec values: M, 16 consecutive primes >= 20000003, exclusive
+@@ -73,11 +76,13 @@ void qwen4_ple_hash(const PleHashConsts& c,
+                     PleHistory& hist,
+                     uint64_t* rows_out /* [T, 16] */);
+ 
+-// Row gather + dequant (host). `table` is the IQ4_NL per_layer_token_embd
+-// buffer (row r at byte offset r*90); E_out[p] = concat of the 16 heads'
+-// 160-elem dequants, head index slowest -> [T, 2560] f32. Uses the reference
+-// dequant (ie::ref::dequant_iq4_nl_buffer) verbatim.
+-void qwen4_ple_gather(const void* table,
++// Row gather + dequant (host). `table` is the per_layer_token_embd buffer;
++// `dt` selects the row layout — IQ4_NL (row r at byte offset r*90, the layout
++// the engine's own converter writes) or Q8_0 (r*170; e.g. community Q8_0 /
++// UD-Q6_K_XL GGUFs quantize the table as Q8_0). E_out[p] = concat of the 16
++// heads' 160-elem dequants, head index slowest -> [T, 2560] f32. Uses the
++// reference dequants (ie::ref::dequant_*_buffer) verbatim.
++void qwen4_ple_gather(const void* table, DType dt,
+                       const uint64_t* rows /* [T, 16] */, uint32_t T,
+                       float* E_out /* [T, 2560] */);
+ 

@@ -1,0 +1,43 @@
+--- src/model/qwen4exp.cpp	2026-10-27 19:45:49.182163171 +0000
++++ src/model/qwen4exp.cpp	2026-10-27 21:02:27.138963693 +0000
+@@ -4285,12 +4285,11 @@
+                             ec.gate_off, ec.up_off, wt,
+                             moe_gT_, moe_uT_, H, EF, Jw, 2);
+                     } else if (gate_q80_pre) {
+-                        gemv_q8_0_q8s_grouped_tiles(q, xg_q8s_,
+-                            static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+-                            ec.gate_off, ec.up_off, wt,
+-                            moe_gT_, moe_uT_, H, EF, Jw);
+-                    } else if (gate_q80_pre) {
+-                        gemv_q8_0_q8s_grouped_tiles(q, xg_q8s_,
++                        // dp4a tiles (0004): 1.14-1.27x over the naive tiles
++                        // at T=8-16 (ie-q8-0-kernel-bench), same numerics
++                        // class. Decode keeps the naive kernel (it is 2.3x
++                        // faster at T=1).
++                        gemv_q8_0_q8s_grouped_tiles_dp4a(q, xg_q8s_,
+                             static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                             ec.gate_off, ec.up_off, wt,
+                             moe_gT_, moe_uT_, H, EF, Jw);
+@@ -4405,10 +4404,18 @@
+                         const uint8_t* xo = static_cast<const uint8_t*>(xg_q8_) +
+                                             uint64_t(j0) * q8row;
+                         if (gate_q80) {
+-                            gemv_q8_0_q8x_batched(q, xo, gp,
+-                                                  moe_gT_ + uint64_t(j0) * EF, H, EF, jn);
+-                            gemv_q8_0_q8x_batched(q, xo, up,
+-                                                  moe_uT_ + uint64_t(j0) * EF, H, EF, jn);
++                            // dp4a batched down (0004): ~1.2x at jn >= 8;
++                            // the naive body is 2.3x faster at T=1, so small
++                            // tail chunks stay on it.
++                            auto* gp_y = moe_gT_ + uint64_t(j0) * EF;
++                            auto* up_y = moe_uT_ + uint64_t(j0) * EF;
++                            if (jn >= 8) {
++                                gemv_q8_0_q8x_batched_dp4a(q, xo, gp, gp_y, H, EF, jn);
++                                gemv_q8_0_q8x_batched_dp4a(q, xo, up, up_y, H, EF, jn);
++                            } else {
++                                gemv_q8_0_q8x_batched(q, xo, gp, gp_y, H, EF, jn);
++                                gemv_q8_0_q8x_batched(q, xo, up, up_y, H, EF, jn);
++                            }
+                         } else {
+                             gemv_q4_K_q8_batched(q, xo, gp,
+                                                  moe_gT_ + uint64_t(j0) * EF, H, EF, jn);

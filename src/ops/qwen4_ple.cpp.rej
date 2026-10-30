@@ -1,0 +1,29 @@
+--- src/ops/qwen4_ple.cpp
++++ src/ops/qwen4_ple.cpp
+@@ -47,10 +47,25 @@ void qwen4_ple_hash(const PleHashConsts& c,
+ // 2. Host row gather + IQ4_NL dequant (spec §3, E assembly). 160 elems =
+ //    5 blocks of 32 = 90 B per row; head index slowest in the 2560.
+ // ---------------------------------------------------------------------------
+-void qwen4_ple_gather(const void* table,
++void qwen4_ple_gather(const void* table, DType dt,
+                       const uint64_t* rows, uint32_t T,
+                       float* E_out) {
+     const uint8_t* base = static_cast<const uint8_t*>(table);
++    if (dt == DType::kQ8_0) {
++        // Community GGUFs (Unsloth Q8_0, UD-Q6_K_XL, ...) store the table as
++        // Q8_0: 5 blocks of 32 (f16 scale + 32 i8) = 170 B a row. Reading it
++        // with the IQ4_NL stride/decoder (the old behavior) returned garbage
++        // embeddings and NaN logits.
++        for (uint32_t p = 0; p < T; ++p) {
++            for (uint32_t h = 0; h < kPleHeads; ++h) {
++                const uint64_t r = rows[size_t(p) * kPleHeads + h];
++                ref::dequant_q8_0_buffer(base + r * kPleRowBytesQ8, kPleHeadDim,
++                                         E_out + size_t(p) * kPleD + size_t(h) * kPleHeadDim);
++            }
++        }
++        return;
++    }
++    // IQ4_NL (the converter-native layout): 5 blocks of 32 = 90 B a row.
+     for (uint32_t p = 0; p < T; ++p) {
+         for (uint32_t h = 0; h < kPleHeads; ++h) {
+             const uint64_t r = rows[size_t(p) * kPleHeads + h];
