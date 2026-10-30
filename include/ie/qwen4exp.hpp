@@ -184,7 +184,8 @@ public:
     sycl::half* out_hc_up_t   = nullptr;  // [K, N] copies (prefill mix gemm)
     sycl::half* out_hc_down_t = nullptr;
     float*      out_hc_norm = nullptr;  // [10240]
-    const GgufTensorInfo* ple_table = nullptr;  // [160, 320001536] IQ4_NL, host
+    const GgufTensorInfo* ple_table = nullptr;  // [160, 320001536] host; IQ4_NL or Q8_0
+    DType ple_dt = DType::kIQ4_NL;              // the table's dtype (gather row layout)
     // P4 B49: the table is read at random, 16 rows a token, straight from the file mapping; cold, a row is a page fault
     // served from disk (measured 2026-10-04: ~130 us a row, 39 % of a first read of 7,933 tokens, 241 against 487
     // tok/s for a repeated prompt). The load starts one background pass that reads the whole table into the page
@@ -522,6 +523,12 @@ private:
 
     // Host F16 fallback storage for non-fast-path banks (kept alive here).
     std::vector<std::vector<sycl::half>> f16_banks_;
+    // Q8_0 raw-bank uploads stage through pinned host memory: the copy
+    // engine cannot DMA the non-USM GGUF mmap safely under page-cache
+    // pressure (bcs -ENOENT faults, 2026-10-27) — the deepseek4
+    // pinned-arena lesson applied to the raw path.
+    void* q8_stage_[3] = {nullptr, nullptr, nullptr};
+    uint64_t q8_stage_bytes_ = 0;
 
     // Runtime state.
     KvCache       kv_;

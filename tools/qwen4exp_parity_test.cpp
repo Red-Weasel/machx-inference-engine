@@ -139,7 +139,7 @@ int main(int argc, char** argv) {
             qwen4_ple_hash(pc, toks.data(), T, hist, rows.data());
             const GgufTensorInfo* tbl = g.find_tensor("per_layer_token_embd.weight");
             std::vector<float> E(uint64_t(T) * H);
-            qwen4_ple_gather(tbl->data, rows.data(), T, E.data());
+            qwen4_ple_gather(tbl->data, tbl->dtype, rows.data(), T, E.data());
             const double eE = rel_l2(E.data(), b.f.at("ple_embed_E").data(), E.size());
             char buf[128];
             std::snprintf(buf, sizeof(buf), "%-14s rel-L2 %.3e (tol 1e-06, exact path)", "ple_embed_E", eE);

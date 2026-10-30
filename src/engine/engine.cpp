@@ -48,8 +48,24 @@ struct Q4eBundle {
     Qwen4ExpConfig  cfg;
     DeviceAllocator a1;          // second card (split mode only)
     Qwen4ExpModel   A, B;        // A: [0,24) or whole model; B: [24,48)
+    // 2026-10-27: N-card layer-split pipelines (nst >= 3): stage 0 = A
+    // (layers [0, per)), stages 1..nst-2 = mid (cards 1..nst-2, own
+    // allocators), the last stage = B (card nst-1; lm_head + MTP head). The
+    // wide state ping-pongs through the shared host buffer at every
+    // boundary, exactly like the 2-stage handoff. nst == 2 keeps the
+    // original A/a1/B structure byte for byte.
+    std::vector<std::unique_ptr<Qwen4ExpModel>> mid;
+    std::vector<std::unique_ptr<DeviceAllocator>> adev;
+    uint32_t nst = 1;
     bool            split = false;
     bool            p2p   = false;  // wide handoff pushes device-to-device
+    // 0007: nst > 2 deep-pipeline D2D wide pushes (IE_P2P shared context).
+    // Unlike p2p this does NOT change the serial paths: the deep pipeline
+    // passes the consumer's wide bank as forward_range's wide_out (a device
+    // pointer — the exit memcpy is then the D2D push) and wide_in_device on
+    // the consumer side; after the loop every stage is restored to bank 0
+    // and the serial paths keep bouncing through host `wide` unchanged.
+    bool            deep_p2p = false;
     bool            vis_card0 = false;   // 2026-10-23: the vision tower on card 0 (the head's bank is on card 1); else card 1
     std::vector<float> wide_b;   // second parity buffer (pipelined prefill)
     std::vector<float> wide;     // pipeline handoff [chunk, 4, hidden]
@@ -61,6 +77,7 @@ struct Q4eBundle {
 
     void reset_all() {
         A.reset_state();
+        for (auto& M : mid) M->reset_state();
         if (split) B.reset_state();
     }
     // P4 B56: prompt-lookup drafts at one request lane (the 35B split's look_step, qwen35moe_split.hpp, over the two
@@ -116,6 +133,9 @@ struct Q4eBundle {
         if (lad_a.size() <= slot) { lad_a.resize(slot + 1); lad_b.resize(slot + 1); }
         std::string m = A.state_save(lad_a[slot], depth);
         if (m.empty() && split) m = B.state_save(lad_b[slot], depth);
+        // (the mid stages of an N-card pipeline: the ladder is only walked by
+        // the lanes module, which N-card runs replace with the time-sliced
+        // path — the mid stages need no slots here)
         if (!m.empty()) lad_a[slot].depth = 0;
         return m;
     }
@@ -126,6 +146,22 @@ struct Q4eBundle {
         return m;
     }
     Qwen4ExpModel& tail() { return split ? B : A; }
+    // The stage chain for a split load: A -> mid[0..] -> B, the wide state
+    // ping-ponging through the shared host buffer (the established 2-stage
+    // handoff generalized; p2p stays a 2-stage feature). For nst == 2 this
+    // is the original A/B pair verbatim.
+    std::string chain_range(const int32_t* t, uint32_t T, uint32_t pos, float* wide) {
+        std::string m = A.forward_range(t, T, pos, nullptr, wide, nullptr);
+        for (auto& M : mid)
+            if (m.empty()) m = M->forward_range(t, T, pos, wide, wide, nullptr);
+        if (m.empty()) m = B.forward_range(t, T, pos, wide, nullptr, nullptr);
+        return m;
+    }
+    template <class F> void for_stage(F&& f) {
+        f(A);
+        for (auto& M : mid) f(*M);
+        if (split) f(B);
+    }
     std::string look_init(uint32_t rows, uint32_t vocab, uint32_t min_match) {
         if (look.rows) return {};
         look.d_all = sycl::malloc_device<sycl::half>(uint64_t(rows) * vocab, tail().queue());
@@ -337,9 +373,17 @@ struct Q4eBundle {
     std::string fwd(const int32_t* t, uint32_t T, uint32_t pos, bool feed = true) {
         std::string m;
         if (split) {
-            m = A.forward_range(t, T, pos, nullptr, wide.data(), nullptr);
-            if (m.empty()) m = B.forward_range(t, T, pos, p2p ? nullptr : wide.data(),
-                                               nullptr, nullptr, /*wide_in_device=*/p2p);
+            // 0005: nst > 2 routes through the N-stage chain — the original
+            // A/B pair SKIPS the mid stages (layers 12..35 of 48 never ran:
+            // caught by GPQA-Diamond collapsing to 22-24% while 1-GPU and
+            // 2-card stayed at the 47-51% baseline). nst <= 2 is untouched.
+            if (nst > 2) {
+                m = chain_range(t, T, pos, wide.data());
+            } else {
+                m = A.forward_range(t, T, pos, nullptr, wide.data(), nullptr);
+                if (m.empty()) m = B.forward_range(t, T, pos, p2p ? nullptr : wide.data(),
+                                                   nullptr, nullptr, /*wide_in_device=*/p2p);
+            }
         } else m = A.forward(t, T, pos, nullptr);
         if (m.empty() && feed) mtp_feed(t, T, pos);
         return m;
@@ -524,6 +568,11 @@ struct Q4eBundle {
         spec_note_round(acc);   // (the round gave `acc` tokens: the first row's and the drafts followed)
         std::string m = A.commit_verify(acc);
         if (m.empty() && split) m = B.commit_verify(acc);
+        // 0005: the mid stages checkpointed their rows too — without the commit
+        // their recurrent/KV state goes stale after every spec round (truncation
+        // after a few tokens) and their vck_T_ drifts until "verify T beyond
+        // checkpoint cap 8".
+        for (auto& M : mid) if (m.empty()) m = M->commit_verify(acc);
         if (!m.empty()) return "spec commit: " + m;
         tail().mtp_rewind();   // (the verify forward's rows are in wide_: the carry before them is the round's first input row)
         if (!tail().mtp_ingest(s.batch.data(), acc, s.base).empty()) mtp_ok = false; else mtp_to = s.base + acc;
@@ -548,12 +597,19 @@ struct Q4eBundle {
         if (Kd == 0) { s.n = 0; return {}; }   // (the caller takes the plain step)
         s.batch.resize(Kd + 1);
         A.set_spec_verify(true); if (split) B.set_spec_verify(true);
+        for (auto& M : mid) M->set_spec_verify(true);   // (0005: the mid stages verify too)
         std::string m;
         if (split) {
-            m = A.forward_range(s.batch.data(), Kd + 1, pos, nullptr, wide.data(), nullptr);
-            if (m.empty()) m = B.forward_range(s.batch.data(), Kd + 1, pos, p2p ? nullptr : wide.data(), nullptr, nullptr, p2p);
+            // 0005: nst > 2 through the chain (the A/B pair skips the mids)
+            if (nst > 2) {
+                m = chain_range(s.batch.data(), Kd + 1, pos, wide.data());
+            } else {
+                m = A.forward_range(s.batch.data(), Kd + 1, pos, nullptr, wide.data(), nullptr);
+                if (m.empty()) m = B.forward_range(s.batch.data(), Kd + 1, pos, p2p ? nullptr : wide.data(), nullptr, nullptr, p2p);
+            }
         } else m = A.forward(s.batch.data(), Kd + 1, pos, nullptr);
         A.set_spec_verify(false); if (split) B.set_spec_verify(false);
+        for (auto& M : mid) M->set_spec_verify(false);
         if (m.empty()) m = tail().logits_rows(Kd + 1, look.d_all);
         if (!m.empty()) return "spec verify: " + m;
         if (ss.on) {   // decide every row now: accept draft j + 1 against row j's target cut, else draw the residual
@@ -609,8 +665,6 @@ struct Q4eBundle {
         const uint64_t wsz = uint64_t(PC) * cfg.hc_count * cfg.hidden;
         if (wide.size() < wsz) wide.resize(wsz);
         if (!banks && wide_b.size() < wsz) wide_b.resize(wsz);
-        float* wb2[2] = {wide.data(), banks ? wide.data() : wide_b.data()};
-        std::future<std::string> bfut;
         std::string err;
         uint32_t done = 0;
         // P4 B63: the draft head ingests the chunks in order on B when the run starts where its record ends
@@ -618,6 +672,166 @@ struct Q4eBundle {
         const bool mtp_feeding = mtp_on && mtp_ok && pos <= mtp_to;
         if (mtp_feeding && pos < mtp_to) B.mtp_rewind();
         if (mtp_on && !mtp_feeding) mtp_ok = false;
+        if (nst > 2) {
+            // 0006: FULL per-stage pipeline. A(k) runs on the main thread
+            // while mid0(k), mid1(k), B(k) run on their own threads over
+            // EARLIER chunks: at chunk k the tail is still draining chunk
+            // k-1, so every stage computes a different chunk concurrently
+            // (the 2-stage shape overlapped only A vs the serial rest
+            // chain, which made the rest chain the critical path). Three
+            // host wide boundaries x 2 slots carry the handoffs:
+            //   b0[slot]: A(k) writes,  mid0(k) reads
+            //   b1[slot]: mid0(k) writes, mid1(k) reads
+            //   b2[slot]: mid1(k) writes, B(k) reads
+            // Reuse hazards are covered by ONE wait per chunk: at the top,
+            // fB[slot] (B(k-2)) is reaped — B(k-2) transitively waited
+            // mid1(k-2) and mid0(k-2), so all three slots are free for
+            // chunk k's writers. Inside the chain each stage waits its
+            // producer (fM0 by mid1, fM1 by B), and B additionally waits
+            // the OTHER slot's fB so MTP ingests and ladder saves stay in
+            // chunk order. Same forwards as the serial path, same order
+            // per stage: numerics are unchanged (verified bit-identical
+            // greedy text vs IE_Q4E_NO_PIPELINE=1).
+            // 0007: D2D wide pushes through the shared context (IE_P2P) —
+            // the producer's exit memcpy writes the consumer's wide BANK
+            // directly (a device pointer as wide_out), the consumer
+            // switches wide_ to it (use_wide_bank) and runs with
+            // wide_in_device=true. No host bounce, no wide_peer_ juggling.
+            // IE_Q4E_NO_PIPE_P2P=1 or a bank-alloc failure = host mode.
+            bool d2d = deep_p2p && std::getenv("IE_Q4E_NO_PIPE_P2P") == nullptr;
+            if (d2d) {
+                for (Qwen4ExpModel* st : {mid[0].get(), mid[1].get(), &B}) {
+                    if (st->max_chunk() < PC || !st->alloc_wide_bank2().empty()) { d2d = false; break; }
+                }
+            }
+            if (d2d)
+                std::fprintf(stderr, "[q4e-pipeline] deep pipeline: wide state pushes device-to-device (IE_Q4E_NO_PIPE_P2P=1 = host bounce)\n");
+            std::vector<float> wp0[2], wp1[2], wp2[2];
+            if (!d2d)
+                for (int s = 0; s < 2; ++s) { wp0[s].resize(wsz); wp1[s].resize(wsz); if (mid.size() > 1) wp2[s].resize(wsz); }
+            const bool two_mids = mid.size() > 1;
+            // All futures are shared_futures and the lambdas capture COPIES
+            // (by value): the main thread reassigns the slot slots while a
+            // lambda may still be inside get() on the same object — a plain
+            // future get() concurrent with operator= is a data race
+            // (SIGSEGV, exit 139). shared_future copies share the state
+            // safely and multi-get is legal.
+            std::shared_future<std::string> fM0[2], fM1[2], fB[2];
+            Qwen4ExpModel* M0p = mid[0].get();
+            Qwen4ExpModel* M1p = two_mids ? mid[1].get() : nullptr;
+            for (uint32_t k = 0; done < count; ++k) {
+                const uint32_t n = std::min(PC, count - done);
+                const uint32_t slot = k & 1;
+                if (fB[slot].valid())
+                    if (auto e = fB[slot].get(); !e.empty()) { err = e; break; }
+                float* a_out = wp0[slot].data();
+                // (under d2d wp0 stays empty-sized: A's exit memcpys straight
+                // into mid0's wide bank on the next card — the D2D push)
+                if (d2d) a_out = mid[0]->wide_bank(slot);
+                if (auto e = A.forward_range(t + done, n, pos + done, nullptr,
+                                             a_out, nullptr); !e.empty()) { err = "A: " + e; break; }
+                const uint32_t ld = pos + done + n;
+                Qwen4ExpModel::StateCopy* lb = nullptr;
+                if (lad_step && lad_k && ld / lad_step > (pos + done) / lad_step) {
+                    const uint32_t sl = (ld / lad_step - 1) % lad_k;
+                    if (sl < lad_a.size() && sl < lad_b.size() && A.state_save(lad_a[sl], ld).empty()) {
+                        lb = &lad_b[sl]; lb->depth = 0;
+                        lad_taken.emplace_back(sl, ld);
+                    }
+                }
+                const uint32_t bn = n, bpos = pos + done;
+                const int32_t* bt = t + done;
+                const bool feed = mtp_feeding;
+                float* a0 = wp0[slot].data(), *b1 = wp1[slot].data();   // host mode (d2d leaves wp* empty and uses the banks)
+                // 0006 fix: the stage's OWN chunks must be in-order too —
+                // without this wait mid0(k) and mid0(k-1) can run CONCURRENTLY
+                // on the same model (KV/DeltaNet/workspaces race -> ccs
+                // -ENOENT faults or a queue hang; nondeterministic).
+                const uint32_t oslot = slot ^ 1u;
+                const auto prev_m0 = fM0[oslot];   // copy: self-order (mid0(k-1))
+                // d2d: wide_ IS the input (the producer pushed into this
+                // stage's bank[slot]); the wide_out is the consumer's
+                // bank[slot] (a device pointer — the exit memcpy is the push)
+                float* out0 = two_mids ? mid[1]->wide_bank(slot) : B.wide_bank(slot);
+                fM0[slot] = std::async(std::launch::async,
+                    [prev_m0, M0p, a0, b1, out0, bn, bpos, slot, d2d]() {
+                        if (prev_m0.valid())
+                            if (auto e = prev_m0.get(); !e.empty()) return e;
+                        if (d2d) {
+                            M0p->use_wide_bank(slot);
+                            return M0p->forward_range(nullptr, bn, bpos, nullptr, out0, nullptr,
+                                                      /*wide_in_device=*/true);
+                        }
+                        return M0p->forward_range(nullptr, bn, bpos, a0, b1, nullptr);
+                    });
+                Qwen4ExpModel* Bp = &B;
+                if (two_mids) {
+                    // d2d: b2 = B's wide bank (mid1's exit memcpy pushes into
+                    // it — a device pointer as wide_out is the D2D push)
+                    float* b2 = wp2[slot].data();
+                    if (d2d) b2 = B.wide_bank(slot);
+                    const auto prod_m0 = fM0[slot];   // copy: producer (mid0(k))
+                    const auto prev_m1 = fM1[oslot];   // copy: self-order (mid1(k-1))
+                    fM1[slot] = std::async(std::launch::async,
+                        [prod_m0, prev_m1, M1p, b1, b2, bn, bpos, slot, d2d]() {
+                            if (auto e = prod_m0.get(); !e.empty()) return e;
+                            if (prev_m1.valid())
+                                if (auto e = prev_m1.get(); !e.empty()) return e;
+                            if (d2d) {
+                                M1p->use_wide_bank(slot);
+                                return M1p->forward_range(nullptr, bn, bpos, nullptr, b2, nullptr,
+                                                          /*wide_in_device=*/true);
+                            }
+                            return M1p->forward_range(nullptr, bn, bpos, b1, b2, nullptr);
+                        });
+                    const auto prod_m1 = fM1[slot];   // copy: producer (mid1(k))
+                    const auto prev_b = fB[slot ^ 1u];   // copy: self-order (B(k-1), also orders MTP ingest + ladder saves)
+                    fB[slot] = std::async(std::launch::async,
+                        [prod_m1, prev_b, Bp, b2, bn, bpos, lb, ld, bt, feed, slot, d2d]() {
+                            std::string e;
+                            if (e = prod_m1.get(); !e.empty()) return e;
+                            if (prev_b.valid())
+                                if (auto ee = prev_b.get(); !ee.empty()) return ee;
+                            if (d2d) Bp->use_wide_bank(slot);
+                            if (e = Bp->forward_range(nullptr, bn, bpos, d2d ? nullptr : b2, nullptr, nullptr,
+                                                      /*wide_in_device=*/d2d); !e.empty()) return e;
+                            if (lb) (void)Bp->state_save(*lb, ld);   // (a failed copy leaves depth 0: the slot does not count)
+                            if (feed) e = Bp->mtp_ingest(bt, bn, bpos);   // (P4 B63: the head reads every chunk)
+                            return e;
+                        });
+                } else {
+                    const auto prod_m0 = fM0[slot];   // copy: producer (mid0(k))
+                    const auto prev_b = fB[slot ^ 1u];   // copy: self-order (B(k-1))
+                    fB[slot] = std::async(std::launch::async,
+                        [prod_m0, prev_b, Bp, b1, bn, bpos, lb, ld, bt, feed, slot, d2d]() {
+                            std::string e;
+                            if (e = prod_m0.get(); !e.empty()) return e;
+                            if (prev_b.valid())
+                                if (auto ee = prev_b.get(); !ee.empty()) return ee;
+                            if (d2d) Bp->use_wide_bank(slot);
+                            if (e = Bp->forward_range(nullptr, bn, bpos, d2d ? nullptr : b1, nullptr, nullptr,
+                                                      /*wide_in_device=*/d2d); !e.empty()) return e;
+                            if (lb) (void)Bp->state_save(*lb, ld);
+                            if (feed) e = Bp->mtp_ingest(bt, bn, bpos);
+                            return e;
+                        });
+                }
+                done += n;
+            }
+            // Reap both slots: each fB transitively waits its mid chain. A
+            // mid error propagates through its consumer's lambda return.
+            for (int s = 0; s < 2; ++s)
+                if (fB[s].valid())
+                    if (auto e = fB[s].get(); !e.empty() && err.empty()) err = e;
+            if (d2d)
+                for (Qwen4ExpModel* st : {mid[0].get(), mid[1].get(), &B})
+                    st->use_wide_bank(0);   // the serial paths expect the canonical wide_
+            if (!err.empty()) lad_taken.clear();
+            if (mtp_feeding) { if (err.empty()) mtp_to = pos + count; else mtp_ok = false; }
+            return err;
+        }
+        float* wb2[2] = {wide.data(), banks ? wide.data() : wide_b.data()};
+        std::future<std::string> bfut;
         for (uint32_t k = 0; done < count; ++k) {
             const uint32_t n = std::min(PC, count - done);
             float* wb = wb2[k & 1];
@@ -643,11 +857,27 @@ struct Q4eBundle {
             const uint32_t bn = n, bpos = pos + done, bank = k & 1;
             const int32_t* bt = t + done;
             const bool feed = mtp_feeding;
-            bfut = std::async(std::launch::async, [Bp, wb, bn, bpos, banks, bank, lb, ld, bt, feed]() {
+            // 0005: the async tail is the WHOLE rest chain (mid stages then
+            // B) — the original lambda ran B only, so the pipelined prefill
+            // skipped the mid stages (same GPQA-caught bug as fwd()). The
+            // stages run sequentially on the async thread through the host
+            // wide buffer; banks (p2p) is a 2-stage feature, so at nst > 2
+            // every stage reads wb and writes wb in place, which forward_range
+            // orders correctly (entry memcpy .wait()s before compute, exit
+            // copies back after q.wait()). nst == 2: mid is empty, behavior
+            // byte-identical to the original lambda.
+            bfut = std::async(std::launch::async, [this, Bp, wb, bn, bpos, banks, bank, lb, ld, bt, feed]() {
                 if (banks) Bp->use_wide_bank(bank);
-                std::string e = Bp->forward_range(nullptr, bn, bpos,
-                                         banks ? nullptr : wb, nullptr, nullptr,
+                std::string e;
+                for (auto& M : mid) {
+                    e = M->forward_range(nullptr, bn, bpos, banks ? nullptr : wb,
+                                         banks ? nullptr : wb, nullptr,
                                          /*wide_in_device=*/banks);
+                    if (!e.empty()) return e;
+                }
+                e = Bp->forward_range(nullptr, bn, bpos,
+                                      banks ? nullptr : wb, nullptr, nullptr,
+                                      /*wide_in_device=*/banks);
                 if (e.empty() && lb) (void)Bp->state_save(*lb, ld);   // (a failed copy leaves depth 0: the slot does not count)
                 if (e.empty() && feed) e = Bp->mtp_ingest(bt, bn, bpos);   // (P4 B63: the head reads every chunk)
                 return e;
@@ -666,11 +896,13 @@ struct Q4eBundle {
     }
     std::string snap(uint32_t depth) {
         std::string m = A.snapshot(depth);
+        for (auto& M : mid) if (m.empty()) m = M->snapshot(depth);
         if (m.empty() && split) m = B.snapshot(depth);
         return m;
     }
     std::string rest() {
         std::string m = A.restore();
+        for (auto& M : mid) if (m.empty()) m = M->restore();
         if (m.empty() && split) m = B.restore();
         return m;
     }
@@ -1775,7 +2007,10 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         // planner would sum all 103 GiB against per-card VRAM and refuse.
         const uint32_t avail = std::max<uint32_t>(1u, ds4_count_gpus());
         if (opts.n_gpus == 0) opts.n_gpus = std::min(avail, 2u);
-        opts.n_gpus     = std::min(std::max<uint32_t>(1u, opts.n_gpus), std::min(avail, 2u));
+        // 2026-10-27: the N-card pipelines plan their own placement (the
+        // per-arch runtime owns the per-card fit) — honor --gpus up to the
+        // card count instead of the old 2-GPU cap.
+        opts.n_gpus     = std::min(std::max<uint32_t>(1u, opts.n_gpus), avail);
         e->opts_.n_gpus = opts.n_gpus;
         std::fprintf(stderr, "[mem-plan] qwen4exp: engine planner bypassed (routed experts "
                              "stream through per-card VRAM caches); %u of %u GPU(s)\n",
@@ -2592,13 +2827,30 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         }
         e->opts_.prefill_chunk = chunk;
         b->split = opts.n_gpus >= 2;
+        // 2026-10-27: N-card layer-split pipelines (nst >= 3). The layer
+        // count must divide evenly (48/4 = 12); the lanes module is a
+        // 2-stage structure, so N-card runs serve ONE request lane through
+        // the time-sliced path.
+        b->nst = b->split ? std::min<uint32_t>(opts.n_gpus, 64) : 1u;
+        if (b->nst > 2 && b->cfg.n_layers % b->nst != 0) {
+            err = "qwen4exp: " + std::to_string(b->cfg.n_layers) + " layers do not divide by --gpus " +
+                  std::to_string(b->nst);
+            e->q4e_.reset(); return nullptr;
+        }
+        const uint32_t per = b->split ? b->cfg.n_layers / b->nst : b->cfg.n_layers;
+        if (b->nst > 2) {
+            if (opts.parallel != 1)
+                std::fprintf(stderr, "[qwen4exp] --gpus %u: the request lanes are a 2-stage structure; "
+                                     "serving one lane through the time-sliced path\n", b->nst);
+            opts.parallel = e->opts_.parallel = 1;
+        }
         // P4 B8: --parallel N > 1 on two cards = N request lanes per stage (lanes 1..N-1 at --slot-ctx, out of the expert
         // cache) served by the lanes module. One card, or IE_Q4E_LANES=0, keeps the time-sliced path.
         const bool lanes_off = [] { const char* v = std::getenv("IE_Q4E_LANES"); return v && *v == '0'; }();
         // P4 B30: no --parallel = the fixed pick (lanes_auto.hpp: 4 lanes at 16K, a placeholder here), their state out of the
         // expert cache; one lane where the lanes would not run (one card, IE_Q4E_LANES=0, IE_P2P)
         uint32_t q4e_slot_ctx = opts.slot_ctx;
-        if (opts.parallel == kLanesAuto) {
+        if (opts.parallel == kLanesAuto && b->nst <= 2) {
             const LanesAutoPlan p = lanes_auto_plan(LanesArch::kFlashNext, b->split ? 2u : 1u, !lanes_off && !q4e_p2p, opts.slot_ctx);
             opts.parallel = e->opts_.parallel = p.n;
             q4e_slot_ctx = p.slot_ctx;
@@ -2620,7 +2872,7 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                          lanes_off ? "IE_Q4E_LANES=0" : "request lanes need two cards");
         if (opts.spec && n_lanes > 1)
             std::fprintf(stderr, "[qwen4exp] --spec: lookup drafts run at one request lane; with --parallel %u they are off\n", opts.parallel);
-        const uint32_t hi = b->split ? b->cfg.n_layers / 2 : b->cfg.n_layers;
+        const uint32_t hi = b->split ? per : b->cfg.n_layers;
         if (auto m = b->A.load(e->alloc_, e->gguf_, b->cfg, 0, 0, hi); !m.empty()) {
             err = "qwen4exp A: " + m; e->q4e_.reset(); return nullptr;
         }
@@ -2657,7 +2909,10 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         if (q4e_mtp && !b->split)
             if (auto m = b->mtp_load(gguf_path, q4e_head, e->gguf_, q4e_k); !m.empty())
                 std::fprintf(stderr, "[qwen4exp] %s -- lookup drafts only\n", m.c_str());
-        if (q4e_mtp && n_lanes > 1) b->A.set_verify_rows(8);   // (2026-10-23: the lanes' rounds verify on both stages)
+        if (q4e_mtp && n_lanes > 1) {
+            b->A.set_verify_rows(8);
+            for (auto& M : b->mid) M->set_verify_rows(8);
+        }   // (2026-10-23: the lanes' rounds verify on both stages)
         // 2026-10-23: the request lanes take images, so the vision tower is placed NOW, before the expert caches are sized (a
         // late 1.6 GB allocation beside a full card is what the 27B's lanes refuse): on card 0 when the head's bank will sit
         // on card 1, else on card 1 (the tail stage's card, as at one lane). No mmproj found = images refused on the lanes.
@@ -2670,26 +2925,78 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             err = "qwen4exp A runtime: " + m; e->q4e_.reset(); return nullptr;
         }
         if (b->split) {
-            b->p2p = q4e_p2p;
-            if (b->p2p) {
+            b->p2p = q4e_p2p && b->nst == 2;   // p2p stays a 2-stage feature
+            // 0007: at nst > 2 the deep pipeline pushes the wide state
+            // device-to-device through the fleet's shared context (same
+            // mechanism as the 2-stage `banks` path); every allocator must
+            // hang off that context. The 2-stage serial handoff flag stays
+            // nst == 2 (the deep pipeline manages its own peers per chunk).
+            if (q4e_p2p) {
                 if (auto m = b->a1.init_with(*q4e_p2p_ctx, q4e_p2p_gpus[1]); !m.empty()) {
                     err = "qwen4exp gpu1: " + m; e->q4e_.reset(); return nullptr;
                 }
             } else if (auto m = b->a1.init("B70", 1); !m.empty()) {
                 err = "qwen4exp gpu1: " + m; e->q4e_.reset(); return nullptr;
             }
-            if (auto m = b->B.load(b->a1, e->gguf_, b->cfg, 0, hi, b->cfg.n_layers); !m.empty()) {
+            if (b->nst > 2) {
+                b->mid.resize(b->nst - 2);
+                // ordinals 2..nst-1 (A on 0, mid[0] on a1 = 1, B on nst-1)
+                for (uint32_t s = 2; s < b->nst; ++s) {
+                    b->mid[s - 2] = std::make_unique<Qwen4ExpModel>();
+                    b->adev.push_back(std::make_unique<DeviceAllocator>());
+                    if (q4e_p2p) {
+                        if (auto m = b->adev.back()->init_with(*q4e_p2p_ctx, q4e_p2p_gpus[s]); !m.empty()) {
+                            err = "qwen4exp gpu" + std::to_string(s) + ": " + m;
+                            e->q4e_.reset(); return nullptr;
+                        }
+                    } else if (auto m = b->adev.back()->init("B70", s); !m.empty()) {
+                        err = "qwen4exp gpu" + std::to_string(s) + ": " + m;
+                        e->q4e_.reset(); return nullptr;
+                    }
+                }
+            }
+            b->deep_p2p = q4e_p2p;   // 0007: the shared context covers every stage
+            if (b->deep_p2p) {
+                // Ordinal sanity: the D2D pushes assume allocator ordinal s
+                // really is q4e_p2p_gpus[s] (the two enumerations come from
+                // different paths). A mismatch falls back to host bounces —
+                // everything already runs on the shared context, so serving
+                // is unaffected.
+                if (e->alloc_.queue().get_device() != q4e_p2p_gpus[0] ||
+                    b->a1.queue().get_device() != q4e_p2p_gpus[1]) b->deep_p2p = false;
+                for (size_t i = 0; i < b->adev.size() && b->deep_p2p; ++i)
+                    if (b->adev[i]->queue().get_device() != q4e_p2p_gpus[i + 2]) b->deep_p2p = false;
+                if (!b->deep_p2p)
+                    std::fprintf(stderr, "[q4e-pipeline] device/ordinal mismatch vs the p2p context — wide state bounces through host\n");
+            }
+            // The mid stages: stage s (layers [s*per, (s+1)*per)) on card s
+            // (mid[0] on a1 = card 1, mid[i] on adev[i-1] = card i+1).
+            for (uint32_t s = 1; s + 1 < b->nst; ++s) {
+                Qwen4ExpModel& M = *b->mid[s - 1];
+                DeviceAllocator& dev = (s == 1) ? b->a1 : *b->adev[s - 2];
+                if (auto m = M.load(dev, e->gguf_, b->cfg, 0, s * per, (s + 1) * per); !m.empty()) {
+                    err = "qwen4exp stage" + std::to_string(s) + ": " + m;
+                    e->q4e_.reset(); return nullptr;
+                }
+            }
+            if (auto m = b->B.load(b->nst == 2 ? b->a1 : *b->adev.back(),
+                                   e->gguf_, b->cfg, 0, (b->nst - 1) * per, b->cfg.n_layers); !m.empty()) {
                 err = "qwen4exp B: " + m; e->q4e_.reset(); return nullptr;
             }
             if (q4e_mtp)
                 if (auto m = b->mtp_load(gguf_path, q4e_head, e->gguf_, q4e_k); !m.empty())
                     std::fprintf(stderr, "[qwen4exp] %s -- lookup drafts only\n", m.c_str());
             if (q4e_mtp && n_lanes > 1) b->B.set_verify_rows(8);   // (2026-10-23)
+            for (auto& M : b->mid) M->set_verify_rows(8);
             if (n_lanes > 1 && !b->vis_card0 && !e->qvis_resolve_mmproj().empty())   // (2026-10-23: the tower on card 1, before its cache)
                 if (auto m = e->qvis_upload_tower(); !m.empty()) { err = "vision: " + m; e->q4e_.reset(); return nullptr; }
             if (auto m = b->B.init_runtime(opts.max_ctx, chunk, n_lanes, lane_ctx); !m.empty()) {
                 err = "qwen4exp B runtime: " + m; e->q4e_.reset(); return nullptr;
             }
+            for (auto& M : b->mid)
+                if (auto m = M->init_runtime(opts.max_ctx, chunk, n_lanes, lane_ctx); !m.empty()) {
+                    err = "qwen4exp mid runtime: " + m; e->q4e_.reset(); return nullptr;
+                }
             if (b->p2p) b->A.set_wide_peer(b->B.wide_device());
             b->wide.resize(uint64_t(chunk) * b->cfg.hc_count * b->cfg.hidden);
         }

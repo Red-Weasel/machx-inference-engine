@@ -439,6 +439,10 @@ add_executable(ie_qwen4exp_bvs qwen4exp_bvs_test.cpp)
 target_link_libraries(ie_qwen4exp_bvs PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_qwen4exp_bvs PROPERTIES OUTPUT_NAME "ie-qwen4exp-bvs")
 
+add_executable(ie_q8_0_kernel_bench q8_0_kernel_bench.cpp)
+target_link_libraries(ie_q8_0_kernel_bench PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_q8_0_kernel_bench PROPERTIES OUTPUT_NAME "ie-q8-0-kernel-bench")
+
 add_executable(ie_q4k_bench q4k_kernel_bench.cpp)
 target_link_libraries(ie_q4k_bench PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_q4k_bench PROPERTIES OUTPUT_NAME "ie-q4k-bench")

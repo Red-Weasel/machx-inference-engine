@@ -207,6 +207,14 @@ std::string Qwen4ExpModel::load(DeviceAllocator& alloc, const GgufReader& g,
     if (cfg.has_ple() && own_ple) {
         ple_table = g.find_tensor("per_layer_token_embd.weight");
         if (!ple_table) return "qwen4exp load: missing per_layer_token_embd.weight";
+        // The gather's row layout follows the table's dtype. The converter
+        // writes IQ4_NL; community GGUFs (Unsloth Q8_0, UD-Q6_K_XL, ...) carry
+        // Q8_0. Anything else is refused rather than misread.
+        if (ple_table->dtype != DType::kIQ4_NL && ple_table->dtype != DType::kQ8_0)
+            return std::string("qwen4exp load: per_layer_token_embd.weight dtype ")
+                 + type_name(ple_table->dtype).data()
+                 + " not supported (want IQ4_NL or Q8_0)";
+        ple_dt = ple_table->dtype;
         host_bytes_ += ple_table->nbytes;
         placement_.push_back({std::string(ple_table->name), "host",
                               type_name(ple_table->dtype).data(), ple_table->nbytes});
@@ -1095,6 +1103,16 @@ std::string Qwen4ExpModel::prepare_bank_views() {
         const uint32_t K = uint32_t(t->shape[0]), N = uint32_t(t->shape[1]);
         const uint32_t E = uint32_t(t->shape[2]);
         bv.K = K; bv.N = N;
+        // Q8_0 banks (community GGUFs) stream raw like the fast paths: the
+        // per-card cache holds raw Q8_0 slices and the Q8_0 MoE kernels
+        // dequant on the fly. The load-time F16 fallback would be 1.88x the
+        // file in anonymous host RAM (swap-thrashes a 128 GiB box).
+        if (t->dtype == DType::kQ8_0) {
+            bv.raw = static_cast<const uint8_t*>(t->data);
+            bv.dt  = DType::kQ8_0;
+            bv.slice_bytes = t->nbytes / E;   // raw slice
+            return {};
+        }
         const bool fast = (!is_down && t->dtype == DType::kQ4_K) ||
                           ( is_down && t->dtype == DType::kQ5_1);
         // PINNED host copies by default: q.memcpy from mmap (non-USM) memory
@@ -1153,6 +1171,25 @@ std::string Qwen4ExpModel::prepare_bank_views() {
         if (auto e = view(w.gate_exps, false, w.gate_bv); !e.empty()) return e;
         if (auto e = view(w.up_exps,   false, w.up_bv);   !e.empty()) return e;
         if (auto e = view(w.down_exps, true,  w.down_bv); !e.empty()) return e;
+    }
+    // Pinned staging buffers for the Q8_0 raw-bank uploads (max raw slice;
+    // three, one per bank — the copies and the H2D reuse them per miss).
+    // Sized over EVERY bank: all three banks upload through the staging
+    // scratch now (see the upload lambdas), any dtype.
+    uint64_t stage_max = 0;
+    for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
+        const Qwen4ExpLayer& w = layers_[L];
+        stage_max = std::max(stage_max, std::max(w.gate_bv.slice_bytes,
+                                      std::max(w.up_bv.slice_bytes,
+                                               w.down_bv.slice_bytes)));
+    }
+    if (stage_max) {
+        for (auto& st : q8_stage_) {
+            st = sycl::malloc_host(stage_max, alloc_->queue());
+            if (!st) return "qwen4exp: q8 stage alloc failed";
+            owned_.push_back(st);
+        }
+        q8_stage_bytes_ = stage_max;
     }
     return {};
 }
@@ -2966,9 +3003,19 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                               : reinterpret_cast<const uint8_t*>(bv.f16) +
                                     uint64_t(e) * bv.slice_bytes;
             };
-            uq.memcpy(dst + ec.gate_off, srcp(w.gate_bv), w.gate_bv.slice_bytes);
-            uq.memcpy(dst + ec.up_off,   srcp(w.up_bv),   w.up_bv.slice_bytes);
-            uq.memcpy(dst + ec.down_off, srcp(w.down_bv), w.down_bv.slice_bytes);
+            const auto upload = [&](const Qwen4ExpLayer::BankView& bv, int bi, uint64_t off) {
+                // Stage EVERY upload through pinned host memory, then DMA: the
+                // copy engine cannot read the non-USM mmap safely under
+                // page-cache pressure (bcs -ENOENT, 2026-10-27; seen again
+                // 2026-10-30 on UD-Q4_K_XL, whose Q4_K/Q5_1 banks streamed
+                // directly — Q8_0-only gating covered the all-Q8_0 file only).
+                std::memcpy(q8_stage_[bi], srcp(bv), bv.slice_bytes);
+                uq.memcpy(dst + off, q8_stage_[bi], bv.slice_bytes);
+            };
+            uq.wait();   // scratch reuse guard (every upload stages now)
+            upload(w.gate_bv, 0, ec.gate_off);
+            upload(w.up_bv,   1, ec.up_off);
+            upload(w.down_bv, 2, ec.down_off);
         }
         ec.last_use[uint32_t(sl)] = ++ecache_clock_;
         if (uint32_t(sl) < pf_pin_mask_.size() && pf_pin_mask_[uint32_t(sl)]) ec.last_use[uint32_t(sl)] = UINT64_MAX - 1;
@@ -2997,6 +3044,8 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
         const uint32_t NU = cfg_.n_experts_used;
         const bool gate_raw = w.gate_bv.raw != nullptr;
         const bool down_raw = w.down_bv.raw != nullptr;
+        const bool gate_q80 = gate_raw && w.gate_bv.dt == DType::kQ8_0;
+        const bool down_q80 = down_raw && w.down_bv.dt == DType::kQ8_0;
         // Flatten picks and order expert-major (stable -> (vt,k) within e).
         struct SPick { uint32_t e, vt, k; float wgt; };
         std::vector<SPick> sp;
@@ -3051,7 +3100,12 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             gather_bytes_rows(q, static_cast<const uint8_t*>(act_q8sT_),
                               static_cast<uint8_t*>(xg_q8s_), moe_tok_idx_,
                               P, q8srow);
-            if (moe_dpas_k)
+            if (gate_q80)
+                gemv_q8_0_q8s_grouped_tiles(q, xg_q8s_,
+                    static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                    ec.gate_off, ec.up_off, moe_tiles_,
+                    moe_gT_, moe_uT_, H, EF, J);
+            else if (moe_dpas_k)
                 gemv_q4_K_q8d_grouped_tiles(q, xg_q8s_,
                     static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
                     ec.gate_off, ec.up_off, moe_tiles_,
@@ -3071,7 +3125,11 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 moe_gT_, moe_uT_, H, EF, J, 2);
         }
         swiglu(q, moe_gT_, moe_uT_, moe_hT_, uint64_t(P) * EF);
-        if (down_raw && moe_dpas_k) {
+        if (down_q80) {
+            gemv_q8_0_grouped_tiles(q, moe_hT_,
+                static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                ec.down_off, moe_tiles_, moe_yT_, EF, H, J);
+        } else if (down_raw && moe_dpas_k) {
             q51_block_rowsums(q, moe_hT_, P, EF, moe_rsum_);
             gemv_q5_1_f16d_grouped_tiles(q, moe_hT_,
                 static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
@@ -3128,7 +3186,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 qwen4_ple_hash(pc, tokens_host, T, ple_hist_, rows.data());
             }
             std::vector<float> E(uint64_t(T) * H);
-            qwen4_ple_gather(ple_table->data, rows.data(), T, E.data());
+            qwen4_ple_gather(ple_table->data, ple_dt, rows.data(), T, E.data());
             std::vector<sycl::half> E16(E.size());
             for (size_t i = 0; i < E.size(); ++i) E16[i] = sycl::half(E[i]);
             q.memcpy(e16_, E16.data(), E16.size() * 2).wait();
@@ -3655,16 +3713,24 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 const void* up = pk.slot + ec.up_off;
                 const void* dp = pk.slot + ec.down_off;
                 if (w.gate_bv.raw) {
-                    gemv_q4_K_q8s(q, act_q8s_, gp, moe_g_, H, EF);
-                    gemv_q4_K_q8s(q, act_q8s_, up, moe_u_, H, EF);
+                    if (w.gate_bv.dt == DType::kQ8_0) {
+                        gemv_q8_0_q8s(q, act_q8s_, gp, moe_g_, H, EF);
+                        gemv_q8_0_q8s(q, act_q8s_, up, moe_u_, H, EF);
+                    } else {
+                        gemv_q4_K_q8s(q, act_q8s_, gp, moe_g_, H, EF);
+                        gemv_q4_K_q8s(q, act_q8s_, up, moe_u_, H, EF);
+                    }
                 } else {
                     gemv_fp16(q, x, static_cast<const sycl::half*>(gp), moe_g_, H, EF);
                     gemv_fp16(q, x, static_cast<const sycl::half*>(up), moe_u_, H, EF);
                 }
                 swiglu(q, moe_g_, moe_u_, moe_h_, EF);
-                if (w.down_bv.raw)
-                    gemv_q5_1(q, moe_h_, dp, moe_y_, EF, H);
-                else
+                if (w.down_bv.raw) {
+                    if (w.down_bv.dt == DType::kQ8_0)
+                        gemv_q8_0(q, moe_h_, dp, moe_y_, EF, H);
+                    else
+                        gemv_q5_1(q, moe_h_, dp, moe_y_, EF, H);
+                } else
                     gemv_fp16(q, moe_h_, static_cast<const sycl::half*>(dp), moe_y_, EF, H);
                 axpy_f16_to_f32(q, moe_acc_, moe_y_, pk.wgt, H);
             }
@@ -3844,6 +3910,8 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 static const bool no_g1  = std::getenv("IE_Q4E_SV_NO_G1") != nullptr;
                 static const bool no_g2  = std::getenv("IE_Q4E_SV_NO_G2") != nullptr;
                 static const bool no_red = std::getenv("IE_Q4E_SV_NO_RED") != nullptr;
+                const bool gate_q80 = gate_q8 && w.gate_bv.dt == DType::kQ8_0;
+                const bool down_q80 = down_q51 && w.down_bv.dt == DType::kQ8_0;
                 if (!gate_q8) {
                     // F16 gate/up banks (pre-dequantized at load): per-pick
                     // decode leaves on the slot's F16 slices.
@@ -3858,6 +3926,25 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                         gemv_fp16(q, x,
                                   reinterpret_cast<const sycl::half*>(slot + ec.up_off),
                                   moe_uT_ + uint64_t(pk) * EF, H, EF);
+                    }
+                } else if (gate_q80) {
+                    if (no_g1) {
+                        for (uint32_t pk = 0; pk < P; ++pk) {
+                            const uint32_t vt = uint32_t(h_tok_idx_[3u * pk + 0]);
+                            const uint8_t* slot = static_cast<uint8_t*>(ec.base) +
+                                uint64_t(h_tok_idx_[3u * pk + 1]) * ec.slot_bytes;
+                            const uint8_t* xq = static_cast<const uint8_t*>(act_q8sT_) +
+                                uint64_t(vt) * (H / 32) * sizeof(block_q8_1s);
+                            gemv_q8_0_q8s(q, xq, slot + ec.gate_off,
+                                          moe_gT_ + uint64_t(pk) * EF, H, EF);
+                            gemv_q8_0_q8s(q, xq, slot + ec.up_off,
+                                          moe_uT_ + uint64_t(pk) * EF, H, EF);
+                        }
+                    } else {
+                        gemv_q8_0_q8s_grouped_dual(q, act_q8sT_,
+                            static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                            ec.gate_off, ec.up_off, moe_tok_idx_,
+                            moe_gT_, moe_uT_, H, EF, P);
                     }
                 } else if (no_g1) {
                     // Bisect alt: per-pick solo gate/up (decode kernels).
@@ -3887,6 +3974,21 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                                   reinterpret_cast<const sycl::half*>(slot + ec.down_off),
                                   moe_yT_ + uint64_t(h_tok_idx_[3u * pk + 2]) * H,
                                   EF, H);
+                    }
+                } else if (down_q80) {
+                    if (no_g2) {
+                        for (uint32_t pk = 0; pk < P; ++pk) {
+                            const uint8_t* slot = static_cast<uint8_t*>(ec.base) +
+                                uint64_t(h_tok_idx_[3u * pk + 1]) * ec.slot_bytes;
+                            gemv_q8_0(q, moe_hT_ + uint64_t(pk) * EF,
+                                      slot + ec.down_off,
+                                      moe_yT_ + uint64_t(h_tok_idx_[3u * pk + 2]) * H,
+                                      EF, H);
+                        }
+                    } else {
+                        gemv_q8_0_grouped(q, moe_hT_,
+                            static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                            ec.down_off, moe_tok_idx_, moe_yT_, H, EF, H, P);
                     }
                 } else if (no_g2) {
                     for (uint32_t pk = 0; pk < P; ++pk) {
@@ -4050,7 +4152,9 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             // job table. Before this, ANY f16 piece sent the whole layer to
             // the per-expert path (~7K submits + 210 ms busy per 1024-chunk).
             const bool gate_raw = q8p;
+            const bool gate_q80_pre = gate_raw && w.gate_bv.dt == DType::kQ8_0;
             const bool down_raw = w.down_bv.raw != nullptr;
+            const bool down_q80_pre = down_raw && w.down_bv.dt == DType::kQ8_0;
             const bool f16tiles_ok = (H % 128 == 0) && (EF % 128 == 0);
             if (grouped_pre && (gate_raw || f16tiles_ok) &&
                 (down_raw || f16tiles_ok)) {
@@ -4179,6 +4283,15 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                             static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
                             ec.gate_off, ec.up_off, wt,
                             moe_gT_, moe_uT_, H, EF, Jw, 2);
+                    } else if (gate_q80_pre) {
+                        // dp4a tiles (0004): 1.14-1.27x over the naive tiles
+                        // at T=8-16 (ie-q8-0-kernel-bench), same numerics
+                        // class. Decode keeps the naive kernel (it is 2.3x
+                        // faster at T=1).
+                        gemv_q8_0_q8s_grouped_tiles_dp4a(q, xg_q8s_,
+                            static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                            ec.gate_off, ec.up_off, wt,
+                            moe_gT_, moe_uT_, H, EF, Jw);
                     } else if (use_xmx) {
                         gemm_q4_K_xmx_grouped(q, xg16_,
                             static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
@@ -4205,7 +4318,11 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                            moe_hT_ + uint64_t(row0) * EF,
                            uint64_t(row1 - row0) * EF);
                     sycl::event kev;   // wave's last slot-reader (kdone gate)
-                    if (!down_raw) {
+                    if (down_q80_pre) {
+                        kev = gemv_q8_0_grouped_tiles(q, moe_hT_,
+                            static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                            ec.down_off, wt, moe_yT_, EF, H, Jw);
+                    } else if (!down_raw) {
                         // F16 down bank: single-mat grouped XMX gemm.
                         kev = gemm_f16_grouped_tiles(q, moe_hT_,
                             static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
@@ -4257,7 +4374,8 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 const void* dp = jb.slot + ec.down_off;
                 static const bool xmx_pre =
                     std::getenv("IE_Q4E_PREFILL_XMX") != nullptr;
-                if (q8p && xmx_pre && EF % 64 == 0 && H % 256 == 0) {
+                const bool gate_q80 = q8p && w.gate_bv.dt == DType::kQ8_0;
+                if (q8p && !gate_q80 && xmx_pre && EF % 64 == 0 && H % 256 == 0) {
                     // A/B (2026-08-27): dpas joint_matrix GEMM on the raw
                     // Q4_K slices, F16 activations — the qwen36 prefill
                     // pattern (M_TILE 16, weight dequant amortized in SLM).
@@ -4284,10 +4402,25 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                         const uint32_t jn = std::min(16u, jb.n - j0);
                         const uint8_t* xo = static_cast<const uint8_t*>(xg_q8_) +
                                             uint64_t(j0) * q8row;
-                        gemv_q4_K_q8_batched(q, xo, gp,
-                                             moe_gT_ + uint64_t(j0) * EF, H, EF, jn);
-                        gemv_q4_K_q8_batched(q, xo, up,
-                                             moe_uT_ + uint64_t(j0) * EF, H, EF, jn);
+                        if (gate_q80) {
+                            // dp4a batched down (0004): ~1.2x at jn >= 8;
+                            // the naive body is 2.3x faster at T=1, so small
+                            // tail chunks stay on it.
+                            auto* gp_y = moe_gT_ + uint64_t(j0) * EF;
+                            auto* up_y = moe_uT_ + uint64_t(j0) * EF;
+                            if (jn >= 8) {
+                                gemv_q8_0_q8x_batched_dp4a(q, xo, gp, gp_y, H, EF, jn);
+                                gemv_q8_0_q8x_batched_dp4a(q, xo, up, up_y, H, EF, jn);
+                            } else {
+                                gemv_q8_0_q8x_batched(q, xo, gp, gp_y, H, EF, jn);
+                                gemv_q8_0_q8x_batched(q, xo, up, up_y, H, EF, jn);
+                            }
+                        } else {
+                            gemv_q4_K_q8_batched(q, xo, gp,
+                                                 moe_gT_ + uint64_t(j0) * EF, H, EF, jn);
+                            gemv_q4_K_q8_batched(q, xo, up,
+                                                 moe_uT_ + uint64_t(j0) * EF, H, EF, jn);
+                        }
                     }
                 } else {
                     gather_bytes_rows(q, reinterpret_cast<const uint8_t*>(mixed_),
@@ -4299,7 +4432,9 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 }
                 swiglu(q, moe_gT_, moe_uT_, moe_hT_, uint64_t(jb.n) * EF);
                 if (w.down_bv.raw) {
-                    if (std::getenv("IE_Q4E_DBG_Q51CHUNK")) {
+                    if (w.down_bv.dt == DType::kQ8_0) {
+                        gemm_q8_0(q, moe_hT_, dp, moe_yT_, jb.n, EF, H);
+                    } else if (std::getenv("IE_Q4E_DBG_Q51CHUNK")) {
                         for (uint32_t j0 = 0; j0 < jb.n; j0 += 16)
                             gemm_q5_1(q, moe_hT_ + uint64_t(j0) * EF, dp,
                                       moe_yT_ + uint64_t(j0) * H,
@@ -4740,7 +4875,7 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
         std::vector<uint64_t> rows(uint64_t(G) * 16);
         for (uint32_t i = 0; i < G; ++i) qwen4_ple_hash(pc, ids + i, 1, *lr[i].ple_hist, rows.data() + uint64_t(i) * 16);
         std::vector<float> E(uint64_t(G) * H);
-        qwen4_ple_gather(ple_table->data, rows.data(), G, E.data());
+        qwen4_ple_gather(ple_table->data, ple_dt, rows.data(), G, E.data());
         std::vector<sycl::half> E16(E.size());
         for (size_t i = 0; i < E.size(); ++i) E16[i] = sycl::half(E[i]);
         q.memcpy(e16_, E16.data(), E16.size() * 2).wait();
@@ -4874,9 +5009,17 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
                     return bv.raw ? bv.raw + uint64_t(e) * bv.slice_bytes
                                   : reinterpret_cast<const uint8_t*>(bv.f16) + uint64_t(e) * bv.slice_bytes;
                 };
-                uq.memcpy(dst + ec.gate_off, srcp(w.gate_bv), w.gate_bv.slice_bytes);
-                uq.memcpy(dst + ec.up_off,   srcp(w.up_bv),   w.up_bv.slice_bytes);
-                uq.memcpy(dst + ec.down_off, srcp(w.down_bv), w.down_bv.slice_bytes);
+                const auto upload = [&](const Qwen4ExpLayer::BankView& bv, int bi, uint64_t off) {
+                    // Stage EVERY upload through pinned host memory, then DMA
+                    // (see the ensure_slot site): the copy engine cannot read
+                    // the non-USM mmap safely under page-cache pressure.
+                    std::memcpy(q8_stage_[bi], srcp(bv), bv.slice_bytes);
+                    uq.memcpy(dst + off, q8_stage_[bi], bv.slice_bytes);
+                };
+                uq.wait();   // scratch reuse guard (every upload stages now)
+                upload(w.gate_bv, 0, ec.gate_off);
+                upload(w.up_bv,   1, ec.up_off);
+                upload(w.down_bv, 2, ec.down_off);
             }
             ec.last_use[uint32_t(sl)] = ++ecache_clock_;
             return static_cast<uint8_t*>(ec.base) + uint64_t(sl) * ec.slot_bytes;
@@ -4896,6 +5039,8 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
         t_route_host += std::chrono::duration<double>(std::chrono::steady_clock::now() - trw1).count();
         const bool gate_q8  = w.gate_bv.raw != nullptr;   // per-piece bank dispatch (the mixed-bank layers)
         const bool down_q51 = w.down_bv.raw != nullptr;
+        const bool gate_q80 = gate_q8 && w.gate_bv.dt == DType::kQ8_0;
+        const bool down_q80 = down_q51 && w.down_bv.dt == DType::kQ8_0;
         const auto tms0 = std::chrono::steady_clock::now();
         // shared expert first (its kernels run while the misses stream on copyq_)
         if (w.shg_q8.qs) {
@@ -4954,6 +5099,9 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
                 gemv_fp16(q, x, reinterpret_cast<const sycl::half*>(slot + ec.gate_off), moe_gT_ + uint64_t(pk) * EF, H, EF);
                 gemv_fp16(q, x, reinterpret_cast<const sycl::half*>(slot + ec.up_off), moe_uT_ + uint64_t(pk) * EF, H, EF);
             }
+        } else if (gate_q80) {
+            gemv_q8_0_q8s_grouped_dual(q, act_q8sT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes, ec.gate_off,
+                                       ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P);
         } else {
             gemv_q4_K_q8s_grouped_dual(q, act_q8sT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes, ec.gate_off,
                                        ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P);
@@ -4965,6 +5113,9 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
                 gemv_fp16(q, moe_hT_ + uint64_t(pk) * EF, reinterpret_cast<const sycl::half*>(slot + ec.down_off),
                           moe_yT_ + uint64_t(h_tok_idx_[3u * pk + 2]) * H, EF, H);
             }
+        } else if (down_q80) {
+            gemv_q8_0_grouped(q, moe_hT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes, ec.down_off, moe_tok_idx_,
+                              moe_yT_, H, EF, H, P);
         } else {
             gemv_q5_1_grouped(q, moe_hT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes, ec.down_off, moe_tok_idx_,
                               moe_yT_, H, EF, H, P);
