@@ -17,6 +17,9 @@
 #include "ie/ds41_serve_rules.hpp"
 #include "ie/expert_stream.hpp"
 #include "ie/ops.hpp"
+#include "ie/exit_codes.hpp"   // sup::kCardWedgedExit (the link probe's deadline); a numerics-key input, unlike supervisor.hpp
+#include <dirent.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <atomic>
@@ -38,6 +41,29 @@ namespace ie {
 
 namespace {
 inline float bf16f(uint16_t h) { const uint32_t b = uint32_t(h) << 16; float f; std::memcpy(&f, &b, 4); return f; }
+
+// 2026-10-27: the link probe's copy never completed on a card whose driver queue was wedged (on 10-26 four loads in a row hung
+// here until a supervisor killed them, each kill a burst of GT resets; docs/research/2026-10-26-card0-copy-engine-wedge.md).
+// The probe is by design the first DMA on each card, so it is where a wedged card is caught: this prints the diagnosis and
+// ends the process with kCardWedgedExit -- not a return, since freeing the probe's buffers waits on the same queue -- so a
+// supervisor can tell it from a crash and stop relaunching.
+[[noreturn]] static void ds41_link_probe_wedged(size_t ci, const sycl::device& dev, double waited_s) {
+    std::string pci = "unknown";
+    try { if (dev.has(sycl::aspect::ext_intel_pci_address)) pci = dev.get_info<sycl::ext::intel::info::device::pci_address>(); } catch (...) {}
+    std::string card = "cardN";
+    if (DIR* d = opendir(("/sys/bus/pci/devices/" + pci + "/drm").c_str())) {   // this PCI device's drm node
+        while (dirent* e = readdir(d)) if (std::strncmp(e->d_name, "card", 4) == 0) { card = e->d_name; break; }
+        closedir(d);
+    }
+    std::fprintf(stderr, "[ds41 forward] card %zu (PCI %s): the first host->card copy did not complete in %.0f s. The driver is not "
+                         "running this card's work -- the known case is the GT reset loop of a wedged kernel copy queue "
+                         "(journalctl -k | grep 'xe %s'; a crash dump may be waiting at /sys/class/drm/%s/device/devcoredump/data, root). "
+                         "Known recovery: reboot (docs/research/2026-10-27-card0-kernel-queue-wedge-recurrence.md). Exiting with code %d "
+                         "so a supervisor stops relaunching; the probe's buffers stay with the driver.\n",
+                 ci, pci.c_str(), waited_s, pci.c_str(), card.c_str(), sup::kCardWedgedExit);
+    std::fflush(stderr);
+    _exit(sup::kCardWedgedExit);
+}
 }  // namespace
 
 std::string Ds41Forward::init(sycl::queue& q, const DeepSeek41Model& m, const Ds41EngramTables& tables) {
@@ -187,7 +213,13 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
     if (const char* v = std::getenv("IE_DS41_LINK_GBS"); v && *v) {
         std::fill(link_gbs.begin(), link_gbs.end(), std::max(0.0, std::atof(v)));
         std::fprintf(stderr, "[ds41 forward] IE_DS41_LINK_GBS=%s (a test switch): every card's link taken as %.1f GB/s, not measured\n", v, link_gbs[0]);
-    } else if (const char* v = std::getenv("IE_DS41_LINK_PROBE"); !(v && *v == '0'))
+    } else if (const char* v = std::getenv("IE_DS41_LINK_PROBE"); !(v && *v == '0')) {
+        // The wait on each copy is bounded (2026-10-27): IE_DS41_LINK_PROBE_DEADLINE_S seconds (default 10), then
+        // ds41_link_probe_wedged (above) -- the diagnosis and exit kCardWedgedExit. IE_DS41_LINK_PROBE_TEST_HANG=1 (a test
+        // switch) treats every copy as never completing, so the deadline path can be exercised on a healthy card.
+        double deadline_s = 10.0;
+        if (const char* dl = std::getenv("IE_DS41_LINK_PROBE_DEADLINE_S"); dl && *dl) deadline_s = std::max(1.0, std::atof(dl));
+        const bool test_hang = [] { const char* e = std::getenv("IE_DS41_LINK_PROBE_TEST_HANG"); return e && *e == '1'; }();
         for (size_t ci = 0; ci < cards_.size(); ++ci) {
             sycl::queue& q = *cards_[ci]->q;
             constexpr size_t kProbe = 64ull << 20;
@@ -198,7 +230,13 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
                     std::memset(h, 0, kProbe);
                     for (int r = 0; r < 4; ++r) {   // the first copy warms the path; the best of the other three
                         const auto t0 = std::chrono::steady_clock::now();
-                        q.memcpy(d, h, kProbe).wait();
+                        sycl::event ev = q.memcpy(d, h, kProbe);
+                        double waited_ms = 0;
+                        while (test_hang || ev.get_info<sycl::info::event::command_execution_status>() != sycl::info::event_command_status::complete) {
+                            waited_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                            if (waited_ms >= deadline_s * 1e3) ds41_link_probe_wedged(ci, q.get_device(), waited_ms / 1e3);
+                            if (waited_ms > 50.0) std::this_thread::sleep_for(std::chrono::milliseconds(1));   // a 64 MB copy takes ~3 ms; past 50 the poll rests
+                        }
                         if (r) best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
                     }
                 }
@@ -212,6 +250,7 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
             }
             else std::fprintf(stderr, "[ds41 forward] card %zu link: not measured (the probe's buffers)\n", ci);
         }
+    }
 
     for (size_t ci = 0; ci < cards_.size(); ++ci) {
         Card& card = *cards_[ci]; sycl::queue& q = *card.q;

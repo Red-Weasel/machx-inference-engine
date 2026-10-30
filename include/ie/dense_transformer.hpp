@@ -51,6 +51,14 @@ struct DenseQuantPtr {
     void* soa_q6_hi = nullptr;     // 2-bit hi plane    [N*(K/4)]   uint8
     void* soa_q6_sc = nullptr;     // per-16 int8 scale [N*(K/16)]  int8
     void* soa_q6_d  = nullptr;     // per-256 d (fp16)  [N*(K/256)] uint16
+    // 2026-10-28 (Nanbeige4.3-33B): the per-layer Q6_K projections as the 27B split's c32 streams
+    // (repack_q6_K_to_c32, gemv_kq_c32.cpp): int-dot W6A8 decode for any T, dequant_q6k_c32_to_Bt
+    // for the prefill GEMM. 6.56 bpw, the GGUF's own bits -- the same bytes as the AoS blocks, which
+    // are NOT uploaded when these are set (`p` is null then). IE_DENSE_KQ_C32=0 keeps the AoS path.
+    void* kq_lo = nullptr;         // 4-bit lo plane    [N*(K/2)]   uint8
+    void* kq_hi = nullptr;         // 2-bit hi plane    [N*(K/4)]   uint8
+    void* kq_sc = nullptr;         // per-16 int8 scale [N*(K/16)]  int8
+    void* kq_d  = nullptr;         // per-256 d (fp16)  [N*(K/256)] uint16
 };
 
 // P3a: row permutation that INVERTS convert_hf_to_gguf.py LlamaModel.permute,

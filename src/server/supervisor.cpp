@@ -292,7 +292,8 @@ public:
                 bad += (bad.empty() ? "" : ", ") + c.spec.name + " (" +
                        (c.exit_signal ? "signal " + std::to_string(c.exit_signal)
                                       : "exit code " + std::to_string(c.exit_code) +
-                                            (c.exit_code == kDeviceLostExit ? ", device lost" : "")) + ")";
+                                            (c.exit_code == kDeviceLostExit ? ", device lost"
+                                             : c.exit_code == kCardWedgedExit ? ", card wedged" : "")) + ")";
             }
         }
         if (!alive.empty()) log("stopped; STILL RUNNING (not killed): %s", alive.c_str());
@@ -448,21 +449,23 @@ private:
                 c.state = clean ? ChildState::Stopped : ChildState::Exited;
                 const std::string how = c.exit_signal ? "was killed by signal " + std::to_string(c.exit_signal)
                                                       : "exited with code " + std::to_string(c.exit_code) +
-                                                            (c.exit_code == kDeviceLostExit ? " (device lost)" : "");
+                                                            (c.exit_code == kDeviceLostExit ? " (device lost)"
+                                                             : c.exit_code == kCardWedgedExit ? " (a card's first copy never completed: wedged driver queue)" : "");
                 if (clean) log("server \"%s\" (pid %d) stopped: %s", c.spec.name.c_str(), int(r), how.c_str());
                 else {
                     log("server \"%s\" (pid %d) %s after %.0f s -- it is down; the other servers keep serving",
                         c.spec.name.c_str(), int(r), how.c_str(), secs_since(c.started));
                     const bool failure = c.exit_signal != 0 || c.exit_code != 0;
                     if (c.spec.restart_on_failure && failure && !stopping_.load() && c.exit_code != kDeviceLostExit &&
-                        c.restarts < kMaxRestarts) {
+                        c.exit_code != kCardWedgedExit && c.restarts < kMaxRestarts) {
                         ++c.restarts;
                         log("server \"%s\": restart %d of %d (\"restart\": \"on-failure\")", c.spec.name.c_str(),
                             c.restarts, kMaxRestarts);
                         spawn(c);
                     } else if (c.spec.restart_on_failure && failure) {
                         log("server \"%s\": not restarted (%s)", c.spec.name.c_str(),
-                            c.exit_code == kDeviceLostExit ? "a lost device needs a person" : "restart limit reached");
+                            c.exit_code == kDeviceLostExit ? "a lost device needs a person"
+                            : c.exit_code == kCardWedgedExit ? "a wedged card needs a reboot; a relaunch would hang the same way" : "restart limit reached");
                     }
                 }
                 return;

@@ -56,6 +56,21 @@ Rules that hold for every model here:
 | Switches | `IE_QWEN35_LANES=0` the one-at-a-time path; `IE_QWEN35_LANES_MTP=0` rounds off, `IE_QWEN35_LANES_MTP_MAX` (default: the card count); `IE_QWEN35_LANES_EAGER=1` the eager lane load |
 | Known | `--int8-kv` is slower on this dense model; tensor parallel gives nothing here |
 
+## Nanbeige4.3-33B (`llama`, dense) -- ported October 28, abliterated and given the dense path's serving features October 29
+
+| | |
+|---|---|
+| Files | `~/models/Nanbeige4.3-33B-abliterated-GGUF/Nanbeige4.3-33B-abliterated-Q6_K.gguf` (27 GB). OUR build: the authors' BF16 release (`Nanbeige/Nanbeige4.3-33B`, 14 shards checksummed against the Hub's records) with a per-layer refusal-direction edit of 20 tensors (layers 18-27's o_proj and down_proj, the direction read at the `assistant` role token), converted and quantized here (`~/models/abliterate-nanbeige43-33b/`, LOG.md). Held-out report: harmful refusals 46/48 -> 7/48 thinking off, harmless 0/24 -> 0/24; on the engine with thinking on (the daily mode) 9 of 24 still refuse -- a stronger window is the next iteration. Q6_K is the native quant on the dense path (Q8_0 / Q5_K would be expanded to F16) |
+| Launch (tested) | `--gpus 2 --ctx 65536 --thinking on` (October 29): 28-29 tok/s decode, the prompt cache on by default, `--spec` for the lookup drafts. One card: `--ctx 8192` is the most that fits (27 GB of weights + the lm_head repack), 19.3 tok/s |
+| Sampler | none on the card: the engine fills the library defaults. Keep thinking on (the default); with it off the model emits a stray `</think>` and repeats its sentence -- llama.cpp does the same on the identical render |
+| Decode | two cards 28.7 / 27.8 tok/s at 901 / 5261 tokens of context (24.2 / 23.6 on October 28; 6.3 / 2.6 before the port's pass): the decode body now runs DenseModel's launch sequence (the fused norm + Q8 quant, the SoA int-dot lm_head). One card 19.3 / 18.5 at ctx 8192 |
+| Prefill | two cards 367 / 254 tok/s at 901 / 5261; one card 224 / 150 (the server's numbers; `ie-bench`'s 307 is DenseModel's own path, known_bugs 39) |
+| Prompt cache | on by default (FleetPrefixCache on the fleet class, one card or two): turn 2 of a 5.4K-token conversation restores 5250 of 5414 tokens in 6 ms (the insert 60 ms), prefill 21.4 s -> 1.7 s, the warm reply byte-identical to a cold one. `IE_NO_PROMPT_CACHE=1` off; `IE_PROMPT_CACHE_MAX_ENTRIES` (12), `IE_PROMPT_CACHE_MAX_PREFIX`, `IE_PROMPT_CACHE_VRAM_MIB` |
+| `--spec` | prompt-lookup drafts at --parallel 1 (rounds of up to 16 rows through the batched SoA lm_head): a repeated text decodes at 77.6 tok/s on two cards and 49.9 on one (2.7x / 2.6x plain), 515 of 539 drafts accepted, 7 tokens a forward; prompts without repetition decode at exactly the plain speed; the texts are byte-identical to plain on every gate request. `IE_DENSE_LOOKUP=0` off, `IE_DENSE_LOOKUP_MIN` (16), `IE_DENSE_LOOKUP_ROWS` (16; 8..16), `IE_DENSE_LOOKUP_STATS=1` a line per request |
+| Context | fp16 KV 212 KB a token (52 layers x 8 kv heads x 128 x 2); `--gpus 2 --ctx 65536` ~13.6 GB of weights + ~6.9 GB of KV a card, ~9 GB a card left for the prompt cache |
+| Switches | `IE_DENSE_ONE_CARD_FLEET=0` the previous one-card path (DenseModel: no cache, no `--spec`; it is also the path of `--int8-kv` and of Q8_0 / Q5_K files); `IE_DENSE_KQ_C32=0` the old Q6_K kernels |
+| Known | no request lanes yet (`--parallel N` queues; P3 of the serving campaign); with the cache on the prompt's last few tokens run as their own small forward (the int-dot rows kernel, naive attention), so one-card greedy text drifts at a near-tie after ~50-80 words against a cache-less prefill and a warm turn's wall is that tail (~95 tok/s for 164 tokens) -- known_bugs 38; `--int8-kv` keeps the fp16 cache too (no VRAM saving); thinking-on refusals on the held-out set ~37 % (thinking off 15 %) |
+
 ## DeepSeek-V4.1-Flash (`deepseek41`)
 
 | | |

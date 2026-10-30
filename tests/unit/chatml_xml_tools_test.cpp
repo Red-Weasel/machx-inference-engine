@@ -653,9 +653,18 @@ void think_template(const char* golden_path) {
     check(!ie::chatml_think_split(A::kQwen3Dense, "<\xef\xbd\x9c" "Assistant\xef\xbd\x9c><think>\\n"),
           "predicate: R1-Distill-Qwen (its own sentinel template path) -> no");
     bool none = true;
-    for (A a : {A::kDeepSeek4, A::kDeepSeek41, A::kMimo26, A::kGlm5Next, A::kGemma4, A::kGptOss, A::kLlama3, A::kUnknown})
+    for (A a : {A::kDeepSeek4, A::kDeepSeek41, A::kMimo26, A::kGlm5Next, A::kGemma4, A::kGptOss, A::kUnknown})
         none = none && !ie::chatml_think_split(a, t35);
-    check(none, "predicate: the archs with their own chat paths (DeepSeek-V4 / V4.1, MiMo, GLM, Gemma, gpt-oss, Llama) -> no");
+    check(none, "predicate: the archs with their own chat paths (DeepSeek-V4 / V4.1, MiMo, GLM, Gemma, gpt-oss) -> no");
+    // 2026-10-28 (Nanbeige4.3-33B): a llama-arch GGUF that carries Qwen's ChatML thinking template renders through the
+    // same ChatML builder and writes the same "reasoning\n</think>\n\nanswer", so it splits too...
+    check(ie::chatml_think_split(A::kLlama3, t35), "predicate: a llama-arch GGUF with the Qwen ChatML thinking template (Nanbeige4.3) splits");
+    // ... while a llama-arch template with <think> but no <|im_start|> (R1-Distill-Llama's sentinels: its own path) and a
+    // ChatML template without <think> (Phi-4) stay off.
+    check(!ie::chatml_think_split(A::kLlama3, "<\xef\xbd\x9c" "Assistant\xef\xbd\x9c><think>\\n"),
+          "predicate: R1-Distill-Llama (sentinel template, <think> without <|im_start|>) -> no");
+    check(!ie::chatml_think_split(A::kLlama3, "{{- '<|im_start|>assistant\\n' }}"),
+          "predicate: a llama-arch ChatML template without <think> (Phi-4) -> no");
 }
 
 }  // namespace

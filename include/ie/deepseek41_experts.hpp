@@ -257,6 +257,13 @@ private:
     // file's (layer, expert) -> offset table is held here, and an mmap expert the file covers is
     // filled by one direct pread instead of pread + permute. Without the file: byte-for-byte today's.
     bool                  stage_imported_ = false;
+    // 2026-10-27 (docs/research/2026-10-27-card0-kernel-queue-wedge-recurrence.md): an imported pointer is a userptr
+    // mapping the driver does not pin -- each page the kernel moved forced a rebind on the card's own migrate queue, the
+    // queue that hung in three of three unrecoverable card-0 wedges. The slots are MAP_HUGETLB pages when a pool is
+    // reserved (vm.nr_hugepages): never swapped, split, collapsed or compacted. mm_stage_bytes_ is what each slot maps
+    // (lay_.bytes, or that rounded up to the huge page) and what the import and the munmap cover.
+    bool                  stage_hugetlb_ = false;
+    size_t                mm_stage_bytes_ = 0;
     void*                 ze_drv_ = nullptr; void* ze_release_ = nullptr;
     int                   mm_file_fd_ = -1;
     std::vector<uint64_t> mm_file_off_;       // [layer of this tier][expert] -> byte offset, 0 = absent; empty = no file

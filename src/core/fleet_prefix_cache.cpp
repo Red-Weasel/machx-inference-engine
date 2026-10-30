@@ -12,6 +12,7 @@
 #include "ie/qwen3moe_split.hpp"   // Qwen3MoeSplitModel (Coder/Tongyi layer-split; KV-only)
 #include "ie/qwen3moe_tp.hpp"      // Qwen3MoeTpModel (Coder/Tongyi tensor-parallel; KV-only)
 #include "ie/qwen35_split.hpp"     // Qwen35SplitModel (27B DeltaNet+dense layer-split; KV+DN)
+#include "ie/dense_tp.hpp"         // DenseModelTP (the dense fleet class, one card or tensor-parallel; KV-only) -- 2026-10-28 P1
 
 #include <algorithm>
 
@@ -355,5 +356,11 @@ template std::string FleetPrefixCache::init<Qwen35SplitModel>(
     Qwen35SplitModel&, const FleetPrefixCacheConfig&);
 template std::string FleetPrefixCache::insert<Qwen35SplitModel>(
     Qwen35SplitModel&, const std::vector<int32_t>&, bool, bool);
+// 2026-10-28 (serving campaign P1): the dense fleet class (Nanbeige4.3-33B and every llama / qwen3 dense GGUF on one card
+// or tensor-parallel): per-card head-sharded KV, no DeltaNet
+template std::string FleetPrefixCache::init<DenseModelTP>(
+    DenseModelTP&, const FleetPrefixCacheConfig&);
+template std::string FleetPrefixCache::insert<DenseModelTP>(
+    DenseModelTP&, const std::vector<int32_t>&, bool, bool);
 
 }  // namespace ie

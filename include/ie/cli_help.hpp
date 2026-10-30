@@ -175,8 +175,10 @@ inline const char* cli_help_env() {
 "  Vision:    IE_MIMO26_VISION=0, IE_DS41_VISION=0 leave the vision tower out; IE_MMPROJ=<file>\n"
 "             names the Qwen3.8 projector (qwen4exp, the qwen35 27B split) when --mmproj is not given\n"
 "  Experts:   IE_MIMO26_STATIC / IE_MIMO26_PINNED / IE_MIMO26_STREAM pin tier sizes;\n"
-"             IE_MIMO26_RANKING / IE_DS41_RANKING name a residency ranking\n"
-"  Server:    IE_EXIT_ON_DEVICE_LOST=0 stays up after a lost device (default: exit 75);\n"
+"             IE_MIMO26_RANKING / IE_DS41_RANKING name a residency ranking; IE_DS41_STAGE_HUGETLB=0 keeps\n"
+"             the V4.1 disk tier's staging in movable memory (default: hugetlb pages when vm.nr_hugepages has them)\n"
+"  Server:    IE_EXIT_ON_DEVICE_LOST=0 stays up after a lost device (default: exit 75); exit 76 = a card's\n"
+"             first copy never completed (a wedged driver queue: reboot), IE_DS41_LINK_PROBE_DEADLINE_S its wait;\n"
 "             IE_IDLE_SPIN_WATCHDOG=0 / IE_IDLE_SPIN_CORES; GLIBC_TUNABLES (when unset, serve\n"
 "             pins the malloc mmap threshold at 256 KiB)\n"
 "  run:       IE_PERF (set) prints prefill/decode rates after each reply\n";

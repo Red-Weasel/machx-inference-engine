@@ -1206,7 +1206,15 @@ static std::vector<std::string_view> pretokenize_joyai(std::string_view text,
 std::vector<int32_t> Tokenizer::encode(std::string_view text, bool allow_special) const {
     std::vector<int32_t> out;
     if (vocab_.empty()) return out;
-    if (add_bos_token_ && bos_id_ >= 0) out.push_back(bos_id_);
+    // 2026-10-28 (Nanbeige4.3-33B): a GGUF can set add_bos_token with bos = <|im_start|> (its HF post-processor opens
+    // every plain encode with it) while its chat template renders <|im_start|> as the first literal; apply_chat_template
+    // adds no special tokens, llama.cpp's chat path skips a BOS the text already starts with -- so does this. A render
+    // that begins with the BOS token's literal (and parses special tokens) keeps that one and gets no second.
+    const bool text_starts_with_bos = allow_special && bos_id_ >= 0 && [&] {
+        const std::string_view b = token_str(bos_id_);
+        return !b.empty() && text.size() >= b.size() && text.substr(0, b.size()) == b;
+    }();
+    if (add_bos_token_ && bos_id_ >= 0 && !text_starts_with_bos) out.push_back(bos_id_);
 
     // Greedy split around special-token literals first.
     auto encode_chunk = [&](std::string_view chunk) {

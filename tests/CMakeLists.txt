@@ -109,6 +109,17 @@ target_link_libraries(pinned_stage_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME pinned_stage_test COMMAND pinned_stage_test)
 set_tests_properties(pinned_stage_test PROPERTIES SKIP_RETURN_CODE 77)
 
+# 2026-10-27: the V4.1 mmap tier's staging as MAP_HUGETLB pages -- huge pages for real, O_DIRECT in, driver import, DMA out
+# byte for byte, 20 rounds, on a B70 (IE_TEST_PCI picks it). Skips without a reserved pool (vm.nr_hugepages).
+add_executable(ds41_hugetlb_staging_test unit/ds41_hugetlb_staging_test.cpp)
+target_link_libraries(ds41_hugetlb_staging_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME ds41_hugetlb_staging_test COMMAND ds41_hugetlb_staging_test)
+set_tests_properties(ds41_hugetlb_staging_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# A bench, not a CTest (2026-10-28): the Q6_K -> fp16 B^T prefill expand, AoS vs c32 tiled, at Nanbeige4.3-33B's shapes.
+add_executable(dequant_q6k_c32_bench unit/dequant_q6k_c32_bench.cpp)
+target_link_libraries(dequant_q6k_c32_bench PRIVATE ie_core ie_sycl_flags)
+
 # A bench, not a CTest: host <-> device copy latency, pageable vs the pinned stage vs pinned memory (issue #2), at decode sizes.
 add_executable(copy_path_bench unit/copy_path_bench.cpp)
 target_link_libraries(copy_path_bench PRIVATE ie_core ie_sycl_flags)
@@ -306,6 +317,25 @@ set_tests_properties(gemv_fp8_test PROPERTIES SKIP_RETURN_CODE 77)
 add_executable(tokenizer_test unit/tokenizer_test.cpp)
 target_link_libraries(tokenizer_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME tokenizer_test COMMAND tokenizer_test)
+
+# 2026-10-28: no second BOS when the text already begins with the BOS literal (Nanbeige4.3: add_bos with bos = <|im_start|>).
+# CPU only; skips 77 without the GGUF (IE_BOS_TEST_GGUF names another).
+add_executable(tokenizer_bos_literal_test unit/tokenizer_bos_literal_test.cpp)
+target_link_libraries(tokenizer_bos_literal_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME tokenizer_bos_literal_test COMMAND tokenizer_bos_literal_test)
+set_tests_properties(tokenizer_bos_literal_test PROPERTIES SKIP_RETURN_CODE 77)
+
+# 2026-10-28 (serving campaign P1): CPU only -- the dtype rule that sends a one-card dense GGUF to the fleet class
+# (DenseModelTP, the prompt cache's path) or keeps it on DenseModel (include/ie/dense_fleet_rules.hpp).
+add_executable(dense_fleet_rules_test unit/dense_fleet_rules_test.cpp)
+target_link_libraries(dense_fleet_rules_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME dense_fleet_rules_test COMMAND dense_fleet_rules_test)
+
+# 2026-10-28 (serving campaign P2): CPU only -- the prompt-lookup draft policy of the dense fleet class
+# (include/ie/dense_lookup.hpp: rounds, served rows, rollback, the probe / grow / block rule), driven by a scripted decode.
+add_executable(dense_lookup_policy_test unit/dense_lookup_policy_test.cpp)
+target_link_libraries(dense_lookup_policy_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME dense_lookup_policy_test COMMAND dense_lookup_policy_test)
 
 if(IE_ENABLE_UNSAFE_BMG_ESIMD_EXPERIMENTS)
   # UNSAFE on BMG-G31: every ESIMD tile-load variant tried causes DEVICE_LOST.

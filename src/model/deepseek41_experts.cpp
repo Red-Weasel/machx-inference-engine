@@ -38,6 +38,20 @@ inline uint64_t align64(uint64_t x) { return (x + 63) & ~uint64_t(63); }
 constexpr uint32_t kReaders = 8;
 
 constexpr uint64_t kPage = 4096;
+// The system's huge page (Hugepagesize in /proc/meminfo; 2 MiB when unreadable): the mmap tier's staging slots are
+// MAP_HUGETLB pages (2026-10-27), each slot rounded up to it.
+size_t ds41_hugepage_bytes() {
+    static const size_t v = [] {
+        size_t kb = 0;
+        if (FILE* f = std::fopen("/proc/meminfo", "r")) {
+            char line[256];
+            while (std::fgets(line, sizeof line, f)) if (std::sscanf(line, "Hugepagesize: %zu kB", &kb) == 1) break;
+            std::fclose(f);
+        }
+        return kb ? kb << 10 : size_t(2) << 20;
+    }();
+    return v;
+}
 // 2026-10-20: IE_DS41_DISK_CACHE -- the disk tier's reads through the page cache instead of O_DIRECT. Unset: a
 // tensor-parallel part's row slices through the cache (measured 16.6 -> 17.3 tok/s, the fill 17.0 -> 14.0 ms/step), the
 // layer split's expert file O_DIRECT (through the cache it read in half the time and the fill did not shorten:
@@ -323,10 +337,10 @@ void Ds41ExpertTier::free_storage(sycl::queue& q) {
     if (row_shift_) { sycl::free(row_shift_, q); row_shift_ = nullptr; }
     for (void** p : {reinterpret_cast<void**>(&h_row_tok_), reinterpret_cast<void**>(&h_tk2p_), reinterpret_cast<void**>(&h_w_pk_), reinterpret_cast<void**>(&h_w_pk2_)}) if (*p) { sycl::free(*p, q); *p = nullptr; }
     for (auto* sp : mm_stage_) if (sp) {
-        if (stage_imported_) { if (ze_drv_ && ze_release_) reinterpret_cast<ze_result_t (*)(ze_driver_handle_t, void*)>(ze_release_)(static_cast<ze_driver_handle_t>(ze_drv_), sp); munmap(sp, size_t(lay_.bytes)); }
+        if (stage_imported_) { if (ze_drv_ && ze_release_) reinterpret_cast<ze_result_t (*)(ze_driver_handle_t, void*)>(ze_release_)(static_cast<ze_driver_handle_t>(ze_drv_), sp); munmap(sp, mm_stage_bytes_ ? mm_stage_bytes_ : size_t(lay_.bytes)); }
         else sycl::free(sp, q);
     }
-    mm_stage_.clear(); stage_imported_ = false; ze_drv_ = nullptr; ze_release_ = nullptr;
+    mm_stage_.clear(); stage_imported_ = false; stage_hugetlb_ = false; mm_stage_bytes_ = 0; ze_drv_ = nullptr; ze_release_ = nullptr;
     if (mm_file_fd_ >= 0) { close(mm_file_fd_); mm_file_fd_ = -1; } mm_file_off_.clear();
     for (void* b : bounce_) std::free(b);
     bounce_.clear();
@@ -422,8 +436,14 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint
     if (!file_path.empty() && ds41_expert_file_foreign(file_path, *s.store)) file_path.clear();
     // the file holds the text layers' experts; an MTP tier (the drafter's) skips it
     if (!file_path.empty()) {
-        // the staging slots as anonymous huge-page memory imported into the driver (docs/40 step 0(c):
-        // O_DIRECT into host USM is refused with EFAULT; imported anonymous memory takes it and DMAs)
+        // the staging slots as memory imported into the driver (docs/40 step 0(c): O_DIRECT into host USM is refused
+        // with EFAULT; imported memory takes it and DMAs). An imported pointer is a userptr mapping the driver does not
+        // pin: every page the kernel split, collapsed, compacted or swapped forced a rebind on the card's own migrate
+        // queue -- the queue that hung in three of three unrecoverable card-0 wedges under V4.1 (09-22, 10-26, 10-27;
+        // docs/research/2026-10-27-card0-kernel-queue-wedge-recurrence.md). Since 2026-10-27 the slots are MAP_HUGETLB
+        // pages, which the kernel never moves, lay_.bytes rounded up to the huge page, all slots or none; without a
+        // reserved pool (vm.nr_hugepages) the anonymous MADV_HUGEPAGE slots of before are kept and a WARNING says so.
+        // IE_DS41_STAGE_HUGETLB=0 keeps the anonymous slots (the A/B switch).
         ze_driver_handle_t drv = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context().get_platform());
         void* lib = dlopen("libze_loader.so.1", RTLD_NOW | RTLD_NOLOAD); if (!lib) lib = dlopen("libze_loader.so.1", RTLD_NOW);
         auto getext = lib ? reinterpret_cast<ze_result_t (*)(ze_driver_handle_t, const char*, void**)>(dlsym(lib, "zeDriverGetExtensionFunctionAddress")) : nullptr;
@@ -432,12 +452,58 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint
                     || getext(drv, "zexDriverReleaseImportedPointer", reinterpret_cast<void**>(&rel)) != ZE_RESULT_SUCCESS || !rel)
             return "tier: IE_DS41_EXPERT_FILE needs the driver's import extension (zexDriverImportExternalPointer), which is not available";
         ze_drv_ = drv; ze_release_ = reinterpret_cast<void*>(rel); stage_imported_ = true;
-        for (auto& sp : mm_stage_) {
-            void* m = mmap(nullptr, size_t(lay_.bytes), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            if (m == MAP_FAILED) return "tier: staging mmap failed";
-            madvise(m, size_t(lay_.bytes), MADV_HUGEPAGE); std::memset(m, 0, size_t(lay_.bytes));
-            if (const ze_result_t r = imp(drv, m, size_t(lay_.bytes)); r != ZE_RESULT_SUCCESS) return "tier: staging import failed (0x" + std::to_string(unsigned(r)) + ")";
-            sp = static_cast<uint8_t*>(m);
+        const size_t huge = ds41_hugepage_bytes();
+        const size_t slot_huge = (size_t(lay_.bytes) + huge - 1) / huge * huge;
+        const bool want_huge = [] { const char* e = std::getenv("IE_DS41_STAGE_HUGETLB"); return !(e && *e == '0'); }();
+        std::vector<void*> maps; maps.reserve(mm_stage_.size());
+        int huge_errno = 0;
+        if (want_huge) {
+            for (size_t i = 0; i < mm_stage_.size(); ++i) {
+                void* m = mmap(nullptr, slot_huge, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+                if (m == MAP_FAILED) { huge_errno = errno; break; }
+                maps.push_back(m);
+            }
+            if (maps.size() != mm_stage_.size()) { for (void* m : maps) munmap(m, slot_huge); maps.clear(); }
+        }
+        // import every slot; a slot the driver refuses is reported, the maps before it stay in mm_stage_ for free_storage
+        auto import_all = [&](std::vector<void*>& ms, size_t bytes) -> ze_result_t {
+            for (size_t i = 0; i < ms.size(); ++i) {
+                std::memset(ms[i], 0, bytes);   // the pages exist from here (a hugetlb reservation is a promise until the first touch)
+                if (const ze_result_t r = imp(drv, ms[i], bytes); r != ZE_RESULT_SUCCESS) {
+                    for (size_t j = i; j < ms.size(); ++j) munmap(ms[j], bytes);
+                    for (size_t j = 0; j < i; ++j) mm_stage_[j] = static_cast<uint8_t*>(ms[j]);
+                    return r;
+                }
+            }
+            for (size_t i = 0; i < ms.size(); ++i) mm_stage_[i] = static_cast<uint8_t*>(ms[i]);
+            return ZE_RESULT_SUCCESS;
+        };
+        stage_hugetlb_ = !maps.empty();
+        mm_stage_bytes_ = stage_hugetlb_ ? slot_huge : size_t(lay_.bytes);
+        std::string why_not;   // why the slots are not hugetlb pages (empty: they are, or IE_DS41_STAGE_HUGETLB=0)
+        if (stage_hugetlb_) {
+            if (const ze_result_t r = import_all(maps, slot_huge); r != ZE_RESULT_SUCCESS) {
+                // the driver refused hugetlb memory: release what it took, drop the pages, go on with the anonymous slots
+                for (uint8_t*& sp : mm_stage_) if (sp) { rel(drv, sp); munmap(sp, slot_huge); sp = nullptr; }
+                maps.clear(); stage_hugetlb_ = false; mm_stage_bytes_ = size_t(lay_.bytes);
+                why_not = "the driver refused to import hugetlb memory (0x" + std::to_string(unsigned(r)) + ")";
+            }
+        } else if (want_huge)
+            why_not = std::string("MAP_HUGETLB failed (") + std::strerror(huge_errno) + ")";
+        if (!stage_hugetlb_) {
+            if (!why_not.empty())
+                std::fprintf(stderr, "[ds41 tier] WARNING: the staging slots are anonymous (movable) memory: %s. Reserve "
+                                     "vm.nr_hugepages >= %zu pages of %zu MiB (this tier's %u slots x %zu; one tier per card), e.g. a line "
+                                     "'vm.nr_hugepages = N' in /etc/sysctl.d, so the driver never rebinds a page the kernel moved "
+                                     "(docs/research/2026-10-27-card0-kernel-queue-wedge-recurrence.md)\n",
+                             why_not.c_str(), (slot_huge / huge) * mm_stage_.size(), huge >> 20, mm_stage_slots_, slot_huge / huge);
+            for (size_t i = 0; i < mm_stage_.size(); ++i) {
+                void* m = mmap(nullptr, mm_stage_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+                if (m == MAP_FAILED) { for (void* p : maps) munmap(p, mm_stage_bytes_); return "tier: staging mmap failed"; }
+                madvise(m, mm_stage_bytes_, MADV_HUGEPAGE); maps.push_back(m);
+            }
+            if (const ze_result_t r = import_all(maps, mm_stage_bytes_); r != ZE_RESULT_SUCCESS)
+                return "tier: staging import failed (0x" + std::to_string(unsigned(r)) + ")";
         }
     } else
         for (auto& sp : mm_stage_) { sp = sycl::malloc_host<uint8_t>(lay_.bytes, q); if (!sp) return "tier: pinned staging alloc failed"; }
@@ -525,8 +591,12 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint
             const int cfd = open(file_path.c_str(), O_RDONLY);
             if (cfd >= 0) { close(dfd); mm_file_fd_ = cfd; }
         }
-        std::fprintf(stderr, "[ds41 tier] expert file %s: covers %u of this tier's %u mmap experts (layers %u..%u); staging imported; %s%s\n",
-                     file_path.c_str(), covered, wanted, L0_, L0_ + n_layers - 1, covered ? "one slot verified byte for byte" : "nothing to verify",
+        std::fprintf(stderr, "[ds41 tier] expert file %s: covers %u of this tier's %u mmap experts (layers %u..%u); staging imported (%s); %s%s\n",
+                     file_path.c_str(), covered, wanted, L0_, L0_ + n_layers - 1,
+                     stage_hugetlb_ ? "hugetlb pages, never moved by the kernel"
+                     : [] { const char* e = std::getenv("IE_DS41_STAGE_HUGETLB"); return e && *e == '0'; }() ? "anonymous memory, MOVABLE: IE_DS41_STAGE_HUGETLB=0"
+                                                                                                             : "anonymous memory, MOVABLE: see the WARNING above",
+                     covered ? "one slot verified byte for byte" : "nothing to verify",
                      mm_file_fd_ != dfd ? "; read through the page cache" : "");
     }
     cpu_start(q);

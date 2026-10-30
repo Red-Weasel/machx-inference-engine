@@ -17,6 +17,8 @@
 //     POST /admin/shutdown (loopback only).
 //
 // Host-only (no SYCL, no model): the pieces below are unit-tested with fake children (tests/unit/supervisor_test.cpp).
+#include "ie/exit_codes.hpp"
+
 #include <cstdint>
 #include <string>
 #include <utility>
@@ -47,7 +49,8 @@ struct Options {
 };
 
 inline constexpr int kMaxRestarts = 3;
-inline constexpr int kDeviceLostExit = 75;   // ie serve's exit code after a lost device (IE_EXIT_ON_DEVICE_LOST)
+// kDeviceLostExit (75) and kCardWedgedExit (76) live in include/ie/exit_codes.hpp (included above): the model code that
+// raises them must not pull this header into the V4.1 numerics-key source list.
 
 // ---- routing (pure) --------------------------------------------------------------------------------------------------
 struct Route {

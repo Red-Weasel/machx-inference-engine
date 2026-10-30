@@ -34,6 +34,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
@@ -232,12 +233,57 @@ inline void maybe_upload_q6k_soa_v2(DeviceAllocator& alloc,
     out.soa_q6_sc = d_sc; out.soa_q6_d  = d_d;
 }
 
+// 2026-10-28 (Nanbeige4.3-33B, docs/research/2026-10-28-nanbeige43-port-plan.md P3-A): the per-layer Q6_K projections
+// as the 27B split's c32 streams (P4 B21, gemv_kq_c32.cpp) instead of AoS blocks. The AoS decode was W6A16 gemv_q6_K
+// for K = 7168 and, for ffn_down (K = 22016: the SLM slab does not fit), scalar gemm_q6_K at M = 1 -- the 140 GB/s
+// cliff; the one-card baseline streamed 152 GB/s effective. The c32 kernel reads the K-quant at its own 6.56 bpw with
+// the Q8_0-SoA lane map (coalesced wide loads) and takes any T (rows 2..16 in one pass, 16s beyond). Same bytes as
+// AoS, so VRAM is unchanged; the GGUF's own quants and scales (a layout move). W6A8 like the Q4_K decode (W4A8).
+// Default ON for the per-layer weights only (the lm_head keeps its SoA-Q6 v2); IE_DENSE_KQ_C32=0 = the AoS path (A/B).
+inline bool q6k_c32_enabled() {
+    static const bool off = [] { const char* e = std::getenv("IE_DENSE_KQ_C32"); return e && *e == '0'; }();
+    return !off;
+}
+// Repack host Q6_K blocks [N rows x K] into the four c32 streams on `alloc`'s device and point `out` at them.
+// Returns false (out untouched) when the gate is off, the geometry does not fit the kernel (K % 256), or on OOM.
+inline bool upload_q6k_c32(DeviceAllocator& alloc, const void* blocks, uint32_t K, uint32_t N,
+                           DenseQuantPtr& out, std::vector<void*>& owned) {
+    if (!q6k_c32_enabled() || !blocks || K == 0 || N == 0 || (K % kQK_K) != 0) return false;
+    const uint64_t lo_n = uint64_t(N) * (K / 2), hi_n = uint64_t(N) * (K / 4);
+    const uint64_t sc_n = uint64_t(N) * (K / 16), d_n = uint64_t(N) * (K / 256);
+    std::vector<uint8_t> h_lo(lo_n), h_hi(hi_n);
+    std::vector<int8_t> h_sc(sc_n);
+    std::vector<uint16_t> h_d(d_n);
+    repack_q6_K_to_c32(blocks, K, N, h_lo.data(), h_hi.data(), h_sc.data(), h_d.data());
+    auto* d_lo = static_cast<uint8_t*>(alloc.malloc(lo_n));
+    auto* d_hi = static_cast<uint8_t*>(alloc.malloc(hi_n));
+    auto* d_sc = static_cast<int8_t*>(alloc.malloc(sc_n));
+    auto* d_d  = static_cast<uint16_t*>(alloc.malloc(d_n * sizeof(uint16_t)));
+    if (!d_lo || !d_hi || !d_sc || !d_d) {
+        for (void* p : {static_cast<void*>(d_lo), static_cast<void*>(d_hi), static_cast<void*>(d_sc), static_cast<void*>(d_d)})
+            if (p) alloc.free(p);
+        return false;   // the caller uploads the AoS blocks as before
+    }
+    owned.push_back(d_lo); owned.push_back(d_hi); owned.push_back(d_sc); owned.push_back(d_d);
+    alloc.h2d(d_lo, h_lo.data(), lo_n);
+    alloc.h2d(d_hi, h_hi.data(), hi_n);
+    alloc.h2d(d_sc, h_sc.data(), sc_n);
+    alloc.h2d(d_d,  h_d.data(),  d_n * sizeof(uint16_t));
+    out.kq_lo = d_lo; out.kq_hi = d_hi; out.kq_sc = d_sc; out.kq_d = d_d;
+    out.p = nullptr; out.dt = DType::kQ6_K;
+    static bool said = false;
+    if (!said) { said = true; std::fprintf(stderr, "[dense] Q6_K projections on the c32 int-dot kernel (IE_DENSE_KQ_C32=0 keeps the AoS path)\n"); }
+    return true;
+}
+
 // Weight loader for the dense path.  [copied: qwen36.cpp:191-208, with the
 // hard-fail dtype policy + F16 transpose-upload changes documented above]
+// `c32`: a per-layer Q6_K projection may take the c32 streams (upload_q6k_c32); the lm_head and embeddings pass false.
 inline DenseQuantPtr upload_quant_dense(DeviceAllocator& alloc,
                                         const GgufTensorInfo* t,
                                         std::vector<void*>& owned,
-                                        std::string& err) {
+                                        std::string& err,
+                                        bool c32 = false) {
     DenseQuantPtr out;
     if (!t) { err = "tensor not found"; return out; }
     if (t->dtype == DType::kF16) {
@@ -299,6 +345,9 @@ inline DenseQuantPtr upload_quant_dense(DeviceAllocator& alloc,
               " (supported: Q4_K, Q6_K, F16, BF16) — refusing to load";
         return out;
     }
+    if (c32 && t->dtype == DType::kQ6_K && t->n_dims == 2 &&
+        upload_q6k_c32(alloc, t->data, uint32_t(t->shape[0]), uint32_t(t->shape[1]), out, owned))
+        return out;   // the c32 streams instead of the AoS blocks (same bytes)
     void* d = alloc.malloc(t->nbytes);
     if (!d) { err = "malloc failed"; return out; }
     alloc.h2d(d, t->data, t->nbytes);
@@ -434,13 +483,14 @@ inline DenseQuantPtr upload_host_dequant_to_fp16(DeviceAllocator& alloc,
 inline DenseQuantPtr upload_quant_dense_auto(DeviceAllocator& alloc,
                                              const GgufTensorInfo* t,
                                              std::vector<void*>& owned,
-                                             std::string& err) {
+                                             std::string& err,
+                                             bool c32 = false) {
     if (!t) { err = "tensor not found"; return {}; }
     if (t->dtype == DType::kQ5_K || t->dtype == DType::kQ8_0)
         return upload_dequant_to_fp16(alloc, t, owned, err);
     if (is_host_fallback_dtype(t->dtype))
         return upload_host_dequant_to_fp16(alloc, t, owned, err);
-    return upload_quant_dense(alloc, t, owned, err);
+    return upload_quant_dense(alloc, t, owned, err, c32);
 }
 
 // Universal token-embedding fallback. Dequant an embedding TABLE of any quant
@@ -548,7 +598,8 @@ inline DenseQuantPtr upload_quant_dense_permuted(DeviceAllocator& alloc,
                                                  const GgufTensorInfo* t,
                                                  std::vector<void*>& owned,
                                                  std::string& err,
-                                                 const std::vector<uint32_t>& perm);
+                                                 const std::vector<uint32_t>& perm,
+                                                 bool c32 = false);
 
 // Phi-unblock Task 2: permuted row-slice — slice output-rows [n0,n0+n_slice)
 // then apply the Llama NEOX Q/K un-permute (perm has size n_slice). Used for the
@@ -644,7 +695,8 @@ inline DenseQuantPtr upload_quant_dense_permuted(DeviceAllocator& alloc,
                                                  const GgufTensorInfo* t,
                                                  std::vector<void*>& owned,
                                                  std::string& err,
-                                                 const std::vector<uint32_t>& perm) {
+                                                 const std::vector<uint32_t>& perm,
+                                                 bool c32) {
     DenseQuantPtr out;
     if (!t) { err = "tensor not found"; return out; }
     const uint64_t K = t->shape[0];   // ggml: shape[0] = contiguous (K)
@@ -689,6 +741,10 @@ inline DenseQuantPtr upload_quant_dense_permuted(DeviceAllocator& alloc,
     const auto* src = reinterpret_cast<const uint8_t*>(t->data);
     for (uint64_t i = 0; i < N; ++i)
         std::memcpy(staging.data() + i * row_bytes, src + perm[i] * row_bytes, row_bytes);
+    // the c32 streams are built from the row-shuffled blocks (the un-permute is a row move, the repack a layout move)
+    if (c32 && t->dtype == DType::kQ6_K &&
+        upload_q6k_c32(alloc, staging.data(), uint32_t(K), uint32_t(N), out, owned))
+        return out;
     void* d = alloc.malloc(t->nbytes);
     if (!d) { err = "malloc failed"; return out; }
     alloc.h2d(d, staging.data(), t->nbytes);
@@ -740,12 +796,51 @@ inline bool q6k_ktiled_enabled() {
 // bit-exact PPL gates (gemm_fp16). Process-global — one model loaded at a time.
 inline bool& prefer_onednn() { static bool v = false; return v; }
 
+// P-B (multi-GPU): the gemv_q_T prefill scratch (dequant→gemm) must be PER
+// DEVICE — a process-global static buffer allocated on the first device and then
+// touched by a kernel on a second device faults it (UR_RESULT_ERROR_DEVICE_LOST).
+// Keyed by the queue's device. The registry is locked (P4 B10: the crown split's
+// request lanes run the two cards' stages on two threads at once); each entry is
+// then used only by its own device's thread. Single-GPU is unchanged (one entry,
+// same grow-on-demand behavior). Also the c32 decode branch's Q8_1 row (2026-10-28).
+struct GemvPrefillScratch {
+    sycl::half* bt = nullptr; uint64_t bt_cap = 0;   // [K,N] dequanted weight
+    float*      c  = nullptr; uint64_t c_cap  = 0;   // [T+8,N] fp32 gemm output
+    void*       q8 = nullptr; uint64_t q8_cap = 0;   // [T*K/32] block_q8_1x (batched verify, c32 rows)
+};
+inline GemvPrefillScratch& gemv_prefill_scratch(sycl::queue& q) {
+    // Heap-allocated entries → stable addresses across cache growth. Leaked at
+    // process exit (process-lifetime scratch, like the statics it replaces).
+    static std::vector<std::pair<sycl::device, GemvPrefillScratch*>> cache;
+    static std::mutex mu;
+    const sycl::device d = q.get_device();
+    std::lock_guard<std::mutex> lk(mu);
+    for (auto& e : cache) if (e.first == d) return *e.second;
+    cache.emplace_back(d, new GemvPrefillScratch{});
+    return *cache.back().second;
+}
+
 // Dispatch GEMV by quant dtype.  [copied: qwen36.cpp:246-252, + F16 branch
 // + the big-K Q6_K reroute documented above]
 inline sycl::event gemv_q(sycl::queue& q, const sycl::half* A, DenseQuantPtr W,
                           sycl::half* y, uint32_t K, uint32_t N,
                           const std::vector<sycl::event>& deps = {}) {
     if (W.dt == DType::kQ4_K) return gemv_q4_K(q, A, W.p, y, K, N, deps);
+    if (W.kq_lo) {
+        // c32 (2026-10-28): the fp16 activation quantized to one Q8_1 row in the per-device scratch (the decode step
+        // normally hands gemv_q_i8 a ready x_q8 and never comes here), then the int-dot kernel at T = 1.
+        GemvPrefillScratch& scr = gemv_prefill_scratch(q);
+        const uint64_t q8_need = (uint64_t(K) / 32) * sizeof(block_q8_1x);
+        if (q8_need > scr.q8_cap) {
+            if (scr.q8) sycl::free(scr.q8, q);
+            scr.q8 = sycl::malloc_device(q8_need, q);
+            scr.q8_cap = scr.q8 ? q8_need : 0;
+        }
+        if (!scr.q8) return {};   // unreachable in practice: the scratch is a few KB
+        sycl::event qe = quantize_q8_1(q, A, scr.q8, K, deps);
+        return gemv_q6k_c32_q8(q, scr.q8, static_cast<const uint8_t*>(W.kq_lo), static_cast<const uint8_t*>(W.kq_hi),
+                               static_cast<const int8_t*>(W.kq_sc), static_cast<const uint16_t*>(W.kq_d), y, K, N, 1, {qe});
+    }
     if (W.dt == DType::kQ6_K) {
         if (N >= 2048 && !q6k_slm_gemv_fits(K))
             return gemm_q6_K(q, A, W.p, y, /*M=*/1, K, N, deps);
@@ -776,6 +871,9 @@ inline bool q8_decode_enabled() {
 inline sycl::event gemv_q_i8(sycl::queue& q, const sycl::half* x,
                              const void* x_q8, DenseQuantPtr W, sycl::half* y,
                              uint32_t K, uint32_t N) {
+    if (x_q8 && W.kq_lo)   // c32 (2026-10-28): the decode step's ready Q8_1 row straight into the int-dot kernel
+        return gemv_q6k_c32_q8(q, x_q8, static_cast<const uint8_t*>(W.kq_lo), static_cast<const uint8_t*>(W.kq_hi),
+                               static_cast<const int8_t*>(W.kq_sc), static_cast<const uint16_t*>(W.kq_d), y, K, N, 1);
     if (x_q8 && W.dt == DType::kQ4_K) {
         // IE_Q4K_SOA_V2: coalesced-load SoA int-dot decode kernel (numerics ==
         // gemv_q4_K_q8). Only when the loader repacked this weight; else AoS.
@@ -807,22 +905,7 @@ inline sycl::event gemv_q_i8(sycl::queue& q, const sycl::half* x,
 // request lanes run the two cards' stages on two threads at once); each entry is
 // then used only by its own device's thread. Single-GPU is unchanged (one entry,
 // same grow-on-demand behavior).
-struct GemvPrefillScratch {
-    sycl::half* bt = nullptr; uint64_t bt_cap = 0;   // [K,N] dequanted weight
-    float*      c  = nullptr; uint64_t c_cap  = 0;   // [T+8,N] fp32 gemm output
-    void*       q8 = nullptr; uint64_t q8_cap = 0;   // [T*K/32] block_q8_1x (batched verify)
-};
-inline GemvPrefillScratch& gemv_prefill_scratch(sycl::queue& q) {
-    // Heap-allocated entries → stable addresses across cache growth. Leaked at
-    // process exit (process-lifetime scratch, like the statics it replaces).
-    static std::vector<std::pair<sycl::device, GemvPrefillScratch*>> cache;
-    static std::mutex mu;
-    const sycl::device d = q.get_device();
-    std::lock_guard<std::mutex> lk(mu);
-    for (auto& e : cache) if (e.first == d) return *e.second;
-    cache.emplace_back(d, new GemvPrefillScratch{});
-    return *cache.back().second;
-}
+// (GemvPrefillScratch / gemv_prefill_scratch moved above gemv_q on 2026-10-28: the c32 decode branch uses them too.)
 
 inline sycl::event gemv_q_T(sycl::queue& q, const sycl::half* A,
                             DenseQuantPtr W, sycl::half* y,
@@ -830,6 +913,47 @@ inline sycl::event gemv_q_T(sycl::queue& q, const sycl::half* A,
                             const std::vector<sycl::event>& deps = {}) {
     if (T == 0) return {};
     if (T == 1) return gemv_q(q, A, W, y, K, N, deps);
+    if (W.kq_lo) {
+        // c32 (2026-10-28): T >= 64 with the GEMM shape -> the dequant-to-Bt + fp16 XMX GEMM route (as the AoS E1 path
+        // below, with dequant_q6k_c32_to_Bt); any other T -> the int-dot kernel over T quantized rows (16 rows a pass).
+        GemvPrefillScratch& scr = gemv_prefill_scratch(q);
+        static const bool deq_off = std::getenv("IE_NO_DEQ_FP16") != nullptr;
+        if (!deq_off && T >= 64 && (N % 64 == 0) && (K % 256 == 0)) {
+            const uint64_t bt_need = uint64_t(K) * N;
+            const uint64_t c_need = (uint64_t(T) + 8) * N;   // +8: gemm_fp16's TM=8 tile may overrun
+            if (bt_need > scr.bt_cap) {
+                if (scr.bt) sycl::free(scr.bt, q);
+                scr.bt = sycl::malloc_device<sycl::half>(bt_need, q);
+                scr.bt_cap = scr.bt ? bt_need : 0;
+            }
+            if (c_need > scr.c_cap) {
+                if (scr.c) sycl::free(scr.c, q);
+                scr.c = sycl::malloc_device<float>(c_need, q);
+                scr.c_cap = scr.c ? c_need : 0;
+            }
+            if (scr.bt && scr.c) {
+                sycl::event e = dequant_q6k_c32_to_Bt(q, static_cast<const uint8_t*>(W.kq_lo), static_cast<const uint8_t*>(W.kq_hi),
+                                                      static_cast<const int8_t*>(W.kq_sc), static_cast<const uint16_t*>(W.kq_d),
+                                                      scr.bt, K, N, deps);
+                static const bool onednn_env = std::getenv("IE_ONEDNN") != nullptr;
+                if (onednn_env || prefer_onednn())
+                    return gemm_fp16_onednn(q, A, scr.bt, y, T, N, K, {e});
+                e = gemm_fp16(q, A, scr.bt, scr.c, T, N, K, {e});
+                return cast_fp32_to_fp16(q, scr.c, y, uint64_t(T) * N, {e});
+            }
+            // scratch allocation failed -> the int-dot rows below (always possible)
+        }
+        const uint64_t q8_need = (uint64_t(T) * K / 32) * sizeof(block_q8_1x);
+        if (q8_need > scr.q8_cap) {
+            if (scr.q8) sycl::free(scr.q8, q);
+            scr.q8 = sycl::malloc_device(q8_need, q);
+            scr.q8_cap = scr.q8 ? q8_need : 0;
+        }
+        if (!scr.q8) return {};
+        sycl::event qe = quantize_q8_1(q, A, scr.q8, uint32_t(uint64_t(T) * K), deps);
+        return gemv_q6k_c32_q8(q, scr.q8, static_cast<const uint8_t*>(W.kq_lo), static_cast<const uint8_t*>(W.kq_hi),
+                               static_cast<const int8_t*>(W.kq_sc), static_cast<const uint16_t*>(W.kq_d), y, K, N, T, {qe});
+    }
     // Spec-decode VERIFY (small T): batched int-dot W4A8 — read each Q4_K column
     // ONCE, dot against T staged Q8_1 activation rows.  Amortizes weight BW over
     // T instead of the T-independent XMX/dequant restream the prefill path uses

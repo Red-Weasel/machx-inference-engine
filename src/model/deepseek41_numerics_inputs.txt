@@ -116,6 +116,7 @@ include/ie/deepseek4_ops.hpp
 include/ie/dequant_ref.hpp
 include/ie/dp4a.hpp
 include/ie/ds41_serve_rules.hpp
+include/ie/exit_codes.hpp
 include/ie/ds41_vision.hpp
 include/ie/ds4_decode_gemv.hpp
 include/ie/ds4_vision.hpp

@@ -19,6 +19,7 @@
 
 **Latest**
 
+- **v0.2.34, October 29 — Nanbeige4.3-33B, and the dense path three times faster with a prompt cache and prompt-lookup speculation:** [Nanbeige4.3-33B](https://huggingface.co/Nanbeige/Nanbeige4.3-33B) (a plain Llama-architecture dense model, Apache 2.0, 512K context, Qwen's ChatML `<think>` template) serves at **28.7 / 27.8 tok/s on two cards** at 0.9K / 5.3K of context in 65K (6.3 / 2.6 before the port), 19.3 on one card. The shared dense path (every K-quant `llama` / `qwen3` dense GGUF) got its Q6_K projections on the c32 int-dot kernel, the fa2 decode attention under tensor parallel, a prompt cache (turn 2 of a 5.4K-token conversation prefills in 1.7 s instead of 21.4, the reply byte-identical) and prompt-lookup `--spec` (a repeated passage at **78 tok/s** on two cards, 50 on one, the texts byte-identical to plain). The Nanbeige file is our own build from the authors' release. [Details](#new-in-v0234)
 - **v0.2.33, October 23 — Flash-Next's request lanes take pictures, wake on demand, and run the draft head with `--spec`:** at `ie serve --parallel 4` an image prompt was refused and the three idle lanes took 20 % of the expert cache at the load; now a request's images are staged on its lane (the replies byte-identical to one lane's, alone or in a decoding group), a lane's VRAM is allocated on its first request (**224 / 227** resident experts a layer on the cards with one conversation, were 179 / 193), and `--spec` — Dream's speculation toggle — runs the MTP draft head's rounds on a lane decoding alone. At `--ctx 262000 --parallel 4 --slot-ctx 75000`, temperature 1.0: a 9.8K-token conversation **27.3 / 26.1 / 25.4 → 28.3 / 27.2 / 26.5 tok/s** over three turns, with `--spec` **29.5 / 28.0 / 27.2**; a 17.3K document 26.3 → 26.9, with `--spec` **30.0**; the tokens the same. [Details](#new-in-v0233)
 - **v0.2.32, October 22 — the XMX decode attention keeps its output in registers:** the kernel the Qwen3.8-27B and the 35B-A3B class run from 4K context now uses one 32-lane work-group of two sub-groups per 64-key chunk (the scores and the softmax once, the next block's scores computed under this block's softmax, each sub-group's half of the output in registers), with the same bits. On the 35B-A3B: a 9.8K conversation **83.7 → 86.5 tok/s**, a 17K document 77.2 → 82.0, greedy decode at a 32K-token prompt 62.8 → 69.8 (+11 %); prompt reading unchanged. [Details](#new-in-v0232)
 - **v0.2.31, October 22 — Qwen3.8-35B-A3B decodes 5–6 % faster, byte-identically:** the decode step's 705 kernel launches a card are now ~460 (one quantize per activation, the shared-expert gate inside the router launch, the DeltaNet prepare in one kernel, the residual folded into the next norm, SiLU fused with its quantize), with the same tokens. In `ie serve` at ctx 262144 with 6 lanes: one request **85.4 → 90.6 tok/s**, a 9.8K conversation 80.0 → 83.7, a 17K document 73.8 → 77.2, three at once 69.7 → 71.7 each; prompt reading unchanged. [Details](#new-in-v0231)
@@ -81,6 +82,13 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 <td align="left" valign="middle" nowrap>Q8_0 GGUF</td>
 <td align="left" valign="middle" nowrap><b>2,962</b> <sub>2.4K</sub><br><b>3,001</b> <sub>10.7K</sub></td>
 <td align="left" valign="middle" nowrap><b>24.3</b> <sub>with <code>--spec</code></sub><br><b>17.1</b> <sub>plain</sub></td>
+</tr>
+<tr>
+<td width="48" align="center" valign="middle"></td>
+<td align="left" valign="middle" nowrap><b>Nanbeige4.3-33B</b><br><sub>dense (llama arch) · measured Oct 29<br>two cards · 65K context · prompt cache · lookup spec</sub></td>
+<td align="left" valign="middle" nowrap>Q6_K GGUF<br><sub>27 GB</sub></td>
+<td align="left" valign="middle" nowrap><b>367</b> <sub>at 0.9K</sub><br><b>254</b> <sub>at 5.3K</sub></td>
+<td align="left" valign="middle" nowrap><b>28.7</b> <sub>at 0.9K</sub><br><b>27.8</b> <sub>at 5.3K</sub> · <b>78</b> <sub>on repeats, --spec</sub></td>
 </tr>
 <tr>
 <td width="48" align="center" valign="middle"><img src="docs/images/logo-qwen.png" width="36" height="36" alt="Qwen"></td>
@@ -186,6 +194,35 @@ class ([New in v0.2.6](#new-in-v026)).
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
 
 ---
+
+## 🆕 New in v0.2.34
+
+### Nanbeige4.3-33B, and the dense path three times faster: a prompt cache and prompt-lookup speculation for every dense GGUF
+
+[Nanbeige4.3-33B](https://huggingface.co/Nanbeige/Nanbeige4.3-33B) (BOSS Zhipin, Apache 2.0, a plain Llama-architecture dense model with a 512K context and Qwen's ChatML `<think>` template) loads as a `llama` GGUF and serves at **28.7 tok/s on two cards with 65K of context** (`--gpus 2 --ctx 65536`; 6.3 before the port, 24 after its first pass), 19.3 tok/s on one card at 8K. Getting there fixed three things in the engine that any dense GGUF on this path benefits from:
+
+- **Correctness for a llama-arch GGUF with a ChatML thinking template:** the reasoning split and the thinking switch were gated on a Qwen architecture, so the model's thinking leaked into `content`; and a GGUF that declares `<|im_start|>` as its BOS got a doubled tag at the start of every prompt (25 / 30 tokens where llama.cpp has 24 / 29), which made the thinking-off reply ramble. Both fixed; the engine's thinking-off reply is byte-identical to llama.cpp's on the same render.
+- **The dense path's Q6_K projections on the c32 int-dot kernel** (the kernel the 27B split already used): the four K = 7168 projections per layer ran a W6A16 SLM-slab GEMV at 132 GB/s, 80 % of a decode step; now 51 ms a token instead of 168 on one card. The load-time Q8_0 copy of ffn_down is gone with it: on a 33B it was a second 8.7 GB of one tensor that over-committed the card and halved prefill. `IE_DENSE_KQ_C32=0` keeps the old path.
+- **The two-card tensor-parallel dense path ran the naive prefill attention at T = 1**, so decode cost grew with context (11.5 tok/s at 900 tokens, 3.3 at 5K); it takes the fa2 decode kernel now: 24.2 and 23.6.
+
+Perplexity on the same text as llama.cpp: 21.05 before, 20.94 after (llama.cpp 22.28 by its half-context method; 15.20 vs 15.27 on identical positions). Measured against llama.cpp on the identical GGUF: tokenizer ids identical on 5,400 tokens, every layer's activations at cosine 0.9998 or better. Settings and numbers: docs/MODEL_SETTINGS.md.
+
+**October 29: the dense path's serving features.** The generic dense path (every `llama` / `qwen3` dense GGUF) had none of what the Qwen splits have. One-card loads now run on the two-card class on a one-card fleet, so the features are built once:
+
+- **A prompt cache** (the engine's fleet prefix cache on the per-card KV): turn 2 of a 5.4K-token conversation restores 5,250 of its 5,414 tokens in 6 ms and prefills in 1.7 s instead of 21.4, the warm reply byte-identical to a cold one. Making the class's decode body run the one-card class's launch sequence (the fused norm + Q8 quant, the int-dot lm_head over a load-time SoA repack) took two-card decode from 24.4 to **29 tok/s**.
+- **Prompt-lookup speculative decoding** (`--spec`): when the text being written repeats something in the context, the following tokens run as one forward of up to 16 rows and the sampler is answered from those rows; a row it does not follow costs only a length reset. A repeated passage decodes at **78 tok/s on two cards** (50 on one), 515 of 539 drafts accepted; prompts without repetition decode at exactly the plain speed, and every gate text is byte-identical to plain.
+- Request lanes (`--parallel` up to 16) for the dense path are the next phase.
+
+The Nanbeige file served here is our own build from the authors' release (the per-layer refusal-direction edit and its before/after report are in docs/MODEL_SETTINGS.md), not a third-party upload.
+
+**Also in this release — DeepSeek-V4.1-Flash's NVMe tier and the first copy on each card.** The tier's 16 staging slots a tier were anonymous memory imported into the driver, which does not pin such a mapping: every page the kernel split, compacted or swapped forced a rebind on the card's own migrate queue, the queue that hung in three of three unrecoverable card-0 wedges, each time with the host under heavy reclaim. The slots are hugetlb pages now when the host has a pool (`vm.nr_hugepages`, 320 of 2 MiB here), never moved by the kernel; without a pool, or when the driver refuses the import, the anonymous slots of before with a warning naming the sysctl (`IE_DS41_STAGE_HUGETLB=0` keeps them). The first DMA on each card waits at most `IE_DS41_LINK_PROBE_DEADLINE_S` (10 s) a copy and then exits 76 with the diagnosis (the PCI link, the journal line, the devcoredump path) instead of hanging the load; `ie supervise` does not relaunch on that code.
+
+### What is still slow, and not checked
+- No request lanes on the dense path yet: `--parallel N` queues the requests. The next phase.
+- With the prompt cache on, the prompt's last few tokens run as their own small forward (the int-dot rows kernel and the naive attention), so a one-card greedy reply can drift at a near-tie after 50–80 words against a cache-less prefill, and a warm turn's wall is mostly that tail (164 tokens in 1.7 s).
+- `--int8-kv` on this path keeps the fp16 cache too (no VRAM saving).
+- The speculative decoding was checked on one card and two (the texts byte-identical to plain on every request, 515 of 539 drafts accepted) by its author only; a second, independent pass over it is still to come.
+- The abliterated file: 7 of 48 held-out harmful prompts still refuse with thinking off, about 37 % with thinking on; a wider layer window is the next iteration.
 
 ## 🆕 New in v0.2.33
 
@@ -1801,7 +1838,7 @@ the benchmarked models. Prebuilt container images may lag these source updates.
 | **gpt-oss** · `gpt-oss` | 20b, 120b (MXFP4) | `ie serve`; attention sinks, sliding-window attention, Harmony chat and tool calls |
 | **Gemma-4** · `gemma4` | 31B dense, 26B-A4B MoE | `ie serve`; per-layer head geometry, sandwich norms, softcap and sliding-window attention |
 | **Qwen dense** · `qwen2`, `qwen3` | Qwen2/2.5/3, compatible Qwen distills | `ie serve`; shared dense transformer path with architecture-specific attention handling |
-| **Llama-compatible dense** · `llama`, `phi3`, `granite` | Llama-3.x, compatible Mistral, Phi and Granite GGUFs | `ie serve`; shared dense path; compatibility depends on GGUF architecture and tensor layout |
+| **Llama-compatible dense** · `llama`, `phi3`, `granite` | Nanbeige4.3-33B, Llama-3.x, compatible Mistral, Phi and Granite GGUFs | `ie serve` on one card or two (`--gpus 2`, tensor parallel); shared dense path with the Q6_K projections on the c32 int-dot kernels, the reasoning split for a ChatML `<think>` template, and for K-quant files the prompt cache and prompt-lookup `--spec` (v0.2.34); compatibility depends on GGUF architecture and tensor layout |
 | **GLM-5.2** · `glm-dsa` | GLM-5.2 | Experimental `ie-glm52-run`; standalone MLA + MoE forward path |
 | **Laguna S 2.1** · `laguna` | Laguna-S-2.1 (118B-A8B MoE) | `ie serve` on one or two cards; sliding-window + full attention, GLM-style thinking and tool calls |
 | **Inkling-Small** · `inkling` | Inkling-Small (276B-A12B MoE) | `ie serve` on one or two cards; shortconv + relative-bias attention |

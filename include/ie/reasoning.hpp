@@ -37,7 +37,10 @@ inline ReasoningCapabilities reasoning_capabilities(ModelArch arch, std::string_
     const bool qwen = arch == ModelArch::kQwen35Moe || arch == ModelArch::kQwen35Dense ||
         arch == ModelArch::kQwen3Dense || arch == ModelArch::kQwen3Moe ||
         arch == ModelArch::kQwen3Next || arch == ModelArch::kQwen4Exp;
-    if (!qwen || tmpl.find("<think>") == std::string_view::npos) return {};
+    // 2026-10-28: a llama-arch GGUF whose own template is Qwen's ChatML with <think> (Nanbeige4.3-33B) renders through
+    // the same ChatML builder and writes the same "reasoning\n</think>\n\nanswer", so it gets the same switch and split.
+    const bool chatml_llama = arch == ModelArch::kLlama3 && tmpl.find("<|im_start|>") != std::string_view::npos;
+    if (!(qwen || chatml_llama) || tmpl.find("<think>") == std::string_view::npos) return {};
     ReasoningCapabilities r{true,{}, {},"on/off selects this GGUF's thinking prompt"};
     if (tmpl.find("reasoning_effort") != std::string_view::npos &&
         tmpl.find("Reasoning effort is set to xhigh.") != std::string_view::npos) {
@@ -54,7 +57,8 @@ inline bool chatml_think_split(ModelArch arch, std::string_view tmpl) {
     const bool qwen = arch == ModelArch::kQwen35Moe || arch == ModelArch::kQwen35Dense ||
         arch == ModelArch::kQwen3Dense || arch == ModelArch::kQwen3Moe ||
         arch == ModelArch::kQwen3Next || arch == ModelArch::kQwen4Exp;
-    if (!qwen || tmpl.find("<think>") == std::string_view::npos) return false;
+    const bool chatml_llama = arch == ModelArch::kLlama3 && tmpl.find("<|im_start|>") != std::string_view::npos;   // Nanbeige4.3
+    if (!(qwen || chatml_llama) || tmpl.find("<think>") == std::string_view::npos) return false;
     if (!is_dense_arch(arch)) return true;
     const DenseConfig::TemplateFamily tf = classify_template_family(tmpl);
     return tf == DenseConfig::TemplateFamily::kChatML || tf == DenseConfig::TemplateFamily::kAuto;

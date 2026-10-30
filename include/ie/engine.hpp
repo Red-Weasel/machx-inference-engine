@@ -462,6 +462,7 @@ private:
     uint64_t ladder_epoch_ = 0;
     bool q4e_look_step_ = false;    // P4 B56: Flash-Next's decode steps go through Q4eBundle::look_step
     bool q35m_look_step_ = false;   // P4 B53: the 35B split's decode steps go through look_step (prompt-lookup drafts)
+    bool dense_look_step_ = false;  // 2026-10-28 (serving campaign P2): the dense fleet class's decode steps go through look_step
     // The decode loop's sampler for the NEXT token (set before each forward_step), for drafts sampled with it:
     // IE_QWEN35_SPEC_DRAFT_SAMPLED=1 (off by default: measured no better than argmax drafts, engine.cpp).
     Qwen35SplitModel::SpecDraftSampling q27_draft_;
@@ -484,6 +485,10 @@ private:
             // are copied into d_logits_ so the existing GPU sampler is unchanged.
             if (tp_ids_host_.size() < T) tp_ids_host_.resize(T);
             alloc_.d2h(tp_ids_host_.data(), ids, T * sizeof(int32_t));   // pinned stage (issue #2)
+            if (T == 1 && dense_look_step_) {   // 2026-10-28 (P2): a decode step through the model's lookup step
+                if (auto m = tp_model_.look_step(tp_ids_host_[0], pos, tp_logits_host_.data()); !m.empty())
+                    std::fprintf(stderr, "dense look step: %s\n", m.c_str());
+            } else
             if (auto m = tp_model_.forward(tp_ids_host_.data(), T, pos,
                                            /*reset_kv=*/(pos == 0),
                                            tp_logits_host_.data()); !m.empty())

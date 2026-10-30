@@ -239,6 +239,11 @@ int main(int argc, char** argv) {
         if (auto err = ie::read_dense_config_auto(g, dcfg); !err.empty()) {
             std::fprintf(stderr, "read_dense_config: %s\n", err.c_str()); return 1;
         }
+        // 2026-10-28: this tool loads the ONE-card DenseModel for a dense arch whatever --gpus says; a gate once took
+        // its number for a two-card figure. Say so; the two-card perplexity is ie-multi-gpu-ppl --gpus N --tp.
+        if (n_gpus > 1)
+            std::fprintf(stderr, "note: --gpus %d is ignored for the dense arch: this is a ONE-card measurement "
+                                 "(two cards: ie-multi-gpu-ppl --gpus %d --tp)\n", int(n_gpus), int(n_gpus));
         if (auto err = dmodel.load(alloc, g, dcfg); !err.empty()) {
             std::fprintf(stderr, "model.load: %s\n", err.c_str()); return 1;
         }

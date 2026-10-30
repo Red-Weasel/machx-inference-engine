@@ -182,9 +182,9 @@ std::string DenseModel::load(DeviceAllocator& alloc, const GgufReader& g,
                     Tlayer(L, (base + ".svh").c_str()), owned_, err);
             }
             // _auto so a STANDALONE Q5_K/Q8_0 dense weight (e.g. a Q5_K_M quant)
-            // also loads; Q4_K/Q6_K/F16 forward to upload_quant_dense unchanged
-            // (byte-identical for every existing dense GGUF).
-            return dense::upload_quant_dense_auto(alloc, ti, owned_, err);
+            // also loads; Q4_K/F16 forward to upload_quant_dense unchanged; a Q6_K
+            // projection takes the c32 streams (2026-10-28, IE_DENSE_KQ_C32=0 = AoS).
+            return dense::upload_quant_dense_auto(alloc, ti, owned_, err, /*c32=*/true);
         };
         // EXL3 weights are HF-natural NEOX order → never row-un-permuted (like phi3).
         auto is_exl3 = [&](const char* name) {
@@ -231,10 +231,10 @@ std::string DenseModel::load(DeviceAllocator& alloc, const GgufReader& g,
         } else {
             // attn_q/attn_k: row-un-permuted for llama (perm_* non-empty), plain otherwise.
             w.attn_q = (llama_unpermute && !is_exl3("attn_q.weight"))
-                ? dense::upload_quant_dense_permuted(alloc, Tlayer(L, "attn_q.weight"), owned_, err, perm_q)
+                ? dense::upload_quant_dense_permuted(alloc, Tlayer(L, "attn_q.weight"), owned_, err, perm_q, /*c32=*/true)
                 : LQ("attn_q.weight");                if (!err.empty()) return layer_err("attn_q");
             w.attn_k = (llama_unpermute && !is_exl3("attn_k.weight"))
-                ? dense::upload_quant_dense_permuted(alloc, Tlayer(L, "attn_k.weight"), owned_, err, perm_k)
+                ? dense::upload_quant_dense_permuted(alloc, Tlayer(L, "attn_k.weight"), owned_, err, perm_k, /*c32=*/true)
                 : LQ("attn_k.weight");                if (!err.empty()) return layer_err("attn_k");
             w.attn_v  = LQ("attn_v.weight");          if (!err.empty()) return layer_err("attn_v");
         }
@@ -285,7 +285,11 @@ std::string DenseModel::load(DeviceAllocator& alloc, const GgufReader& g,
         // all within ±0.22% NLL; decode +19%→~2.9×). Opt-out IE_DENSE_NO_Q6K_REPACK=1
         // restores the fp16 ffn_down decode (the bit-exact NLL 2.940491 leak-canary).
         static const bool no_repack = std::getenv("IE_DENSE_NO_Q6K_REPACK") != nullptr;
-        if (!no_repack && w.ffn_down.dt == DType::kQ6_K) {
+        // 2026-10-28 (Nanbeige4.3-33B, P3-A): a c32 ffn_down decodes through the int-dot kernel at the Q8_0 copy's speed
+        // or better (51 vs 56 ms a token on the 33B) from the GGUF's own 6-bit bits, so the copy is skipped: on a 33B it
+        // was a second 8.7 GB of ffn_down beside the 6.7 GB one, ~34 GB of allocations on a 32 GB card -- the driver
+        // paged it, and prefill ran at 186 tok/s where the fitting model does 307. IE_DENSE_KQ_C32=0 restores the copy.
+        if (!no_repack && w.ffn_down.dt == DType::kQ6_K && !w.ffn_down.kq_lo) {
             const auto* dt = Tlayer(L, "ffn_down.weight");
             const uint32_t Kd = cfg.ffn, Nd = cfg.hidden;   // ffn_down: K=ffn, N=hidden
             if (Kd % 256 == 0) {
@@ -696,15 +700,21 @@ sycl::event DenseModel::forward(sycl::queue& q,
         // Q6_K-repack decode (IE_DENSE_Q6K_REPACK): T==1 routes the Q6_K ffn_down
         // through its SoA Q8_0 copy — int8 dp4a, no 6-bit unpack, 2.96× vs scalar.
         const bool down_q8_0_repack = ffn_q8 && T == 1 && w.ffn_down_q8_qs != nullptr;
-        const bool down_q6k_ktiled = ffn_q8 && !down_q8_0_repack &&
+        // 2026-10-28: a c32 ffn_down (no AoS blocks on the device) decodes through the int-dot kernel when the Q8_0
+        // repack copy is off (IE_DENSE_NO_Q6K_REPACK=1); the branches below that read w.ffn_down.p never see it.
+        const bool down_c32 = ffn_q8 && T == 1 && !down_q8_0_repack && w.ffn_down.kq_lo != nullptr;
+        const bool down_q6k_ktiled = ffn_q8 && !down_q8_0_repack && !down_c32 &&
             w.ffn_down.dt == DType::kQ6_K &&
             !dense::q6k_slm_gemv_q8_fits(F) && dense::q6k_ktiled_enabled();
-        const bool down_q8 = ffn_q8 && !down_q8_0_repack &&
+        const bool down_q8 = ffn_q8 && !down_q8_0_repack && !down_c32 &&
             (w.ffn_down.dt == DType::kQ4_K ||
              (w.ffn_down.dt == DType::kQ6_K && dense::q6k_slm_gemv_q8_fits(F)));
         if (down_q8_0_repack) {
             quantize_q8_1(q, ws_h_, ws_q8_, F);
             gemv_q8_0_soa_q8(q, ws_q8_, w.ffn_down_q8_qs, w.ffn_down_q8_d, ws_attn_block_, F, H);
+        } else if (down_c32) {
+            quantize_q8_1(q, ws_h_, ws_q8_, F);
+            dense::gemv_q_i8(q, ws_h_, ws_q8_, w.ffn_down, ws_attn_block_, F, H);
         } else if (down_q6k_ktiled) {
             quantize_q8_1(q, ws_h_, ws_q8_, F);
             gemv_q6_K_q8_ktiled(q, ws_q8_, w.ffn_down.p, ws_attn_block_, F, H);

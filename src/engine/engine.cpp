@@ -10,6 +10,7 @@
 #include "ie/mimo26_host_rules.hpp"  // mimo26_vision_refusal (vision_status_json)
 #include "ie/ds41_vision.hpp"        // kDs41VisMaxTok (vision_status_json)
 #include "ie/prompt_cache_slots.hpp" // prompt_cache_slots_rule (/props "prompt_cache_slots", P4 B45 (3))
+#include "ie/dense_fleet_rules.hpp"  // dense_fleet_loads: one-card dense on the fleet class (2026-10-28, serving campaign P1)
 #include "../../third_party/nlohmann/json.hpp"
 #include "ie/reasoning.hpp"
 #include <future>
@@ -1822,18 +1823,49 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         // Reads <arch>.* for the actual arch ("qwen3" or "qwen2" — both ride this
         // dense path; the forward gates QK-norm vs attention-bias on presence).
         if (auto m = read_dense_config_auto(e->gguf_, e->dcfg_); !m.empty()) { err = "config: " + m; return nullptr; }
-        if (opts.n_gpus > 1) {
-            // Multi-GPU tensor-parallel: split every layer across n_gpus cards.
-            // The single-GPU dense_/kv_ are NOT loaded (the model may not fit one
-            // card). int8 KV is unsupported on the TP path (fp16 only).
-            if (auto m = e->fleet_.init(opts.n_gpus); !m.empty()) { err = "fleet: " + m; return nullptr; }
-            if (e->fleet_.size() < 2) { err = "tensor-parallel needs >=2 GPUs (have " +
-                                              std::to_string(e->fleet_.size()) + ")"; return nullptr; }
+        // 2026-10-28 (serving campaign P1, docs/research/2026-10-28-nanbeige43-serving-campaign.md): ONE card takes the
+        // fleet class too -- DenseModelTP on a one-card fleet, no reduction (the 27B's B58 rule: "one card takes the split
+        // model") -- so the prompt cache, and the lookup drafts and the request lanes after it, are built once for one
+        // and two cards. The previous one-card path (DenseModel + Engine::kv_) stays for --int8-kv (the fleet class has
+        // fp16 KV only), for a file the fleet class does not load (Q8_0 / Q5_K projections: the F16 expansion is
+        // DenseModel's; dense_fleet_rules.hpp) and under IE_DENSE_ONE_CARD_FLEET=0.
+        const bool one_card_fleet = opts.n_gpus <= 1 && !opts.int8_kv &&
+                                    dense_fleet_loads(e->gguf_, e->dcfg_.n_layers, e->arch_ == ModelArch::kLlama3,
+                                                      e->dcfg_.n_q_heads * e->dcfg_.head_dim, e->dcfg_.ffn) &&
+                                    !(std::getenv("IE_DENSE_ONE_CARD_FLEET") && *std::getenv("IE_DENSE_ONE_CARD_FLEET") == '0');
+        if (opts.n_gpus > 1 || one_card_fleet) {
+            // Tensor-parallel across n_gpus cards (every layer split, two host-bounce all-reduces a layer), or the same
+            // class on one card. The single-GPU dense_/kv_ are NOT loaded. int8 KV is unsupported here (fp16 only).
+            const uint32_t ndev = opts.n_gpus > 1 ? opts.n_gpus : 1u;
+            if (auto m = e->fleet_.init(ndev); !m.empty()) { err = "fleet: " + m; return nullptr; }
+            if (ndev > 1 && e->fleet_.size() < 2) { err = "tensor-parallel needs >=2 GPUs (have " +
+                                                          std::to_string(e->fleet_.size()) + ")"; return nullptr; }
+            if (one_card_fleet)
+                std::fprintf(stderr, "[dense] one card: the fleet class on one card (the prompt cache's path; "
+                                     "IE_DENSE_ONE_CARD_FLEET=0 = the previous one-card path)\n");
             if (auto m = e->tp_model_.load(e->fleet_, e->gguf_, e->dcfg_, opts.max_ctx); !m.empty())
                 { err = "tp model: " + m; return nullptr; }
             e->tp_ = true;
-            e->tp_ids_host_.resize(opts.prefill_chunk);
+            e->tp_ids_host_.resize(std::max<uint32_t>(opts.prefill_chunk, 1u));
             e->tp_logits_host_.resize(e->dcfg_.vocab);
+            // The workspace now: the prompt cache's room below is measured after it, and the first request allocates nothing
+            if (auto m = e->tp_model_.ensure_workspace(std::max<uint32_t>(opts.prefill_chunk, 1u)); !m.empty())
+                { err = "tp workspace: " + m; return nullptr; }
+            // The prompt cache: the fleet cache on the per-card KV (the 27B split's rules: P4 B45 for the prefix bound, B60
+            // for the room). Every turn re-prefilled the whole conversation before this.
+            if ((opts.prompt_cache || std::getenv("IE_PROMPT_CACHE")) && !std::getenv("IE_NO_PROMPT_CACHE")) {
+                FleetPrefixCacheConfig pcfg;
+                pcfg.max_prefix_len = opts.max_ctx;
+                if (const char* s = std::getenv("IE_PROMPT_CACHE_MAX_PREFIX"))
+                    if (unsigned v = unsigned(std::atoi(s))) pcfg.max_prefix_len = v;
+                if (const char* s = std::getenv("IE_PROMPT_CACHE_MAX_ENTRIES"))
+                    if (unsigned v = unsigned(std::atoi(s))) pcfg.max_entries = v;
+                if (auto m = e->fleet_cache_.init(e->tp_model_, pcfg); !m.empty()) {
+                    err = "dense prompt-cache: " + m; return nullptr;
+                }
+                e->prompt_cache_on_ = true;
+                e->q_prompt_cache_room(e->tp_model_, "dense");
+            }
         } else {
             if (auto m = e->dense_.load(e->alloc_, e->gguf_, e->dcfg_); !m.empty())  { err = "model: " + m;  return nullptr; }
             KvCacheConfig kvcfg{};
@@ -5835,6 +5867,15 @@ GenerateResult Engine::generate(const std::string& prompt,
     } else if (prompt_cache_on_ && q3moe_tp_) {
         // qwen3moe (Coder/Tongyi) tensor-parallel — KV-only, head-sharded per card.
         restored = fleet_cache_restore(q3moe_tp_model_, fleet_cache_, ids, "q3moe-tp-cache");
+    } else if (prompt_cache_on_ && tp_) {
+        // 2026-10-28 (serving campaign P1): the dense fleet class (one card or tensor-parallel; Nanbeige4.3-33B) -- KV-only,
+        // head-sharded a card; the per-card snapshot restores exactly (the all-reduce is downstream of attention).
+        const auto t_r = std::chrono::steady_clock::now();
+        restored = fleet_cache_restore(tp_model_, fleet_cache_, ids, "dense-cache");
+        if (restored) {
+            res.restore_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_r).count();
+            std::fprintf(stderr, "[dense-cache] restored %u of %zu prompt tokens (%.1f ms)\n", restored, ids.size(), res.restore_ms);
+        }
     } else if (prompt_cache_on_ && qwen35_split_) {
         // 27B DeltaNet+dense layer-split — snapshots per-card KV + DeltaNet (like crown).
         // P4 B45: an image request neither restores nor snapshots (the insert below): its pad ids cannot tell one
@@ -6368,7 +6409,15 @@ GenerateResult Engine::generate(const std::string& prompt,
                 if (m.empty()) glm5_->snap_tokens = pref;
             }
         }
-        else if (!tp_)               { m = prefix_cache_.insert(q, pref, kv_, dn_);           tag = "prompt-cache"; }
+        else if (tp_) {   // 2026-10-28 P1: the dense fleet class. Its cost is logged on success too: the insert sits inside
+                          // the [gen] line's "new in X ms" window (the P1 gate measured ~220 ms of a 5K-token turn there).
+            const auto t_i = std::chrono::steady_clock::now();
+            m = fleet_cache_.insert(tp_model_, pref); tag = "dense-cache";
+            if (m.empty())
+                std::fprintf(stderr, "[dense-cache] insert %u tokens (%.1f ms)\n", snap_at,
+                             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_i).count());
+        }
+        else                         { m = prefix_cache_.insert(q, pref, kv_, dn_);           tag = "prompt-cache"; }
         if (!m.empty() && tag) std::fprintf(stderr, "[%s] insert: %s\n", tag, m.c_str());
     }
     prefill_lad(uint32_t(ids.size()));   // volatile suffix (gen-prompt/think), if any
@@ -6588,6 +6637,30 @@ GenerateResult Engine::generate(const std::string& prompt,
             q35m_look_step_ = true;
         }
     }
+    // 2026-10-28 (serving campaign P2): the dense fleet class at --parallel 1 with --spec: prompt-lookup drafts
+    // (DenseModelTP::look_step; the policy of dense_lookup.hpp). IE_DENSE_LOOKUP=0 off; IE_DENSE_LOOKUP_MIN (16) the repeated
+    // span that starts a draft; IE_DENSE_LOOKUP_ROWS (16; 8..16, the batched lm_head's rows) the longest round;
+    // IE_DENSE_LOOKUP_STATS=1 a line per request.
+    if (opts_.spec && tp_) {
+        static const bool off = [] { const char* v = std::getenv("IE_DENSE_LOOKUP"); return v && *v == '0'; }();
+        static bool said = false;
+        if (off || opts_.int8_kv) {
+            if (!said) { said = true; std::fprintf(stderr, "[look-step] dense lookup off (%s) -- plain decode\n", off ? "IE_DENSE_LOOKUP=0" : "--int8-kv"); }
+        } else {
+            DenseLookupParams lp;
+            lp.rows = 16;
+            if (const char* e = std::getenv("IE_DENSE_LOOKUP_ROWS")) lp.rows = uint32_t(std::clamp(std::atoi(e), 8, 16));
+            lp.strong_rows = lp.rows;
+            if (const char* e = std::getenv("IE_DENSE_LOOKUP_MIN")) { const int n = std::atoi(e); lp.min_match = uint32_t(n >= 2 ? n : 16); }
+            if (auto m = tp_model_.look_step_init(lp); !m.empty()) {
+                if (!said) { said = true; std::fprintf(stderr, "[look-step] %s -- plain decode\n", m.c_str()); }
+            } else {
+                tp_model_.look_step_reset();
+                tp_model_.look_step_context(ids.data(), pos);
+                dense_look_step_ = true;
+            }
+        }
+    }
     // GLM-5.3-Flash with the MTP pipelined draft on: this request's decode steps through it
     if (glm5_ && glm5_->dr.on && glm5_err_.empty())
         if (auto m = glm5_->draft_begin(pos); !m.empty()) std::fprintf(stderr, "[glm5-draft] %s -- plain decode\n", m.c_str());
@@ -6804,6 +6877,12 @@ GenerateResult Engine::generate(const std::string& prompt,
         qwen35moe_split_model_.look_step_reset();
         q35m_look_step_ = false;
     }
+    if (dense_look_step_) {   // 2026-10-28 (P2): likewise for the dense fleet class's lookup rows
+        if (auto m = tp_model_.look_step_flush(); !m.empty())
+            std::fprintf(stderr, "[look-step] flush: %s\n", m.c_str());
+        tp_model_.look_step_reset();
+        dense_look_step_ = false;
+    }
     if (q27_spec_step_) {   // P4 B48: the model's state back at `pos` (rows the sampler did not follow are rolled back)
         if (auto m = qwen35_split_model_.spec_step_flush(); !m.empty())
             std::fprintf(stderr, "[spec-step] flush: %s\n", m.c_str());
@@ -6853,6 +6932,7 @@ GenerateResult Engine::generate(const std::string& prompt,
         else if (q3moe_split_)     { m = fleet_cache_.insert(q3moe_split_model_, full);     tag = "q3moe-split-cache"; }
         else if (q3moe_tp_)        { m = fleet_cache_.insert(q3moe_tp_model_, full);        tag = "q3moe-tp-cache"; }
         else if (qwen35_split_)    { m = fleet_cache_.insert(qwen35_split_model_, full);    tag = "27b-split-cache"; }
+        else if (tp_)              { m = fleet_cache_.insert(tp_model_, full);              tag = "dense-cache"; }   // 2026-10-28 P1
         else if (!tp_ && arch_ != ModelArch::kGemma4 && arch_ != ModelArch::kQwen4Exp &&
                  arch_ != ModelArch::kDeepSeek4 && arch_ != ModelArch::kGlm5Next) {
             m = prefix_cache_.insert(q, full, kv_, dn_); tag = "prompt-cache";
@@ -7078,7 +7158,8 @@ uint32_t Engine::prompt_cache_slots() const {
     // line's "up to N entries", q35m_lanes_init's set_limits; the 27B's shared-prefix cache: 12, IE_PROMPT_CACHE_MAX_ENTRIES),
     // so they report that limit -- Dream skips its end-of-turn verifier at 1 ("this engine keeps one conversation cached ...
     // would evict this one"). The other arches: the live conversation's prefix (1) when the cache is on, 0 when off.
-    return prompt_cache_slots_rule(prompt_cache_on_, qwen35moe_split_ || qwen35_split_, fleet_cache_.config().max_entries);
+    // 2026-10-28 (P1): the dense fleet class keeps its conversations in the same FleetPrefixCache (12 entries by default).
+    return prompt_cache_slots_rule(prompt_cache_on_, qwen35moe_split_ || qwen35_split_ || tp_, fleet_cache_.config().max_entries);
 }
 
 std::string Engine::vision_status_json() const {

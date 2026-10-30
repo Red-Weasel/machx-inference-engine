@@ -2,6 +2,8 @@
 #include "ie/glm5_server.hpp"   // kGlm5PrefillChunk
 #include "ie/engine.hpp"
 #include "ie/gguf.hpp"
+#include "ie/dense_fleet_rules.hpp"   // dense_fleet_loads: which dense files keep a prompt cache (2026-10-28, serving campaign P1)
+#include "ie/model_config.hpp"        // read_dense_config_auto
 #include "ie/reasoning.hpp"
 #include "ie/glm5_memory_policy.hpp"
 #include "ie/openai_proto.hpp"
@@ -43,6 +45,7 @@ std::string server_capabilities_json(const std::string& model_path) {
     ModelArch arch = ModelArch::kUnknown;
     std::string name;
     std::string chat_template, model_name, base_repo;
+    bool dense_fleet_file = true;   // a dense GGUF the fleet class loads (the prompt cache's path); see below
     if (!model_path.empty() && Engine::ds41_dir(model_path)) { arch = ModelArch::kDeepSeek41; name = "deepseek_v41"; }
     else if (!model_path.empty() && Engine::mimo26_dir(model_path)) { arch = ModelArch::kMimo26; name = "mimo_v2"; }
     else if (!model_path.empty()) {
@@ -57,6 +60,14 @@ std::string server_capabilities_json(const std::string& model_path) {
         // P4 B20: what recommended_sampling matches the exact weights on
         if (auto t=g.find_kv("general.name");t && t->type==GgufValueType::kString)model_name=t->as_string();
         if (auto t=g.find_kv("general.base_model.0.repo_url");t && t->type==GgufValueType::kString)base_repo=t->as_string();
+        // 2026-10-28 (serving campaign P1, its gate's finding): a dense file keeps a prompt cache only when it runs on the
+        // fleet class, which loads the dtypes and geometry of dense_fleet_rules.hpp (a Q8_0 / Q5_K file stays on the
+        // cache-less DenseModel). --int8-kv is a load option, not known here: it also keeps the old path.
+        if (is_dense_arch(arch)) {
+            DenseConfig dc;
+            dense_fleet_file = read_dense_config_auto(g, dc).empty() &&
+                               dense_fleet_loads(g, dc.n_layers, arch == ModelArch::kLlama3, dc.n_q_heads * dc.head_dim, dc.ffn);
+        }
     }
     const bool generic = model_path.empty();
     const bool supported = generic || server_supports_arch(arch);
@@ -72,14 +83,17 @@ std::string server_capabilities_json(const std::string& model_path) {
         if(auto error=reasoning_effort_error(reasoning,reasoning.default_effort);!error.empty())
             throw std::runtime_error("invalid reasoning default: "+error);
     }
-    const bool cache = generic || arch == ModelArch::kQwen35Moe ||
+    // 2026-10-28 (serving campaign P1): the dense archs (llama / qwen3 GGUFs, Nanbeige4.3-33B) keep a FleetPrefixCache on
+    // the fleet class (one card or tensor-parallel; --int8-kv and the F16-expansion files stay on the cache-less DenseModel).
+    const bool cache = generic || (is_dense_arch(arch) && dense_fleet_file) || arch == ModelArch::kQwen35Moe ||
         arch == ModelArch::kQwen35Dense || arch == ModelArch::kQwen3Next ||
         arch == ModelArch::kGemma4 || arch == ModelArch::kQwen4Exp ||
         arch == ModelArch::kDeepSeek4 || arch == ModelArch::kDeepSeek41 || arch == ModelArch::kMimo26 ||
         arch == ModelArch::kLaguna || arch == ModelArch::kInkling || arch == ModelArch::kGlm5Next;
     // v0.2.21: the 35B-A3B class (lookup drafts on the request lanes, P4 B55) and Flash-Next (lookup drafts at one lane, B56; its
     // MTP head only with a --spec-head path, B63) take --spec too, so a client's load screen can offer it.
-    const bool spec = generic || arch == ModelArch::kQwen35Dense || arch == ModelArch::kGemma4 ||
+    // 2026-10-28 (serving campaign P2): the dense fleet class takes --spec too (prompt-lookup drafts at one lane).
+    const bool spec = generic || (is_dense_arch(arch) && dense_fleet_file) || arch == ModelArch::kQwen35Dense || arch == ModelArch::kGemma4 ||
         arch == ModelArch::kQwen35Moe || arch == ModelArch::kQwen4Exp;
     // int8 KV is only offered where the Engine uses ordinary KvCache; multi-GPU
     // and concurrency combinations remain subject to Engine's load validation.
