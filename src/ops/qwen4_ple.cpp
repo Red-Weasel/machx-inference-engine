@@ -44,20 +44,27 @@ void qwen4_ple_hash(const PleHashConsts& c,
 }
 
 // ---------------------------------------------------------------------------
-// 2. Host row gather + IQ4_NL dequant (spec §3, E assembly). 160 elems =
-//    5 blocks of 32 = 90 B per row; head index slowest in the 2560.
+// 2. Host row gather + dequant (spec §3, E assembly). 160 elems = 5 blocks
+//    of 32 per row: IQ4_NL 90 B (the converter's table) or Q8_0 170 B
+//    (community GGUFs); head index slowest in the 2560.
 // ---------------------------------------------------------------------------
-void qwen4_ple_gather(const void* table,
-                      const uint64_t* rows, uint32_t T,
-                      float* E_out) {
+std::string qwen4_ple_gather(const void* table, DType dt,
+                             const uint64_t* rows, uint32_t T,
+                             float* E_out) {
     const uint8_t* base = static_cast<const uint8_t*>(table);
+    const uint32_t rb = qwen4_ple_row_bytes(dt);
+    if (rb == 0)
+        return std::string("qwen4exp PLE: per_layer_token_embd.weight is ") + std::string(type_name(dt)) +
+               "; the gather reads IQ4_NL (the converter's table) or Q8_0 (community GGUFs)";
     for (uint32_t p = 0; p < T; ++p) {
         for (uint32_t h = 0; h < kPleHeads; ++h) {
             const uint64_t r = rows[size_t(p) * kPleHeads + h];
-            ref::dequant_iq4_nl_buffer(base + r * kPleRowBytes, kPleHeadDim,
-                                       E_out + size_t(p) * kPleD + size_t(h) * kPleHeadDim);
+            float* out = E_out + size_t(p) * kPleD + size_t(h) * kPleHeadDim;
+            if (dt == DType::kQ8_0) ref::dequant_q8_0_buffer(base + r * rb, kPleHeadDim, out);
+            else                    ref::dequant_iq4_nl_buffer(base + r * rb, kPleHeadDim, out);
         }
     }
+    return {};
 }
 
 // ---------------------------------------------------------------------------

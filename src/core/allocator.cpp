@@ -105,12 +105,14 @@ bool gpu_p2p_shared_context(std::string_view name_filter,
                      std::string::npos))
                 gpus.push_back(d);
     }
-    if (gpus.size() > 2) gpus.resize(2);
+    // 2026-11-02 (GitHub issue 3, a 4 x B70 box): every matching card, peer access both ways for every pair --
+    // gpu_p2p_available answered the all-pairs question. The cap at two cards was the two-card era's.
     if (gpus.size() < 2) return false;
     if (!gpu_p2p_available(gpus, "p2p-ctx")) return false;
     try {
-        gpus[0].ext_oneapi_enable_peer_access(gpus[1]);
-        gpus[1].ext_oneapi_enable_peer_access(gpus[0]);
+        for (size_t a = 0; a < gpus.size(); ++a)
+            for (size_t b = 0; b < gpus.size(); ++b)
+                if (a != b) gpus[a].ext_oneapi_enable_peer_access(gpus[b]);
         ctx_out = std::make_unique<sycl::context>(gpus);
     } catch (const sycl::exception& e) {
         std::fprintf(stderr, "[p2p-ctx] enable/context failed: %s — "

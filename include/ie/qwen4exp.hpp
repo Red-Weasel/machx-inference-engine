@@ -184,7 +184,8 @@ public:
     sycl::half* out_hc_up_t   = nullptr;  // [K, N] copies (prefill mix gemm)
     sycl::half* out_hc_down_t = nullptr;
     float*      out_hc_norm = nullptr;  // [10240]
-    const GgufTensorInfo* ple_table = nullptr;  // [160, 320001536] IQ4_NL, host
+    const GgufTensorInfo* ple_table = nullptr;  // [160, 320001536] IQ4_NL or Q8_0 (community GGUFs), host
+    DType                 ple_dt    = DType::kIQ4_NL;   // its dtype (checked at load; the gather's row layout)
     // P4 B49: the table is read at random, 16 rows a token, straight from the file mapping; cold, a row is a page fault
     // served from disk (measured 2026-10-04: ~130 us a row, 39 % of a first read of 7,933 tokens, 241 against 487
     // tok/s for a repeated prompt). The load starts one background pass that reads the whole table into the page
@@ -206,7 +207,14 @@ public:
     // file) — beyond that forward() refuses honestly (QSA lands next).
     // lanes / lane_ctx (P4 B8): request lanes 1..lanes-1 at lane_ctx positions (0 = max_ctx; at most max_ctx), allocated
     // before the expert cache and taken out of its budget. lanes <= 1 (the default) allocates nothing new.
-    std::string init_runtime(uint32_t max_ctx, uint32_t max_chunk, uint32_t lanes = 1, uint32_t lane_ctx = 0);
+    // vram_share (2026-11-02): stages that share one card (IE_Q4E_LOGICAL_CARDS, the run2 gate) each take 1/share of the
+    // card's free memory for their expert cache -- this stage's share counts itself and the stages still to be placed
+    // after it on the same card (the last one takes what is left). 1 = the whole card, as on a real N-card box.
+    std::string init_runtime(uint32_t max_ctx, uint32_t max_chunk, uint32_t lanes = 1, uint32_t lane_ctx = 0,
+                             uint32_t vram_share = 1, bool defer_cache = false);
+    // defer_cache = true: init_runtime leaves the expert cache unsized; init_ecache(share) sizes it later (the stages that
+    // share a card: every context and the tail's head first, then the caches in chain order from what is really left).
+    std::string init_ecache(uint32_t vram_share = 1);
 
     // -- P4 B8: request lanes (docs/qwen4exp/P4_B8_LANES.md) ----------------
     // A lane is one sequence's state on this stage: the KV of the full-attention layers, the QSA indexer's raw and pooled
@@ -649,6 +657,19 @@ private:
     // VRAM page-alias self-test (init_runtime). A quarantined slot keeps last_use = UINT64_MAX, so no victim scan
     // takes it; the wave size, the union checks and the rows group bound use this count.
     uint32_t ecache_usable_ = 0;
+    uint64_t ecache_lanes_total_ = 0;      // the extra lanes' bytes init_runtime took before the cache (init_ecache adds them back)
+    bool     ecache_deferred_ = false;     // init_ecache runs after init_runtime's workspaces (no workspace estimate twice)
+    // 2026-11-02 (GitHub issue 3): every expert upload staged through a ring of pinned host entries, one DMA a slot,
+    // instead of a copy straight from the file mapping (the copy engine reads a pageable mapping through the driver's
+    // page pinning, which faulted on the reporter's box under page-cache pressure: bcs -ENOENT). An entry is reused
+    // once the DMA that read it is done (its event). OPT-IN: IE_Q4E_PINNED_UPLOADS=1 (measured 2026-11-02 at the owner's
+    // launch: decode 14-23 % slower, the first token 47 % later, concurrent requests 29-74 % longer than the direct copies:
+    // a 9.4 MiB CPU copy per miss); IE_Q4E_UPLOAD_RING=N entries (default 32). One thread uploads per stage object (the
+    // stage's own), so the ring needs no lock.
+    std::vector<uint8_t*>    up_ring_;
+    std::vector<sycl::event> up_ev_;
+    size_t                   up_next_ = 0;
+    uint64_t                 up_entry_bytes_ = 0;
     // Prefill expert-upload prefetch queue (in-order, same device/context as
     // compute): with half-cache waves, wave i+1's slot refills overlap wave
     // i's kernels — see the wave loop's eviction-safety argument.

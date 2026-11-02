@@ -14,8 +14,11 @@
 
 #include <sycl/sycl.hpp>
 
+#include "ie/dtype.hpp"
+
 #include <cstddef>
 #include <cstdint>
+#include <string>
 #include <vector>
 
 namespace ie {
@@ -29,7 +32,14 @@ inline constexpr uint32_t kPleSI        = 10240;  // 4*2560 flat group-norm widt
 inline constexpr uint32_t kPleConvK     = 4;      // ple.conv_kernel
 inline constexpr uint32_t kPleConvDil   = 3;      // token-axis dilation
 inline constexpr uint32_t kPleStateRows = 9;      // (K-1)*dil conv history columns
-inline constexpr uint32_t kPleRowBytes  = 90;     // 160 IQ4_NL elems = 5 blocks * 18 B
+inline constexpr uint32_t kPleRowBytes  = 90;     // 160 IQ4_NL elems = 5 blocks * 18 B (the converter's table)
+inline constexpr uint32_t kPleRowBytesQ8 = 170;   // 160 Q8_0 elems = 5 blocks * 34 B (community GGUFs: Unsloth Q8_0, UD-Q6_K_XL)
+
+// The table dtypes the gather reads, and a row's bytes for one (0 = not a table dtype). 2026-11-02 (GitHub issue 3): the
+// gather always read the table as IQ4_NL, so a community file's Q8_0 table came out as garbage embeddings and NaN logits.
+inline constexpr uint32_t qwen4_ple_row_bytes(DType dt) noexcept {
+    return dt == DType::kIQ4_NL ? kPleRowBytes : dt == DType::kQ8_0 ? kPleRowBytesQ8 : 0u;
+}
 
 // Hash constants, passed in by the caller (read from GGUF metadata; the gate
 // uses the spec values: M, 16 consecutive primes >= 20000003, exclusive
@@ -73,13 +83,14 @@ void qwen4_ple_hash(const PleHashConsts& c,
                     PleHistory& hist,
                     uint64_t* rows_out /* [T, 16] */);
 
-// Row gather + dequant (host). `table` is the IQ4_NL per_layer_token_embd
-// buffer (row r at byte offset r*90); E_out[p] = concat of the 16 heads'
-// 160-elem dequants, head index slowest -> [T, 2560] f32. Uses the reference
-// dequant (ie::ref::dequant_iq4_nl_buffer) verbatim.
-void qwen4_ple_gather(const void* table,
-                      const uint64_t* rows /* [T, 16] */, uint32_t T,
-                      float* E_out /* [T, 2560] */);
+// Row gather + dequant (host). `table` is the per_layer_token_embd buffer; `dt` is its dtype, which sets the row layout:
+// IQ4_NL (row r at byte offset r*90, the layout the engine's converter writes) or Q8_0 (r*170; community GGUFs).
+// E_out[p] = concat of the 16 heads' 160-elem dequants, head index slowest -> [T, 2560] f32. Uses the reference dequants
+// (ie::ref::dequant_iq4_nl_buffer / dequant_q8_0_buffer) verbatim. Returns "" or a message naming an unsupported dtype
+// (nothing is written then).
+std::string qwen4_ple_gather(const void* table, DType dt,
+                             const uint64_t* rows /* [T, 16] */, uint32_t T,
+                             float* E_out /* [T, 2560] */);
 
 // Device workspace for qwen4_ple_layer, in floats (caller allocates USM):
 // u [T,10240] + gated [T,10240] + g [T,4] + state_in [9,10240].

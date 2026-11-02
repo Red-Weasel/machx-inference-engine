@@ -284,7 +284,8 @@ int main() {
         for (auto& r : rows) r = rowd(rng);
 
         std::vector<float> E(size_t(T) * kPleD);
-        qwen4_ple_gather(table.data(), rows.data(), T, E.data());
+        const std::string ge = qwen4_ple_gather(table.data(), DType::kIQ4_NL, rows.data(), T, E.data());
+        check(ge.empty(), "IQ4_NL gather accepted");
 
         bool ok = true;
         float direct[kPleHeadDim];
@@ -299,6 +300,55 @@ int main() {
             }
         }
         check(ok, "E[T,2560] == per-row ref dequant, all 9x16 rows byte-exact");
+    }
+
+    // ---- 2b. Q8_0 row gather (community GGUFs store the table as Q8_0: 5 blocks of 34 B = 170 B a row) -------------
+    // 2026-11-02, GitHub issue 3: the gather read every table as IQ4_NL (90 B a row), so a Q8_0 table came out as garbage.
+    std::printf("\n\033[1m2b. Q8_0 row gather (byte-exact) + the dtype refusal\033[0m\n");
+    {
+        constexpr uint32_t R = 64;
+        std::mt19937 rng(778);
+        std::uniform_real_distribution<float> df(-0.1f, 0.1f);
+        std::uniform_int_distribution<int> byte(0, 255);
+        std::vector<uint8_t> table(size_t(R) * kPleRowBytesQ8);
+        for (uint32_t r = 0; r < R; ++r) {
+            for (int b = 0; b < 5; ++b) {  // 5 blocks of 34 B per row: f16 scale + 32 int8
+                uint8_t* blk = table.data() + size_t(r) * kPleRowBytesQ8 + size_t(b) * 34;
+                const uint16_t d = fp32_to_fp16(df(rng));
+                std::memcpy(blk, &d, 2);
+                for (int i = 0; i < 32; ++i) blk[2 + i] = uint8_t(byte(rng));
+            }
+        }
+        constexpr uint32_t T = 9;
+        std::uniform_int_distribution<uint64_t> rowd(0, R - 1);
+        std::vector<uint64_t> rows(size_t(T) * 16);
+        for (auto& r : rows) r = rowd(rng);
+
+        std::vector<float> E(size_t(T) * kPleD, 12345.f);
+        const std::string ge = qwen4_ple_gather(table.data(), DType::kQ8_0, rows.data(), T, E.data());
+        check(ge.empty(), "Q8_0 gather accepted");
+        bool ok = ge.empty();
+        float direct[kPleHeadDim];
+        for (uint32_t p = 0; p < T && ok; ++p) {
+            for (uint32_t h = 0; h < 16 && ok; ++h) {
+                ref::dequant_q8_0_buffer(table.data() + rows[size_t(p) * 16 + h] * kPleRowBytesQ8, kPleHeadDim, direct);
+                if (std::memcmp(direct, E.data() + size_t(p) * kPleD + size_t(h) * kPleHeadDim, sizeof direct) != 0) ok = false;
+            }
+        }
+        check(ok, "E[T,2560] == per-row ref Q8_0 dequant, all 9x16 rows byte-exact");
+        // the stride is the dtype's, not IQ4_NL's: reading the Q8_0 table at 90 B a row must NOT reproduce the rows
+        {
+            std::vector<float> wrong(size_t(T) * kPleD);
+            const std::string we = qwen4_ple_gather(table.data(), DType::kIQ4_NL, rows.data(), T, wrong.data());
+            check(we.empty() && std::memcmp(wrong.data(), E.data(), E.size() * sizeof(float)) != 0,
+                  "the IQ4_NL layout on a Q8_0 table is accepted (as before the fix) and reads different values (the old bug)");
+        }
+        check(qwen4_ple_row_bytes(DType::kIQ4_NL) == 90 && qwen4_ple_row_bytes(DType::kQ8_0) == 170 &&
+              qwen4_ple_row_bytes(DType::kF16) == 0, "row bytes: IQ4_NL 90, Q8_0 170, others 0");
+        std::vector<float> untouched(size_t(T) * kPleD, 7.f);
+        const std::string re = qwen4_ple_gather(table.data(), DType::kF16, rows.data(), T, untouched.data());
+        check(!re.empty() && re.find("F16") != std::string::npos, ("an F16 table is refused by name: " + re).c_str());
+        check(std::all_of(untouched.begin(), untouched.end(), [](float v) { return v == 7.f; }), "a refused gather writes nothing");
     }
 
     // ---- 3 + 4. device layer ------------------------------------------------

@@ -87,6 +87,9 @@ void Qwen4ExpModel::free_all() {
         ple_prefetch_.join();
     }
     if (!alloc_) return;
+    for (sycl::event& ev : up_ev_) { try { ev.wait(); } catch (...) {} }   // (2026-11-02: no DMA still reads the ring)
+    for (uint8_t* p : up_ring_) if (p) { try { sycl::free(p, alloc_->queue()); } catch (...) {} }
+    up_ring_.clear(); up_ev_.clear(); up_entry_bytes_ = 0;
     for (void* p : owned_) if (p) alloc_->free(p);
     owned_.clear();
     ag_ = AttnGemmScratch{};   // (P4 B49: its buffers were in owned_)
@@ -207,6 +210,19 @@ std::string Qwen4ExpModel::load(DeviceAllocator& alloc, const GgufReader& g,
     if (cfg.has_ple() && own_ple) {
         ple_table = g.find_tensor("per_layer_token_embd.weight");
         if (!ple_table) return "qwen4exp load: missing per_layer_token_embd.weight";
+        // 2026-11-02 (GitHub issue 3): the table's dtype sets the gather's row layout. The converter writes IQ4_NL (90 B
+        // a row); community GGUFs (Unsloth Q8_0, UD-Q6_K_XL) carry Q8_0 (170 B). Before this the gather read every
+        // table as IQ4_NL: a Q8_0 file loaded and answered garbage. Anything else is refused by name, and a table whose
+        // bytes do not match its row count at that layout is refused too (a wrong layout can never read past the end).
+        ple_dt = ple_table->dtype;
+        if (qwen4_ple_row_bytes(ple_dt) == 0)
+            return std::string("qwen4exp load: per_layer_token_embd.weight is ") + std::string(type_name(ple_dt)) +
+                   "; this engine reads it as IQ4_NL (the converter's table) or Q8_0 (community GGUFs)";
+        if (ple_table->n_dims != 2 || ple_table->shape[0] != kPleHeadDim ||
+            ple_table->nbytes != ple_table->shape[1] * uint64_t(qwen4_ple_row_bytes(ple_dt)))
+            return "qwen4exp load: per_layer_token_embd.weight has " + std::to_string(ple_table->nbytes) + " bytes, not " +
+                   std::to_string(ple_table->shape[1]) + " rows x " + std::to_string(qwen4_ple_row_bytes(ple_dt)) + " (" +
+                   std::string(type_name(ple_dt)) + ")";
         host_bytes_ += ple_table->nbytes;
         placement_.push_back({std::string(ple_table->name), "host",
                               type_name(ple_table->dtype).data(), ple_table->nbytes});
@@ -1158,7 +1174,8 @@ std::string Qwen4ExpModel::prepare_bank_views() {
 }
 
 std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
-                                        uint32_t lanes, uint32_t lane_ctx) {
+                                        uint32_t lanes, uint32_t lane_ctx,
+                                         uint32_t vram_share, bool defer_cache) {
     if (!alloc_) return "qwen4exp runtime: load() first";
     max_ctx_ = max_ctx; max_chunk_ = max_chunk;
     const uint32_t H = cfg_.hidden, MT = max_chunk;
@@ -1314,136 +1331,11 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
     }
     // 2026-10-23: the spec-verify checkpoint slabs before the cache is sized (the lanes' MTP rounds verify on both stages)
     if (want_verify_) if (auto e = vck_alloc(cfg_.has_ple() && own_ple); !e.empty()) return e;
-    {   // MoE VRAM expert cache: C slots/layer within IE_Q4E_ECACHE_GB
-        // (default 10 GiB). C is derived from the summed per-layer slot sizes.
-        uint64_t sum_slot = 0;
-        for (uint32_t L = layer_lo_; L < layer_hi_; ++L)
-            sum_slot += layers_[L].gate_bv.slice_bytes +
-                        layers_[L].up_bv.slice_bytes +
-                        layers_[L].down_bv.slice_bytes;
-        // ADAPTIVE default: fill the card to a reserve line (2.5 GiB for
-        // driver/display + KV growth + workspaces) instead of a fixed size —
-        // per-card budgets then track what load() actually left free
-        // (founder 2026-08-27: the cards should be loaded, hit rate is the
-        // game). IE_Q4E_ECACHE_GB still overrides.
-        const uint64_t gmem =
-            alloc_->device().get_info<sycl::info::device::global_mem_size>();
-        // 4 GiB reserve: 2.5 proved too thin — the driver near-OOM-migrates
-        // and L0 spin-stalls when a tool's real workspaces exceed the 1 GiB
-        // estimate (2026-08-27, run2 reference section at ~30/32 GiB).
-        const uint64_t reserve = 4096ull << 20;
-        const uint64_t ws_est  = 1536ull << 20;
-        const uint64_t used = dev_bytes_ + ws_est;            // weights + ws estimate
-        uint64_t budget = gmem > used + reserve ? gmem - used - reserve
-                                                : 4ull << 30;
-        // P4 B46 (2026-10-02): dev_bytes_ counts the WEIGHTS only. The KV cache, the DeltaNet /
-        // conv states and the max_chunk-sized workspaces that init_runtime allocated above were
-        // never subtracted, so at --ctx 250000 the budget oversubscribed the card (the owner's
-        // Flash-Next load: 32.6 of 32 GiB per card, the driver paging device memory, decode at
-        // 0.2 tok/s; capping the cache by hand gave 23.3 tok/s). Ask the device what is really
-        // free now -- that figure already excludes everything allocated so far, the lanes' buffers
-        // included -- and keep the formula as the ceiling (it still bounds a device that reports
-        // more free memory than this process may safely take).
-        const sycl::device& dv = alloc_->device();
-        if (dv.has(sycl::aspect::ext_intel_free_memory)) {
-            const uint64_t free_now = dv.get_info<sycl::ext::intel::info::device::free_memory>();
-            const uint64_t from_free = free_now > reserve + ws_est ? free_now - reserve - ws_est : 0;
-            // the lanes' share is added back here because q4e_lanes_cache_fit below takes it out
-            // again (its refusal message needs the pre-lanes budget)
-            const uint64_t capped = std::min(budget, from_free + lanes_total);
-            std::fprintf(stderr,
-                "[qwen4exp] expert-cache budget: %.2f GiB from the weights formula, %.2f GiB from the "
-                "device's free memory after the context's KV, states and workspaces (%.2f GiB free, "
-                "%.1f GiB reserve) -> %.2f GiB\n",
-                budget / 1073741824.0, (from_free + lanes_total) / 1073741824.0,
-                free_now / 1073741824.0, reserve / 1073741824.0, capped / 1073741824.0);
-            budget = capped;
-        }
-        if (lanes_total) {
-            // P4 B8: the extra lanes come out of the cache. Refuse, with the numbers, when what is left cannot hold
-            // kQ4eLaneMinSlots experts per layer (q4e_lanes_cache_fit, ie/q4e_lanes.hpp).
-            uint64_t left = 0;
-            const std::string refusal = q4e_lanes_cache_fit(budget, lane_bytes_, uint32_t(lanes_.size() - 1), lanes_[1].max_ctx,
-                                                            sum_slot, left);
-            std::fprintf(stderr,
-                "[qwen4exp] lanes: %zu extra x %.3f GiB at ctx %u -> expert-cache budget %.2f -> %.2f GiB "
-                "(%llu -> %llu slots/layer)\n",
-                lanes_.size() - 1, lane_bytes_ / 1073741824.0, lanes_[1].max_ctx, budget / 1073741824.0,
-                left / 1073741824.0,
-                (unsigned long long)std::min<uint64_t>(cfg_.n_experts, budget / sum_slot),
-                (unsigned long long)std::min<uint64_t>(cfg_.n_experts, left / sum_slot));
-            if (!refusal.empty()) return refusal;
-            budget = left;
-        }
-        if (lanes_lazy_ && lanes_.size() > 1) {   // 2026-10-23: the lanes that will wake must still leave kQ4eLaneMinSlots
-            uint64_t left = 0;
-            const std::string refusal = q4e_lanes_cache_fit(budget, lane_bytes_ + mtp_lane_bytes_, uint32_t(lanes_.size() - 1),
-                                                            lanes_[1].max_ctx, sum_slot, left);
-            if (!refusal.empty()) return refusal;
-        }
-        if (const char* e = std::getenv("IE_Q4E_ECACHE_GB"))
-            if (int v = std::atoi(e); v > 0) {
-                // CLAMP to the adaptive fit: an override above what the card
-                // can actually hold oversubscribes VRAM, and sustained
-                // eviction pressure wedges the GuC command channel (the
-                // 2026-08-27 17:41 desktop crash — IE_Q4E_ECACHE_GB=26 on a
-                // 32 GiB card with ~9 GiB resident: TLB-invalidation storms
-                // then "Invalid G2H release"). Never trust the env to know
-                // the card's headroom.
-                const uint64_t want = uint64_t(v) << 30;
-                if (want > budget)
-                    std::fprintf(stderr,
-                        "[qwen4exp] IE_Q4E_ECACHE_GB=%d exceeds the safe fit "
-                        "(%.1f GiB free after weights+reserve) — clamped\n",
-                        v, budget / 1073741824.0);
-                budget = std::min(want, budget);
-            }
-        ecache_slots_ = uint32_t(std::min<uint64_t>(
-            cfg_.n_experts, std::max<uint64_t>(4, budget / sum_slot)));
-        ecache_.resize(cfg_.n_layers);
-        for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
-            const Qwen4ExpLayer& w = layers_[L];
-            ECache& ec = ecache_[L];
-            ec.gate_off = 0;
-            ec.up_off   = w.gate_bv.slice_bytes;
-            ec.down_off = ec.up_off + w.up_bv.slice_bytes;
-            ec.slot_bytes = ec.down_off + w.down_bv.slice_bytes;
-            ec.base = alloc_->malloc(uint64_t(ecache_slots_) * ec.slot_bytes);
-            if (!ec.base) return "qwen4exp runtime: expert-cache malloc failed";
-            owned_.push_back(ec.base);
-            ec.slot_of.assign(cfg_.n_experts, -1);
-            ec.expert_in.assign(ecache_slots_, -1);
-            ec.last_use.assign(ecache_slots_, 0);
-        }
-        std::fprintf(stderr, "[qwen4exp] expert cache: %u slots/layer, %.2f GiB\n",
-                     ecache_slots_,
-                     double(ecache_slots_) * sum_slot / 1073741824.0);
-        if (lanes_lazy_ && lanes_.size() > 1) {   // 2026-10-23: what a wake gives back (one slot of slack for the allocator)
-            lane_slots_ = uint32_t((lane_bytes_ + mtp_lane_bytes_ + sum_slot - 1) / sum_slot) + 1;
-            mtp_lane0_slots_ = mtp_.loaded ? uint32_t((mtp_lane_bytes(max_ctx) + sum_slot - 1) / sum_slot) + 1 : 0;
-            const std::string l0 = mtp_lane0_slots_ ? ", lane 0's head state from " + std::to_string(mtp_lane0_slots_) : std::string();
-            std::fprintf(stderr, "[qwen4exp] lazy lanes: %zu extra lane(s) of %.3f GiB at ctx %u wake on their first request, each from "
-                                 "%u expert slots a layer%s; the cache once all are awake: %u slots/layer (IE_Q4E_LAZY_LANES=0 = at "
-                                 "the load)\n", lanes_.size() - 1, (lane_bytes_ + mtp_lane_bytes_) / 1073741824.0, lanes_[1].max_ctx,
-                         lane_slots_, l0.c_str(), ecache_slots_floor());
-        }
-        copyq_ = std::make_unique<sycl::queue>(
-            alloc_->queue().get_context(), alloc_->queue().get_device(),
-            sycl::property_list{sycl::property::queue::in_order{}});
-        ecache_usable_ = ecache_slots_;
-        // ---- P4 B49: VRAM 2 MiB page-alias self-test (glm5next.cpp's, 2026-09-03; IE_Q4E_NO_ALIAS_TEST=1 skips) ----
-        // On card 1 two virtual 2 MiB pages of one malloc_device allocation can be backed by ONE physical page: a fill
-        // into one expert slot silently rewrites what another slot reads. Found here 2026-10-04 on Flash-Next (ie serve
-        // --ctx 65536 --parallel 1, stage B): rows routed through the hit slots came out NaN from the last layers' MoE,
-        // their keys / values poisoned the last attention layer's cache, and a later decode step that attended one
-        // returned no token (pick -1, finish "stop" after 15 / 61 / 69 tokens). It moves with the allocation layout, so
-        // it must be tested, not assumed away. Two passes over ALL of the stage's caches (a page written and read
-        // straight back cannot show an alias: its partner is not written yet); every word tagged by a KERNEL (a small
-        // probe stays in the caches); word 0 of each page rewritten by the COPY ENGINE and verified by the EUs -- the
-        // pair the fills (copyq_) and the kernels use. A page that fails, and the page whose tag it shows, lose their
-        // slots: last_use = UINT64_MAX, which no victim scan takes.
-        ecache_alias_test();
-    }
+    // 2026-11-02: the cache is sized last (init_ecache); with defer_cache the caller sizes it later, once every stage
+    // that shares this card has its context and the tail its draft head (IE_Q4E_LOGICAL_CARDS, the run2 gate)
+    ecache_lanes_total_ = lanes_total;
+    ecache_deferred_ = defer_cache;
+    if (!defer_cache) if (auto e = init_ecache(vram_share); !e.empty()) return e;
     if (cfg_.has_ple() && own_ple) {
         e16_ = ah(uint64_t(MT) * H);
         ple_key_out_ = ah(uint64_t(MT) * D);
@@ -1543,6 +1435,188 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
         reset_state();
     }
     if (auto e = select_lane(0); !e.empty()) return e;
+    return {};
+}
+
+// 2026-11-02: the MoE expert cache sized from what the card has left -- init_runtime's last step, or deferred
+// (defer_cache) until every stage sharing the card has its context and the tail its draft head, then in chain order with
+// vram_share = this stage and the ones still to size on the same card (the loader under IE_Q4E_LOGICAL_CARDS, the run2
+// gate on fewer cards than stages). A real N-card box sizes each stage at its init_runtime, as before.
+std::string Qwen4ExpModel::init_ecache(uint32_t vram_share) {
+    if (!alloc_) return "qwen4exp runtime: load() first";
+    if (ecache_slots_) return {};   // sized already
+    {   // MoE VRAM expert cache: C slots/layer within IE_Q4E_ECACHE_GB
+        // (default 10 GiB). C is derived from the summed per-layer slot sizes.
+        uint64_t sum_slot = 0;
+        for (uint32_t L = layer_lo_; L < layer_hi_; ++L)
+            sum_slot += layers_[L].gate_bv.slice_bytes +
+                        layers_[L].up_bv.slice_bytes +
+                        layers_[L].down_bv.slice_bytes;
+        // ADAPTIVE default: fill the card to a reserve line (2.5 GiB for
+        // driver/display + KV growth + workspaces) instead of a fixed size —
+        // per-card budgets then track what load() actually left free
+        // (founder 2026-08-27: the cards should be loaded, hit rate is the
+        // game). IE_Q4E_ECACHE_GB still overrides.
+        const uint64_t gmem =
+            alloc_->device().get_info<sycl::info::device::global_mem_size>();
+        // 4 GiB reserve: 2.5 proved too thin — the driver near-OOM-migrates
+        // and L0 spin-stalls when a tool's real workspaces exceed the 1 GiB
+        // estimate (2026-08-27, run2 reference section at ~30/32 GiB).
+        const uint64_t reserve = 4096ull << 20;
+        const uint64_t ws_est  = 1536ull << 20;
+        const uint64_t used = dev_bytes_ + ws_est;            // weights + ws estimate
+        uint64_t budget = gmem > used + reserve ? gmem - used - reserve
+                                                : 4ull << 30;
+        // 2026-11-02: stages sharing one card (IE_Q4E_LOGICAL_CARDS) split what is free: this stage takes 1/vram_share
+        // of it (the first stage on a card half of a two-stage card, the last the rest). 1 on a real N-card box.
+        if (vram_share > 1) budget /= vram_share;
+        // P4 B46 (2026-10-02): dev_bytes_ counts the WEIGHTS only. The KV cache, the DeltaNet /
+        // conv states and the max_chunk_-sized workspaces that init_runtime allocated above were
+        // never subtracted, so at --ctx 250000 the budget oversubscribed the card (the owner's
+        // Flash-Next load: 32.6 of 32 GiB per card, the driver paging device memory, decode at
+        // 0.2 tok/s; capping the cache by hand gave 23.3 tok/s). Ask the device what is really
+        // free now -- that figure already excludes everything allocated so far, the lanes' buffers
+        // included -- and keep the formula as the ceiling (it still bounds a device that reports
+        // more free memory than this process may safely take).
+        const sycl::device& dv = alloc_->device();
+        if (dv.has(sycl::aspect::ext_intel_free_memory)) {
+            const uint64_t free_now = dv.get_info<sycl::ext::intel::info::device::free_memory>();
+            // (deferred: init_runtime's workspaces are allocated already, so free_now excludes them -- no ws_est twice)
+            const uint64_t ws_left = ecache_deferred_ ? 0 : ws_est;
+            // stages sharing a card keep the reserve once between them: this stage leaves 1/share of it, the last the whole
+            const uint64_t reserve_here = vram_share > 1 ? reserve / vram_share : reserve;
+            uint64_t from_free = free_now > reserve_here + ws_left ? free_now - reserve_here - ws_left : 0;
+            if (vram_share > 1) from_free /= vram_share;
+            // the lanes' share is added back here because q4e_lanes_cache_fit below takes it out
+            // again (its refusal message needs the pre-lanes budget)
+            const uint64_t capped = std::min(budget, from_free + ecache_lanes_total_);
+            std::fprintf(stderr,
+                "[qwen4exp] expert-cache budget: %.2f GiB from the weights formula, %.2f GiB from the "
+                "device's free memory after the context's KV, states and workspaces (%.2f GiB free, "
+                "%.1f GiB reserve%s) -> %.2f GiB\n",
+                budget / 1073741824.0, (from_free + ecache_lanes_total_) / 1073741824.0,
+                free_now / 1073741824.0, reserve / 1073741824.0,
+                vram_share > 1 ? (", 1/" + std::to_string(vram_share) + " of the card: stages share it").c_str() : "",
+                capped / 1073741824.0);
+            budget = capped;
+        }
+        if (ecache_lanes_total_) {
+            // P4 B8: the extra lanes come out of the cache. Refuse, with the numbers, when what is left cannot hold
+            // kQ4eLaneMinSlots experts per layer (q4e_lanes_cache_fit, ie/q4e_lanes.hpp).
+            uint64_t left = 0;
+            const std::string refusal = q4e_lanes_cache_fit(budget, lane_bytes_, uint32_t(lanes_.size() - 1), lanes_[1].max_ctx,
+                                                            sum_slot, left);
+            std::fprintf(stderr,
+                "[qwen4exp] lanes: %zu extra x %.3f GiB at ctx %u -> expert-cache budget %.2f -> %.2f GiB "
+                "(%llu -> %llu slots/layer)\n",
+                lanes_.size() - 1, lane_bytes_ / 1073741824.0, lanes_[1].max_ctx, budget / 1073741824.0,
+                left / 1073741824.0,
+                (unsigned long long)std::min<uint64_t>(cfg_.n_experts, budget / sum_slot),
+                (unsigned long long)std::min<uint64_t>(cfg_.n_experts, left / sum_slot));
+            if (!refusal.empty()) return refusal;
+            budget = left;
+        }
+        if (lanes_lazy_ && lanes_.size() > 1) {   // 2026-10-23: the lanes that will wake must still leave kQ4eLaneMinSlots
+            uint64_t left = 0;
+            const std::string refusal = q4e_lanes_cache_fit(budget, lane_bytes_ + mtp_lane_bytes_, uint32_t(lanes_.size() - 1),
+                                                            lanes_[1].max_ctx, sum_slot, left);
+            if (!refusal.empty()) return refusal;
+        }
+        if (const char* e = std::getenv("IE_Q4E_ECACHE_GB"))
+            if (int v = std::atoi(e); v > 0) {
+                // CLAMP to the adaptive fit: an override above what the card
+                // can actually hold oversubscribes VRAM, and sustained
+                // eviction pressure wedges the GuC command channel (the
+                // 2026-08-27 17:41 desktop crash — IE_Q4E_ECACHE_GB=26 on a
+                // 32 GiB card with ~9 GiB resident: TLB-invalidation storms
+                // then "Invalid G2H release"). Never trust the env to know
+                // the card's headroom.
+                const uint64_t want = uint64_t(v) << 30;
+                if (want > budget)
+                    std::fprintf(stderr,
+                        "[qwen4exp] IE_Q4E_ECACHE_GB=%d exceeds the safe fit "
+                        "(%.1f GiB free after weights+reserve) — clamped\n",
+                        v, budget / 1073741824.0);
+                budget = std::min(want, budget);
+            }
+        ecache_slots_ = uint32_t(std::min<uint64_t>(
+            cfg_.n_experts, std::max<uint64_t>(4, budget / sum_slot)));
+        ecache_.resize(cfg_.n_layers);
+        for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
+            const Qwen4ExpLayer& w = layers_[L];
+            ECache& ec = ecache_[L];
+            ec.gate_off = 0;
+            ec.up_off   = w.gate_bv.slice_bytes;
+            ec.down_off = ec.up_off + w.up_bv.slice_bytes;
+            ec.slot_bytes = ec.down_off + w.down_bv.slice_bytes;
+            ec.base = alloc_->malloc(uint64_t(ecache_slots_) * ec.slot_bytes);
+            if (!ec.base) return "qwen4exp runtime: expert-cache malloc failed";
+            owned_.push_back(ec.base);
+            ec.slot_of.assign(cfg_.n_experts, -1);
+            ec.expert_in.assign(ecache_slots_, -1);
+            ec.last_use.assign(ecache_slots_, 0);
+        }
+        std::fprintf(stderr, "[qwen4exp] expert cache: %u slots/layer, %.2f GiB\n",
+                     ecache_slots_,
+                     double(ecache_slots_) * sum_slot / 1073741824.0);
+        {   // 2026-11-02: the pinned upload ring (the header note by up_ring_)
+            // Measured 2026-11-02 at the owner's launch: the tokens identical, but decode 28.5 / 27.0 / 26.0 -> 24.4 / 21.7 /
+            // 20.0 tok/s over three turns (-14..-23 %), the first token 13.6 -> 19.9 s (+47 %), concurrent requests 29-74 %
+            // longer, ie-prompt-bench 161 -> 144 tok/s reading: a 9.4 MiB CPU copy per expert miss, and a prefill wave of 48
+            // misses blocks on the 32-entry ring. OPT-IN (IE_Q4E_PINNED_UPLOADS=1) for a box whose copy engine faults on the
+            // mapping.
+            const char* pv = std::getenv("IE_Q4E_PINNED_UPLOADS");
+            const bool on = pv && *pv == '1';
+            uint64_t entry = 0;
+            for (uint32_t L = layer_lo_; L < layer_hi_; ++L) entry = std::max(entry, ecache_[L].slot_bytes);
+            const int rn = [] { const char* v = std::getenv("IE_Q4E_UPLOAD_RING"); const int n = v ? std::atoi(v) : 32;
+                                return std::clamp(n, 2, 1024); }();
+            for (uint8_t* p : up_ring_) if (p) sycl::free(p, alloc_->queue());
+            up_ring_.clear(); up_ev_.clear(); up_next_ = 0; up_entry_bytes_ = 0;
+            if (on && entry) {
+                up_ring_.assign(size_t(rn), nullptr);
+                up_ev_.assign(size_t(rn), sycl::event{});
+                bool ok = true;
+                for (auto& p : up_ring_) { p = static_cast<uint8_t*>(sycl::malloc_host(entry, alloc_->queue())); ok = ok && p; }
+                if (!ok) {
+                    for (uint8_t* p : up_ring_) if (p) sycl::free(p, alloc_->queue());
+                    up_ring_.clear(); up_ev_.clear();
+                    std::fprintf(stderr, "[qwen4exp] expert uploads: the pinned ring could not be allocated; copies straight from the file mapping\n");
+                } else {
+                    up_entry_bytes_ = entry;
+                    std::fprintf(stderr, "[qwen4exp] expert uploads staged through pinned host memory: %d x %.2f MiB ring, one DMA a slot "
+                                         "(IE_Q4E_PINNED_UPLOADS=1; measured here: decode 14-23 %% slower and the first token 47 %% later "
+                                         "than the copies straight from the mapping)\n",
+                                 rn, entry / 1048576.0);
+                }
+            }
+        }
+        if (lanes_lazy_ && lanes_.size() > 1) {   // 2026-10-23: what a wake gives back (one slot of slack for the allocator)
+            lane_slots_ = uint32_t((lane_bytes_ + mtp_lane_bytes_ + sum_slot - 1) / sum_slot) + 1;
+            mtp_lane0_slots_ = mtp_.loaded ? uint32_t((mtp_lane_bytes(max_ctx_) + sum_slot - 1) / sum_slot) + 1 : 0;
+            const std::string l0 = mtp_lane0_slots_ ? ", lane 0's head state from " + std::to_string(mtp_lane0_slots_) : std::string();
+            std::fprintf(stderr, "[qwen4exp] lazy lanes: %zu extra lane(s) of %.3f GiB at ctx %u wake on their first request, each from "
+                                 "%u expert slots a layer%s; the cache once all are awake: %u slots/layer (IE_Q4E_LAZY_LANES=0 = at "
+                                 "the load)\n", lanes_.size() - 1, (lane_bytes_ + mtp_lane_bytes_) / 1073741824.0, lanes_[1].max_ctx,
+                         lane_slots_, l0.c_str(), ecache_slots_floor());
+        }
+        copyq_ = std::make_unique<sycl::queue>(
+            alloc_->queue().get_context(), alloc_->queue().get_device(),
+            sycl::property_list{sycl::property::queue::in_order{}});
+        ecache_usable_ = ecache_slots_;
+        // ---- P4 B49: VRAM 2 MiB page-alias self-test (glm5next.cpp's, 2026-09-03; IE_Q4E_NO_ALIAS_TEST=1 skips) ----
+        // On card 1 two virtual 2 MiB pages of one malloc_device allocation can be backed by ONE physical page: a fill
+        // into one expert slot silently rewrites what another slot reads. Found here 2026-10-04 on Flash-Next (ie serve
+        // --ctx 65536 --parallel 1, stage B): rows routed through the hit slots came out NaN from the last layers' MoE,
+        // their keys / values poisoned the last attention layer's cache, and a later decode step that attended one
+        // returned no token (pick -1, finish "stop" after 15 / 61 / 69 tokens). It moves with the allocation layout, so
+        // it must be tested, not assumed away. Two passes over ALL of the stage's caches (a page written and read
+        // straight back cannot show an alias: its partner is not written yet); every word tagged by a KERNEL (a small
+        // probe stays in the caches); word 0 of each page rewritten by the COPY ENGINE and verified by the EUs -- the
+        // pair the fills (copyq_) and the kernels use. A page that fails, and the page whose tag it shows, lose their
+        // slots: last_use = UINT64_MAX, which no victim scan takes.
+        ecache_alias_test();
+    }
     return {};
 }
 
@@ -2966,9 +3040,20 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                               : reinterpret_cast<const uint8_t*>(bv.f16) +
                                     uint64_t(e) * bv.slice_bytes;
             };
-            uq.memcpy(dst + ec.gate_off, srcp(w.gate_bv), w.gate_bv.slice_bytes);
-            uq.memcpy(dst + ec.up_off,   srcp(w.up_bv),   w.up_bv.slice_bytes);
-            uq.memcpy(dst + ec.down_off, srcp(w.down_bv), w.down_bv.slice_bytes);
+            if (up_entry_bytes_) {   // 2026-11-02: through the pinned ring (the header note), one DMA a slot
+                uint8_t* st = up_ring_[up_next_];
+                sycl::event& ev = up_ev_[up_next_];
+                up_next_ = (up_next_ + 1) % up_ring_.size();
+                ev.wait();   // the DMA that last read this entry (long done with 32 entries ahead of it)
+                std::memcpy(st + ec.gate_off, srcp(w.gate_bv), w.gate_bv.slice_bytes);
+                std::memcpy(st + ec.up_off,   srcp(w.up_bv),   w.up_bv.slice_bytes);
+                std::memcpy(st + ec.down_off, srcp(w.down_bv), w.down_bv.slice_bytes);
+                ev = uq.memcpy(dst, st, ec.slot_bytes);
+            } else {   // the direct copies (IE_Q4E_PINNED_UPLOADS=0, or no ring)
+                uq.memcpy(dst + ec.gate_off, srcp(w.gate_bv), w.gate_bv.slice_bytes);
+                uq.memcpy(dst + ec.up_off,   srcp(w.up_bv),   w.up_bv.slice_bytes);
+                uq.memcpy(dst + ec.down_off, srcp(w.down_bv), w.down_bv.slice_bytes);
+            }
         }
         ec.last_use[uint32_t(sl)] = ++ecache_clock_;
         if (uint32_t(sl) < pf_pin_mask_.size() && pf_pin_mask_[uint32_t(sl)]) ec.last_use[uint32_t(sl)] = UINT64_MAX - 1;
@@ -3128,7 +3213,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 qwen4_ple_hash(pc, tokens_host, T, ple_hist_, rows.data());
             }
             std::vector<float> E(uint64_t(T) * H);
-            qwen4_ple_gather(ple_table->data, rows.data(), T, E.data());
+            if (auto e = qwen4_ple_gather(ple_table->data, ple_dt, rows.data(), T, E.data()); !e.empty()) { block_err_ = e; return; }
             std::vector<sycl::half> E16(E.size());
             for (size_t i = 0; i < E.size(); ++i) E16[i] = sycl::half(E[i]);
             q.memcpy(e16_, E16.data(), E16.size() * 2).wait();
@@ -4740,7 +4825,7 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
         std::vector<uint64_t> rows(uint64_t(G) * 16);
         for (uint32_t i = 0; i < G; ++i) qwen4_ple_hash(pc, ids + i, 1, *lr[i].ple_hist, rows.data() + uint64_t(i) * 16);
         std::vector<float> E(uint64_t(G) * H);
-        qwen4_ple_gather(ple_table->data, rows.data(), G, E.data());
+        if (auto e = qwen4_ple_gather(ple_table->data, ple_dt, rows.data(), G, E.data()); !e.empty()) { block_err_ = e; return; }
         std::vector<sycl::half> E16(E.size());
         for (size_t i = 0; i < E.size(); ++i) E16[i] = sycl::half(E[i]);
         q.memcpy(e16_, E16.data(), E16.size() * 2).wait();
@@ -4874,9 +4959,20 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
                     return bv.raw ? bv.raw + uint64_t(e) * bv.slice_bytes
                                   : reinterpret_cast<const uint8_t*>(bv.f16) + uint64_t(e) * bv.slice_bytes;
                 };
-                uq.memcpy(dst + ec.gate_off, srcp(w.gate_bv), w.gate_bv.slice_bytes);
-                uq.memcpy(dst + ec.up_off,   srcp(w.up_bv),   w.up_bv.slice_bytes);
-                uq.memcpy(dst + ec.down_off, srcp(w.down_bv), w.down_bv.slice_bytes);
+                if (up_entry_bytes_) {   // 2026-11-02: through the pinned ring (the header note), one DMA a slot
+                    uint8_t* st = up_ring_[up_next_];
+                    sycl::event& ev = up_ev_[up_next_];
+                    up_next_ = (up_next_ + 1) % up_ring_.size();
+                    ev.wait();   // the DMA that last read this entry (long done with 32 entries ahead of it)
+                    std::memcpy(st + ec.gate_off, srcp(w.gate_bv), w.gate_bv.slice_bytes);
+                    std::memcpy(st + ec.up_off,   srcp(w.up_bv),   w.up_bv.slice_bytes);
+                    std::memcpy(st + ec.down_off, srcp(w.down_bv), w.down_bv.slice_bytes);
+                    ev = uq.memcpy(dst, st, ec.slot_bytes);
+                } else {   // the direct copies (IE_Q4E_PINNED_UPLOADS=0, or no ring)
+                    uq.memcpy(dst + ec.gate_off, srcp(w.gate_bv), w.gate_bv.slice_bytes);
+                    uq.memcpy(dst + ec.up_off,   srcp(w.up_bv),   w.up_bv.slice_bytes);
+                    uq.memcpy(dst + ec.down_off, srcp(w.down_bv), w.down_bv.slice_bytes);
+                }
             }
             ec.last_use[uint32_t(sl)] = ++ecache_clock_;
             return static_cast<uint8_t*>(ec.base) + uint64_t(sl) * ec.slot_bytes;
