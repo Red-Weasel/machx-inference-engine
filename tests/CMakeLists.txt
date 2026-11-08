@@ -653,6 +653,13 @@ add_executable(q27_lanes_test
 target_include_directories(q27_lanes_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME q27_lanes_test COMMAND q27_lanes_test)
 
+# Host-only (no GPU, no SYCL): the deep prefill pipeline's scheduling (include/ie/deep_pipe.hpp, 2026-11-08: Flash-Next's
+# N-stage chain) with fake stages carrying values through the handoff ring -- intact, in order, never two threads on a stage,
+# the stages really overlap, an error drains, the destructor waits. Header-only: no ie_core.
+add_executable(deep_pipe_test unit/deep_pipe_test.cpp)
+target_include_directories(deep_pipe_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME deep_pipe_test COMMAND deep_pipe_test)
+
 # Host-only (no GPU, no SYCL): P4 B30, the lane pick of `ie serve` without --parallel (include/ie/lanes_auto.hpp) with fake
 # free-VRAM numbers per arch -- one card / an arch without lanes / a refusing switch = one lane, the measured pick's edges
 # (never above or below what fits; the explicit --parallel admission's rule), the 27B's load-time budget, the load line.

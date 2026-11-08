@@ -14,8 +14,10 @@
 #include "ie/prompt_guard.hpp"       // known_bugs 45 (2026-11-05): the content ranges of a rendered chat prompt
 #include "../../third_party/nlohmann/json.hpp"
 #include "ie/reasoning.hpp"
+#include <functional>
 #include <future>
 #include "ie/qwen4exp.hpp"
+#include "ie/deep_pipe.hpp"
 #include "ie/q4e_lanes.hpp"
 #include "ie/q35m_lanes.hpp"
 #include "ie/q27_lanes.hpp"
@@ -97,6 +99,33 @@ struct Q4eBundle {
         return m;
     }
     void reset_all() { each_stage_v([](Qwen4ExpModel& M) { M.reset_state(); }); }
+    // 2026-11-08: the deep prefill pipeline for three or more stages (GitHub issue 3's finding 7, rebuilt on our gates): each
+    // stage after A reads its part of a chunk on its own thread, chunk k on stage s beside chunk k + 1 on stage s - 1, so an
+    // N-card prompt read is bounded by the slowest stage instead of stages 1..N-1 in a row on one thread. The scheduling
+    // (both waits, the shared futures, the ring rule) is ie::DeepPipe (include/ie/deep_pipe.hpp, gated by deep_pipe_test).
+    // Same kernels in the same order on every stage and the same exact fp32 handoff: bit-identical to the serial chain.
+    // IE_Q4E_NO_DEEP_PIPE=1 = the two-thread form (A beside the rest of the chain in a row). Two stages are unchanged.
+    std::vector<std::vector<float>> wide_ring;   // [N] the handoff slots: chunk k uses slot k % N
+    static bool deep_pipe_on() { static const bool on = std::getenv("IE_Q4E_NO_DEEP_PIPE") == nullptr; return on; }
+    float* deep_slot(uint32_t k, uint64_t floats) {
+        const uint32_t N = n_stages();
+        static std::atomic<bool> said{false};
+        if (!said.exchange(true))
+            std::fprintf(stderr, "[qwen4exp] prefill: the deep pipeline, %u stages each on its own thread (IE_Q4E_NO_DEEP_PIPE=1 = "
+                                 "stage 0 beside the rest in a row)\n", N);
+        if (wide_ring.size() < N) wide_ring.resize(N);
+        auto& w = wide_ring[k % N];
+        if (w.size() < floats) w.resize(floats);
+        return w.data();
+    }
+    // Stage s's part of chunk [p0, p0 + n) (wb holds the wide state stage s - 1 left): a middle stage rewrites wb, the tail
+    // leaves the logits.
+    std::string deep_part(uint32_t s, float* wb, const int32_t* bt, uint32_t n, uint32_t p0) {
+        const bool tail = s + 1 == n_stages();
+        if (auto e = stage(s).forward_range(tail ? nullptr : bt, n, p0, wb, tail ? nullptr : wb, nullptr); !e.empty())
+            return "stage " + std::to_string(s) + ": " + e;
+        return {};
+    }
     // P4 B56: prompt-lookup drafts at one request lane (the 35B split's look_step, qwen35moe_split.hpp, over the two
     // stages). look_step(token, pos) gives the logits of position `pos` for the input `token`, as fwd(T = 1) does. When
     // the last tokens repeat an earlier span of the history, the tokens that followed it run with `token` in ONE
@@ -606,6 +635,50 @@ struct Q4eBundle {
         s.base = pos; s.n = Kd + 1; s.next = 1; ++s.rounds;
         return {};
     }
+    // The deep form of fwd_pipelined below (three or more stages; ie::DeepPipe): the same chunks, restart points and draft
+    // head ingest, every stage on its own thread.
+    std::string fwd_pipelined_deep(const int32_t* t, uint32_t count, uint32_t pos, uint32_t PC) {
+        const uint32_t N = n_stages();
+        const uint64_t wsz = uint64_t(PC) * cfg.hc_count * cfg.hidden;
+        std::string err;
+        uint32_t done = 0;
+        if (mtp_on && pos == 0) { mtp_ok = true; mtp_to = 0; }
+        const bool mtp_feeding = mtp_on && mtp_ok && pos <= mtp_to;
+        if (mtp_feeding && pos < mtp_to) B.mtp_rewind();
+        if (mtp_on && !mtp_feeding) mtp_ok = false;
+        {
+            DeepPipe pipe(N);
+            for (uint32_t k = 0; done < count; ++k) {
+                const uint32_t n = std::min(PC, count - done);
+                if (auto e = pipe.slot_free(k); !e.empty()) { err = e; break; }
+                float* wb = deep_slot(k, wsz);
+                if (auto e = A.forward_range(t + done, n, pos + done, nullptr, wb, nullptr); !e.empty()) { err = "A: " + e; break; }
+                const uint32_t ld = pos + done + n;
+                std::vector<Qwen4ExpModel::StateCopy*> lc(N, nullptr);   // a restart point in this chunk: each stage copies after its part
+                if (lad_step && lad_k && ld / lad_step > (pos + done) / lad_step) {
+                    const uint32_t sl = (ld / lad_step - 1) % lad_k;
+                    if (lad.size() == N && sl < lad[0].size() && A.state_save(lad[0][sl], ld).empty()) {
+                        for (uint32_t s = 1; s < N; ++s) { lc[s] = &lad[s][sl]; lc[s]->depth = 0; }
+                        lad_taken.emplace_back(sl, ld);
+                    }
+                }
+                const int32_t* bt = t + done;
+                const uint32_t bpos = pos + done;
+                const bool feed = mtp_feeding;
+                pipe.enqueue([this, lc, ld, feed, wb, bt, n, bpos, N](uint32_t s) -> std::string {
+                    if (auto e = deep_part(s, wb, bt, n, bpos); !e.empty()) return e;
+                    if (lc[s]) (void)stage(s).state_save(*lc[s], ld);   // (a failed copy leaves depth 0: the slot does not count)
+                    if (feed && s + 1 == N) return B.mtp_ingest(bt, n, bpos);   // (P4 B63: the head reads every chunk)
+                    return {};
+                });
+                done += n;
+            }
+            if (const std::string e = pipe.drain(); err.empty()) err = e;
+        }
+        if (!err.empty()) lad_taken.clear();
+        if (mtp_feeding) { if (err.empty()) mtp_to = pos + count; else mtp_ok = false; }
+        return err;
+    }
     // Chunk-PIPELINED prefill over the split (run2's certified overlap: A
     // runs chunk k+1 while B runs chunk k; B is sequential with itself via
     // the future chain; double host wide buffers). P2P peer handoff is OFF
@@ -625,6 +698,7 @@ struct Q4eBundle {
         const uint32_t PC = pc_env ? pc_env : 2048u;
         (void)count;
         if (!split || count <= PC) return "q4e pipeline: not applicable";
+        if (!mid.empty() && !p2p && deep_pipe_on()) return fwd_pipelined_deep(t, count, pos, PC);
         // P2P + pipelining now coexist via B's double wide banks: A pushes
         // chunk k into bank k&1 while B reads chunk k-1 from the other bank.
         // Bank alloc failure (or no P2P) falls back to the host double-bounce.
@@ -1418,6 +1492,27 @@ private:
     std::string run_chunks(uint32_t lane, const int32_t* ids, std::span<const LanesChunk> ch, const std::function<bool()>& stop,
                            size_t& done) {
         done = 0;
+        if (!b_.mid.empty() && Q4eBundle::deep_pipe_on()) {   // 2026-11-08: three or more stages, each on its own thread
+            const uint32_t N = b_.n_stages();
+            DeepPipe pipe(N);
+            std::string err;
+            for (size_t k = 0; k < ch.size(); ++k) {
+                if (k > 0 && stop && stop()) break;
+                const auto [p0, n] = ch[k];
+                if (auto e = pipe.slot_free(k); !e.empty()) { err = e; break; }
+                float* wb = b_.deep_slot(uint32_t(k), b_.wide.size());
+                if (auto e = b_.A.forward_range(ids + p0, n, p0, nullptr, wb, nullptr); !e.empty()) { err = "A: " + e; break; }
+                const int32_t* bt = ids + p0;
+                pipe.enqueue([this, lane, wb, bt, n, p0, N](uint32_t s) -> std::string {
+                    if (auto e = b_.deep_part(s, wb, bt, n, p0); !e.empty()) return e;
+                    if (s + 1 == N) head_feed(lane, bt, n, p0);   // (the head's record reads every chunk; the tail's thread)
+                    return {};
+                });
+            }
+            if (const std::string e = pipe.drain(); err.empty()) err = e;
+            done = pipe.done();
+            return err;
+        }
         float* wb2[2] = {b_.wide.data(), b_.wide_b.data()};
         std::future<std::string> bfut;
         std::string err;

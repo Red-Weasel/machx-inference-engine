@@ -20,11 +20,12 @@
 > [!IMPORTANT]
 > ## 🚀 Qwen 4 — ready to run on Intel Arc the day it is released
 >
-> **We will have Qwen 4 up on Mach X the same day it drops.** Qwen3.8-Flash-Next is the public preview of Qwen 4's architecture (`qwen4exp`: QSA sparse attention + Gated DeltaNet, a 512-expert MoE, hyper-connections, per-layer n-gram embeddings, an MTP draft head), and Mach X already runs it on Arc Pro B70 cards. In v0.2.36 and v0.2.37 we built ahead of time everything a Qwen 4 release is expected to ship with:
+> **We will have Qwen 4 up on Mach X the same day it drops.** Qwen3.8-Flash-Next is the public preview of Qwen 4's architecture (`qwen4exp`: QSA sparse attention + Gated DeltaNet, a 512-expert MoE, hyper-connections, per-layer n-gram embeddings, an MTP draft head), and Mach X already runs it on Arc Pro B70 cards. In v0.2.36–v0.2.38 we built ahead of time everything a Qwen 4 release is expected to ship with:
 >
 > - **Every community quant on its own kernels:** Q4_K, Q5_K, Q6_K, Q8_0, Q5_0 and Q4_0 expert banks stream as they lie on disk (no host F16 copy). Unsloth's UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 Flash-Next builds were downloaded, loaded and checked against an fp64 reference, then perplexity, lossless speculation and speed.
 > - **The draft head and the config the way the converters write them:** the MTP head in llama.cpp's `nextn` layout (Unsloth's `MTP/*.gguf` or inside the model), the hyperparameters llama.cpp reads (per-block attention schedule, per-block arrays), and the `qwen35` pre-tokenizer (30 of 30 lines identical to the HF tokenizer).
 > - **Whatever shape Qwen 4 ships in:** a dense model with no experts, hidden size 5120, 4 KV heads, no sparse-attention indexer, fused gate/up expert banks, the `qwen4` / `qwen4moe` arch names. Each was built as a small random model from the Hugging Face reference code, written as a GGUF in llama.cpp's layout and run through the engine end to end: **15 shapes match the reference's output**. Four failed before v0.2.37 (hidden 5120 lost the GPU; dense and indexer-less files were refused) and are fixed.
+> - **One card to four:** `--gpus N` splits the model into N stages, and on three or more cards every stage reads the prompt on its own thread (v0.2.38): a 12K-token prompt on four stages reads 572 → 910 tok/s, measured with two stages per card here.
 > - **Fast where it counts:** integer-dot and XMX (DPAS) kernels for the K-quant and Q8_0 banks, and a faster decode step (two cards 41.1 → 49.7 tok/s over v0.2.36 and v0.2.37, the long-context step 26.2 → 20.1 ms of GPU time), all with identical output.
 >
 > <table>
@@ -38,6 +39,7 @@
 
 **Latest**
 
+- **v0.2.38, November 8 — Flash-Next on four cards reads prompts up to 60 % faster:** on three or more cards every stage of the [layer split](#new-in-v0238) now reads its part of the prompt on its own thread; before, stages 1 … N − 1 read one after another. A 12,069-token prompt on four stages (two per card here) reads **572 → 910 tok/s**, and **610 → 975** with the request lanes, with byte-identical replies. The scheduling is a small header with its own race test, and two cards are unchanged. [Details](#new-in-v0238)
 - **v0.2.37, November 8 — Qwen 4's possible shapes tested before the weights exist, and Flash-Next decodes 12 % faster:** a new [mini end-to-end check](#new-in-v0237) builds small random models from the Hugging Face reference code in 15 shapes a Qwen 4 tier may take (dense, hidden 5120, 4 KV heads, no sparse-attention indexer, fused expert banks, …), writes them in llama.cpp's layout and compares the engine's output with the reference. It found that hidden 5120 lost the GPU and that dense and indexer-less files were refused; all fixed. Fused gate/up expert banks load. Flash-Next's hyper-connection mixing reads 8-bit and its expert routing runs on the GPU when that pays: two cards **44.4 → 49.7 tok/s**, the tokens unchanged. [Details](#new-in-v0237)
 - **v0.2.36, November 8 — Qwen 4 day-one readiness, Flash-Next decodes faster, and a request can no longer forge a control token:** every community quant of [Flash-Next](#new-in-v0236) (the Qwen 4 preview architecture) streams on its own kernels — Q8_0, Q5_K, Q6_K, Q5_0 and Q4_0 expert banks beside Q4_K — proven on Unsloth's UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 builds; the MTP head loads in llama.cpp's layout; integer-dot and XMX kernels for the bigger quants (the Q8_0 build reads 87.4 → 103.9 tok/s on two cards). The decode step lost launches, a 3× faster sparse attention and a 4× faster router GEMV: two cards **41.1 → 44.4 tok/s**, the step at ~3K context 26.2 → 21.0 ms of GPU time, the output identical. Every chat renderer now keeps a control-token spelling inside a request's own text as text (a fetched page could open a turn or a tool call), a tool call whose JSON lost its last bracket is repaired, and DeepSeek-V4.1 serves with the expert ranking profiled on its own traffic (code-writing replies 7.8 → 12.8 tok/s). [Details](#new-in-v0236)
 - **v0.2.35, November 2 — Flash-Next on N cards, and community GGUFs read right:** `ie serve --gpus N` runs [Flash-Next](#new-in-v0235) as an N-stage layer split (stage s owns layers [s·48/N, (s+1)·48/N)), with the request lanes, the draft head's rounds, the prompt cache, the restart points and the pictures all going through one chain, so no path can skip a stage; on this two-card box the 4-stage chain was proven byte-identical to the 2-stage one by running two stages per card (`IE_Q4E_LOGICAL_CARDS=2`), the way DeepSeek-V4.1's 4-card split was. The per-layer-embedding table of a community Q8_0 / UD-Q6_K_XL GGUF was read with the converter's IQ4_NL layout (garbage replies); it is read by its dtype now, and anything else is refused by name. The P2P context takes every card. An opt-in pinned-memory path for the expert uploads is there for boxes whose copy engine faults on the file mapping; here it cost 14–23 % of decode and made the first token 47 % later, so it is off by default.
@@ -216,6 +218,29 @@ class ([New in v0.2.6](#new-in-v026)).
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
 
 ---
+
+<a id="new-in-v0238"></a>
+## 🆕 New in v0.2.38
+
+### Flash-Next on three or more cards: every stage reads the prompt on its own thread
+
+The N-stage chain (v0.2.35) overlapped only stage 0 with the rest. While stage 0 read chunk k + 1, stages 1 … N − 1 read chunk k one after another on a single thread, so on four cards three stages waited in line. Now every stage after the first runs on its own thread, chunk k on stage s beside chunk k + 1 on stage s − 1, and an N-card prompt read is bounded by the slowest stage. This is GitHub [issue 3](https://github.com/Red-Weasel/machx-inference-engine/issues/3)'s finding 7, rebuilt on our gates. The reporter measured +49–52 % prompt reading at 16K+ tokens on four B70s with their version.
+
+- **The two races the reporter hit are designed out**, in one small header (`include/ie/deep_pipe.hpp`):
+  - A stage's part of a chunk waits for its producer *and* for its own previous chunk, whatever either returned, so a stage is never driven by two threads.
+  - The futures are shared and captured by value.
+  - Chunk k's handoff buffer is ring slot k mod N, written only after the last stage is done with chunk k − N.
+- **`deep_pipe_test`** (host-only, also clean under ThreadSanitizer) runs fake stages through the ring. Every value arrives intact, every stage sees its chunks in order, and no stage ever runs on two threads. A latch that only the next stage can open proves the stages really overlap, and an error drains without running a later part.
+- **Measured** on the real UD-Q4_K_XL file at four stages, two per card (`IE_Q4E_LOGICAL_CARDS=2 --gpus 2`, ctx 32768), with a 12,069-token prompt:
+
+  | `ie serve` | before | now |
+  |---|---|---|
+  | one request (`--parallel 1`) | 572 tok/s | **910 tok/s** |
+  | request lanes (`--parallel 4`) | 610 tok/s | **975 tok/s** |
+  | two stages on two cards (unchanged) | 921 tok/s | 921 tok/s |
+
+  The replies to the prompt and to a follow-up turn are byte-identical in every row (the deep and the previous form, one request and the lanes, two and four stages); the follow-up restarts from the prompt cache in ~0.6 s. On four real cards each stage has a card to itself, so the gain should be larger, but we cannot measure that here.
+- Restart points, the draft head's record and the request lanes' prefill all run through it. Two cards are unchanged (there is no middle stage to overlap). `IE_Q4E_NO_DEEP_PIPE=1` gives the previous form, and the startup log names the deep pipeline when it runs.
 
 <a id="new-in-v0237"></a>
 ## 🆕 New in v0.2.37
