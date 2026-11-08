@@ -438,6 +438,16 @@ sycl::event gemv_q4_K_q8s_grouped_dual(sycl::queue& q,
                          sycl::half* g_out, sycl::half* u_out,
                          uint32_t K, uint32_t N, uint32_t P,
                          const std::vector<sycl::event>& deps = {});
+// The same with swiglu fused into the epilogue: writes h_out[p*N ..] = silu(f16(g)) * f16(u), bit-identical to
+// gemv_q4_K_q8s_grouped_dual followed by swiglu() over P x N (the decode host gap, option 1, 2026-11-08).
+sycl::event gemv_q4_K_q8s_grouped_dual_swiglu(sycl::queue& q,
+                         const void* x_q8s,
+                         const uint8_t* slot_base, uint64_t slot_bytes,
+                         uint64_t gate_off, uint64_t up_off,
+                         const int32_t* jobs,
+                         sycl::half* h_out,
+                         uint32_t K, uint32_t N, uint32_t P,
+                         const std::vector<sycl::event>& deps = {});
 sycl::event gemv_q4_K_q8s_grouped_tiles(sycl::queue& q,
                          const void* x_q8s_mega,
                          const uint8_t* slot_base, uint64_t slot_bytes,

@@ -121,6 +121,73 @@ bool test_shape(sycl::queue& q, uint32_t K, uint32_t N, uint32_t seed,
     return ok;
 }
 
+// gemv_fp16_rows(R) must equal R gemv_fp16 calls BIT FOR BIT (the buckets
+// replay the T=1 chain per row; R=1 IS gemv_fp16). perf: rows(R) vs R solo.
+bool test_rows(sycl::queue& q, uint32_t K, uint32_t N, uint32_t seed, bool report_perf) {
+    constexpr uint32_t RM = 8;
+    std::vector<sycl::half> hX(size_t(RM) * K), hW(size_t(K) * N);
+    {
+        std::mt19937 rng(seed);
+        std::uniform_real_distribution<float> dist(-0.5f, 0.5f);
+        for (auto& v : hX) v = sycl::half(dist(rng));
+        for (auto& v : hW) v = sycl::half(dist(rng));
+    }
+    auto* dX = sycl::malloc_device<sycl::half>(size_t(RM) * K, q);
+    auto* dW = sycl::malloc_device<sycl::half>(size_t(K) * N, q);
+    auto* dS = sycl::malloc_device<sycl::half>(size_t(RM) * N, q);   // R solo calls
+    auto* dR = sycl::malloc_device<sycl::half>(size_t(RM) * N, q);   // one rows call
+    q.memcpy(dX, hX.data(), size_t(RM) * K * sizeof(sycl::half)).wait();
+    q.memcpy(dW, hW.data(), size_t(K) * N * sizeof(sycl::half)).wait();
+    for (uint32_t r = 0; r < RM; ++r) ie::gemv_fp16(q, dX + size_t(r) * K, dW, dS + size_t(r) * N, K, N);
+    q.wait_and_throw();
+    std::vector<uint16_t> hS(size_t(RM) * N), hR(size_t(RM) * N);
+    q.memcpy(hS.data(), dS, hS.size() * 2).wait();
+    bool ok = true;
+    std::printf("  gemv_fp16_rows K=%5u N=%6u  bits differing from R gemv_fp16 calls:", K, N);
+    for (uint32_t R : {1u, 2u, 3u, 4u, 8u}) {
+        q.memset(dR, 0xff, size_t(RM) * N * 2).wait();
+        ie::gemv_fp16_rows(q, dX, K, dW, dR, N, K, N, R).wait_and_throw();
+        q.memcpy(hR.data(), dR, hR.size() * 2).wait();
+        uint32_t d = 0;
+        for (size_t i = 0; i < size_t(R) * N; ++i) d += hS[i] != hR[i];
+        std::printf(" R=%u %u", R, d);
+        ok = ok && d == 0;
+    }
+    std::printf("  %s%s%s\n", ok ? G : R, ok ? "OK" : "FAIL", Z);
+    if (report_perf) {
+        constexpr int N_BUFS = 16, REPS = 48;   // 16 copies of W: every call streams it from DRAM
+        std::vector<sycl::half*> dWs(N_BUFS);
+        for (auto& p : dWs) {
+            p = sycl::malloc_device<sycl::half>(size_t(K) * N, q);
+            q.memcpy(p, hW.data(), size_t(K) * N * sizeof(sycl::half)).wait();
+        }
+        auto ns_of = [](const sycl::event& e) {
+            const uint64_t t0 = e.get_profiling_info<sycl::info::event_profiling::command_start>();
+            const uint64_t t1 = e.get_profiling_info<sycl::info::event_profiling::command_end>();
+            return t1 > t0 ? t1 - t0 : 0;
+        };
+        for (uint32_t R : {1u, 2u, 4u, 8u}) {
+            uint64_t t_rows = 0, t_solo = 0;
+            for (int i = -N_BUFS; i < REPS; ++i) {   // the first N_BUFS warm up
+                const sycl::half* W = dWs[(i + N_BUFS) % N_BUFS];
+                auto e = ie::gemv_fp16_rows(q, dX, K, W, dR, N, K, N, R);
+                e.wait();
+                if (i >= 0) t_rows += ns_of(e);
+                for (uint32_t r = 0; r < R; ++r) {
+                    auto s = ie::gemv_fp16(q, dX + size_t(r) * K, dWs[(i + N_BUFS + 7) % N_BUFS], dS + size_t(r) * N, K, N);
+                    s.wait();
+                    if (i >= 0) t_solo += ns_of(s);
+                }
+            }
+            std::printf("    R=%u  rows %6.1f us   %u x gemv_fp16 %6.1f us\n", R, double(t_rows) * 1e-3 / REPS, R,
+                        double(t_solo) * 1e-3 / REPS);
+        }
+        for (auto* p : dWs) sycl::free(p, q);
+    }
+    sycl::free(dX, q); sycl::free(dW, q); sycl::free(dS, q); sycl::free(dR, q);
+    return ok;
+}
+
 }  // namespace
 
 int main() {
@@ -136,6 +203,14 @@ int main() {
     if (!test_shape(q, 333, 129, 0xC29, false)) ++fails;
     // K=1 / N=1 degenerate corners.
     if (!test_shape(q, 1, 1, 0xD31, false)) ++fails;
+    // The rows buckets vs R solo calls, bit for bit (the Flash-Next router
+    // [2560, 512] with perf, the qwen3 attn_v shape, odd / tiny / tail shapes).
+    if (!test_rows(q, 2560, 512, 0xE41, /*report_perf=*/true)) ++fails;
+    if (!test_rows(q, 4096, 1024, 0xA53, false)) ++fails;
+    if (!test_rows(q, 2560, 4099, 0xE43, false)) ++fails;
+    if (!test_rows(q, 333, 129, 0xC29, false)) ++fails;
+    if (!test_rows(q, 192, 7, 0xB17, false)) ++fails;
+    if (!test_rows(q, 1, 1, 0xD31, false)) ++fails;
 
     std::printf("\n%s\n", fails == 0 ? "ALL PASS" : "FAILURES");
     return fails;

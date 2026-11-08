@@ -367,6 +367,17 @@ add_executable(ie_qwen4_quant_test qwen4_quant_test.cpp)
 target_link_libraries(ie_qwen4_quant_test PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_qwen4_quant_test PROPERTIES OUTPUT_NAME "ie-qwen4-quant-test")
 
+# qwen4exp expert banks in Q8_0 / Q5_K / Q6_K / Q5_0 / Q4_0 (Qwen 4 readiness, 2026-11-07): the A16 bank kernels vs a CPU
+# fp64 reference on synthetic banks, every grouped / tiles / batched variant bit-identical to the solo kernel. No model file.
+add_executable(ie_qwen4_bank_test qwen4_bank_test.cpp)
+target_link_libraries(ie_qwen4_bank_test PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_qwen4_bank_test PROPERTIES OUTPUT_NAME "ie-qwen4-bank-test")
+
+# The raw bank kernel vs the host F16 copy vs an fp64 reference on the real file's banks (which path deviates).
+add_executable(ie_q4e_bank_ab q4e_bank_ab.cpp)
+target_link_libraries(ie_q4e_bank_ab PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_q4e_bank_ab PROPERTIES OUTPUT_NAME "ie-q4e-bank-ab")
+
 # qwen4exp hyper-connections correctness gate: GPU mix/combine/expand kernels
 # vs a CPU fp64 reference of docs/qwen4/11_hyper_connections.md. Self-contained.
 add_executable(ie_qwen4_hc_test qwen4_hc_test.cpp)

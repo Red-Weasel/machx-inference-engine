@@ -37,8 +37,20 @@ inline constexpr uint32_t kPleRowBytesQ8 = 170;   // 160 Q8_0 elems = 5 blocks *
 
 // The table dtypes the gather reads, and a row's bytes for one (0 = not a table dtype). 2026-11-02 (GitHub issue 3): the
 // gather always read the table as IQ4_NL, so a community file's Q8_0 table came out as garbage embeddings and NaN logits.
+// 2026-11-07: the community tables add Q5_0 (bartowski, 22 B a block), Q5_1 (Unsloth's swappable table, 24 B), Q4_0
+// (ggml-org, 18 B), and the lossless F16 / BF16 / F32 tables; a 160-wide row is 5 blocks of 32 in every 32-block type.
 inline constexpr uint32_t qwen4_ple_row_bytes(DType dt) noexcept {
-    return dt == DType::kIQ4_NL ? kPleRowBytes : dt == DType::kQ8_0 ? kPleRowBytesQ8 : 0u;
+    switch (dt) {
+        case DType::kIQ4_NL: return kPleRowBytes;      // 90
+        case DType::kQ4_0:   return 5u * 18u;          // 90
+        case DType::kQ5_0:   return 5u * 22u;          // 110
+        case DType::kQ5_1:   return 5u * 24u;          // 120
+        case DType::kQ8_0:   return kPleRowBytesQ8;    // 170
+        case DType::kF16:    return 160u * 2u;
+        case DType::kBF16:   return 160u * 2u;
+        case DType::kF32:    return 160u * 4u;
+        default:             return 0u;
+    }
 }
 
 // Hash constants, passed in by the caller (read from GGUF metadata; the gate

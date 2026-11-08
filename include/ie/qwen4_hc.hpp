@@ -92,6 +92,25 @@ sycl::event qwen4_hc_combine(sycl::queue& q,
                              uint32_t T, uint32_t H, uint32_t hc,
                              const std::vector<sycl::event>& deps = {});
 
+// COMBINE + the following mix's norm in ONE launch (2026-11-08): the combine above, then xn_ws[t,s,:] = rms-norm(res[t,s,:])
+// * gamma[s,:] exactly as qwen4_hc_mix_v2's first stage computes it (same split-H reduction). Pair with qwen4_hc_mix_v2_xn,
+// which is qwen4_hc_mix_v2 minus that first stage (it reads xn_ws instead of x + gamma). Both bit-identical to the
+// separate launches (ie-qwen4-hc-test).
+sycl::event qwen4_hc_combine_norm(sycl::queue& q,
+                                  float* res, const sycl::half* block_out,
+                                  const float* inj_logits,
+                                  const float* gamma,          // the FOLLOWING mix's norm weights [hc*H]
+                                  float* xn_ws,                // F32 out [T, hc*H]
+                                  uint32_t T, uint32_t H, uint32_t hc, float eps,
+                                  const std::vector<sycl::event>& deps = {});
+sycl::event qwen4_hc_mix_v2_xn(sycl::queue& q,
+                               const float* xn_ws,            // F32 [T, hc*H], pre-normed
+                               const sycl::half* w_down, const sycl::half* w_up,
+                               const float* w_inject,
+                               float* lo_ws, sycl::half* mixed, float* inj_logits,
+                               uint32_t T, uint32_t H, uint32_t hc, uint32_t r,
+                               const std::vector<sycl::event>& deps = {});
+
 // PREFILL MIX (T > 16): qwen4_hc_mix_v2's math with the two low-rank
 // projections routed through gemm_fp16 over [K, N]-TRANSPOSED weight copies
 // (w_down_t F16 [hc*H][r], w_up_t F16 [r][hc*H] — built once at load;

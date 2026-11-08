@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace ie {
 
@@ -46,13 +47,20 @@ inline bool clean_tool_name(std::string_view raw, std::string& out, bool* change
 //   * a raw control character inside a string (a literal newline/tab in multi-line code) -> its escape;
 //   * a backslash that starts no valid escape (`\d`, `\.`, `C:\x`) -> a literal backslash;
 //   * a comma before `}` / `]`;
-//   * the Python spellings True / False / None.
+//   * the Python spellings True / False / None;
+//   * closers missing at the very end (`{"edits": [...]` + EOF -> `{"edits": [...]}`, 2026-11-04): every string closed, every
+//     opener still open gets its `}` / `]` in nesting order. One reading because the callers hand this function a value the
+//     model's own markup already bounded (a closed DSML parameter block inside a completed generation): nothing more was
+//     coming. Not when the text ends after `,` or `:` (a value is missing: a guess), inside a string, or after a closer that
+//     matched nothing (`{"a": 1]`).
 // Whatever else is wrong (unbalanced quotes, bare words, single-quoted strings) is left as it was, so the caller's strict parse of the
 // result rejects it. Returns the candidate text; the CALLER must parse it -- this function only writes it.
 inline std::string json_syntax_repair(std::string_view in) {
     std::string out;
     out.reserve(in.size() + 16);
     bool in_str = false;
+    std::vector<char> open;     // the closers owed, innermost last
+    bool mismatched = false;    // a `}` / `]` that closed nothing: the text is not the prefix of one document, never complete it
     for (size_t i = 0; i < in.size(); ++i) {
         const unsigned char c = static_cast<unsigned char>(in[i]);
         if (in_str) {
@@ -77,11 +85,13 @@ inline std::string json_syntax_repair(std::string_view in) {
             else out += static_cast<char>(c);
         } else {
             if (c == '"') { in_str = true; out += '"'; }
+            else if (c == '{' || c == '[') { open.push_back(c == '{' ? '}' : ']'); out += static_cast<char>(c); }
             else if (c == '}' || c == ']') {
                 size_t k = out.size();
                 while (k > 0 && std::isspace(static_cast<unsigned char>(out[k - 1]))) --k;
                 if (k > 0 && out[k - 1] == ',') out.erase(k - 1, 1);   // a trailing comma
                 out += static_cast<char>(c);
+                if (!open.empty() && open.back() == static_cast<char>(c)) open.pop_back(); else mismatched = true;
             }
             else if (std::isalpha(c) || c == '_') {
                 size_t j = i;
@@ -95,6 +105,13 @@ inline std::string json_syntax_repair(std::string_view in) {
             }
             else out += static_cast<char>(c);
         }
+    }
+    if (!in_str && !mismatched && !open.empty()) {
+        size_t k = out.size();
+        while (k > 0 && std::isspace(static_cast<unsigned char>(out[k - 1]))) --k;
+        const char last = k > 0 ? out[k - 1] : '\0';
+        if (last != ',' && last != ':')                             // after a comma or a colon a value is missing: that is a guess
+            for (auto it = open.rbegin(); it != open.rend(); ++it) out += *it;
     }
     return out;
 }

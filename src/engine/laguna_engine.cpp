@@ -49,11 +49,14 @@ std::string rstrip(std::string s) { while (!s.empty() && std::isspace(uint8_t(s.
 bool has_text(const std::string& s) { for (char c : s) if (!std::isspace(uint8_t(c))) return true; return false; }
 
 // The GGUF's chat template (laguna_glm_thinking_v8 iteration), rendered natively. add_generation_prompt is always on here.
-std::string laguna_render(std::span<const ChatTurn> turns, std::string_view tools_json, bool thinking, std::string& err) {
-    std::string p = "〈|EOS|〉";
+std::string laguna_render(std::span<const ChatTurn> turns, std::string_view tools_json, bool thinking, std::string& err,
+                          std::vector<std::pair<size_t, size_t>>* content_out) {
+    PromptPiece p;
+    p.add_text("〈|EOS|〉");
     std::string system = "You are a helpful, conversationally-fluent assistant made by Poolside. You are here to be helpful to users through natural language conversations.";
+    bool system_is_request = false;   // the template's default text is the template's; a request's system turn is the request's
     size_t first = 0;
-    if (!turns.empty() && turns[0].role == "system") { system = turns[0].content; first = 1; }
+    if (!turns.empty() && turns[0].role == "system") { system = turns[0].content; system_is_request = true; first = 1; }
     ojson tools = ojson::array();
     if (!tools_json.empty()) {
         tools = ojson::parse(tools_json, nullptr, false);
@@ -61,47 +64,53 @@ std::string laguna_render(std::span<const ChatTurn> turns, std::string_view tool
     }
     const bool has_sys = has_text(system), has_tools = !tools.empty();
     if (has_sys || has_tools || thinking) {
-        p += "<system>";
-        if (has_sys) { p += rstrip(system); if (has_tools) p += "\n\n"; }
-        if (has_tools) {
-            p += "### Tools\n\nYou may call functions to assist with the user query.\nAll available function signatures are listed below:\n<available_tools>\n";
-            for (const auto& t : tools) p += py_dumps(t) + "\n";
-            p += "</available_tools>";
+        p.add_text("<system>");
+        if (has_sys) {
+            const std::string sys = rstrip(system);
+            if (system_is_request) p.add_content(sys); else p.add_text(sys);
+            if (has_tools) p.add_text("\n\n");
         }
-        p += "</system>\n";
+        if (has_tools) {
+            p.add_text("### Tools\n\nYou may call functions to assist with the user query.\nAll available function signatures are listed below:\n<available_tools>\n");
+            for (const auto& t : tools) { p.add_content(py_dumps(t)); p.add_text("\n"); }
+            p.add_text("</available_tools>");
+        }
+        p.add_text("</system>\n");
     }
     for (size_t i = first; i < turns.size(); ++i) {
         const ChatTurn& m = turns[i];
-        if (m.role == "user") p += "<user>" + m.content + "</user>\n";
+        if (m.role == "user") { p.add_text("<user>"); p.add_content(m.content); p.add_text("</user>\n"); }
         else if (m.role == "assistant") {
-            p += "<assistant>";
-            const std::string reasoning = m.reasoning_content.value_or("");
-            p += thinking ? "<think>" + reasoning + "</think>" : std::string("</think>");
-            const std::string content = m.content_without_tool_calls.value_or(m.content);
-            p += content;
+            p.add_text("<assistant>");
+            if (thinking) { p.add_text("<think>"); p.add_content(m.reasoning_content.value_or("")); p.add_text("</think>"); }
+            else p.add_text("</think>");
+            p.add_content(m.content_without_tool_calls.value_or(m.content));
             if (!m.tool_calls_json.empty()) {
                 const ojson calls = ojson::parse(m.tool_calls_json, nullptr, false);
                 if (calls.is_discarded() || !calls.is_array()) { err = "laguna: an assistant turn's tool_calls is not a JSON array"; return {}; }
                 for (const auto& c : calls) {
                     const ojson& f = c.contains("function") ? c["function"] : c;
                     if (!f.contains("name") || !f["name"].is_string()) { err = "laguna: a tool call has no name"; return {}; }
-                    p += "<tool_call>" + f["name"].get<std::string>();
+                    p.add_text("<tool_call>"); p.add_content(f["name"].get_ref<const std::string&>());
                     ojson args = f.contains("arguments") ? f["arguments"] : ojson::object();
                     if (args.is_string()) { args = ojson::parse(args.get<std::string>(), nullptr, false); if (args.is_discarded()) args = ojson::object(); }
                     if (args.is_object())
-                        for (auto it = args.begin(); it != args.end(); ++it)
-                            p += "<arg_key>" + it.key() + "</arg_key><arg_value>" +
-                                 (it.value().is_string() ? it.value().get<std::string>() : py_dumps(it.value())) + "</arg_value>";
-                    p += "</tool_call>";
+                        for (auto it = args.begin(); it != args.end(); ++it) {
+                            p.add_text("<arg_key>"); p.add_content(it.key()); p.add_text("</arg_key><arg_value>");
+                            if (it.value().is_string()) p.add_content(it.value().get_ref<const std::string&>()); else p.add_content(py_dumps(it.value()));
+                            p.add_text("</arg_value>");
+                        }
+                    p.add_text("</tool_call>");
                 }
             }
-            p += "</assistant>\n";
-        } else if (m.role == "tool") p += "<tool_response>" + m.content + "</tool_response>\n";
-        else if (m.role == "system") p += "<system>" + m.content + "</system>\n";
+            p.add_text("</assistant>\n");
+        } else if (m.role == "tool") { p.add_text("<tool_response>"); p.add_content(m.content); p.add_text("</tool_response>\n"); }
+        else if (m.role == "system") { p.add_text("<system>"); p.add_content(m.content); p.add_text("</system>\n"); }
         else { err = "laguna: unknown role '" + m.role + "'"; return {}; }
     }
-    p += thinking ? "<assistant><think>" : "<assistant></think>";
-    return p;
+    p.add_text(thinking ? "<assistant><think>" : "<assistant></think>");
+    if (content_out) *content_out = std::move(p.content);
+    return std::move(p.text);
 }
 
 // Prefill (reusing the live sequence's common prefix) + sampling loop. r.text is the raw completion (reasoning, content and
@@ -222,15 +231,21 @@ GenerateResult Engine::laguna_generate(const std::string& prompt, const Sampling
     return laguna_run(*laguna_, ids, sp, on_token);
 }
 
+std::string laguna_render_prompt(std::span<const ChatTurn> turns, std::string_view tools_json, bool thinking, std::string& err,
+                                 std::vector<std::pair<size_t, size_t>>* content) {
+    return laguna_render(turns, tools_json, thinking, err, content);
+}
+
 GenerateResult Engine::laguna_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
                                    bool enable_thinking, std::string_view tools_json, std::string_view /*reasoning_effort*/) {
     std::lock_guard<std::mutex> lk(laguna_mu_);
     GenerateResult r;
     for (const auto& t : turns) if (!t.images.empty()) { r.finish_reason = "error: laguna takes no images"; return r; }
     std::string err;
-    const std::string prompt = laguna_render(turns, tools_json, enable_thinking, err);
+    std::vector<std::pair<size_t, size_t>> content;   // known_bugs 45: the renderer's own request-text ranges
+    const std::string prompt = laguna_render(turns, tools_json, enable_thinking, err, &content);
     if (!err.empty()) { r.finish_reason = "error: " + err; return r; }
-    auto ids = laguna_->tok.encode(prompt, /*allow_special=*/true);
+    auto ids = laguna_->tok.encode(prompt, /*allow_special=*/true, content);   // a spelling in the request's text stays text
     // the template writes 〈|EOS|〉 (the BOS) itself: drop the tokenizer's own when it doubles it
     if (ids.size() > 1 && laguna_->tok.add_bos_token() && ids[0] == laguna_->tok.bos_token_id() && ids[1] == ids[0]) ids.erase(ids.begin());
     r = laguna_run(*laguna_, ids, sp, on_token);

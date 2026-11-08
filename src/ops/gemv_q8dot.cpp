@@ -556,6 +556,105 @@ sycl::event gemv_q4_K_q8s_grouped_dual(sycl::queue& q,
     });
 }
 
+// gemv_q4_K_q8s_grouped_dual with swiglu fused into the epilogue (2026-11-08, the decode host gap, option 1): one work-group
+// per (pick, 32-column strip) walks the gate AND the up column of each strip in the same block loop -- two independent
+// accumulators, each the dual kernel's exact chain -- and lane 0 writes h = silu(f16(g)) * f16(u) exactly as swiglu()
+// computes it from the dual kernel's f16 outputs. Bit-identical to dual + swiglu (ie-qwen4-bank-test); one launch and
+// one P x N f16 round trip fewer a MoE layer.
+sycl::event gemv_q4_K_q8s_grouped_dual_swiglu(sycl::queue& q,
+                         const void* x_q8s,
+                         const uint8_t* slot_base, uint64_t slot_bytes,
+                         uint64_t gate_off, uint64_t up_off,
+                         const int32_t* jobs,
+                         sycl::half* h_out,
+                         uint32_t K, uint32_t N, uint32_t P,
+                         const std::vector<sycl::event>& deps) {
+    constexpr int SG_SIZE  = 16;
+    constexpr int N_PER_WG = 32;
+    constexpr int WG_ITEMS = N_PER_WG * SG_SIZE;
+
+    const auto* X8 = static_cast<const block_q8_1s*>(x_q8s);
+    const uint32_t blocks_per_col = K / 256;
+    const uint32_t q8_blocks      = K / 32;
+    const uint32_t n_wgs = (N + N_PER_WG - 1) / N_PER_WG;
+
+    return ie::ps(q, "gemv_q4k_q8s_grp_sw", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::nd_range<1>(uint64_t(P) * n_wgs * WG_ITEMS, WG_ITEMS),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const uint32_t lid   = uint32_t(it.get_local_id(0));
+            const uint32_t gid   = uint32_t(it.get_group(0));
+            const uint32_t pk    = gid / n_wgs;
+            const uint32_t wgid  = gid % n_wgs;
+            const uint32_t sg_id = lid / SG_SIZE;
+            const uint32_t lane  = lid % SG_SIZE;
+            const uint32_t n     = wgid * N_PER_WG + sg_id;
+            if (n >= N) return;
+
+            const uint32_t vt   = uint32_t(jobs[pk * 3 + 0]);
+            const uint32_t slot = uint32_t(jobs[pk * 3 + 1]);
+            const block_q8_1s* xrow = X8 + uint64_t(vt) * q8_blocks;
+            const uint8_t* sb = slot_base + uint64_t(slot) * slot_bytes;
+            const auto* Wg = reinterpret_cast<const block_q4_K*>(sb + gate_off) + uint64_t(n) * blocks_per_col;
+            const auto* Wu = reinterpret_cast<const block_q4_K*>(sb + up_off)   + uint64_t(n) * blocks_per_col;
+
+            const int sub  = int(lane) >> 1;
+            const int half = int(lane) & 1;
+            const int g     = sub >> 1;
+            const int hi_nib = sub & 1;
+            const int qs_off = g * 32 + half * 16;
+            const int out_off = g * 64 + hi_nib * 32 + half * 16;
+            const int q4_shift = hi_nib ? 4 : 0;
+
+            // One Q4_K block of one column into one accumulator: gemv_q4_K_q8s_grouped_dual's loop body, verbatim.
+            const auto blk_dot = [&](const block_q4_K& blk, uint32_t b, float& acc) {
+                const auto hdr = *reinterpret_cast<const sycl::vec<uint32_t, 4>*>(&blk);
+                const auto hsc = [&](int j) {
+                    return uint8_t(hdr[1 + (j >> 2)] >> ((j & 3) * 8));
+                };
+                uint8_t s_raw, m_raw;
+                if (sub < 4) {
+                    s_raw = hsc(sub)     & 0x3F;
+                    m_raw = hsc(sub + 4) & 0x3F;
+                } else {
+                    s_raw = (hsc(sub + 4) & 0x0F) | ((hsc(sub - 4) >> 6) << 4);
+                    m_raw = (hsc(sub + 4) >>   4) | ((hsc(sub    ) >> 6) << 4);
+                }
+                const float d4  = dev_fp16_to_fp32(uint16_t(hdr[0] & 0xFFFFu)) * float(s_raw);
+                const float dm4 = dev_fp16_to_fp32(uint16_t(hdr[0] >> 16))     * float(m_raw);
+                const auto qv = *reinterpret_cast<const sycl::vec<uint32_t, 4>*>(&blk.qs[qs_off]);
+                const uint32_t q8_base = (uint32_t(b) * 256 + uint32_t(out_off));
+                const uint32_t q8_blk  = q8_base / 32;
+                const uint32_t q8_word = (q8_base % 32) / 4;
+                const block_q8_1s& xb = xrow[q8_blk];
+                const uint32_t* xqw = reinterpret_cast<const uint32_t*>(xb.qs);
+                int32_t idot = 0;
+                #pragma unroll
+                for (int w = 0; w < 4; ++w) {
+                    const uint32_t nib = (qv[w] >> q4_shift) & 0x0F0F0F0Fu;
+                    idot = ie::dp4a_us(nib, int32_t(xqw[q8_word + w]), idot);
+                }
+                const float sdot = xb.d * float(idot);
+                acc += d4 * sdot - dm4 * (half ? xb.s1 : xb.s0);
+            };
+            float acc_g = 0.f, acc_u = 0.f;
+            for (uint32_t b = 0; b < blocks_per_col; ++b) {
+                blk_dot(Wg[b], b, acc_g);
+                blk_dot(Wu[b], b, acc_u);
+            }
+            acc_g = sycl::reduce_over_group(it.get_sub_group(), acc_g, sycl::plus<float>());
+            acc_u = sycl::reduce_over_group(it.get_sub_group(), acc_u, sycl::plus<float>());
+            if (lane == 0) {
+                // swiglu() on the f16-rounded dual outputs, verbatim
+                const float gf = float(sycl::half(acc_g));
+                const float uf = float(sycl::half(acc_u));
+                const float s = gf / (1.f + sycl::native::exp(-gf));
+                h_out[uint64_t(pk) * N + n] = sycl::half(s * uf);
+            }
+        });
+    });
+}
+
 sycl::event gemv_q4_K_q8s_grouped_tiles(sycl::queue& q,
                          const void* x_q8s_mega,
                          const uint8_t* slot_base, uint64_t slot_bytes,

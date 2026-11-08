@@ -24,6 +24,7 @@
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace ie {
@@ -59,12 +60,22 @@ public:
     bool        is_special(int32_t id) const noexcept;
     std::string_view token_str(int32_t id) const noexcept;
     int32_t     find_token(std::string_view s) const noexcept;
+    // The special-token spellings encode() matches (for prompt_guard.hpp: which request texts need a content range).
+    std::vector<std::string_view> special_spellings() const;
 
     // Encode text → token IDs.
     //   `allow_special`: if true, recognize special-token literals like
     //   `<|im_start|>` in the input and emit them as their special IDs.
     //   If false, encode them as raw bytes (safer when input is user content).
     std::vector<int32_t> encode(std::string_view text, bool allow_special = true) const;
+    // The same, with `content` = the byte ranges of `text` that came from a request (system / user / assistant text, tool
+    // names, arguments and schemas, tool results): a special-token spelling inside them is plain text, never a control
+    // token -- the rule deepseek-recipe states for the official API, and known_bugs 45 (2026-11-04): with the whole render
+    // tokenised with specials on, a page a tool fetched could forge a turn, end the reasoning or open a tool-call block.
+    // The template's own specials outside the ranges encode as before, so a render whose content holds no spelling
+    // tokenises exactly as encode(text, true) does.
+    std::vector<int32_t> encode(std::string_view text, bool allow_special,
+                                std::span<const std::pair<size_t, size_t>> content) const;
 
     // Decode token IDs → text.
     //   `skip_special`: if true, omit special tokens from the output.
@@ -156,6 +167,11 @@ private:
     // tokenizer.json whose one Split is the Qwen2 pattern (MiMo-V2.6, docs/mimo26 P1 gate finding 1). The GGUF path
     // keeps the byte-level approximation of pretokenize_simple, byte for byte.
     bool        qwen2_unicode_ = false;
+    // "qwen35" (Qwen3.5 / 3.6 / 3.8 incl. Flash-Next, the Qwen 4 preview; llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN35, 2026-11-07):
+    // the qwen2 regex with \p{M} inside the letter runs ([^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+) and outside the punctuation
+    // runs ( ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*), over real Unicode classes (pretokenize_qwen35_unicode). Before this the
+    // GGUF path fell back to pretokenize_simple's byte split with a divergence warning.
+    bool        qwen35_        = false;
 
     // Diagnostic for an unimplemented tokenizer.ggml.pre (see pre_warning()).
     std::string pre_warning_;
@@ -244,13 +260,50 @@ struct ChatmlXmlTools {
 // "<function=". Never inspects the arch.
 ChatmlXmlTools chatml_xml_tools_from_template(std::string_view chat_template);
 
+// known_bugs 45 (2026-11-05): a rendered prompt with the byte ranges that are the request's own text. The template's
+// markers go in through add_text, the request's strings (message contents, reasoning, tool names, parameter names and
+// values, the tool schemas) through add_content; Tokenizer::encode(text, true, content) keeps a control-token spelling
+// inside a content range text. The V4.1 renderer's Piece (deepseek41_prompt.hpp) has the same shape.
+struct PromptPiece {
+    std::string text;
+    std::vector<std::pair<size_t, size_t>> content;
+    void add_text(std::string_view s) { text += s; }
+    void add_text(char c) { text += c; }
+    void add_content(std::string_view s) {
+        if (s.empty()) return;
+        const size_t b = text.size();
+        text += s;
+        if (!content.empty() && content.back().second == b) content.back().second = b + s.size();
+        else content.emplace_back(b, b + s.size());
+    }
+    // f's slice [a, b) appended: its text, and the content ranges inside it, shifted.
+    void add_piece(const PromptPiece& f, size_t a = 0, size_t b = std::string::npos) {
+        if (b > f.text.size()) b = f.text.size();
+        if (a >= b) return;
+        const size_t base = text.size();
+        text.append(f.text, a, b - a);
+        for (const auto& [rb, re] : f.content) {
+            const size_t cb = rb > a ? rb : a, ce = re < b ? re : b;
+            if (cb >= ce) continue;
+            const size_t nb = base + (cb - a), ne = base + (ce - a);
+            if (!content.empty() && content.back().second == nb) content.back().second = ne;
+            else content.emplace_back(nb, ne);
+        }
+    }
+};
+
+// `content`: when given, receives the request-text ranges of the returned prompt (PromptPiece above): every byte the
+// request brought -- contents (the leading vision sentinel run of a turn with images is the template's), reasoning, the
+// roles, tool-call names / parameter names / values, the tool schemas, the legacy <tool_call> blocks' JSON -- and none of
+// the template's markers. The text is the same with or without it.
 std::string build_chatml_prompt(std::span<const ChatTurn> turns,
                                 bool add_generation_prompt = true,
                                 bool enable_thinking      = true,
                                 std::string_view tools_json = {},
                                 bool model_has_think      = true,
                                 std::string_view reasoning_preamble = {},
-                                ChatmlXmlTools xml = {});
+                                ChatmlXmlTools xml = {},
+                                std::vector<std::pair<size_t, size_t>>* content = nullptr);
 
 // P4 B27: parse the model's tool calls back into OpenAI tool_calls. Only the text
 // from `answer_start` on is scanned (the reasoning generated before the model's
@@ -336,8 +389,12 @@ private:
 // BOS (<|begin_of_text|>) is NOT a template literal — add_bos_token=true
 // prepends it at encode(). No <think> convention; tools are NOT supported on
 // the llama path in v1 (Engine::chat errors if tools_json is non-empty).
+// Every renderer below takes `content` (known_bugs 45): when given, it receives the request-text ranges of the returned
+// prompt (PromptPiece above) -- the message contents, the roles, and for the families that render tools the tool-call
+// names / arguments and the schemas -- and none of the template's markers. The text is the same with or without it.
 std::string build_llama3_prompt(std::span<const ChatTurn> turns,
-                                bool add_generation_prompt = true);
+                                bool add_generation_prompt = true,
+                                std::vector<std::pair<size_t, size_t>>* content = nullptr);
 
 // Wave-1: Mistral / Nemo / Small + Devstral / Codestral chat template
 // (llama.cpp LLM_CHAT_TEMPLATE_MISTRAL_V*):
@@ -350,7 +407,8 @@ std::string build_llama3_prompt(std::span<const ChatTurn> turns,
 // No trailing generation token: the model continues right after [/INST].
 std::string build_mistral_prompt(std::span<const ChatTurn> turns,
                                  bool add_generation_prompt = true,
-                                 bool system_prompt_block   = false);
+                                 bool system_prompt_block = false,
+                                 std::vector<std::pair<size_t, size_t>>* content = nullptr);
 
 // Wave-1: DeepSeek-R1-Distill (Qwen2 & Llama) reasoning chat template. Uses the
 // fullwidth sentinels (U+FF5C bar) directly rather than ChatML:
@@ -362,7 +420,8 @@ std::string build_mistral_prompt(std::span<const ChatTurn> turns,
 // (R1 emits a reasoning trace), else the empty-think convention <think>\n\n</think>\n\n.
 std::string build_deepseek_prompt(std::span<const ChatTurn> turns,
                                   bool add_generation_prompt = true,
-                                  bool enable_thinking       = true);
+                                  bool enable_thinking       = true,
+                                  std::vector<std::pair<size_t, size_t>>* content = nullptr);
 
 // Phase 6: DeepSeek-V4-Flash (arch `deepseek4`). There is NO official jinja
 // template for this model — the authoritative encoder is the repo's
@@ -385,10 +444,14 @@ struct DeepSeek4ChatOptions {
     std::string_view reasoning_effort = "low";  // "low" | "high" | "max"; thinking only
     bool             add_bos          = true;   // encode_messages(add_default_bos_token)
     std::string_view tools_json;                // OpenAI `tools` array; empty → no tools
+    // The engine's image placeholder spelling (the token it put into a turn's content per image, Engine::chat): in a turn
+    // that carries images it is the template's text, never the request's (known_bugs 45). Empty = none.
+    std::string_view image_placeholder;
 };
 std::string build_deepseek4_prompt(std::span<const ChatTurn> turns,
                                    bool add_generation_prompt = true,
-                                   const DeepSeek4ChatOptions& opt = {});
+                                   const DeepSeek4ChatOptions& opt = {},
+                                   std::vector<std::pair<size_t, size_t>>* content = nullptr);
 
 // Phase 6: the matching output parser — a port of
 // `parse_message_from_completion_text()` / `parse_tool_calls()`. `text` is one
@@ -405,12 +468,14 @@ DeepSeek4Completion parse_deepseek4_completion(std::string_view text, bool think
 
 // IBM Granite-3.x: <|start_of_role|>{role}<|end_of_role|>{content}<|end_of_text|>
 std::string build_granite_prompt(std::span<const ChatTurn> turns,
-                                 bool add_generation_prompt = true);
+                                 bool add_generation_prompt = true,
+                                 std::vector<std::pair<size_t, size_t>>* content = nullptr);
 
 // Gemma 4: <|turn>{role}\n{content}<turn|>\n per turn (assistant→model);
 // <|turn>model\n to generate. BOS added by encode(); stop on <turn|>.
 std::string build_gemma_prompt(std::span<const ChatTurn> turns,
-                               bool add_generation_prompt = true);
+                               bool add_generation_prompt = true,
+                               std::vector<std::pair<size_t, size_t>>* content = nullptr);
 
 // gpt-oss (OpenAI Harmony). Emits the canned Harmony SYSTEM message (identity +
 // knowledge cutoff + current date + reasoning effort + valid channels); a caller
@@ -426,6 +491,7 @@ std::string build_gemma_prompt(std::span<const ChatTurn> turns,
 std::string build_harmony_prompt(std::span<const ChatTurn> turns,
                                  bool add_generation_prompt = true,
                                  std::string_view reasoning_effort = "low",
-                                 std::string_view tools_json = {});
+                                 std::string_view tools_json = {},
+                                 std::vector<std::pair<size_t, size_t>>* content = nullptr);
 
 }  // namespace ie

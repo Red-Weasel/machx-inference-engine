@@ -11,6 +11,7 @@
 #include "ie/ds41_vision.hpp"        // kDs41VisMaxTok (vision_status_json)
 #include "ie/prompt_cache_slots.hpp" // prompt_cache_slots_rule (/props "prompt_cache_slots", P4 B45 (3))
 #include "ie/dense_fleet_rules.hpp"  // dense_fleet_loads: one-card dense on the fleet class (2026-10-28, serving campaign P1)
+#include "ie/prompt_guard.hpp"       // known_bugs 45 (2026-11-05): the content ranges of a rendered chat prompt
 #include "../../third_party/nlohmann/json.hpp"
 #include "ie/reasoning.hpp"
 #include <future>
@@ -40,6 +41,17 @@
 #include <vector>
 
 namespace ie {
+
+// known_bugs 45 (2026-11-05): the content ranges of the chat prompt being served on THIS thread. Engine::chat sets them for
+// the families that render plain strings (prompt_guard.hpp finds them after the render) and clears them when it returns;
+// every encode of that prompt, or of a prefix of it, on the way to the forward goes through encode_served, which clips the
+// ranges to its text, so a control-token spelling inside the request's text stays text. Thread-local: a chat() and the
+// generate() / lanes entry it calls run on one server thread; a raw-prompt completion never sets them and tokenises as before.
+static thread_local std::vector<std::pair<size_t, size_t>> t_chat_guard;
+struct ChatGuardScope { ChatGuardScope() { t_chat_guard.clear(); } ~ChatGuardScope() { t_chat_guard.clear(); } };
+static std::vector<int32_t> encode_served(const Tokenizer& tok, std::string_view text) {
+    return tok.encode(text, /*allow_special=*/true, prompt_guard_clip(t_chat_guard, text.size()));
+}
 
 // DeepSeek-V4-Flash state. Opaque to engine.hpp (see the forward declaration
 // there) so the whole deepseek4 stack — model, both runtimes, expert cache —
@@ -2701,6 +2713,21 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                 const std::string fn = it->path().filename().string();
                 if (fn.rfind("mtp", 0) == 0 && fn.size() > 5 && fn.substr(fn.size() - 5) == ".gguf") { q4e_head = it->path().string(); break; }
             }
+            // 2026-11-07: unsloth's layout -- the heads in <repo>/MTP/ beside the quant folders (the "shared" file omits the
+            // embedding and lm_head the main model has; preferred), then the model's own nextn block (llama.cpp's export
+            // without --no-mtp). load_mtp binds the nextn layout (qwen4exp_mtp_nextn_block).
+            if (q4e_head.empty()) {
+                std::error_code ec2;
+                std::string first;
+                for (fs::directory_iterator it(fs::path(gguf_path).parent_path().parent_path() / "MTP", ec2), end; !ec2 && it != end; ++it) {
+                    const std::string fn = it->path().filename().string();
+                    if (fn.rfind("mtp", 0) != 0 || fn.size() <= 5 || fn.substr(fn.size() - 5) != ".gguf") continue;
+                    if (fn.find("shared") != std::string::npos) { q4e_head = it->path().string(); break; }
+                    if (first.empty()) first = it->path().string();
+                }
+                if (q4e_head.empty()) q4e_head = first;
+            }
+            if (q4e_head.empty() && ie::qwen4exp_mtp_nextn_block(e->gguf_) >= 0) q4e_head = gguf_path;
         }
         // 2026-10-23: the head is the DEFAULT at one request lane (v0.2.30); on the request lanes (--parallel > 1) it runs with
         // --spec (Dream's speculation toggle): its rounds give one conversation +10-26 % but its expert bank costs card 1
@@ -4774,7 +4801,7 @@ GenerateResult Engine::q35m_generate_lanes(const std::string& prompt, const Samp
                                            uint32_t cache_prefix_len, bool reply_cache, uint32_t shared_prefix_len, bool anchor,
                                            std::vector<QvisPendingImage>* imgs) {
     GenerateResult res;
-    const auto ids = tok_.encode(prompt, /*allow_special=*/true);
+    const auto ids = encode_served(tok_, prompt);
     res.prompt_tokens = uint32_t(ids.size());
     const uint32_t budget = opts_.max_ctx - 8;
     if (ids.size() >= budget) { res.finish_reason = "context_length_exceeded"; return res; }
@@ -5384,7 +5411,7 @@ GenerateResult Engine::generate(const std::string& prompt,
     auto& q = alloc_.queue();
     qvis_active_ = false;   // re-armed below iff this request carries images
     ds4_vis_active_ = false;
-    auto ids = tok_.encode(prompt, /*allow_special=*/true);
+    auto ids = encode_served(tok_, prompt);   // known_bugs 45: chat()'s content ranges when this is a chat, none for a raw prompt
     if (ds4_ && !ds4_pending_imgs_.empty()) {
         if (auto e = ds4_expand_vision(ids); !e.empty()) {
             ds4_pending_imgs_.clear();
@@ -7194,7 +7221,7 @@ GenerateResult Engine::q4e_generate_lanes(const std::string& prompt, const Sampl
                                           uint32_t cache_prefix_len, uint32_t shared_prefix_len,
                                           std::vector<QvisPendingImage>* imgs) {
     GenerateResult res;
-    const auto ids = tok_.encode(prompt, /*allow_special=*/true);
+    const auto ids = encode_served(tok_, prompt);
     res.prompt_tokens = uint32_t(ids.size());
     const uint32_t budget = opts_.max_ctx - 8;
     if (ids.size() >= budget) { res.finish_reason = "context_length_exceeded"; return res; }
@@ -7323,6 +7350,10 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
     if (arch_ == ModelArch::kMimo26) return mimo26_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
     if (arch_ == ModelArch::kLaguna) return laguna_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
     if (arch_ == ModelArch::kInkling) return inkling_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
+    // known_bugs 45 (2026-11-05): the request's own text never carries a control token. Every renderer below records the
+    // request's byte ranges as it renders (PromptPiece, tokenizer.hpp) and hands them to t_chat_guard, held for this thread
+    // until chat() returns; every encode on the way to the forward (encode_served) keeps a spelling inside them text.
+    ChatGuardScope guard_scope;
     // Vision guard: only the Qwen3.8 ChatML branch below (Flash-Next; P4 B45: the
     // 27B two-card split) consumes turn images; every other arch must refuse rather
     // than silently drop. Each refusal helper is the one /props "vision" reports.
@@ -7375,13 +7406,15 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
     }
     if (arch_ == ModelArch::kGlm5Next) {
         std::string error;
-        const std::string prompt=build_glm5_prompt(turns,enable_thinking,tools_json,error,reasoning_effort);
+        std::vector<std::pair<size_t, size_t>> glm5_content;
+        const std::string prompt=build_glm5_prompt(turns,enable_thinking,tools_json,error,reasoning_effort,&glm5_content);
         if(!error.empty()) { GenerateResult r;r.finish_reason="error: "+error;return r; }
+        t_chat_guard=std::move(glm5_content);   // known_bugs 45: the renderer's own ranges (history calls, tool results, schemas); never a refusal
         // the prompt cache's copy goes at the stable conversation boundary (the render without its generation suffix)
         uint32_t cache_prefix_len=0;
         if(prompt_cache_on_)
             if(const auto stable=glm5_stable_prefix(prompt,enable_thinking);!stable.empty())
-                cache_prefix_len=uint32_t(tok_.encode(stable,/*allow_special=*/true).size());
+                cache_prefix_len=uint32_t(encode_served(tok_,stable).size());
         auto r=generate(prompt,sp,on_token,cache_prefix_len);
         auto parsed=parse_glm5_completion(r.text,enable_thinking,tools_json);
         r.text=std::move(parsed.content);r.reasoning_content=std::move(parsed.reasoning);
@@ -7417,9 +7450,10 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
         // the turn text; generate() expands the placeholders into blocks.
         std::span<const ChatTurn> ds4_turns = turns;
         std::vector<ChatTurn> ds4_vis_turns;
+        std::string ph;   // the image placeholder spelling (the renderer keeps it the template's, known_bugs 45)
         if (has_images) {
             ds4_vis_turns.assign(turns.begin(), turns.end());
-            const std::string ph(tok_.token_str(kDs4ImagePlaceholderId));
+            ph = std::string(tok_.token_str(kDs4ImagePlaceholderId));
             for (auto& t : ds4_vis_turns) {
                 for (const auto& bytes : t.images) {
                     Ds4PendingImage im;
@@ -7455,6 +7489,7 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
         opt.thinking   = enable_thinking;
         opt.tools_json = tools_json;
         if(!reasoning_effort.empty())opt.reasoning_effort=reasoning_effort;
+        opt.image_placeholder = ph;
         //
         // Stable conversation boundary = the same render WITHOUT the trailing
         // generation prompt. That is the prefix the NEXT turn shares, so the
@@ -7462,15 +7497,16 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
         // re-prefilled fresh each turn. Without this the cache would only ever
         // reuse an EXACT full repeat — which no chat client ever sends. Mirrors
         // the chatml / harmony / gemma paths.
+        std::vector<std::pair<size_t, size_t>> ds4_content;   // known_bugs 45: the renderer's own ranges (tool history, schemas included)
+        const std::string full_ds4 = build_deepseek4_prompt(ds4_turns, /*add_generation_prompt=*/true, opt, &ds4_content);
+        t_chat_guard = std::move(ds4_content);
         uint32_t cache_prefix_len = 0;
         if (prompt_cache_on_ && !has_images) {   // vision requests never touch the cache
             const std::string stable =
                 build_deepseek4_prompt(ds4_turns, /*add_generation_prompt=*/false, opt);
-            cache_prefix_len = uint32_t(tok_.encode(stable, /*allow_special=*/true).size());
+            cache_prefix_len = uint32_t(encode_served(tok_, stable).size());
         }
-        GenerateResult res =
-            generate(build_deepseek4_prompt(ds4_turns, /*add_generation_prompt=*/true, opt),
-                     sp, on_token, cache_prefix_len);
+        GenerateResult res = generate(full_ds4, sp, on_token, cache_prefix_len);
         ds4_finish_completion(tok_, res, enable_thinking);
         return res;
     }
@@ -7484,9 +7520,10 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
             res.finish_reason = "error: tool calling not supported on the Mistral path (v1)";
             return res;
         }
-        return generate(build_mistral_prompt(turns, /*add_generation_prompt=*/true,
-                                             dcfg_.mistral_sysprompt != 0),
-                        sp, on_token);
+        std::vector<std::pair<size_t, size_t>> mi_content;   // known_bugs 45: the renderer's own ranges
+        const std::string full_mi = build_mistral_prompt(turns, /*add_generation_prompt=*/true, dcfg_.mistral_sysprompt != 0, &mi_content);
+        t_chat_guard = std::move(mi_content);
+        return generate(full_mi, sp, on_token);
     }
     if (tf == TF::kDeepSeek) {
         // DeepSeek-R1-Distill sentinel template (reasoning; emits <think>). Tools
@@ -7496,9 +7533,10 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
             res.finish_reason = "error: tool calling not supported on the DeepSeek path (v1)";
             return res;
         }
-        return generate(build_deepseek_prompt(turns, /*add_generation_prompt=*/true,
-                                              enable_thinking),
-                        sp, on_token);
+        std::vector<std::pair<size_t, size_t>> ds_content;   // known_bugs 45: the renderer's own ranges
+        const std::string full_ds = build_deepseek_prompt(turns, /*add_generation_prompt=*/true, enable_thinking, &ds_content);
+        t_chat_guard = std::move(ds_content);
+        return generate(full_ds, sp, on_token);
     }
     if (tf == TF::kGranite) {
         // Granite-3.x <|start_of_role|> turns. Tools not rendered (v1).
@@ -7507,8 +7545,10 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
             res.finish_reason = "error: tool calling not supported on the Granite path (v1)";
             return res;
         }
-        return generate(build_granite_prompt(turns, /*add_generation_prompt=*/true),
-                        sp, on_token);
+        std::vector<std::pair<size_t, size_t>> gr_content;   // known_bugs 45: the renderer's own ranges
+        const std::string full_gr = build_granite_prompt(turns, /*add_generation_prompt=*/true, &gr_content);
+        t_chat_guard = std::move(gr_content);
+        return generate(full_gr, sp, on_token);
     }
     if (arch_ == ModelArch::kGemma4) {
         // Gemma 4 <|turn>{role}\n…<turn|> turns. Tools not rendered (v1). BOS by encode().
@@ -7517,7 +7557,9 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
             res.finish_reason = "error: tool calling not supported on the Gemma path (v1)";
             return res;
         }
-        const std::string full = build_gemma_prompt(turns, /*add_generation_prompt=*/true);
+        std::vector<std::pair<size_t, size_t>> gemma_content;   // known_bugs 45: the renderer's own ranges
+        const std::string full = build_gemma_prompt(turns, /*add_generation_prompt=*/true, &gemma_content);
+        t_chat_guard = std::move(gemma_content);
         // Stable conversation boundary = the same render WITHOUT the trailing
         // generation prompt. That's the prefix the NEXT turn shares, so the VRAM-
         // guarded snapshot is taken there (the gen-prompt suffix is a few tokens,
@@ -7525,7 +7567,7 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
         uint32_t cache_prefix_len = 0;
         if (prompt_cache_on_) {
             const std::string stable = build_gemma_prompt(turns, /*add_generation_prompt=*/false);
-            cache_prefix_len = uint32_t(tok_.encode(stable, /*allow_special=*/true).size());
+            cache_prefix_len = uint32_t(encode_served(tok_, stable).size());
         }
         return generate(full, sp, on_token, cache_prefix_len);
     }
@@ -7536,15 +7578,17 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
         // prepends none for this GGUF). enable_thinking maps to the reasoning effort.
         const std::string_view effort = !reasoning_effort.empty()?reasoning_effort:
             enable_thinking ? "high" : "low";
+        std::vector<std::pair<size_t, size_t>> harmony_content;   // known_bugs 45: the renderer's own ranges (tool history, schemas included)
         const std::string full = build_harmony_prompt(turns, /*add_generation_prompt=*/true,
-                                                      effort, tools_json);
+                                                      effort, tools_json, &harmony_content);
+        t_chat_guard = std::move(harmony_content);
         // Stable boundary (no trailing assistant/analysis header) so the prompt cache
         // snapshots the shared prefix the next turn reuses — mirrors the chatml path.
         uint32_t cache_prefix_len = 0;
         if (prompt_cache_on_) {
             const std::string stable = build_harmony_prompt(turns, /*add_generation_prompt=*/false,
                                                             effort, tools_json);
-            cache_prefix_len = uint32_t(tok_.encode(stable, /*allow_special=*/true).size());
+            cache_prefix_len = uint32_t(encode_served(tok_, stable).size());
         }
         return generate(full, sp, on_token, cache_prefix_len);
     }
@@ -7558,7 +7602,10 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
             res.finish_reason = "error: tool calling not supported on the llama path (v1)";
             return res;
         }
-        return generate(build_llama3_prompt(turns, /*add_generation_prompt=*/true), sp, on_token);
+        std::vector<std::pair<size_t, size_t>> l3_content;   // known_bugs 45: the renderer's own ranges
+        const std::string full_l3 = build_llama3_prompt(turns, /*add_generation_prompt=*/true, &l3_content);
+        t_chat_guard = std::move(l3_content);
+        return generate(full_l3, sp, on_token);
     }
     // Inject the <think> block ONLY for reasoning models whose CHAT TEMPLATE uses
     // it. Qwen3-Coder HAS <think> tokens in vocab (151667/151668) but is a
@@ -7652,9 +7699,15 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
             }
         }
     }
+    // known_bugs 45: the ChatML renderer records the request's ranges as it renders (contents, reasoning, tool-call names /
+    // parameter names / values, the tool schemas; a turn's vision sentinel run stays the template's), so this family takes
+    // them exactly and never refuses a request. The stable and shared-prefix renders below are byte prefixes of `full`:
+    // encode_served clips the same ranges to them.
+    std::vector<std::pair<size_t, size_t>> chatml_content;
     const std::string full = build_chatml_prompt(render_turns, /*add_generation_prompt=*/true,
                                                  enable_thinking, tools_json, model_has_think,
-                                                 effort_preamble, xml_tools);
+                                                 effort_preamble, xml_tools, &chatml_content);
+    t_chat_guard = std::move(chatml_content);
     // Stable conversation boundary = the same render WITHOUT the generation prompt /
     // think suffix. That's the prefix the NEXT turn shares, so the prompt cache snapshots
     // there (the gen-prompt/think suffix is re-prefilled fresh each turn — a few tokens).
@@ -7663,7 +7716,7 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
         const std::string stable = build_chatml_prompt(render_turns, /*add_generation_prompt=*/false,
                                                        enable_thinking, tools_json, model_has_think,
                                                        effort_preamble, xml_tools);
-        cache_prefix_len = uint32_t(tok_.encode(stable, /*allow_special=*/true).size());
+        cache_prefix_len = uint32_t(encode_served(tok_, stable).size());
     }
     // P4 B15: the SHARED prefix = the leading system turn(s) + the tools block (rendered alone, no generation prompt): what
     // every conversation with the same system prompt and tools shares. Used only when its tokens are a strict prefix of this
@@ -7676,8 +7729,8 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
             const std::string sys = build_chatml_prompt(render_turns.subspan(0, n_sys), /*add_generation_prompt=*/false,
                                                         enable_thinking, tools_json, model_has_think, effort_preamble,
                                                         xml_tools);
-            const auto sys_ids = tok_.encode(sys, /*allow_special=*/true);
-            const auto full_ids = tok_.encode(full, /*allow_special=*/true);
+            const auto sys_ids = encode_served(tok_, sys);
+            const auto full_ids = encode_served(tok_, full);
             shared_prefix_len = shared_prefix_accept(sys_ids, full_ids, shared_prefix_min(std::getenv("IE_SHARED_PREFIX_MIN")));
         }
     }

@@ -112,12 +112,29 @@ void test_step_qstar() {   // P4 B19: the lanes' PCIe share (IE_DS41_QSTAR_LANES
     check(ds41_step_qstar(0.60f, 0.60f, 1, 3) == 0.60f, "qstar: equal to the tier's: nothing changes");
 }
 
+void test_ranking_choice() {   // 2026-11-04: the served-traffic profile outranks the September chat ranking once it is big enough
+    using ie::ds41_choose_ranking; using ie::ds41_profile_generated_tokens;
+    const std::string dir = "/m";
+    check(ds41_choose_ranking("/x/r.txt", "/c/p.txt", 870266, 100000, true, dir).path == "/x/r.txt", "ranking: IE_DS41_RANKING wins over everything");
+    check(ds41_choose_ranking("", "/c/p.txt", 870266, 100000, true, dir).path == "/c/p.txt", "ranking: an empty IE_DS41_RANKING is unset; the served profile with 870K tokens wins over the chat ranking");
+    check(ds41_choose_ranking(nullptr, "/c/p.txt", 3813, 100000, true, dir).path == "/m/ie_ranking_decode_chat.txt", "ranking: a served profile of 3,813 tokens is below the floor: the chat ranking");
+    check(ds41_choose_ranking(nullptr, "/c/p.txt", 100000, 100000, true, dir).path == "/c/p.txt", "ranking: exactly the floor counts");
+    check(ds41_choose_ranking(nullptr, "/c/p.txt", 0, 100000, false, dir).path == "/m/ie_ranking_heldout.txt", "ranking: no usable profile, no chat ranking: the held-out profile");
+    check(ds41_choose_ranking(nullptr, nullptr, 0, 100000, true, dir).path == "/m/ie_ranking_decode_chat.txt", "ranking: no profile env: the chat ranking");
+    check(std::string(ds41_choose_ranking(nullptr, "/c/p.txt", 870266, 100000, true, dir).why).find("served") != std::string::npos, "ranking: the choice says why");
+    check(ds41_profile_generated_tokens("# ds4-expert-priority 1\n# V4.1 DECODE-PHASE profile from served requests (IE_DS41_PROFILE_OUT): 870266 generated tokens\n# total selections 222281280\n") == 870266, "profile header: the generated-token count");
+    check(ds41_profile_generated_tokens("# ds4-expert-priority 1\n# V4.1 DECODE-PHASE profile from REAL text: 512 prompt tokens, 3813 generated tokens\n") == 3813, "profile header: a run tool's profile counts too");
+    check(ds41_profile_generated_tokens("# ds4-expert-priority 1\nexperts 384\n") == 0, "profile header: no such line = 0");
+    check(ds41_profile_generated_tokens("") == 0 && ds41_profile_generated_tokens(" generated tokens") == 0, "profile header: empty and a count-less line = 0");
+}
+
 int main() {
     test_reply_room();
     test_continuation();
     test_reply_budget();
     test_static_tier();
     test_step_qstar();
+    test_ranking_choice();
     std::printf("\nDS41 SERVE RULES: %s\n", g_fail ? "FAILURE(S)" : "PASS");
     return g_fail ? 1 : 0;
 }

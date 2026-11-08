@@ -252,7 +252,13 @@ int main(int argc, char** argv) {
 
     std::printf("\n\033[1m6. size + dtype coverage (informational)\033[0m\n");
     const double gib = bytes_total / 1073741824.0;
-    check(gib > 103.0 && gib < 104.5, "total size within 103.0-104.5 GiB (card: 111 GB)");
+    // The 103.0-104.5 GiB window is the daily UD-Q4_K_XL's (general.file_type 15); another build's size is reported, not
+    // judged (2026-11-07: Unsloth's UD-Q6_K_XL, file_type 18, is 157.5 GiB -- 97 GiB of Q8_0 down banks + dense, 60 GiB of
+    // Q6_K gate/up banks; it passes every structural check above).
+    const auto* ft = g.find_kv("general.file_type");
+    if (ft && ft->as_uint() == 15) check(gib > 103.0 && gib < 104.5, "total size within 103.0-104.5 GiB (UD-Q4_K_XL; card: 111 GB)");
+    else std::printf("  [info] total size %.3f GiB (file_type %llu; the 103.0-104.5 GiB window is the UD-Q4_K_XL's)\n",
+                     gib, ft ? (unsigned long long)ft->as_uint() : 0ull);
     std::printf("      total %.3f GiB across %zu dtypes:\n", gib, by_dtype.size());
     for (const auto& [dt, cnt] : by_dtype)
         std::printf("        %-8s %4zu tensors  %9.3f GiB\n",

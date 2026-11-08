@@ -321,6 +321,35 @@ int main() {
             check(bad == 0, "combine inj=0: res + block_out bit-exact (w=1)");
         }
 
+        // ---- COMBINE + NORM fused (2026-11-08): res, xn, mixed, inj bit-identical to combine then mix_v2 ----------
+        {
+            float* d_resA = dcopy(q, res); float* d_resB = dcopy(q, res);
+            float* d_xnA = sycl::malloc_device<float>(size_t(T) * D, q);
+            float* d_xnB = sycl::malloc_device<float>(size_t(T) * D, q);
+            float* d_loA = sycl::malloc_device<float>(size_t(T) * R, q);
+            float* d_loB = sycl::malloc_device<float>(size_t(T) * R, q);
+            sycl::half* d_mA = sycl::malloc_device<sycl::half>(size_t(T) * H, q);
+            sycl::half* d_mB = sycl::malloc_device<sycl::half>(size_t(T) * H, q);
+            float* d_iA = sycl::malloc_device<float>(size_t(T) * HC, q);
+            float* d_iB = sycl::malloc_device<float>(size_t(T) * HC, q);
+            qwen4_hc_combine(q, d_resA, d_blk, d_injc, T, H, HC).wait();
+            qwen4_hc_mix_v2(q, d_resA, d_gamma, d_wdown, d_wup, d_winj, d_xnA, d_loA, d_mA, d_iA, T, H, HC, R, EPS).wait();
+            qwen4_hc_combine_norm(q, d_resB, d_blk, d_injc, d_gamma, d_xnB, T, H, HC, EPS).wait();
+            qwen4_hc_mix_v2_xn(q, d_xnB, d_wdown, d_wup, d_winj, d_loB, d_mB, d_iB, T, H, HC, R).wait();
+            auto same = [&](const void* a, const void* b, size_t bytes) {
+                std::vector<uint8_t> ha(bytes), hb(bytes);
+                q.memcpy(ha.data(), a, bytes).wait(); q.memcpy(hb.data(), b, bytes).wait();
+                return std::memcmp(ha.data(), hb.data(), bytes) == 0;
+            };
+            check(same(d_resA, d_resB, res.size() * sizeof(float)), "combine+norm fused: res bit-identical to combine");
+            check(same(d_xnA, d_xnB, size_t(T) * D * sizeof(float)), "combine+norm fused: xn bit-identical to combine then norm");
+            check(same(d_mA, d_mB, size_t(T) * H * sizeof(sycl::half)) && same(d_iA, d_iB, size_t(T) * HC * sizeof(float)),
+                  "combine+norm fused: mix_v2_xn mixed + inj bit-identical to mix_v2");
+            sycl::free(d_resA, q); sycl::free(d_resB, q); sycl::free(d_xnA, q); sycl::free(d_xnB, q);
+            sycl::free(d_loA, q); sycl::free(d_loB, q); sycl::free(d_mA, q); sycl::free(d_mB, q);
+            sycl::free(d_iA, q); sycl::free(d_iB, q);
+        }
+
         // ---- expand_streams ------------------------------------------------
         std::vector<sycl::half> emb(size_t(T) * H);
         for (auto& v : emb) v = sycl::half(rf(-1.f, 1.f));

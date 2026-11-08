@@ -212,6 +212,78 @@ sycl::event qwen4_hc_combine(sycl::queue& q,
 }
 
 
+// COMBINE + the following mix's L1 norm in one launch (2026-11-08, the decode host gap): one WG of 128 lanes per (t, s)
+// stream row does the combine's fma on its row (four elements a lane, elementwise), the norm's split-H sum of squares over
+// the SAME values with the SAME lane striding and 8-partial SLM sum (qwen4_hc_norm_l1's), and writes xn = res * rs * gamma
+// (four a lane, elementwise) -- bit-identical to qwen4_hc_combine followed by qwen4_hc_norm_l1, one launch fewer. The
+// first form did all three passes with the norm's scalar striding and measured 14.6 us against 4 + 9.8 for the pair.
+sycl::event qwen4_hc_combine_norm(sycl::queue& q,
+                                  float* res, const sycl::half* block_out,
+                                  const float* inj_logits, const float* gamma,
+                                  float* xn_ws,
+                                  uint32_t T, uint32_t H, uint32_t hc, float eps,
+                                  const std::vector<sycl::event>& deps) {
+    const uint32_t D = hc * H;
+    const float inv_hc = 1.f / float(hc);
+    constexpr int SG = 16;
+    return ie::ps(q, "q4hc_combine_norm", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        sycl::local_accessor<float, 1> part(8, h);
+        h.parallel_for(sycl::nd_range<1>(uint64_t(T) * hc * 128, 128),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const uint32_t row = uint32_t(it.get_group(0));
+            const uint32_t lid = uint32_t(it.get_local_id(0));
+            const uint32_t t = row / hc, s = row % hc;
+            const float w = 2.f * sigmoid_f(inj_logits[uint64_t(t) * hc + s] * inv_hc);
+            float* xr = res + uint64_t(row) * H;
+            const sycl::half* bo = block_out + uint64_t(t) * H;
+            float* o = xn_ws + uint64_t(t) * D + uint64_t(s) * H;
+            const float* gm = gamma + uint64_t(s) * H;
+            const bool v4 = (H % 8u) == 0;   // every row start is then 16-byte aligned (USM allocations are)
+            // phase 1: qwen4_hc_combine's element, four a lane (elementwise: the order is free)
+            if (v4) {
+                auto* xr4 = reinterpret_cast<sycl::vec<float, 4>*>(xr);
+                const auto* bo4 = reinterpret_cast<const sycl::vec<sycl::half, 4>*>(bo);
+                for (uint32_t i4 = lid; i4 < H / 4; i4 += 128) {
+                    sycl::vec<float, 4> v = xr4[i4];
+                    const sycl::vec<sycl::half, 4> b = bo4[i4];
+                    #pragma unroll
+                    for (int k = 0; k < 4; ++k) v[k] = sycl::fma(w, float(b[k]), v[k]);
+                    xr4[i4] = v;
+                }
+            } else {
+                for (uint32_t i = lid; i < H; i += 128) xr[i] = sycl::fma(w, float(bo[i]), xr[i]);
+            }
+            sycl::group_barrier(it.get_group());
+            // phase 2: qwen4_hc_norm_l1's sum of squares -- its lane striding, its 8-partial order (the bit-identity contract)
+            float p = 0.f;
+            for (uint32_t i = lid; i < H; i += 128) p += xr[i] * xr[i];
+            auto sg = it.get_sub_group();
+            const float ps2 = sycl::reduce_over_group(sg, p, sycl::plus<float>());
+            if (sg.get_local_id()[0] == 0) part[sg.get_group_id()[0]] = ps2;
+            sycl::group_barrier(it.get_group());
+            float ss = 0.f;
+            for (int j = 0; j < 8; ++j) ss += part[j];
+            const float rs = sycl::rsqrt(ss / float(H) + eps);
+            // phase 3: the normed write, four a lane (elementwise: xr[i] * rs * gm[i], the norm's expression)
+            if (v4) {
+                const auto* xr4 = reinterpret_cast<const sycl::vec<float, 4>*>(xr);
+                const auto* gm4 = reinterpret_cast<const sycl::vec<float, 4>*>(gm);
+                auto* o4 = reinterpret_cast<sycl::vec<float, 4>*>(o);
+                for (uint32_t i4 = lid; i4 < H / 4; i4 += 128) {
+                    const sycl::vec<float, 4> v = xr4[i4], g = gm4[i4];
+                    sycl::vec<float, 4> r;
+                    #pragma unroll
+                    for (int k = 0; k < 4; ++k) r[k] = v[k] * rs * g[k];
+                    o4[i4] = r;
+                }
+            } else {
+                for (uint32_t i = lid; i < H; i += 128) o[i] = xr[i] * rs * gm[i];
+            }
+        });
+    });
+}
+
 // L1 (shared by v2 and the prefill mix): WG of 8 subgroups per (t, s) stream
 // row — split-H sumsq reduced in SLM, then a cooperative normalize+gamma
 // write. (One subgroup per row left the GPU ~4 WGs at T=1.)
@@ -352,18 +424,13 @@ static sycl::event q4hc2_up_v3(sycl::queue& q, sycl::event e2,
     });
 }
 
-sycl::event qwen4_hc_mix_v2(sycl::queue& q,
-                            const float* x, const float* gamma,
-                            const sycl::half* w_down, const sycl::half* w_up,
-                            const float* w_inject,
-                            float* xn_ws, float* lo_ws,
-                            sycl::half* mixed, float* inj_logits,
-                            uint32_t T, uint32_t H, uint32_t hc, uint32_t r,
-                            float eps,
-                            const std::vector<sycl::event>& deps) {
+// The mix after the norm (L2 + L3; the v3 grids at T <= 4): qwen4_hc_mix_v2's tail, shared with qwen4_hc_mix_v2_xn.
+static sycl::event mix_v2_tail(sycl::queue& q, sycl::event e1,
+                               const sycl::half* w_down, const sycl::half* w_up, const float* w_inject,
+                               const float* xn_ws, float* lo_ws, sycl::half* mixed, float* inj_logits,
+                               uint32_t T, uint32_t H, uint32_t hc, uint32_t r) {
     const uint32_t D = hc * H;
     constexpr int SG = 16;
-    auto e1 = qwen4_hc_norm_l1(q, x, gamma, xn_ws, T, H, hc, eps, deps);
     static const bool v3_on = [] {
         const char* v = std::getenv("IE_Q4E_HC_V3");
         return !(v && v[0] == '0');
@@ -456,6 +523,30 @@ sycl::event qwen4_hc_mix_v2(sycl::queue& q,
             mixed[uint64_t(t) * H + hh] = sycl::half(m / float(hc));
         });
     });
+}
+
+sycl::event qwen4_hc_mix_v2(sycl::queue& q,
+                            const float* x, const float* gamma,
+                            const sycl::half* w_down, const sycl::half* w_up,
+                            const float* w_inject,
+                            float* xn_ws, float* lo_ws,
+                            sycl::half* mixed, float* inj_logits,
+                            uint32_t T, uint32_t H, uint32_t hc, uint32_t r,
+                            float eps,
+                            const std::vector<sycl::event>& deps) {
+    auto e1 = qwen4_hc_norm_l1(q, x, gamma, xn_ws, T, H, hc, eps, deps);
+    return mix_v2_tail(q, e1, w_down, w_up, w_inject, xn_ws, lo_ws, mixed, inj_logits, T, H, hc, r);
+}
+
+sycl::event qwen4_hc_mix_v2_xn(sycl::queue& q,
+                               const float* xn_ws,
+                               const sycl::half* w_down, const sycl::half* w_up,
+                               const float* w_inject,
+                               float* lo_ws, sycl::half* mixed, float* inj_logits,
+                               uint32_t T, uint32_t H, uint32_t hc, uint32_t r,
+                               const std::vector<sycl::event>& deps) {
+    const sycl::event e1 = deps.empty() ? sycl::event{} : q.ext_oneapi_submit_barrier(deps);
+    return mix_v2_tail(q, e1, w_down, w_up, w_inject, xn_ws, lo_ws, mixed, inj_logits, T, H, hc, r);
 }
 
 sycl::event qwen4_hc_mix_prefill(sycl::queue& q,

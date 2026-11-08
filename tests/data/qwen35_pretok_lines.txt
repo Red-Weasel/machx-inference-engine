@@ -1,0 +1,30 @@
+Hello world, this is a plain ASCII line.
+I'm sure they'd've said we're fine; it's John's 'quoted' text.
+Numbers 12345 and 3.14159 and 1,000,000 and 2026-11-07 and 0x1F.
+Tiếng Việt có dấu: Hà Nội, Đà Nẵng, Thành phố Hồ Chí Minh.
+Tiếng Việt decomposed: Tiếng Việt Hà Nội
+नमस्ते दुनिया, यह एक परीक्षण है। क्या आप ठीक हैं?
+สวัสดีครับ ผมชื่อสมชาย วันนี้อากาศดีมาก
+مَرْحَبًا بِالْعَالَمِ، كَيْفَ حَالُكَ؟
+é decomposed: Café resumé naïve
+I love this ❤️ 👍🏽 🇫🇷 👨‍👩‍👧 ✨ emoji sequence
+日本語のテキスト。これはテストです！「引用」と（括弧）
+中文测试：你好，世界！今天天气很好。
+한국어 테스트입니다. 안녕하세요, 세계!
+Русский текст с ё и й: Привет, мир!
+Ελληνικά: Καλημέρα κόσμε, τί κάνεις;
+עברית עם ניקוד: שָׁלוֹם עוֹלָם
+def f(x):\n    return x**2  # comment\n\tprint(f'{x!r}')
+tabs\tand   multiple    spaces\n\nand blank lines\r\nwith CRLF
+<|im_start|>user\nmarkup-like text <tool_call> {"a": 1} </tool_call>
+Mixed: abc123def 42abc mañana piñata über straße ÆØÅ æøå
+Punctuation runs: !!! ??? ... --- *** ~~~ ((( ))) [[ ]] {{ }}
+Math: ∑∞ ≠ ≤ ≥ ± × ÷ √ ∫ π ≈ ∆ Ω
+Currency: $100 €50 £20 ¥1000 ₹500 ₩2000
+Zero-width: a​b c‍d e
+Combining heavy: à́̂̃ x̄ q̃ š
+Devanagari matras: कि की कु कू के कै को कौ कं कः
+Thai marks: กำ ก่ ก้ ก๊ ก๋ กั กิ กี กึ กื กุ กู
+Emoji keycaps and flags: 1️⃣ 2️⃣ #️⃣ 🇺🇸 🇯🇵 🏳️‍🌈
+URLs and paths: https://example.com/a/b?c=1&d=2 /usr/local/bin C:\\Users\\x
+Mark after symbol: ✓́ and mark alone: ́ and ZWJ chain 👩‍💻

@@ -181,7 +181,8 @@ struct Mimo26Bundle {
 
 // P6.2: the turn's text with `<|vision_start|><|image_pad|><|vision_end|>` per image -- where the server's
 // kChatImageMarker sits when the markers match the images, else all of them in front (V4.1's rule).
-std::string mimo26_place_images(std::string text, size_t n_images);
+// `at`: the byte offsets of the placeholders it put in (Mimo26Message::image_at): the template's text, not the request's.
+std::string mimo26_place_images(std::string text, size_t n_images, std::vector<size_t>* at = nullptr);
 // The id of an image position: negative, and a function of the image's bytes and the slot -- two images never share a
 // prefix in the prompt cache, the same image at the same place always does (V4.1's ds41_image_id).
 int32_t mimo26_image_id(uint64_t image_hash, uint32_t slot);
@@ -193,9 +194,13 @@ inline uint64_t mimo26_image_max_px(uint32_t tokens) { return uint64_t(tokens) *
 // separator between them, assistant turns as <think>{reasoning}</think>{content}{tool calls} (calls as
 // <tool_call><function=NAME><parameter=K>V</parameter>...</function></tool_call>), and the generation prompt
 // "<|im_start|>assistant\n" + "<think>" (thinking: the model's own first token, primed) or "<think></think>".
-struct Mimo26Message { std::string role, content, reasoning, tool_calls_json; };
+// `image_at`: the offsets in `content` of the engine's image placeholders (mimo26_place_images): rendered as the template's
+// text; everything else of the content is the request's. `content` (known_bugs 45): when given, receives the request-text
+// ranges of the returned prompt (PromptPiece, tokenizer.hpp): contents, reasoning, the roles, tool-call names / parameter
+// names / values, the tool schemas -- and none of the template's markers. The text is the same with or without it.
+struct Mimo26Message { std::string role, content, reasoning, tool_calls_json; std::vector<size_t> image_at; };
 std::string mimo26_render_chat(const std::vector<Mimo26Message>& msgs, const std::string& tools_json, bool add_generation_prompt,
-                               bool thinking, std::string& err);
+                               bool thinking, std::string& err, std::vector<std::pair<size_t, size_t>>* content = nullptr);
 // Python json.dumps(x, ensure_ascii=False) (the template's tojson): ", " and ": " separators, keys in order.
 std::string mimo26_tojson(const std::string& json_text, std::string& err);
 

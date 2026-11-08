@@ -12,6 +12,7 @@
 
 #include "ie/deepseek41_generate.hpp"   // Ds41Generator::sample (the host sampler the other dir runtimes use)
 #include "ie/inkling_engine.hpp"
+#include "ie/tokenizer.hpp"   // PromptPiece (known_bugs 45)
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
@@ -160,9 +161,10 @@ GenerateResult inkling_run(InklingBundle& b, const std::vector<int32_t>& ids, co
 }  // namespace
 
 std::string inkling_render_prompt(std::span<const ChatTurn> turns, std::string_view tools_json, bool thinking, std::string_view effort,
-                           std::string& err) {
-    std::string out, eff;
+                           std::string& err, std::vector<std::pair<size_t, size_t>>* content_out) {
+    std::string eff;
     if (!effort_text(effort, thinking, eff, err)) return {};
+    PromptPiece out;
     auto role_token = [](const std::string& r) -> const char* {
         if (r == "user") return "<|message_user|>";
         if (r == "assistant") return "<|message_model|>";
@@ -174,7 +176,7 @@ std::string inkling_render_prompt(std::span<const ChatTurn> turns, std::string_v
         const json tools = json::parse(tools_json, nullptr, false);
         if (tools.is_discarded() || !tools.is_array()) { err = "inkling: tools must be a JSON array"; return {}; }
         if (!tools.empty()) {
-            out += "<|message_system|>tool_declare<|content_xml|>[";
+            out.add_text("<|message_system|>tool_declare<|content_xml|>[");
             bool first = true;
             for (const auto& t : tools) {
                 const json fn = t.contains("function") && t["function"].is_object() ? t["function"] : json::object();
@@ -182,12 +184,12 @@ std::string inkling_render_prompt(std::span<const ChatTurn> turns, std::string_v
                 const json params = fn.contains("parameters") && !fn["parameters"].is_null() && !fn["parameters"].empty() ? fn["parameters"] : json::object();
                 const json name = fn.contains("name") ? fn["name"] : json(nullptr);
                 const json type = t.contains("type") ? t["type"] : json("function");
-                if (!first) out += ",";
+                if (!first) out.add_text(",");
                 first = false;
-                out += "{\"description\":" + canon(desc) + ",\"name\":" + canon(name) + ",\"parameters\":" + canon(params) +
-                       ",\"type\":" + canon(type) + "}";
+                out.add_text("{\"description\":"); out.add_content(canon(desc)); out.add_text(",\"name\":"); out.add_content(canon(name));
+                out.add_text(",\"parameters\":"); out.add_content(canon(params)); out.add_text(",\"type\":"); out.add_content(canon(type)); out.add_text("}");
             }
-            out += "]<|end_message|>";
+            out.add_text("]<|end_message|>");
         }
     }
     size_t first_idx = turns.size();
@@ -197,7 +199,7 @@ std::string inkling_render_prompt(std::span<const ChatTurn> turns, std::string_v
     for (size_t i = 0; i < turns.size(); ++i) {
         const ChatTurn& m = turns[i];
         if (!m.images.empty()) { err = "inkling: this engine takes no images for Inkling"; return {}; }
-        if (!emitted && i == first_idx) { out += effort_msg; emitted = true; }
+        if (!emitted && i == first_idx) { out.add_text(effort_msg); emitted = true; }
         if (m.role == "tool") {
             std::string name;
             if (!m.tool_call_id.empty())                      // the name from the call this result answers
@@ -210,17 +212,18 @@ std::string inkling_render_prompt(std::span<const ChatTurn> turns, std::string_v
                             c["function"].contains("name") && c["function"]["name"].is_string())
                             name = c["function"]["name"].get<std::string>();
                 }
-            out += "<|message_tool|>" + name + "<|content_text|>" + m.content + "<|end_message|>";
+            out.add_text("<|message_tool|>"); out.add_content(name); out.add_text("<|content_text|>"); out.add_content(m.content); out.add_text("<|end_message|>");
             continue;
         }
         const char* rt = role_token(m.role);
         if (!rt) { err = "inkling: unknown message role '" + m.role + "'"; return {}; }
-        std::string turn;
+        PromptPiece turn;
         const bool model = m.role == "assistant";
-        if (model && m.reasoning_content && !m.reasoning_content->empty())
-            turn += "<|message_model|><|content_thinking|>" + *m.reasoning_content + "<|end_message|>";
+        if (model && m.reasoning_content && !m.reasoning_content->empty()) {
+            turn.add_text("<|message_model|><|content_thinking|>"); turn.add_content(*m.reasoning_content); turn.add_text("<|end_message|>");
+        }
         const std::string content = model ? m.content_without_tool_calls.value_or(m.content) : m.content;
-        if (!content.empty()) turn += std::string(rt) + "<|content_text|>" + content + "<|end_message|>";
+        if (!content.empty()) { turn.add_text(rt); turn.add_text("<|content_text|>"); turn.add_content(content); turn.add_text("<|end_message|>"); }
         if (model && !m.tool_calls_json.empty()) {
             const json calls = json::parse(m.tool_calls_json, nullptr, false);
             if (calls.is_discarded() || !calls.is_array()) { err = "inkling: an assistant turn's tool_calls is not a JSON array"; return {}; }
@@ -241,16 +244,17 @@ std::string inkling_render_prompt(std::span<const ChatTurn> turns, std::string_v
                     }
                 }
                 const std::string name = fn["name"].get<std::string>();
-                turn += "<|message_model|>" + name + "<|content_invoke_tool_json|>{\"name\":" + canon(json(name)) + ",\"args\":" + args +
-                        "}<|end_message|>";
+                turn.add_text("<|message_model|>"); turn.add_content(name); turn.add_text("<|content_invoke_tool_json|>{\"name\":");
+                turn.add_content(canon(json(name))); turn.add_text(",\"args\":"); turn.add_content(args); turn.add_text("}<|end_message|>");
             }
         }
-        out += turn;
-        if (model && !turn.empty()) out += "<|content_model_end_sampling|>";
+        out.add_piece(turn);
+        if (model && !turn.text.empty()) out.add_text("<|content_model_end_sampling|>");
     }
-    if (!emitted) out += effort_msg;
-    out += "<|message_model|>";
-    return out;
+    if (!emitted) out.add_text(effort_msg);
+    out.add_text("<|message_model|>");
+    if (content_out) *content_out = std::move(out.content);
+    return std::move(out.text);
 }
 
 InklingReply inkling_parse_reply(std::string_view raw) {
@@ -349,9 +353,10 @@ GenerateResult Engine::inkling_chat(std::span<const ChatTurn> turns, const Sampl
     std::lock_guard<std::mutex> lk(inkling_mu_);
     GenerateResult r;
     std::string err;
-    const std::string prompt = inkling_render_prompt(turns, tools_json, enable_thinking, reasoning_effort, err);
+    std::vector<std::pair<size_t, size_t>> content;   // known_bugs 45: the renderer's own request-text ranges
+    const std::string prompt = inkling_render_prompt(turns, tools_json, enable_thinking, reasoning_effort, err, &content);
     if (!err.empty()) { r.finish_reason = "error: " + err; return r; }
-    auto ids = inkling_->tok.encode(prompt, /*allow_special=*/true);
+    auto ids = inkling_->tok.encode(prompt, /*allow_special=*/true, content);   // a spelling in the request's text stays text
     r = inkling_run(*inkling_, ids, sp, on_token, true, enable_thinking);
     if (r.finish_reason == "stop" || r.finish_reason == "length") {
         InklingReply pr = inkling_parse_reply(r.text);

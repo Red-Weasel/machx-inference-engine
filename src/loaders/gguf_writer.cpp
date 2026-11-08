@@ -59,6 +59,12 @@ void GgufWriter::kv_i32_array(const std::string& k, const std::vector<int32_t>& 
     for (int32_t x : v) put<int32_t>(body, x);
     kvs_.push_back({k, std::move(body)});
 }
+void GgufWriter::kv_bool_array(const std::string& k, const std::vector<bool>& v) {
+    std::vector<uint8_t> body;
+    put<uint32_t>(body, GT_ARRAY); put<uint32_t>(body, GT_BOOL); put<uint64_t>(body, v.size());
+    for (bool x : v) put<uint8_t>(body, x ? 1 : 0);
+    kvs_.push_back({k, std::move(body)});
+}
 void GgufWriter::kv_f32_array(const std::string& k, const std::vector<float>& v) {
     std::vector<uint8_t> body;
     put<uint32_t>(body, GT_ARRAY); put<uint32_t>(body, GT_F32); put<uint64_t>(body, v.size());

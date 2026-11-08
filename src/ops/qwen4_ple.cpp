@@ -9,6 +9,7 @@
 #include <sycl/sycl.hpp>
 
 #include <cmath>
+#include <cstring>
 
 namespace ie {
 
@@ -55,13 +56,30 @@ std::string qwen4_ple_gather(const void* table, DType dt,
     const uint32_t rb = qwen4_ple_row_bytes(dt);
     if (rb == 0)
         return std::string("qwen4exp PLE: per_layer_token_embd.weight is ") + std::string(type_name(dt)) +
-               "; the gather reads IQ4_NL (the converter's table) or Q8_0 (community GGUFs)";
+               "; the gather reads IQ4_NL, Q4_0, Q5_0, Q5_1, Q8_0, F16, BF16 or F32";
     for (uint32_t p = 0; p < T; ++p) {
         for (uint32_t h = 0; h < kPleHeads; ++h) {
             const uint64_t r = rows[size_t(p) * kPleHeads + h];
             float* out = E_out + size_t(p) * kPleD + size_t(h) * kPleHeadDim;
-            if (dt == DType::kQ8_0) ref::dequant_q8_0_buffer(base + r * rb, kPleHeadDim, out);
-            else                    ref::dequant_iq4_nl_buffer(base + r * rb, kPleHeadDim, out);
+            const uint8_t* src = base + r * rb;
+            switch (dt) {
+                case DType::kQ8_0:   ref::dequant_q8_0_buffer(src, kPleHeadDim, out); break;
+                case DType::kQ5_1:   ref::dequant_q5_1_buffer(src, kPleHeadDim, out); break;
+                case DType::kQ5_0:   ref::dequant_q5_0_buffer(src, kPleHeadDim, out); break;
+                case DType::kQ4_0:   ref::dequant_q4_0_buffer(src, kPleHeadDim, out); break;
+                case DType::kF16: {
+                    const auto* s16 = reinterpret_cast<const uint16_t*>(src);
+                    for (uint32_t i = 0; i < kPleHeadDim; ++i) out[i] = float(sycl::bit_cast<sycl::half>(s16[i]));
+                    break;
+                }
+                case DType::kBF16: {
+                    const auto* s16 = reinterpret_cast<const uint16_t*>(src);
+                    for (uint32_t i = 0; i < kPleHeadDim; ++i) out[i] = sycl::bit_cast<float>(uint32_t(s16[i]) << 16);
+                    break;
+                }
+                case DType::kF32:    std::memcpy(out, src, kPleHeadDim * sizeof(float)); break;
+                default:             ref::dequant_iq4_nl_buffer(src, kPleHeadDim, out); break;
+            }
         }
     }
     return {};

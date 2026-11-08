@@ -105,8 +105,16 @@ uint64_t estimate_kv_bytes(const GgufReader& g, uint32_t max_ctx, bool int8_kv) 
     // Hybrid arches (crown qwen35moe, qwen35 27B, qwen3next) keep KV only on the
     // full-attention layers (every `full_attention_interval`-th). When the key is
     // absent (dense / gemma4) every layer keeps KV.
-    const uint32_t interval = kv_u32(g, p + "full_attention_interval", 1);
-    const uint32_t n_full   = interval > 1 ? (n_layers + interval - 1) / interval : n_layers;
+    // (2026-11-07) a per-block attention.recurrent_layers array (llama.cpp's hparams; 1 = linear) counts exactly when present
+    uint32_t n_full = 0;
+    if (const auto* rl = g.find_kv(p + "attention.recurrent_layers"); rl && rl->type == GgufValueType::kArray && rl->n_array) {
+        const bool wide = rl->inner_type == GgufValueType::kU32 || rl->inner_type == GgufValueType::kI32;
+        for (uint64_t i = 0; i < rl->n_array && i < n_layers; ++i)
+            n_full += (wide ? uint32_t(rl->as_pod_array<uint32_t>()[i]) : uint32_t(rl->as_pod_array<uint8_t>()[i])) == 0 ? 1u : 0u;
+    } else {
+        const uint32_t interval = kv_u32(g, p + "full_attention_interval", 1);
+        n_full = interval > 1 ? (n_layers + interval - 1) / interval : n_layers;
+    }
 
     // K and V, fp16 (or int8 + a small fp16 scale shadow ≈ +1/32 per element).
     const uint64_t per_layer = uint64_t(n_kv_heads) * max_ctx * head_dim;

@@ -63,9 +63,14 @@ inline uint64_t glm5_lane_bytes(const Glm5NextConfig& c, uint32_t ctx, uint32_t 
 inline bool glm5_residency_fits(uint64_t weights,uint64_t runtime,uint64_t cache,uint64_t available) {
     return weights<=available && runtime<=available-weights && cache<=available-weights-runtime;
 }
+// `content` (known_bugs 45): when given, receives the request-text ranges of the returned prompt (PromptPiece,
+// tokenizer.hpp): the message contents, reasoning (a reasoning_content, or the <think> block the history content carried),
+// the tool-call names / argument keys / values of the history's <tool_call> blocks (the cut-off block a reply streamed
+// stays verbatim and is the request's), the tool results, the tool schemas -- and none of the template's markers.
 std::string build_glm5_prompt(std::span<const ChatTurn> turns, bool thinking,
                              std::string_view tools_json, std::string& error,
-                             std::string_view reasoning_effort = {});
+                             std::string_view reasoning_effort = {},
+                             std::vector<std::pair<size_t, size_t>>* content = nullptr);
 // The stable conversation boundary of a build_glm5_prompt render: the prompt without its generation suffix
 // (<|assistant|><think>, and </think> after it when thinking is off) -- the text the next turn's prompt starts
 // with, where the prompt cache takes its copy. Empty when the prompt does not end with that suffix.

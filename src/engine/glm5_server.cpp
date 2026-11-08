@@ -1,8 +1,12 @@
 #include "ie/glm5_server.hpp"
 #include "ie/reasoning.hpp"
 #include "nlohmann/json.hpp"
+#include <algorithm>
 #include <cctype>
+#include <string_view>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 namespace ie {
 namespace {
 using Json=nlohmann::ordered_json;
@@ -22,14 +26,37 @@ std::string pyjson(const Json& j) {
     }
     return out+(j.is_object()?"}":"]");
 }
-std::string render_history_calls(std::string text,std::string& error) {
-    size_t pos=0;
-    while((pos=text.find("<tool_call>",pos))!=std::string::npos) {
+// A piece's slice [a, b) appended to `out`: its text, and the content ranges inside it, shifted (known_bugs 45).
+void append_slice(PromptPiece& out, const PromptPiece& f, size_t a, size_t b) {
+    if (b > f.text.size()) b = f.text.size();
+    if (a >= b) return;
+    const size_t base = out.text.size();
+    out.text.append(f.text, a, b - a);
+    for (const auto& [rb, re] : f.content) {
+        const size_t cb = std::max(rb, a), ce = std::min(re, b);
+        if (cb >= ce) continue;
+        const size_t nb = base + (cb - a), ne = base + (ce - a);
+        if (!out.content.empty() && out.content.back().second == nb) out.content.back().second = ne;
+        else out.content.emplace_back(nb, ne);
+    }
+}
+// trim's bounds of s[a, b).
+std::pair<size_t, size_t> trim_bounds(std::string_view s, size_t a, size_t b) {
+    while (a < b && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
+    while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
+    return {a, b};
+}
+// The assistant history's <tool_call>{json}</tool_call> blocks (the OpenAI parser's form) in the template's XML form; the
+// prose between them, the names, the keys and the values are the request's text, the markers the template's.
+PromptPiece render_history_calls(std::string_view text,std::string& error) {
+    PromptPiece f;
+    size_t pos=0, seg=0;   // seg: where the pending request-text segment starts
+    while((pos=text.find("<tool_call>",pos))!=std::string_view::npos) {
         const size_t begin=pos+11, end=text.find("</tool_call>",begin);
         // a reply cut mid call (max_tokens) streamed the raw call as content; the history then carries what the model
         // wrote, so keep it verbatim (2026-10-21: it was refused, "incomplete assistant tool history", ending the chat)
-        if(end==std::string::npos)break;
-        auto body=trim(std::string_view(text).substr(begin,end-begin));
+        if(end==std::string_view::npos)break;
+        auto body=trim(text.substr(begin,end-begin));
         if(body.empty() || body.front()!='{'){pos=end+12;continue;}
         auto call=Json::parse(body,nullptr,false);
         if(!call.is_object() || !call.contains("name") || !call["name"].is_string()){
@@ -38,34 +65,40 @@ std::string render_history_calls(std::string text,std::string& error) {
         auto args=call.value("arguments",Json::object());
         if(args.is_string())args=Json::parse(args.get<std::string>(),nullptr,false);
         if(!args.is_object()){error="glm5next: tool arguments must be an object";return {};}
-        std::string xml="<tool_call>"+call["name"].get<std::string>();
-        for(auto it=args.begin();it!=args.end();++it)
-            xml+="<arg_key>"+it.key()+"</arg_key><arg_value>"+
-                (it->is_string()?it->get<std::string>():pyjson(*it))+"</arg_value>";
-        xml+="</tool_call>";
-        text.replace(pos,end+12-pos,xml);
         // The OpenAI parser separates flattened calls with a newline. The
         // GLM template trims prose and appends structured calls adjacently.
-        while(pos && std::isspace(static_cast<unsigned char>(text[pos-1])))text.erase(--pos,1);
-        pos+=xml.size();
+        size_t cut=pos;
+        while(cut>seg && std::isspace(static_cast<unsigned char>(text[cut-1])))--cut;
+        f.add_content(text.substr(seg,cut-seg));
+        f.add_text("<tool_call>");f.add_content(call["name"].get_ref<const std::string&>());
+        for(auto it=args.begin();it!=args.end();++it) {
+            f.add_text("<arg_key>");f.add_content(it.key());f.add_text("</arg_key><arg_value>");
+            if(it->is_string())f.add_content(it->get_ref<const std::string&>());else f.add_content(pyjson(*it));
+            f.add_text("</arg_value>");
+        }
+        f.add_text("</tool_call>");
+        pos=end+12;seg=pos;
     }
-    return text;
+    f.add_content(text.substr(seg));
+    return f;
 }
 }
 
 std::string build_glm5_prompt(std::span<const ChatTurn> turns,bool thinking,
                              std::string_view tools_json,std::string& error,
-                             std::string_view reasoning_effort) {
+                             std::string_view reasoning_effort,
+                             std::vector<std::pair<size_t,size_t>>* content_out) {
     error=reasoning_effort_error(reasoning_capabilities(ModelArch::kGlm5Next),reasoning_effort);
     if(!error.empty())return {};
     const std::string effort=reasoning_effort.empty()?"max":std::string(reasoning_effort);
-    std::string out="[gMASK]<sop><|system|>Reasoning Effort: ";
-    out+=char(std::toupper(static_cast<unsigned char>(effort.front())));out+=effort.substr(1);
+    PromptPiece p;
+    p.add_text("[gMASK]<sop><|system|>Reasoning Effort: ");
+    p.add_text(char(std::toupper(static_cast<unsigned char>(effort.front()))));p.add_text(effort.substr(1));
     if(!tools_json.empty()) {
         auto tools=Json::parse(tools_json,nullptr,false);
         if(!tools.is_array()){error="glm5next tools must be an array";return {};}
         if(!tools.empty()) {
-            out+="<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n";
+            p.add_text("<|system|>\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n");
             for(auto tool:tools) {
                 if(tool.contains("function"))tool=tool["function"];
                 if(!tool.is_object() || !tool.contains("name") || !tool["name"].is_string()){
@@ -75,9 +108,9 @@ std::string build_glm5_prompt(std::span<const ChatTurn> turns,bool thinking,
                     error="glm5next defer_loading must be boolean";return {};
                 }
                 if(tool.value("defer_loading",false)) {error="glm5next deferred tool loading is not supported";return {};}
-                tool.erase("defer_loading");tool.erase("strict");out+=pyjson(tool)+"\n";
+                tool.erase("defer_loading");tool.erase("strict");p.add_content(pyjson(tool));p.add_text('\n');
             }
-            out+="</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>";
+            p.add_text("</tools>\n\nFor each function call, output the function name and arguments within the following XML format:\n<tool_call>{function-name}<arg_key>{arg-key-1}</arg_key><arg_value>{arg-value-1}</arg_value><arg_key>{arg-key-2}</arg_key><arg_value>{arg-value-2}</arg_value>...</tool_call>");
         }
     }
     for(size_t ti=0;ti<turns.size();++ti) {
@@ -97,28 +130,33 @@ std::string build_glm5_prompt(std::span<const ChatTurn> turns,bool thinking,
             if(sortable)for(const auto& id:prior->tool_call_ids)
                 for(size_t k=ti;k<end;++k)if(turns[k].tool_call_id==id)order.push_back(k);
             if(!sortable)for(size_t k=ti;k<end;++k)order.push_back(k);
-            out+="<|observation|>";
-            for(size_t k:order)out+="<tool_response>"+turns[k].content+"</tool_response>";
+            p.add_text("<|observation|>");
+            for(size_t k:order){p.add_text("<tool_response>");p.add_content(turns[k].content);p.add_text("</tool_response>");}
             ti=end-1;continue;
         }
-        if(t.role=="user" || t.role=="system")out+="<|"+t.role+"|>"+t.content;
+        if(t.role=="user" || t.role=="system"){p.add_text("<|"+t.role+"|>");p.add_content(t.content);}
         else if(t.role=="assistant") {
-            out+="<|assistant|>";
-            std::string content=render_history_calls(t.content,error);
+            p.add_text("<|assistant|>");
+            const PromptPiece hist=render_history_calls(t.content,error);
             if(!error.empty())return {};
-            auto end=content.find("</think>");
-            if(t.reasoning_content)out+="<think>"+*t.reasoning_content+"</think>";
+            const std::string& content=hist.text;
+            const auto end=content.find("</think>");
+            size_t rest=0;
+            if(t.reasoning_content){p.add_text("<think>");p.add_content(*t.reasoning_content);p.add_text("</think>");}
             else if(end!=std::string::npos) {
-                auto start=content.rfind("<think>",end);
-                out+="<think>"+content.substr(start==std::string::npos?0:start+7,end-(start==std::string::npos?0:start+7))+"</think>";
-                content.erase(0,content.rfind("</think>")+8);
-            } else out+="<think></think>";
-            out+=trim(content);
+                const auto start=content.rfind("<think>",end);
+                const size_t s0=start==std::string::npos?0:start+7;
+                p.add_text("<think>");append_slice(p,hist,s0,end);p.add_text("</think>");
+                rest=content.rfind("</think>")+8;
+            } else p.add_text("<think></think>");
+            const auto [a,b]=trim_bounds(content,rest,content.size());
+            append_slice(p,hist,a,b);
         } else {error="glm5next does not support role '"+t.role+"'";return {};}
     }
-    out+="<|assistant|><think>";
-    if(!thinking)out+="</think>";
-    return out;
+    p.add_text("<|assistant|><think>");
+    if(!thinking)p.add_text("</think>");
+    if(content_out)*content_out=std::move(p.content);
+    return std::move(p.text);
 }
 
 std::string_view glm5_stable_prefix(std::string_view prompt,bool thinking) {

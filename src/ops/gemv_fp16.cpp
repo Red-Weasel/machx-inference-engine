@@ -46,6 +46,8 @@
 #include <sycl/sycl.hpp>
 #include "ie/kernel_profiler.hpp"
 
+#include <cstdlib>
+
 namespace ie {
 
 sycl::event gemv_fp16(sycl::queue& q,
@@ -379,6 +381,105 @@ sycl::event gemv_fp16_rows_impl(sycl::queue& q,
         });
     });
 }
+// The SLM form (2026-11-08): the R rows of X staged in SLM once per WG (rows
+// >= R zero-filled) and the k loop runs all R_MAX rows with no runtime break,
+// so the W loads pipeline as in gemv_fp16. Per row the chain is unchanged (the
+// same K-slice, k ascending, acc += a * w; the same partial layout and in-order
+// cross-SG sum) -> bit-identical to the form above and to R gemv_fp16 calls.
+// The form above measured SLOWER than R separate gemv_fp16 calls at the
+// Flash-Next router's [2560, 512]: R=2 30.2 vs 10.6 us, R=4 36.7 vs 18.7.
+template <int R_MAX>
+sycl::event gemv_fp16_rows_slm_impl(sycl::queue& q,
+                                    const sycl::half* X, uint32_t x_stride,
+                                    const sycl::half* W_kn, sycl::half* y,
+                                    uint32_t y_stride,
+                                    uint32_t K, uint32_t N, uint32_t R,
+                                    const std::vector<sycl::event>& deps) {
+    constexpr int SG_SIZE       = 16;
+    constexpr int SGS_PER_WG    = 32;
+    constexpr int WG_ITEMS      = SGS_PER_WG * SG_SIZE;       // 512
+    constexpr int COLS_PER_LANE = 2;
+    constexpr int N_PER_WG      = SG_SIZE * COLS_PER_LANE;    // 32
+
+    const uint32_t n_wgs   = (N + N_PER_WG - 1) / N_PER_WG;
+    const uint32_t k_slice = (K + SGS_PER_WG - 1) / SGS_PER_WG;
+
+    return ie::ps(q, "gemv_fp16_rowsS", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        sycl::local_accessor<sycl::half, 1> X_slm(sycl::range<1>(uint64_t(R_MAX) * K), h);
+        sycl::local_accessor<float, 1> part(
+            sycl::range<1>(uint64_t(R_MAX) * SGS_PER_WG * N_PER_WG), h);
+
+        h.parallel_for(sycl::nd_range<1>(uint64_t(n_wgs) * WG_ITEMS, WG_ITEMS),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG_SIZE)]] {
+            const uint32_t lid   = uint32_t(it.get_local_id(0));
+            const uint32_t wgid  = uint32_t(it.get_group(0));
+            const uint32_t sg_id = lid / SG_SIZE;
+            const uint32_t lane  = lid % SG_SIZE;
+
+            for (uint32_t i = lid; i < uint32_t(R_MAX) * K; i += WG_ITEMS) {
+                const uint32_t r = i / K;
+                X_slm[i] = r < R ? X[uint64_t(r) * x_stride + (i - r * K)] : sycl::half(0.f);
+            }
+            sycl::group_barrier(it.get_group());
+
+            const uint32_t n0 = wgid * N_PER_WG + lane * COLS_PER_LANE;
+            const uint32_t k0 = sg_id * k_slice;
+            const uint32_t k1 = sycl::min(k0 + k_slice, K);
+
+            float acc[R_MAX][COLS_PER_LANE];
+            #pragma unroll
+            for (int r = 0; r < R_MAX; ++r)
+                for (int c = 0; c < COLS_PER_LANE; ++c) acc[r][c] = 0.f;
+
+            if ((N & 1u) == 0 && n0 + COLS_PER_LANE - 1 < N) {
+                #pragma unroll 16
+                for (uint32_t k = k0; k < k1; ++k) {
+                    const auto wv = *reinterpret_cast<const sycl::vec<sycl::half, 2>*>(
+                        &W_kn[uint64_t(k) * N + n0]);
+                    #pragma unroll
+                    for (int r = 0; r < R_MAX; ++r) {
+                        const float a = float(X_slm[uint32_t(r) * K + k]);
+                        #pragma unroll
+                        for (int c = 0; c < COLS_PER_LANE; ++c)
+                            acc[r][c] += a * float(wv[c]);
+                    }
+                }
+            } else {
+                for (uint32_t k = k0; k < k1; ++k) {
+                    const uint64_t row = uint64_t(k) * N;
+                    #pragma unroll
+                    for (int r = 0; r < R_MAX; ++r) {
+                        const float a = float(X_slm[uint32_t(r) * K + k]);
+                        #pragma unroll
+                        for (int c = 0; c < COLS_PER_LANE; ++c)
+                            if (n0 + c < N) acc[r][c] += a * float(W_kn[row + n0 + c]);
+                    }
+                }
+            }
+            #pragma unroll
+            for (int r = 0; r < R_MAX; ++r)
+                for (int c = 0; c < COLS_PER_LANE; ++c)
+                    part[(uint64_t(r) * SGS_PER_WG + sg_id) * N_PER_WG +
+                         lane * COLS_PER_LANE + c] = acc[r][c];
+            sycl::group_barrier(it.get_group());
+
+            if (lid < N_PER_WG) {
+                const uint32_t n = wgid * N_PER_WG + lid;
+                if (n < N) {
+                    for (uint32_t r = 0; r < R; ++r) {
+                        float s = 0.f;
+                        #pragma unroll
+                        for (int sg = 0; sg < SGS_PER_WG; ++sg)
+                            s += part[(uint64_t(r) * SGS_PER_WG + uint32_t(sg)) *
+                                      N_PER_WG + lid];
+                        y[uint64_t(r) * y_stride + n] = sycl::half(s);
+                    }
+                }
+            }
+        });
+    });
+}
 }  // namespace
 
 // Per-row dot against ONE weight vector: y[r] = X[r,:] . w  — the N=1 GEMV
@@ -441,6 +542,20 @@ sycl::event gemv_fp16_rows(sycl::queue& q,
             e = gemv_fp16(q, X + uint64_t(r) * x_stride, W_kn,
                           y + uint64_t(r) * y_stride, K, N, deps);
         return e;
+    }
+    // One row: gemv_fp16 itself -- the same math (the buckets' per-row chain IS its chain), 6.6 vs 27.4 us at the
+    // Flash-Next router's [2560, 512] (the R_MAX=2 bucket reads X from global inside the k loop; 2026-11-08,
+    // tests/gemv_fp16_test). IE_GEMV_FP16_ROWS1=0 = the bucket as before.
+    static const bool solo1 = [] { const char* v = std::getenv("IE_GEMV_FP16_ROWS1"); return !(v && *v == '0'); }();
+    if (R == 1 && solo1) return gemv_fp16(q, X, W_kn, y, K, N, deps);
+    // R >= 2: the SLM form when its X rows + partials fit the device's SLM (IE_GEMV_FP16_ROWS_SLM=0 = the form above).
+    static const bool slm_on = [] { const char* v = std::getenv("IE_GEMV_FP16_ROWS_SLM"); return !(v && *v == '0'); }();
+    const uint64_t slm_cap = q.get_device().get_info<sycl::info::device::local_mem_size>();
+    const auto fits = [&](uint64_t rmax) { return rmax * K * sizeof(sycl::half) + rmax * 32 * 32 * sizeof(float) <= slm_cap; };
+    if (slm_on) {
+        if (R <= 2 && fits(2)) return gemv_fp16_rows_slm_impl<2>(q, X, x_stride, W_kn, y, y_stride, K, N, R, deps);
+        if (R <= 4 && fits(4)) return gemv_fp16_rows_slm_impl<4>(q, X, x_stride, W_kn, y, y_stride, K, N, R, deps);
+        if (R > 4 && fits(8))  return gemv_fp16_rows_slm_impl<8>(q, X, x_stride, W_kn, y, y_stride, K, N, R, deps);
     }
     if (R <= 2) return gemv_fp16_rows_impl<2>(q, X, x_stride, W_kn, y, y_stride, K, N, R, deps);
     if (R <= 4) return gemv_fp16_rows_impl<4>(q, X, x_stride, W_kn, y, y_stride, K, N, R, deps);

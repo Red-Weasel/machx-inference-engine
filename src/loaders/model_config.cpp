@@ -850,6 +850,47 @@ std::string read_qwen4exp_config(const GgufReader& g, Qwen4ExpConfig& out) {
         dst.assign(a.begin(), a.end());
         return true;
     };
+    // A per-block array of flags (GGUF BOOL / U8 / I8 / U32 / I32 elements -> 0 or 1); false when absent or not an array.
+    auto arr_flags = [&](const char* suffix, std::vector<uint8_t>& dst) -> bool {
+        const auto* kv = g.find_kv(std::string("qwen4exp.") + suffix);
+        if (!kv || kv->type != GgufValueType::kArray) return false;
+        dst.clear();
+        switch (kv->inner_type) {
+            case GgufValueType::kBool: case GgufValueType::kU8: case GgufValueType::kI8:
+                for (uint8_t v : kv->as_pod_array<uint8_t>()) dst.push_back(v ? 1 : 0);
+                return true;
+            case GgufValueType::kU32: case GgufValueType::kI32:
+                for (uint32_t v : kv->as_pod_array<uint32_t>()) dst.push_back(v ? 1 : 0);
+                return true;
+            default: return false;
+        }
+    };
+    // A scalar, or a per-block array whose entries all agree (llama.cpp's get_key_or_arr takes either for the head counts
+    // and expert_feed_forward_length); entries that differ are an error -- the kernels take one geometry for every block.
+    // false = absent (err empty) or rejected (err set).
+    auto u32_or_uniform = [&](const char* suffix, uint32_t& dst, std::string& err) -> bool {
+        const auto* kv = g.find_kv(std::string("qwen4exp.") + suffix);
+        if (!kv) return false;
+        if (kv->type != GgufValueType::kArray) { dst = uint32_t(kv->as_uint()); return true; }
+        std::vector<uint64_t> vals;
+        switch (kv->inner_type) {
+            case GgufValueType::kU32: case GgufValueType::kI32: for (uint32_t v : kv->as_pod_array<uint32_t>()) vals.push_back(v); break;
+            case GgufValueType::kU64: case GgufValueType::kI64: for (uint64_t v : kv->as_pod_array<uint64_t>()) vals.push_back(v); break;
+            case GgufValueType::kU16: case GgufValueType::kI16: for (uint16_t v : kv->as_pod_array<uint16_t>()) vals.push_back(v); break;
+            case GgufValueType::kU8:  case GgufValueType::kI8:  for (uint8_t  v : kv->as_pod_array<uint8_t>())  vals.push_back(v); break;
+            default: err = std::string("qwen4exp.") + suffix + ": an array of an unexpected element type"; return false;
+        }
+        if (vals.empty()) { err = std::string("qwen4exp.") + suffix + ": an empty array"; return false; }
+        for (uint64_t v : vals)
+            if (v != vals[0]) {
+                err = std::string("qwen4exp.") + suffix + " differs per block (" + std::to_string(vals[0]) + " vs " +
+                      std::to_string(v) + "); the kernels take one geometry for every block";
+                return false;
+            }
+        dst = uint32_t(vals[0]);
+        return true;
+    };
+    std::string uerr;
     auto arr_u64 = [&](const char* suffix, std::vector<uint64_t>& dst) -> bool {
         const auto* kv = g.find_kv(std::string("qwen4exp.") + suffix);
         if (!kv || kv->type != GgufValueType::kArray) return false;
@@ -859,9 +900,13 @@ std::string read_qwen4exp_config(const GgufReader& g, Qwen4ExpConfig& out) {
     };
 
     if (!u32("block_count", out.n_layers))               return "missing qwen4exp.block_count";
+    // llama.cpp's nextn export (2026-11-07): the MTP draft block(s) are counted in block_count; the trunk is the rest.
+    u32("nextn_predict_layers", out.nextn_predict_layers);
+    if (out.nextn_predict_layers >= out.n_layers)        return "qwen4exp: nextn_predict_layers >= block_count";
+    out.n_layers -= out.nextn_predict_layers;
     if (!u32("embedding_length", out.hidden))            return "missing qwen4exp.embedding_length";
-    if (!u32("attention.head_count", out.n_q_heads))     return "missing qwen4exp.attention.head_count";
-    if (!u32("attention.head_count_kv", out.n_kv_heads)) return "missing qwen4exp.attention.head_count_kv";
+    if (!u32_or_uniform("attention.head_count", out.n_q_heads, uerr))     return uerr.empty() ? "missing qwen4exp.attention.head_count" : uerr;
+    if (!u32_or_uniform("attention.head_count_kv", out.n_kv_heads, uerr)) return uerr.empty() ? "missing qwen4exp.attention.head_count_kv" : uerr;
     if (!u32("attention.key_length", out.head_dim))      return "missing qwen4exp.attention.key_length";
     // value_length exists on the real file and must EQUAL key_length — the KV
     // cache and attn_output binding assume one head width (256 == 256 today).
@@ -871,8 +916,10 @@ std::string read_qwen4exp_config(const GgufReader& g, Qwen4ExpConfig& out) {
         if (v_len != out.head_dim)
             return "qwen4exp: attention.value_length != attention.key_length";
     }
-    if (!u32("full_attention_interval", out.full_attention_interval))
-        return "missing qwen4exp.full_attention_interval";
+    // The layer schedule (2026-11-07, as llama.cpp's hparams): attention.recurrent_layers per block when present (1 = linear,
+    // 0 = full attention), else every full_attention_interval-th block, the key defaulting to 4.
+    arr_flags("attention.recurrent_layers", out.recurrent_layers);
+    if (!u32("full_attention_interval", out.full_attention_interval)) out.full_attention_interval = 4;
     u32("context_length", out.ctx_train);
     f32("attention.layer_norm_rms_epsilon", out.rms_eps);
 
@@ -907,7 +954,8 @@ std::string read_qwen4exp_config(const GgufReader& g, Qwen4ExpConfig& out) {
     // MoE.
     if (!u32("expert_count", out.n_experts))                return "missing qwen4exp.expert_count";
     if (!u32("expert_used_count", out.n_experts_used))      return "missing qwen4exp.expert_used_count";
-    if (!u32("expert_feed_forward_length", out.expert_ffn)) return "missing qwen4exp.expert_feed_forward_length";
+    if (!u32_or_uniform("expert_feed_forward_length", out.expert_ffn, uerr))
+        return uerr.empty() ? "missing qwen4exp.expert_feed_forward_length" : uerr;
     u32("expert_shared_feed_forward_length", out.shared_expert_ffn);
 
     // PLE — all-or-none, keyed on ple.layers (the convert script omits the
@@ -935,8 +983,17 @@ std::string read_qwen4exp_config(const GgufReader& g, Qwen4ExpConfig& out) {
     // -- consistency, so a wrong file fails here rather than in a kernel -----
     if (out.n_layers == 0 || out.hidden == 0)
         return "qwen4exp: zero block_count/embedding_length";
-    if (out.full_attention_interval == 0 || out.n_layers % out.full_attention_interval)
+    if (!out.recurrent_layers.empty()) {
+        if (out.recurrent_layers.size() != out.n_layers && out.recurrent_layers.size() != out.n_layers + out.nextn_predict_layers)
+            return "qwen4exp: attention.recurrent_layers length != block_count";
+        out.recurrent_layers.resize(out.n_layers);   // (a nextn entry after the trunk's is dropped)
+        if (out.n_full_attn_layers() == 0) return "qwen4exp: attention.recurrent_layers marks no full-attention block";
+    } else if (out.full_attention_interval == 0 || out.n_layers % out.full_attention_interval)
         return "qwen4exp: block_count not a multiple of full_attention_interval";
+    // The QSA kernels pool indexer keys in blocks of 4 cells (qsa_pool_norm_rope, the block selection, the budget in blocks
+    // of top_k / 4): the budget must be whole blocks, and every QSA block's compress ratio must be 4 (checked below).
+    if (out.indexer_top_k && out.indexer_top_k % 4)
+        return "qwen4exp: attention.indexer.top_k is not a multiple of the 4-cell QSA block";
     if (out.n_kv_heads == 0 || out.n_q_heads % out.n_kv_heads)
         return "qwen4exp: head_count not a multiple of head_count_kv";
     if (out.rope_dim > out.head_dim)
@@ -968,11 +1025,16 @@ std::string read_qwen4exp_config(const GgufReader& g, Qwen4ExpConfig& out) {
     // (nonzero exactly on full-attention blocks). Disagreement means the layer
     // schedule is ambiguous and NOTHING may be bound.
     if (!out.compress_ratios.empty()) {
-        if (out.compress_ratios.size() != out.n_layers)
+        // (the converter may append the draft block's entry: trunk + nextn entries; only the trunk's are checked)
+        if (out.compress_ratios.size() != out.n_layers && out.compress_ratios.size() != out.n_layers + out.nextn_predict_layers)
             return "qwen4exp: attention.compress_ratios length != block_count";
         for (uint32_t il = 0; il < out.n_layers; ++il)
             if ((out.compress_ratios[il] != 0) != out.is_full_attn(il))
                 return "qwen4exp: compress_ratios schedule disagrees with full_attention_interval";
+        for (uint32_t il = 0; il < out.n_layers; ++il)
+            if (out.compress_ratios[il] != 0 && out.compress_ratios[il] != 4)
+                return "qwen4exp: attention.compress_ratios = " + std::to_string(out.compress_ratios[il]) + " on block " +
+                       std::to_string(il) + "; the QSA kernels pool keys in blocks of 4 (a kernel change generalises them)";
     }
     if (out.has_ple()) {
         for (int32_t l : out.ple_layers)

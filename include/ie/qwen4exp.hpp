@@ -23,13 +23,17 @@
 #include "ie/gguf.hpp"
 #include "ie/kv_cache.hpp"
 #include "ie/model_config.hpp"
+#include "ie/qwen4_bank.hpp"
 #include "ie/qwen4_ple.hpp"
 
 #include <sycl/sycl.hpp>
+#include <utility>
+#include <string_view>
 
 #include <thread>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <cstdlib>
 #include <functional>
 #include <string>
@@ -144,6 +148,10 @@ struct Qwen4ExpLayer {
         const int8_t*     q8  = nullptr;
         const uint16_t*   q8d = nullptr;
         uint64_t slice_bytes = 0;          // per-expert bytes of the ACTIVE repr
+        // 2026-11-07: a raw bank in Q8_0 / Q5_K / Q6_K / Q5_0 / Q4_0 (qwen4_bank.hpp's A16 kernels); raw && !kq is the
+        // Q4_K gate/up or Q5_1 down bank of the original int-dot / Q5_1 families.
+        bool  kq   = false;
+        BankQ kind = BankQ::kQ8_0;
         uint32_t K = 0, N = 0;
     };
     BankView gate_bv, up_bv, down_bv;
@@ -156,6 +164,62 @@ struct Qwen4ExpLayer {
     float*      ple_norm_key   = nullptr;
     float*      ple_norm_conv  = nullptr;
 };
+
+// The MTP draft head's two file layouts (Qwen4ExpModel::load_mtp). (a) scripts/mtp_to_gguf.py: general.architecture
+// "qwen4exp-mtp", tensors mtp.<name>, F16/F32, the fusion as fc_embedding + fc_hidden. (b) llama.cpp's nextn export
+// (convert_hf_to_gguf since PR 27742; unsloth's MTP/mtp-*.gguf, and a main file converted without --no-mtp):
+// general.architecture "qwen4exp", qwen4exp.nextn_predict_layers >= 1, the block's own tensors at blk.<B>.<name> with
+// B = block_count - nextn_predict_layers, the fusion fused as blk.<B>.nextn.eh_proj [in 2H, out H] = [fc_embedding | fc_hidden]
+// along the input (eh_proj([e ; h]) = fc_embedding(e) + fc_hidden(h)), pre_fc_norm_embedding / _hidden as nextn.enorm /
+// nextn.hnorm, the output mixer as nextn.hc_head_{norm,down,up}. Verified 2026-11-07 on unsloth's
+// mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf against our F16 head: every norm gamma bit-equal (the +1 fold is the converter's),
+// eh_proj columns [0,H) = fc_embedding and [H,2H) = fc_hidden within Q8_0 rounding.
+// The nextn block index of a reader, or -1 when the file is not in layout (b).
+inline int qwen4exp_mtp_nextn_block(const GgufReader& g) {
+    const KvRef* bc = g.find_kv("qwen4exp.block_count");
+    const KvRef* nn = g.find_kv("qwen4exp.nextn_predict_layers");
+    if (!bc || !nn || nn->as_uint() == 0 || nn->as_uint() >= bc->as_uint()) return -1;
+    const int b = int(bc->as_uint() - nn->as_uint());
+    return g.find_tensor("blk." + std::to_string(b) + ".nextn.eh_proj.weight") ? b : -1;
+}
+// The layout-(b) name of an engine-layout tensor ("mtp.<name>"; "mtp.eh_proj.weight" names the fused projection);
+// nextn_blk < 0 or a name outside mtp.* returns the name unchanged.
+inline std::string qwen4exp_mtp_tensor_name(std::string_view engine_name, int nextn_blk) {
+    if (nextn_blk < 0 || engine_name.substr(0, 4) != "mtp.") return std::string(engine_name);
+    std::string_view rest = engine_name.substr(4);
+    static constexpr std::pair<std::string_view, std::string_view> kFusion[] = {
+        {"pre_fc_norm_embedding.weight", "nextn.enorm.weight"},    {"pre_fc_norm_hidden.weight", "nextn.hnorm.weight"},
+        {"eh_proj.weight", "nextn.eh_proj.weight"},                 {"out_hc_norm.weight", "nextn.hc_head_norm.weight"},
+        {"out_hc_down.weight", "nextn.hc_head_down.weight"},        {"out_hc_up.weight", "nextn.hc_head_up.weight"}};
+    for (const auto& [ours, theirs] : kFusion) if (rest == ours) rest = theirs;
+    return "blk." + std::to_string(nextn_blk) + "." + std::string(rest);
+}
+// Splits a dequantised eh_proj (row-major [H rows][2H] = GGUF [in 2H, out H]) into the two [K, N] = [H, H] F16 operands the
+// head's gemm_fp16 reads: fc_embed from the first H input columns, fc_hidden from the last H (the host F16 rounding the
+// engine-layout path applies to its F16 tensors).
+inline void qwen4exp_mtp_split_eh_proj(const float* eh, uint32_t H, sycl::half* fc_embed_kn, sycl::half* fc_hidden_kn) {
+    for (uint64_t n = 0; n < H; ++n)
+        for (uint64_t k = 0; k < H; ++k) {
+            fc_embed_kn[k * H + n]  = sycl::half(eh[n * 2 * H + k]);
+            fc_hidden_kn[k * H + n] = sycl::half(eh[n * 2 * H + H + k]);
+        }
+}
+
+// A merged [a | b] weight -- llama.cpp's converter (since 2026-10-25, +7 % decode there) stacks two matrices that read the
+// same input along the OUTPUT dimension: attn_qkv_gate = [attn_qkv | attn_gate], ssm_beta_alpha = [ssm_beta | ssm_alpha],
+// hc_{attn,ffn}_down_inject = [hc_*_down | hc_*_inject] -- split into two views at output column n_a. Block-quantised rows
+// are whole per output column, so each half is a byte range of the merged tensor; the views keep its name and dtype. False
+// when the shape cannot be split that way (not 2-D, n_a past the end, a row count that does not divide the bytes).
+inline bool qwen4exp_split_merged(const GgufTensorInfo& m, uint64_t n_a, GgufTensorInfo& a, GgufTensorInfo& b) {
+    if (m.n_dims != 2 || n_a == 0 || m.shape[1] <= n_a) return false;
+    const uint64_t row_bytes = m.shape[1] ? m.nbytes / m.shape[1] : 0;
+    if (row_bytes == 0 || row_bytes * m.shape[1] != m.nbytes) return false;
+    a = m; a.shape[1] = n_a;              a.nbytes = row_bytes * n_a;
+    b = m; b.shape[1] = m.shape[1] - n_a; b.nbytes = row_bytes * b.shape[1];
+    b.offset_in_data = m.offset_in_data + a.nbytes;
+    if (m.data) b.data = m.data + a.nbytes;
+    return true;
+}
 
 class Qwen4ExpModel {
 public:
@@ -524,6 +588,7 @@ private:
     Qwen4ExpConfig     cfg_{};
     std::vector<Qwen4ExpLayer> layers_;
     std::vector<void*> owned_;
+    std::deque<GgufTensorInfo> tensor_views_;   // the halves of merged tensors (qwen4exp_split_merged); stable addresses
     uint64_t dev_bytes_  = 0;
     uint64_t host_bytes_ = 0;
     std::vector<PlacementRow> placement_;
@@ -541,6 +606,8 @@ private:
     AttnGemmScratch ag_;
     uint32_t ag_maxctx_ = 0;
     uint32_t layer_lo_ = 0, layer_hi_ = 0;      // owned block range [lo, hi)
+    uint32_t hc_xn_layer_ = UINT32_MAX, hc_xn_T_ = 0;   // xn_ws_ holds block hc_xn_layer_'s attention-site normed state for
+                                                     // hc_xn_T_ rows (written by the previous block's combine+norm)
     // Snapshot storage (device): DeltaNet recurrent+conv state, PLE conv
     // state; host: PLE history, per-layer QSA block counters, KV lengths.
     float*      snap_dn_state_ = nullptr;
@@ -653,6 +720,22 @@ private:
     std::vector<uint8_t> pf_pin_mask_;
     uint64_t ecache_clock_ = 0;
     uint32_t ecache_slots_ = 0;
+    // IE_Q4E_EXPERT_HIST=<file> (2026-11-07): per-layer expert pick counts over the run (decode, verify, prefill, lanes; not
+    // the MTP head's bank), dumped at free_all() with the share of picks the cache's slot count of most-used experts covers.
+    // The prefill floor is the expert bank streaming over PCIe; this measures whether a profile-ranked pin set (the DS4.1
+    // ranking idea) could keep the cache warm. Empty = off. Counts are relaxed atomics (the prefill routes on worker threads).
+    std::vector<uint64_t> expert_hist_;
+    // IE_Q4E_EXPERT_PINS=<that histogram file> (2026-11-08): the IE_Q4E_PIN_FRAC (default 0.5) x slots most-used experts of
+    // every layer are pinned -- once resident their slot's last_use sits at UINT64_MAX - 2, below the prefetch ring's pins
+    // and above every LRU stamp, so eviction never picks them while an unpinned slot exists. Residency only: the numerics are
+    // the same with or without pins (the gate is PPL bit-identity). [n_layers][n_experts] flags; empty = off.
+    std::vector<uint8_t> expert_pin_;
+    void load_expert_pins(const char* path);
+    void hist_add(uint32_t L, const std::vector<std::pair<uint32_t, float>>& picks) noexcept {
+        if (expert_hist_.empty()) return;
+        uint64_t* h = expert_hist_.data() + uint64_t(L) * cfg_.n_experts;
+        for (const auto& pk : picks) __atomic_fetch_add(&h[pk.first], uint64_t(1), __ATOMIC_RELAXED);
+    }
     // P4 B49: slots a layer can really use -- ecache_slots_ minus the most slots any layer of this stage lost to the
     // VRAM page-alias self-test (init_runtime). A quarantined slot keeps last_use = UINT64_MAX, so no victim scan
     // takes it; the wave size, the union checks and the rows group bound use this count.

@@ -79,4 +79,29 @@ inline float ds41_step_qstar(float tier_q, float lanes_q, uint32_t rows, uint32_
     return lanes_q >= 0.f && rows == 1 && busy >= 2 ? std::min(lanes_q, 1.f) : tier_q;
 }
 
+// 2026-11-04: which residency ranking a load takes. The served-traffic decode profile this deployment writes
+// (IE_DS41_PROFILE_OUT, rewritten at the end of every request) is the box's own workload, and a ranking has to match the
+// workload it serves (docs/deepseek41/69): over 870K generated tokens of Dream's traffic the September chat profile covered
+// 38 % of the expert selections with 64 resident experts a layer and left 9 % of them to the NVMe tier, the served profile
+// 57 % and 1.6 % (ranking_compare, 2026-11-04: code-writing replies had fallen to 6-7 tok/s on disk reads). Precedence:
+// IE_DS41_RANKING (an explicit choice) > the served profile once it holds at least `min_tokens` generated tokens (a few
+// hundred would rank by noise) > the decode-phase chat ranking beside the model > the held-out prefill profile.
+struct Ds41RankingChoice { std::string path; const char* why; };
+inline Ds41RankingChoice ds41_choose_ranking(const char* env_ranking, const char* env_profile, uint64_t profile_tokens,
+                                             uint64_t min_tokens, bool chat_exists, const std::string& dir) {
+    if (env_ranking && *env_ranking) return {env_ranking, "IE_DS41_RANKING"};
+    if (env_profile && *env_profile && profile_tokens >= min_tokens) return {env_profile, "the served-traffic profile (IE_DS41_PROFILE_OUT)"};
+    if (chat_exists) return {dir + "/ie_ranking_decode_chat.txt", "the decode-phase chat ranking beside the model"};
+    return {dir + "/ie_ranking_heldout.txt", "the held-out prefill profile"};
+}
+// The generated-token count a profile's header carries ("...: N generated tokens"); 0 when the text has no such line.
+inline uint64_t ds41_profile_generated_tokens(const std::string& head) {
+    const auto at = head.find(" generated tokens");
+    if (at == std::string::npos) return 0;
+    size_t b = at;
+    while (b > 0 && head[b - 1] >= '0' && head[b - 1] <= '9') --b;
+    if (b == at) return 0;
+    return std::stoull(head.substr(b, at - b));
+}
+
 }  // namespace ie

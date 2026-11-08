@@ -124,6 +124,7 @@ include/ie/dtype.hpp
 include/ie/expert_stream.hpp
 include/ie/fp8.hpp
 include/ie/gguf.hpp
+include/ie/hugetlb_pool.hpp
 include/ie/kernel_profiler.hpp
 include/ie/model_config.hpp
 include/ie/ngram_draft.hpp

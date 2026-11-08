@@ -74,12 +74,20 @@ std::string Engine::ds41_load(const std::string& dir) {
         } else { b->vis_error = e; std::fprintf(stderr, "[deepseek41] vision tower NOT available: %s\n", e.c_str()); }
     }
     std::vector<std::vector<uint32_t>> ranking;
-    // Phase 48 (docs/deepseek41/88): IE_DS41_RANKING names the residency ranking; otherwise a decode-phase chat ranking
-    // beside the model (ie_ranking_decode_chat.txt) when present, else the held-out prefill profile
-    std::string rank_path = dir + "/ie_ranking_heldout.txt";
-    if (const char* rp = std::getenv("IE_DS41_RANKING"); rp && *rp) rank_path = rp;
-    else if (std::ifstream(dir + "/ie_ranking_decode_chat.txt").good()) rank_path = dir + "/ie_ranking_decode_chat.txt";
-    std::fprintf(stderr, "[deepseek41] residency ranking: %s\n", rank_path.c_str());
+    // Phase 48 (docs/deepseek41/88) + 2026-11-04 (ds41_choose_ranking, host-tested): IE_DS41_RANKING names the residency
+    // ranking; otherwise the served-traffic profile this deployment writes (IE_DS41_PROFILE_OUT) once it holds 100K generated
+    // tokens; otherwise a decode-phase chat ranking beside the model (ie_ranking_decode_chat.txt), else the held-out prefill
+    // profile. The NVMe tail file is cut from one ranking (ie-ds41-expert-file): the init line prints its coverage.
+    uint64_t profile_tokens = 0;
+    const char* profile_env = std::getenv("IE_DS41_PROFILE_OUT");
+    if (profile_env && *profile_env) {
+        if (std::ifstream pf(profile_env); pf.good()) { std::string head(512, '\0'); pf.read(head.data(), std::streamsize(head.size())); profile_tokens = ds41_profile_generated_tokens(head); }
+    }
+    const auto choice = ds41_choose_ranking(std::getenv("IE_DS41_RANKING"), profile_env, profile_tokens, 100000,
+                                            std::ifstream(dir + "/ie_ranking_decode_chat.txt").good(), dir);
+    std::string rank_path = choice.path;
+    std::fprintf(stderr, "[deepseek41] residency ranking: %s (%s%s)\n", rank_path.c_str(), choice.why,
+                 profile_tokens ? (", the served profile holds " + std::to_string(profile_tokens) + " generated tokens").c_str() : "");
     if (std::ifstream(rank_path).good()) {
         if (auto e = ds4_expert_priority_read_layers(rank_path, b->model.config().n_routed_experts, b->model.config().n_layers, ranking); !e.empty()) return "deepseek41 ranking: " + e;
     } else std::fprintf(stderr, "[deepseek41] no %s: index-order expert placement (slower)\n", rank_path.c_str());
@@ -882,9 +890,10 @@ GenerateResult Engine::ds41_chat(std::span<const ChatTurn> turns, const Sampling
     }
     Ds41PromptOptions po; po.thinking = enable_thinking; po.has_tools = !tools_json.empty(); po.tools_json = std::string(tools_json); std::string err;
     if (!reasoning_effort.empty()) { po.reasoning_effort = ds41_reasoning_effort_of(std::string(reasoning_effort), err); if (!err.empty()) { r.finish_reason = "error: " + err; return r; } }
-    const std::string prompt = ds41_encode_messages(msgs, po, err);
+    std::vector<std::pair<size_t, size_t>> content;                   // known_bugs 45: the request's own text never carries a control token
+    const std::string prompt = ds41_encode_messages(msgs, po, err, &content);
     if (!err.empty()) { r.finish_reason = "error: " + err; return r; }
-    auto ids = ds41_->tok.encode(prompt, /*allow_special=*/true);
+    auto ids = ds41_->tok.encode(prompt, /*allow_special=*/true, content);
     const bool lanes = !ds41_->serve.lanes.empty();   // P4 B6b: --parallel > 1
     if (images.empty()) return lanes ? ds41_run_lanes(*ds41_, ids, sp, on_token, enable_thinking, /*chat=*/true)
                                      : ds41_run_ids(*ds41_, ids, sp, on_token, enable_thinking, /*chat=*/true);

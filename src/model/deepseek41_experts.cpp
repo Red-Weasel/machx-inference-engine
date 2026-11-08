@@ -9,6 +9,7 @@
 #include "ie/deepseek4_ops.hpp"
 #include "ie/ops.hpp"
 #include "ie/quant_blocks.hpp"
+#include "ie/hugetlb_pool.hpp"   // 2026-11-05: the staging WARNING names the pool's holders
 
 #include <algorithm>
 #include <atomic>
@@ -497,6 +498,8 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint
                                      "'vm.nr_hugepages = N' in /etc/sysctl.d, so the driver never rebinds a page the kernel moved "
                                      "(docs/research/2026-10-27-card0-kernel-queue-wedge-recurrence.md)\n",
                              why_not.c_str(), (slot_huge / huge) * mm_stage_.size(), huge >> 20, mm_stage_slots_, slot_huge / huge);
+            if (!why_not.empty())   // 2026-11-05: the pool and who holds it (a container's PostgreSQL had 141 of the 320 pages for a week)
+                std::fprintf(stderr, "[ds41 tier]   %s\n", hugetlb_pool_advice(hugetlb_pool_status(), (slot_huge / huge) * mm_stage_.size()).c_str());
             for (size_t i = 0; i < mm_stage_.size(); ++i) {
                 void* m = mmap(nullptr, mm_stage_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
                 if (m == MAP_FAILED) { for (void* p : maps) munmap(p, mm_stage_bytes_); return "tier: staging mmap failed"; }

@@ -446,6 +446,7 @@ std::string Tokenizer::load_from_gguf(const GgufReader& g) {
     // The qwen2 pass uses real Unicode classes (pretokenize_qwen2_unicode). ignore_merges stays off, as upstream.
     laguna_        = (pre_ == "laguna");
     inkling_       = (pre_ == "inkling");   // the o200k-family split (pretokenize_inkling); ignore_merges off, as upstream
+    qwen35_        = (pre_ == "qwen35");    // the qwen2 regex with \p{M} letters, real Unicode classes (pretokenize_qwen35_unicode)
     // tekken splits digits singly (\p{N}); llama-bpe and dbrx group runs of 1-3.
     // dbrx (Phi-4, cl100k/gpt2 BPE) pretokenizes IDENTICALLY to llama-bpe — the
     // only split delta vs the qwen2 default is digit-runs-≤3 (which digits_1to3_
@@ -491,7 +492,7 @@ std::string Tokenizer::load_from_gguf(const GgufReader& g) {
         const bool implemented = pre_.empty() || pre_ == "default" || pre_ == "qwen2" ||
                                  pre_ == "llama-bpe" || pre_ == "dbrx" || pre_ == "tekken" ||
                                  pre_ == "joyai-llm" || pre_ == "glm4" || pre_ == "hyv4" || pre_ == "laguna" ||
-                                 pre_ == "inkling";
+                                 pre_ == "inkling" || pre_ == "qwen35";
         if (!implemented) {
             pre_warning_ = "tokenizer.ggml.pre=\"" + pre_ +
                            "\" has no dedicated pre-tokenizer in this engine; falling back to "
@@ -518,6 +519,12 @@ std::string Tokenizer::load_from_gguf(const GgufReader& g) {
 
 bool Tokenizer::is_special(int32_t id) const noexcept {
     return special_ids_.count(id) > 0;
+}
+std::vector<std::string_view> Tokenizer::special_spellings() const {
+    std::vector<std::string_view> out;
+    out.reserve(special_text_.size());
+    for (const auto& [s, _] : special_text_) out.push_back(s);
+    return out;
 }
 std::string_view Tokenizer::token_str(int32_t id) const noexcept {
     if (id < 0 || size_t(id) >= vocab_.size()) return {};
@@ -840,6 +847,75 @@ static std::vector<std::string_view> pretokenize_qwen2_unicode(std::string_view 
                 if (kj != kUWs && kj != kULet && kj != kUNum) {
                     j = q;
                     while (j < n) { const UniCls kk = at(j, q); if (kk == kUWs || kk == kULet || kk == kUNum) break; j = q; }
+                    while (j < n && is_crlf(j)) ++j;
+                    out.emplace_back(text.substr(i, j - i)); i = j; continue;
+                }
+            }
+        }
+        // alts 5/6/7: whitespace (\s = kUWs; the run is walked by codepoint)
+        if (k0 == kUWs) {
+            size_t e = i, last_nl = std::string_view::npos, last_start = i;
+            while (e < n) { size_t q = 0; if (at(e, q) != kUWs) break; if (is_crlf(e)) last_nl = e; last_start = e; e = q; }
+            if (last_nl != std::string_view::npos) { out.emplace_back(text.substr(i, last_nl + 1 - i)); i = last_nl + 1; }   // alt 5
+            else if (e == n)                      { out.emplace_back(text.substr(i, e - i)); i = e; }                        // alt 6 at the end
+            else if (last_start > i)              { out.emplace_back(text.substr(i, last_start - i)); i = last_start; }      // alt 6: the run minus its last codepoint
+            else                                  { out.emplace_back(text.substr(i, e - i)); i = e; }                        // alt 7: one codepoint
+            continue;
+        }
+        out.emplace_back(text.substr(i, i1 - i)); i = i1;   // unreachable for the classes above; guarantees progress
+    }
+    return out;
+}
+
+// "qwen35" (llama.cpp LLAMA_VOCAB_PRE_TYPE_QWEN35; Qwen3.5 / 3.6 / 3.8 and Flash-Next, the Qwen 4 preview), 2026-11-07:
+//   (?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+
+// = pretokenize_qwen2_unicode with two changes: a letter run is [\p{L}\p{M}]+ (a combining mark continues it, and a run may
+// start on a mark: "e" + U+0301 stays one pretoken, as the regex's optional prefix then the run), and the punctuation run
+// excludes \p{M}. Everything else (contractions, single digits, whitespace alternatives) is the qwen2 function's.
+static std::vector<std::string_view> pretokenize_qwen35_unicode(std::string_view text) {
+    std::vector<std::string_view> out;
+    const size_t n = text.size();
+    auto at = [&](size_t p, size_t& next) -> UniCls { size_t q = p; const uint32_t cp = utf8_decode(text, q); next = q; return uni_class(cp); };
+    auto is_crlf = [&](size_t p) { return text[p] == '\r' || text[p] == '\n'; };
+    auto is_lm = [](UniCls k) { return k == kULet || k == kUMrk; };
+    size_t i = 0;
+    while (i < n) {
+        const unsigned char c = uint8_t(text[i]);
+        // alt 1: (?i:'s|'t|'re|'ve|'m|'ll|'d)
+        if (c == '\'' && i + 1 < n) {
+            const unsigned char a = uint8_t(text[i + 1]) | 0x20;
+            size_t len = 0;
+            if (a == 's' || a == 't' || a == 'm' || a == 'd') len = 2;
+            else if (i + 2 < n) {
+                const unsigned char b = uint8_t(text[i + 2]) | 0x20;
+                if ((a == 'r' && b == 'e') || (a == 'v' && b == 'e') || (a == 'l' && b == 'l')) len = 3;
+            }
+            if (len) { out.emplace_back(text.substr(i, len)); i += len; continue; }
+        }
+        size_t i1 = 0;
+        const UniCls k0 = at(i, i1);
+        // alt 2: [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+  (the optional prefix is ONE codepoint; a mark may start the run itself)
+        {
+            size_t j = i;
+            if (!is_lm(k0) && k0 != kUNum && !is_crlf(i)) j = i1;
+            size_t nx = 0;
+            if (j < n && is_lm(at(j, nx))) {
+                while (j < n) { size_t q = 0; if (!is_lm(at(j, q))) break; j = q; }
+                out.emplace_back(text.substr(i, j - i)); i = j; continue;
+            }
+        }
+        // alt 3: \p{N}  (one codepoint)
+        if (k0 == kUNum) { out.emplace_back(text.substr(i, i1 - i)); i = i1; continue; }
+        // alt 4:  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
+        {
+            size_t j = i;
+            if (text[j] == ' ') ++j;
+            size_t q = 0;
+            if (j < n) {
+                const UniCls kj = at(j, q);
+                if (kj != kUWs && !is_lm(kj) && kj != kUNum) {
+                    j = q;
+                    while (j < n) { const UniCls kk = at(j, q); if (kk == kUWs || is_lm(kk) || kk == kUNum) break; j = q; }
                     while (j < n && is_crlf(j)) ++j;
                     out.emplace_back(text.substr(i, j - i)); i = j; continue;
                 }
@@ -1204,15 +1280,25 @@ static std::vector<std::string_view> pretokenize_joyai(std::string_view text,
 }
 
 std::vector<int32_t> Tokenizer::encode(std::string_view text, bool allow_special) const {
+    return encode(text, allow_special, {});
+}
+
+std::vector<int32_t> Tokenizer::encode(std::string_view text, bool allow_special,
+                                       std::span<const std::pair<size_t, size_t>> content) const {
     std::vector<int32_t> out;
     if (vocab_.empty()) return out;
+    // known_bugs 45 (2026-11-04): a special spelling that overlaps a content range is text, not a control token
+    const auto in_content = [&](size_t pos, size_t len) {
+        for (const auto& [b, e] : content) if (pos < e && pos + len > b) return true;
+        return false;
+    };
     // 2026-10-28 (Nanbeige4.3-33B): a GGUF can set add_bos_token with bos = <|im_start|> (its HF post-processor opens
     // every plain encode with it) while its chat template renders <|im_start|> as the first literal; apply_chat_template
     // adds no special tokens, llama.cpp's chat path skips a BOS the text already starts with -- so does this. A render
     // that begins with the BOS token's literal (and parses special tokens) keeps that one and gets no second.
     const bool text_starts_with_bos = allow_special && bos_id_ >= 0 && [&] {
         const std::string_view b = token_str(bos_id_);
-        return !b.empty() && text.size() >= b.size() && text.substr(0, b.size()) == b;
+        return !b.empty() && text.size() >= b.size() && text.substr(0, b.size()) == b && !in_content(0, b.size());
     }();
     if (add_bos_token_ && bos_id_ >= 0 && !text_starts_with_bos) out.push_back(bos_id_);
 
@@ -1266,7 +1352,8 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text, bool allow_special
                 a = b;
             }
         } else
-            pretoks = inkling_ ? pretokenize_inkling(chunk)
+            pretoks = qwen35_ ? pretokenize_qwen35_unicode(chunk)
+                    : inkling_ ? pretokenize_inkling(chunk)
                     : (joyai_ || hyv4_) ? pretokenize_joyai(chunk, hyv4_)
                     : tekken_ ? pretokenize_tekken(chunk)
                     : qwen2_unicode_ ? pretokenize_qwen2_unicode(chunk)
@@ -1301,9 +1388,7 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text, bool allow_special
         bool matched = false;
         for (const auto& [s, id] : special_text_) {
             if (i + s.size() <= text.size() &&
-                std::memcmp(text.data() + i, s.data(), s.size()) == 0) {
-                // Encode the prefix before this special, then emit the special.
-                encode_chunk(text.substr(0, 0));   // no-op; placeholder
+                std::memcmp(text.data() + i, s.data(), s.size()) == 0 && !in_content(i, s.size())) {
                 out.push_back(id);
                 i += s.size();
                 matched = true;
@@ -1311,11 +1396,12 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text, bool allow_special
             }
         }
         if (matched) continue;
-        // Find the start of the next special token (or end).
+        // Find the start of the next special token outside the content ranges (or the end): the chunk up to it is
+        // plain text, a spelling inside a content range included.
         size_t next = text.size();
         for (const auto& [s, _] : special_text_) {
-            const auto pos = text.find(s, i);
-            if (pos != std::string_view::npos && pos < next) next = pos;
+            for (auto pos = text.find(s, i); pos != std::string_view::npos && pos < next; pos = text.find(s, pos + 1))
+                if (!in_content(pos, s.size())) { next = pos; break; }
         }
         encode_chunk(text.substr(i, next - i));
         i = next;
@@ -1389,22 +1475,22 @@ std::string Tokenizer::decode(std::span<const int32_t> ids, bool skip_special,
 // P4 B27: templates that teach the XML form get it (build_chatml_xml_prompt
 // below; the server hands every client structured tool_calls either way); this
 // preamble stays for the other templates and for IE_QWEN_TOOLS_JSON=1.
-static void append_tools_preamble(std::string& s, std::string_view tools_json) {
-    s += "# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
-         "You are provided with function signatures within <tools></tools> XML tags:\n"
-         "<tools>";
-    // One JSON schema object per line, client key order preserved.
+static void append_tools_preamble(PromptPiece& p, std::string_view tools_json) {
+    p.add_text("# Tools\n\nYou may call one or more functions to assist with the user query.\n\n"
+               "You are provided with function signatures within <tools></tools> XML tags:\n"
+               "<tools>");
+    // One JSON schema object per line, client key order preserved. The schemas are the request's text (known_bugs 45).
     nlohmann::ordered_json tools = nlohmann::ordered_json::parse(
         tools_json, nullptr, /*allow_exceptions=*/false);
     if (tools.is_array()) {
-        for (const auto& t : tools) { s += '\n'; s += t.dump(); }
+        for (const auto& t : tools) { p.add_text('\n'); p.add_content(t.dump()); }
     } else {
-        s += '\n'; s += tools_json;   // unparseable: embed verbatim
+        p.add_text('\n'); p.add_content(tools_json);   // unparseable: embed verbatim
     }
-    s += "\n</tools>\n\n"
-         "For each function call, return a json object with function name and "
-         "arguments within <tool_call></tool_call> XML tags:\n"
-         "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>";
+    p.add_text("\n</tools>\n\n"
+               "For each function call, return a json object with function name and "
+               "arguments within <tool_call></tool_call> XML tags:\n"
+               "<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>");
 }
 
 // ---- P4 B27: the Qwen3.6+ template's XML tool convention ----
@@ -1466,44 +1552,81 @@ std::string_view xml_trim(std::string_view s) {
     return s;
 }
 
+// The request's text of a turn (known_bugs 45). A turn with images carries the engine's sentinel run
+// (<|vision_start|><|image_pad|>...<|vision_end|> per image, Engine::chat) at the front of its content: that run is the
+// template's, the rest is the request's.
+void add_turn_content(PromptPiece& p, const ChatTurn& t, std::string_view c) {
+    if (!t.images.empty()) {
+        static constexpr std::string_view kRun[] = {"<|vision_start|>", "<|image_pad|>", "<|vision_end|>"};
+        size_t k = 0;
+        for (bool more = true; more;) {
+            more = false;
+            for (const auto m : kRun) if (c.substr(k).starts_with(m)) { k += m.size(); more = true; break; }
+        }
+        p.add_text(c.substr(0, k));
+        c.remove_prefix(k);
+    }
+    p.add_content(c);
+}
+
+// An assistant turn's content in the plain (JSON-convention) template: the OpenAI parser appended the turn's tool calls
+// to its content as text <tool_call> blocks (openai_proto.cpp), so the block markers are the template's and the rest --
+// the content before them, the calls' JSON -- is the request's. A turn without tool calls is all request text.
+void add_assistant_content(PromptPiece& p, const ChatTurn& t) {
+    std::string_view c = t.content;
+    if (!t.content_without_tool_calls || !c.starts_with(*t.content_without_tool_calls)) { p.add_content(c); return; }
+    p.add_content(c.substr(0, t.content_without_tool_calls->size()));
+    c.remove_prefix(t.content_without_tool_calls->size());
+    static constexpr std::string_view kOpen = "<tool_call>", kClose = "</tool_call>";
+    while (!c.empty()) {
+        const size_t o = c.find(kOpen), e = c.find(kClose), at = std::min(o, e);
+        if (at == std::string_view::npos) { p.add_content(c); return; }
+        p.add_content(c.substr(0, at));
+        const std::string_view m = o < e ? kOpen : kClose;
+        p.add_text(m);
+        c.remove_prefix(at + m.size());
+    }
+}
+
 // The template's tools block, byte for byte (the 27B and the 35B share it).
-void append_xml_tools_block(std::string& s, std::string_view tools_json) {
-    s += "# Tools\n\nYou have access to the following functions:\n\n<tools>";
+void append_xml_tools_block(PromptPiece& p, std::string_view tools_json) {
+    p.add_text("# Tools\n\nYou have access to the following functions:\n\n<tools>");
     xjson tools = xjson::parse(tools_json, nullptr, /*allow_exceptions=*/false);
     if (tools.is_array()) {
-        for (const auto& t : tools) { s += '\n'; xml_py_dump(t, s); }
+        for (const auto& t : tools) { p.add_text('\n'); std::string d; xml_py_dump(t, d); p.add_content(d); }
     } else {
-        s += '\n'; s += tools_json;   // unparseable: embed verbatim
+        p.add_text('\n'); p.add_content(tools_json);   // unparseable: embed verbatim
     }
-    s += "\n</tools>"
-         "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
-         "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
-         "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
-         "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
-         "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested "
-         "within <tool_call></tool_call> XML tags\n"
-         "- Required parameters MUST be specified\n"
-         "- You may provide optional reasoning for your function call in natural language BEFORE the function call, "
-         "but NOT after\n"
-         "- If there is no function call available, answer the question like normal with your current knowledge and "
-         "do not tell the user about function calls\n</IMPORTANT>";
+    p.add_text("\n</tools>"
+               "\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n"
+               "<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n"
+               "<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n"
+               "</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n"
+               "- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested "
+               "within <tool_call></tool_call> XML tags\n"
+               "- Required parameters MUST be specified\n"
+               "- You may provide optional reasoning for your function call in natural language BEFORE the function call, "
+               "but NOT after\n"
+               "- If there is no function call available, answer the question like normal with your current knowledge and "
+               "do not tell the user about function calls\n</IMPORTANT>");
 }
 
 // An assistant turn's OpenAI tool_calls in the template's history form. The
 // OpenAI `arguments` is a JSON string: parsed into its object (the template
 // wants a mapping); a string value as it is, anything else through tojson.
-void append_xml_tool_calls(std::string& s, std::string_view tool_calls_json, bool content_nonempty) {
+// The name, the parameter names and the values are the request's text.
+void append_xml_tool_calls(PromptPiece& p, std::string_view tool_calls_json, bool content_nonempty) {
     xjson calls = xjson::parse(tool_calls_json, nullptr, /*allow_exceptions=*/false);
     if (!calls.is_array()) return;
     bool first = true;
     for (const auto& tc0 : calls) {
         const xjson& tc = (tc0.is_object() && tc0.contains("function") && tc0["function"].is_object()) ? tc0["function"] : tc0;
         if (!tc.is_object() || !tc.contains("name") || !tc["name"].is_string()) continue;
-        s += first ? (content_nonempty ? "\n\n<tool_call>\n<function=" : "<tool_call>\n<function=")
-                   : "\n<tool_call>\n<function=";
+        p.add_text(first ? (content_nonempty ? "\n\n<tool_call>\n<function=" : "<tool_call>\n<function=")
+                         : "\n<tool_call>\n<function=");
         first = false;
-        s += tc["name"].get<std::string>();
-        s += ">\n";
+        p.add_content(tc["name"].get_ref<const std::string&>());
+        p.add_text(">\n");
         xjson args;
         if (tc.contains("arguments")) {
             args = tc["arguments"];
@@ -1511,37 +1634,39 @@ void append_xml_tool_calls(std::string& s, std::string_view tool_calls_json, boo
         }
         if (args.is_object()) {
             for (auto it = args.begin(); it != args.end(); ++it) {
-                s += "<parameter="; s += it.key(); s += ">\n";
-                if (it.value().is_string()) s += it.value().get<std::string>();
-                else xml_py_dump(it.value(), s);
-                s += "\n</parameter>\n";
+                p.add_text("<parameter="); p.add_content(it.key()); p.add_text(">\n");
+                if (it.value().is_string()) p.add_content(it.value().get_ref<const std::string&>());
+                else { std::string d; xml_py_dump(it.value(), d); p.add_content(d); }
+                p.add_text("\n</parameter>\n");
             }
         }
-        s += "</function>\n</tool_call>";
+        p.add_text("</function>\n</tool_call>");
     }
 }
 
 // The template with tools (tools_json non-empty, ChatmlXmlTools::enabled).
 std::string build_chatml_xml_prompt(std::span<const ChatTurn> turns, bool add_generation_prompt, bool enable_thinking,
                                     std::string_view tools_json, bool model_has_think,
-                                    std::string_view reasoning_preamble, bool think_all_history) {
+                                    std::string_view reasoning_preamble, bool think_all_history,
+                                    std::vector<std::pair<size_t, size_t>>* content_out) {
     const size_t n = turns.size();
-    std::string s = "<|im_start|>system\n";
-    if (!reasoning_preamble.empty()) { s += reasoning_preamble; s += "\n\n"; }
-    append_xml_tools_block(s, tools_json);
+    PromptPiece p;
+    p.add_text("<|im_start|>system\n");
+    if (!reasoning_preamble.empty()) { p.add_text(reasoning_preamble); p.add_text("\n\n"); }
+    append_xml_tools_block(p, tools_json);
     // The leading system turns (the engine folds `developer` into system), each
     // trimmed, joined by '\n' (the 27B's merge; the 35B takes exactly one), AFTER
     // the tools block.
-    std::string sys;
     size_t i = 0;
+    bool any_sys = false;
     for (; i < n && turns[i].role == "system"; ++i) {
         const std::string_view c = xml_trim(turns[i].content);
         if (c.empty()) continue;
-        if (!sys.empty()) sys += '\n';
-        sys += c;
+        p.add_text(any_sys ? "\n" : "\n\n");
+        any_sys = true;
+        p.add_content(c);
     }
-    if (!sys.empty()) { s += "\n\n"; s += sys; }
-    s += "<|im_end|>\n";
+    p.add_text("<|im_end|>\n");
     // The last user query = the last user turn that is not a bare <tool_response>
     // wrapper; assistant turns after it carry their <think> block (the 27B: all).
     size_t last_query = n == 0 ? 0 : n - 1;
@@ -1553,42 +1678,43 @@ std::string build_chatml_xml_prompt(std::span<const ChatTurn> turns, bool add_ge
     for (; i < n; ++i) {
         const auto& t = turns[i];
         if (t.role == "tool") {
-            s += "<|im_start|>user";
+            p.add_text("<|im_start|>user");
             while (i < n && turns[i].role == "tool") {
-                s += "\n<tool_response>\n";
-                s += xml_trim(turns[i].content);
-                s += "\n</tool_response>";
+                p.add_text("\n<tool_response>\n");
+                p.add_content(xml_trim(turns[i].content));
+                p.add_text("\n</tool_response>");
                 ++i;
             }
             --i;
-            s += "<|im_end|>\n";
+            p.add_text("<|im_end|>\n");
             continue;
         }
         if (t.role == "assistant") {
             const std::string_view content =
                 xml_trim(t.content_without_tool_calls ? *t.content_without_tool_calls : t.content);
-            s += "<|im_start|>assistant\n";
+            p.add_text("<|im_start|>assistant\n");
             if (think_all_history || i > last_query) {
-                s += "<think>\n";
-                if (t.reasoning_content) s += xml_trim(*t.reasoning_content);
-                s += "\n</think>\n\n";
+                p.add_text("<think>\n");
+                if (t.reasoning_content) p.add_content(xml_trim(*t.reasoning_content));
+                p.add_text("\n</think>\n\n");
             }
-            s += content;
-            if (!t.tool_calls_json.empty()) append_xml_tool_calls(s, t.tool_calls_json, !content.empty());
-            s += "<|im_end|>\n";
+            p.add_content(content);
+            if (!t.tool_calls_json.empty()) append_xml_tool_calls(p, t.tool_calls_json, !content.empty());
+            p.add_text("<|im_end|>\n");
             continue;
         }
-        s += "<|im_start|>";
-        s += t.role;
-        s += '\n';
-        s += xml_trim(t.content);
-        s += "<|im_end|>\n";
+        p.add_text("<|im_start|>");
+        p.add_content(t.role);
+        p.add_text('\n');
+        add_turn_content(p, t, xml_trim(t.content));
+        p.add_text("<|im_end|>\n");
     }
     if (add_generation_prompt) {
-        s += "<|im_start|>assistant\n";
-        if (model_has_think) s += enable_thinking ? "<think>\n" : "<think>\n\n</think>\n\n";
+        p.add_text("<|im_start|>assistant\n");
+        if (model_has_think) p.add_text(enable_thinking ? "<think>\n" : "<think>\n\n</think>\n\n");
     }
-    return s;
+    if (content_out) *content_out = std::move(p.content);
+    return std::move(p.text);
 }
 
 // ---- the parser ----
@@ -1874,129 +2000,137 @@ std::string build_chatml_prompt(std::span<const ChatTurn> turns,
                                 std::string_view tools_json,
                                 bool model_has_think,
                                 std::string_view reasoning_preamble,
-                                ChatmlXmlTools xml) {
+                                ChatmlXmlTools xml,
+                                std::vector<std::pair<size_t, size_t>>* content_out) {
     if (xml.enabled && !tools_json.empty())
         return build_chatml_xml_prompt(turns, add_generation_prompt, enable_thinking, tools_json, model_has_think,
-                                       reasoning_preamble, xml.think_all_history);
-    std::string s;
+                                       reasoning_preamble, xml.think_all_history, content_out);
+    PromptPiece p;
     size_t i = 0;
     const size_t n = turns.size();
     if (!tools_json.empty()) {
         // Tools preamble lives in the system turn (created if absent). The
         // reasoning-effort sentence goes FIRST in the block (vendor template order).
-        s += "<|im_start|>system\n";
-        if (!reasoning_preamble.empty()) { s += reasoning_preamble; s += "\n\n"; }
+        p.add_text("<|im_start|>system\n");
+        if (!reasoning_preamble.empty()) { p.add_text(reasoning_preamble); p.add_text("\n\n"); }
         if (n > 0 && turns[0].role == "system") {
-            if (!turns[0].content.empty()) { s += turns[0].content; s += "\n\n"; }
+            if (!turns[0].content.empty()) { p.add_content(turns[0].content); p.add_text("\n\n"); }
             i = 1;
         }
-        append_tools_preamble(s, tools_json);
-        s += "<|im_end|>\n";
+        append_tools_preamble(p, tools_json);
+        p.add_text("<|im_end|>\n");
     } else if (!reasoning_preamble.empty()) {
         // No tools: effort sentence heads the system block; merge a leading
         // system turn under it, else emit a standalone system block.
-        s += "<|im_start|>system\n";
-        s += reasoning_preamble;
+        p.add_text("<|im_start|>system\n");
+        p.add_text(reasoning_preamble);
         if (n > 0 && turns[0].role == "system") {
-            if (!turns[0].content.empty()) { s += "\n\n"; s += turns[0].content; }
+            if (!turns[0].content.empty()) { p.add_text("\n\n"); p.add_content(turns[0].content); }
             i = 1;
         }
-        s += "<|im_end|>\n";
+        p.add_text("<|im_end|>\n");
     }
     for (; i < n; ++i) {
         const auto& t = turns[i];
         if (t.role == "tool") {
             // Tool results render inside a user turn as <tool_response> blocks;
             // consecutive tool turns merge into one user turn (Qwen3 template).
-            s += "<|im_start|>user";
+            p.add_text("<|im_start|>user");
             while (i < n && turns[i].role == "tool") {
-                s += "\n<tool_response>\n";
-                s += turns[i].content;
-                s += "\n</tool_response>";
+                p.add_text("\n<tool_response>\n");
+                p.add_content(turns[i].content);
+                p.add_text("\n</tool_response>");
                 ++i;
             }
             --i;                       // for-loop will ++i past the last tool turn
-            s += "<|im_end|>\n";
+            p.add_text("<|im_end|>\n");
             continue;
         }
-        s += "<|im_start|>";
-        s += t.role;
-        s += '\n';
-        s += t.content;
-        s += "<|im_end|>\n";
+        p.add_text("<|im_start|>");
+        p.add_content(t.role);
+        p.add_text('\n');
+        if (t.role == "assistant") add_assistant_content(p, t);
+        else add_turn_content(p, t, t.content);
+        p.add_text("<|im_end|>\n");
     }
     if (add_generation_prompt) {
-        s += "<|im_start|>assistant\n";
+        p.add_text("<|im_start|>assistant\n");
         if (model_has_think) {
             if (enable_thinking) {
-                s += "<think>\n";
+                p.add_text("<think>\n");
             } else {
                 // Qwen3-family convention: an empty think block signals "reasoning
                 // already done" and suppresses the reasoning trace.
-                s += "<think>\n\n</think>\n\n";
+                p.add_text("<think>\n\n</think>\n\n");
             }
         }
         // Non-thinking models (Qwen3-Coder): plain ChatML, no <think> block.
     }
-    return s;
+    if (content_out) *content_out = std::move(p.content);
+    return std::move(p.text);
 }
 
 std::string build_llama3_prompt(std::span<const ChatTurn> turns,
-                                bool add_generation_prompt) {
+                                bool add_generation_prompt,
+                                std::vector<std::pair<size_t, size_t>>* content_out) {
     // <|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>
     // BOS is added by encode() (add_bos_token=true); not a template literal.
-    std::string s;
+    PromptPiece p;
     for (const auto& t : turns) {
-        s += "<|start_header_id|>";
-        s += t.role;                       // "system" | "user" | "assistant"
-        s += "<|end_header_id|>\n\n";
-        s += t.content;
-        s += "<|eot_id|>";
+        p.add_text("<|start_header_id|>");
+        p.add_content(t.role);                       // "system" | "user" | "assistant"
+        p.add_text("<|end_header_id|>\n\n");
+        p.add_content(t.content);
+        p.add_text("<|eot_id|>");
     }
     if (add_generation_prompt)
-        s += "<|start_header_id|>assistant<|end_header_id|>\n\n";
-    return s;
+        p.add_text("<|start_header_id|>assistant<|end_header_id|>\n\n");
+    if (content_out) *content_out = std::move(p.content);
+    return std::move(p.text);
 }
 
 std::string build_mistral_prompt(std::span<const ChatTurn> turns,
                                  bool add_generation_prompt,
-                                 bool system_prompt_block) {
+                                 bool system_prompt_block,
+                                 std::vector<std::pair<size_t, size_t>>* content_out) {
     // <s>[INST] {user} [/INST] {assistant}</s>[INST] {u2} [/INST] ...
     // BOS (<s>) is added by encode() (add_bos_token), not a template literal.
-    std::string s;
+    PromptPiece p;
     size_t i = 0;
     const size_t n = turns.size();
-    std::string sys;
+    std::string_view sys;
     if (n > 0 && turns[0].role == "system") { sys = turns[0].content; i = 1; }
     bool first_user = true;
     for (; i < n; ++i) {
         const auto& t = turns[i];
         if (t.role == "user") {
-            s += "[INST] ";
+            p.add_text("[INST] ");
             if (first_user && !sys.empty()) {
                 if (system_prompt_block) {
-                    s += "[SYSTEM_PROMPT]"; s += sys; s += "[/SYSTEM_PROMPT]\n\n";
+                    p.add_text("[SYSTEM_PROMPT]"); p.add_content(sys); p.add_text("[/SYSTEM_PROMPT]\n\n");
                 } else {
-                    s += sys; s += "\n\n";
+                    p.add_content(sys); p.add_text("\n\n");
                 }
             }
-            s += t.content;
-            s += " [/INST]";
+            p.add_content(t.content);
+            p.add_text(" [/INST]");
             first_user = false;
         } else if (t.role == "assistant") {
-            s += ' ';
-            s += t.content;
-            s += "</s>";
+            p.add_text(' ');
+            p.add_content(t.content);
+            p.add_text("</s>");
         }
     }
     // No trailing token needed for generation: the model continues after [/INST].
     (void)add_generation_prompt;
-    return s;
+    if (content_out) *content_out = std::move(p.content);
+    return std::move(p.text);
 }
 
 std::string build_deepseek_prompt(std::span<const ChatTurn> turns,
                                   bool add_generation_prompt,
-                                  bool enable_thinking) {
+                                  bool enable_thinking,
+                                  std::vector<std::pair<size_t, size_t>>* content_out) {
     // {system}<｜User｜>{u}<｜Assistant｜>{a}<｜end▁of▁sentence｜>...   (R1-Distill)
     // The fullwidth sentinels (U+FF5C bar, U+2581 underscore) ship as special
     // tokens in the GGUF; encode() greedily matches them. BOS
@@ -2007,29 +2141,30 @@ std::string build_deepseek_prompt(std::span<const ChatTurn> turns,
     static constexpr const char* kAssistant = "<\xef\xbd\x9c" "Assistant" "\xef\xbd\x9c>";
     static constexpr const char* kEos       =
         "<\xef\xbd\x9c" "end" "\xe2\x96\x81" "of" "\xe2\x96\x81" "sentence" "\xef\xbd\x9c>";
-    std::string s;
+    PromptPiece p;
     size_t i = 0;
     const size_t n = turns.size();
-    if (n > 0 && turns[0].role == "system") { s += turns[0].content; i = 1; }
+    if (n > 0 && turns[0].role == "system") { p.add_content(turns[0].content); i = 1; }
     for (; i < n; ++i) {
         const auto& t = turns[i];
         if (t.role == "user") {
-            s += kUser;
-            s += t.content;
+            p.add_text(kUser);
+            p.add_content(t.content);
         } else if (t.role == "assistant") {
-            s += kAssistant;
-            s += t.content;
-            s += kEos;
+            p.add_text(kAssistant);
+            p.add_content(t.content);
+            p.add_text(kEos);
         }
     }
     if (add_generation_prompt) {
-        s += kAssistant;
+        p.add_text(kAssistant);
         // R1-Distill emits a <think> reasoning trace; mirror the ChatML gate so
         // enable_thinking=false yields the empty-think convention.
-        if (enable_thinking) s += "<think>\n";
-        else                 s += "<think>\n\n</think>\n\n";
+        if (enable_thinking) p.add_text("<think>\n");
+        else                 p.add_text("<think>\n\n</think>\n\n");
     }
-    return s;
+    if (content_out) *content_out = std::move(p.content);
+    return std::move(p.text);
 }
 
 // ===== DeepSeek-V4-Flash (arch `deepseek4`) =====
@@ -2143,7 +2278,7 @@ void ds4_json_dump_py(const nlohmann::ordered_json& j, std::string& out) {
 // render_tools(): TOOLS_TEMPLATE with one schema per line. `tools_json` is the
 // raw OpenAI `tools` array; tools_from_openai_format() takes each entry's
 // "function" object (a bare function object is also accepted).
-void append_ds4_tools(std::string& s, std::string_view tools_json) {
+void append_ds4_tools(PromptPiece& p, std::string_view tools_json) {
     std::string schemas;
     nlohmann::ordered_json tools =
         nlohmann::ordered_json::parse(tools_json, nullptr, /*allow_exceptions=*/false);
@@ -2158,6 +2293,7 @@ void append_ds4_tools(std::string& s, std::string_view tools_json) {
     } else {
         schemas.assign(tools_json);   // unparseable: embed verbatim
     }
+    std::string s;
     s += "## Tools\n\nYou have access to a set of tools to help answer the user's question. "
          "You can invoke tools by writing a \"<";
     s += kDsml; s += "tool_calls>\" block like the following:\n\n<";
@@ -2178,9 +2314,10 @@ void append_ds4_tools(std::string& s, std::string_view tools_json) {
     s += "Otherwise, output directly after "; s += kThinkClose;
     s += " with tool calls or final response.\n\n";
     s += "### Available Tool Schemas\n\n";
-    s += schemas;
-    s += "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to "
-         "invoke tool calls.\n";
+    p.add_text(s);
+    p.add_content(schemas);   // the schemas are the request's text (known_bugs 45)
+    p.add_text("\n\nYou MUST strictly follow the above defined tool name and parameter schemas to "
+               "invoke tool calls.\n");
 }
 
 }  // namespace
@@ -2190,62 +2327,75 @@ void append_ds4_tools(std::string& s, std::string_view tools_json) {
 // (openai_proto.cpp render_tool_call).  encode_tool_calls() upstream renders
 // them as the DSML block the model itself emits, so that is what the model
 // must see in its history.  Anything that does not parse as such a block is
-// returned unchanged — never a guessed rendering.
-static std::string ds4_transcode_tool_calls(const std::string& text) {
-    static const std::string OPEN = "<tool_call>", CLOSE = "</tool_call>";
-    if (text.find(OPEN) == std::string::npos) return text;
+// emitted unchanged — never a guessed rendering. The prose, the names, the
+// keys and the values are the request's text; the DSML markers the template's.
+static void ds4_transcode_tool_calls(PromptPiece& p, std::string_view text) {
+    static constexpr std::string_view OPEN = "<tool_call>", CLOSE = "</tool_call>";
+    if (text.find(OPEN) == std::string_view::npos) { p.add_content(text); return; }
     const std::string dsml = kDsml;
-    std::string prose, block;
+    PromptPiece prose, block;
     size_t pos = 0;
     while (true) {
         const size_t a = text.find(OPEN, pos);
-        if (a == std::string::npos) { prose += text.substr(pos); break; }
+        if (a == std::string_view::npos) { prose.add_content(text.substr(pos)); break; }
         const size_t b = text.find(CLOSE, a + OPEN.size());
-        if (b == std::string::npos) return text;                    // unterminated: leave it
-        prose += text.substr(pos, a - pos);
+        if (b == std::string_view::npos) { p.add_content(text); return; }          // unterminated: leave it
+        prose.add_content(text.substr(pos, a - pos));
         nlohmann::ordered_json call = nlohmann::ordered_json::parse(
             text.substr(a + OPEN.size(), b - a - OPEN.size()), nullptr, /*allow_exceptions=*/false);
-        if (!call.is_object() || !call.contains("name") || !call["name"].is_string()) return text;
+        if (!call.is_object() || !call.contains("name") || !call["name"].is_string()) { p.add_content(text); return; }
         nlohmann::ordered_json args = call.value("arguments", nlohmann::ordered_json::object());
         if (args.is_string())
             args = nlohmann::ordered_json::parse(args.get<std::string>(), nullptr, false);
-        if (!args.is_object()) return text;
-        block += "<"; block += dsml; block += "invoke name=\"";
-        block += call["name"].get<std::string>(); block += "\">\n";
+        if (!args.is_object()) { p.add_content(text); return; }
+        block.add_text("<" + dsml + "invoke name=\"");
+        block.add_content(call["name"].get_ref<const std::string&>()); block.add_text("\">\n");
         for (auto it = args.begin(); it != args.end(); ++it) {
-            block += "<"; block += dsml; block += "parameter name=\""; block += it.key();
-            if (it.value().is_string()) { block += "\" string=\"true\">";  block += it.value().get<std::string>(); }
-            else                        { block += "\" string=\"false\">"; block += it.value().dump(-1, ' ', false); }
-            block += "</"; block += dsml; block += "parameter>\n";
+            block.add_text("<" + dsml + "parameter name=\""); block.add_content(it.key());
+            if (it.value().is_string()) { block.add_text("\" string=\"true\">");  block.add_content(it.value().get_ref<const std::string&>()); }
+            else                        { block.add_text("\" string=\"false\">"); block.add_content(it.value().dump(-1, ' ', false)); }
+            block.add_text("</" + dsml + "parameter>\n");
         }
-        block += "</"; block += dsml; block += "invoke>\n";
+        block.add_text("</" + dsml + "invoke>\n");
         pos = b + CLOSE.size();
     }
-    while (!prose.empty() && (prose.back() == '\n' || prose.back() == ' ')) prose.pop_back();
-    std::string out = prose;
-    out += "\n\n<"; out += dsml; out += "tool_calls>\n";
-    out += block;
-    out += "</"; out += dsml; out += "tool_calls>";
-    return out;
+    size_t keep = prose.text.size();
+    while (keep > 0 && (prose.text[keep - 1] == '\n' || prose.text[keep - 1] == ' ')) --keep;
+    p.add_piece(prose, 0, keep);
+    p.add_text("\n\n<" + dsml + "tool_calls>\n");
+    p.add_piece(block);
+    p.add_text("</" + dsml + "tool_calls>");
+}
+
+// A user block's text: the request's, except the engine's image placeholders in a turn that carries images.
+static void ds4_add_user_text(PromptPiece& p, std::string_view text, bool images, std::string_view placeholder) {
+    if (!images || placeholder.empty()) { p.add_content(text); return; }
+    for (size_t at = text.find(placeholder); at != std::string_view::npos; at = text.find(placeholder)) {
+        p.add_content(text.substr(0, at));
+        p.add_text(placeholder);
+        text.remove_prefix(at + placeholder.size());
+    }
+    p.add_content(text);
 }
 
 std::string build_deepseek4_prompt(std::span<const ChatTurn> turns,
                                    bool add_generation_prompt,
-                                   const DeepSeek4ChatOptions& opt) {
+                                   const DeepSeek4ChatOptions& opt,
+                                   std::vector<std::pair<size_t, size_t>>* content_out) {
     // ---- merge_tool_messages(): "tool" turns become <tool_result> blocks on the
     // preceding user turn, and consecutive user turns merge into one. ----
-    struct Block { bool tool_result; std::string_view text; };
+    struct Block { bool tool_result; bool images; std::string_view text; };
     struct Msg   { std::string_view role, content; std::vector<Block> blocks; };
     std::vector<Msg> msgs;
     for (const auto& t : turns) {
         const bool is_tool = (t.role == "tool");
         if (is_tool || t.role == "user") {
             if (!msgs.empty() && msgs.back().role == "user") {
-                msgs.back().blocks.push_back({is_tool, t.content});
+                msgs.back().blocks.push_back({is_tool, !t.images.empty(), t.content});
                 continue;
             }
             msgs.push_back({"user", is_tool ? std::string_view{} : std::string_view(t.content),
-                            {{is_tool, t.content}}});
+                            {{is_tool, !t.images.empty(), t.content}}});
             continue;
         }
         msgs.push_back({t.role, t.content, {}});
@@ -2275,30 +2425,30 @@ std::string build_deepseek4_prompt(std::span<const ChatTurn> turns,
     // assistant (only stripping reasoning_content, which ChatTurn never carries),
     // so over the supported role set it is the identity — nothing to do here.
 
-    std::string s;
-    if (opt.add_bos) s += kDs4Bos;
+    PromptPiece p;
+    if (opt.add_bos) p.add_text(kDs4Bos);
     for (size_t i = 0; i < msgs.size(); ++i) {
         const Msg& m = msgs[i];
-        if (i == 0 && opt.thinking) s += ds4_effort_prompt(opt.reasoning_effort);
+        if (i == 0 && opt.thinking) p.add_text(ds4_effort_prompt(opt.reasoning_effort));
 
         if (m.role == "system") {
-            s += m.content;
-            if (has_tools && i == sys_idx) { s += "\n\n"; append_ds4_tools(s, opt.tools_json); }
+            p.add_content(m.content);
+            if (has_tools && i == sys_idx) { p.add_text("\n\n"); append_ds4_tools(p, opt.tools_json); }
         } else if (m.role == "user") {
-            s += kDs4User;
+            p.add_text(kDs4User);
             bool first = true;
             for (const Block& b : m.blocks) {
-                if (!first) s += "\n\n";
+                if (!first) p.add_text("\n\n");
                 first = false;
-                if (b.tool_result) { s += "<tool_result>"; s += b.text; s += "</tool_result>"; }
-                else               { s += b.text; }
+                if (b.tool_result) { p.add_text("<tool_result>"); p.add_content(b.text); p.add_text("</tool_result>"); }
+                else               { ds4_add_user_text(p, b.text, b.images, opt.image_placeholder); }
             }
         } else if (m.role == "assistant") {
             // {reasoning}</think> only when upstream would keep it; reasoning is
             // always empty here (see the NOT PORTED list).
-            if (opt.thinking && (!drop_thinking || i > last_user_idx)) s += kThinkClose;
-            s += ds4_transcode_tool_calls(std::string(m.content));
-            s += kDs4Eos;
+            if (opt.thinking && (!drop_thinking || i > last_user_idx)) p.add_text(kThinkClose);
+            ds4_transcode_tool_calls(p, m.content);
+            p.add_text(kDs4Eos);
         }
         // Unsupported roles render nothing — Engine::chat rejects them up front.
 
@@ -2307,11 +2457,12 @@ std::string build_deepseek4_prompt(std::span<const ChatTurn> turns,
         if (i + 1 < msgs.size() && msgs[i + 1].role != "assistant") continue;
         if (m.role != "user") continue;
         if (i + 1 == msgs.size() && !add_generation_prompt) continue;
-        s += kDs4Asst;
-        if (opt.thinking && (!drop_thinking || i >= last_user_idx)) s += kThinkOpen;
-        else                                                        s += kThinkClose;
+        p.add_text(kDs4Asst);
+        if (opt.thinking && (!drop_thinking || i >= last_user_idx)) p.add_text(kThinkOpen);
+        else                                                        p.add_text(kThinkClose);
     }
-    return s;
+    if (content_out) *content_out = std::move(p.content);
+    return std::move(p.text);
 }
 
 namespace {
@@ -2544,7 +2695,8 @@ DeepSeek4Completion parse_deepseek4_completion_impl(std::string_view text, bool 
 }  // namespace
 
 std::string build_granite_prompt(std::span<const ChatTurn> turns,
-                                 bool add_generation_prompt) {
+                                 bool add_generation_prompt,
+                                 std::vector<std::pair<size_t, size_t>>* content_out) {
     // IBM Granite-3.x:
     //   <|start_of_role|>{role}<|end_of_role|>{content}<|end_of_text|>\n  (per turn)
     //   <|start_of_role|>assistant<|end_of_role|>                         (gen prompt)
@@ -2556,33 +2708,36 @@ std::string build_granite_prompt(std::span<const ChatTurn> turns,
     static constexpr const char* kSOR = "<|start_of_role|>";
     static constexpr const char* kEOR = "<|end_of_role|>";
     static constexpr const char* kEOT = "<|end_of_text|>";
-    std::string s;
+    PromptPiece p;
     for (const auto& t : turns) {
-        s += kSOR; s += t.role; s += kEOR;
-        s += t.content;
-        s += kEOT;
-        s += "\n";
+        p.add_text(kSOR); p.add_content(t.role); p.add_text(kEOR);
+        p.add_content(t.content);
+        p.add_text(kEOT);
+        p.add_text("\n");
     }
     if (add_generation_prompt) {
-        s += kSOR; s += "assistant"; s += kEOR;
+        p.add_text(kSOR); p.add_text("assistant"); p.add_text(kEOR);
     }
-    return s;
+    if (content_out) *content_out = std::move(p.content);
+    return std::move(p.text);
 }
 
 std::string build_gemma_prompt(std::span<const ChatTurn> turns,
-                               bool add_generation_prompt) {
+                               bool add_generation_prompt,
+                               std::vector<std::pair<size_t, size_t>>* content_out) {
     // Gemma 4: <|turn>{role}\n{content}<turn|>\n per turn (assistant→model),
     // <|turn>model\n to start generation. <|turn>=105, <turn|>=106 are single
     // special tokens; BOS prepended by encode(); the model closes with <turn|>.
-    std::string s;
+    PromptPiece p;
     for (const auto& t : turns) {
-        const std::string role = (t.role == "assistant") ? "model" : t.role;
-        s += "<|turn>"; s += role; s += "\n";
-        s += t.content;
-        s += "<turn|>\n";
+        p.add_text("<|turn>");
+        if (t.role == "assistant") p.add_text("model"); else p.add_content(t.role);
+        p.add_text("\n");
+        p.add_content(t.content);
+        p.add_text("<turn|>\n");
     }
     if (add_generation_prompt) {
-        s += "<|turn>model\n";
+        p.add_text("<|turn>model\n");
         // Gemma 4's official template, when thinking is disabled (this engine's
         // only mode), pre-fills an EMPTY closed "thought" channel after the model
         // turn marker so the model skips its reasoning preamble and answers
@@ -2592,9 +2747,10 @@ std::string build_gemma_prompt(std::span<const ChatTurn> turns,
         // answer (`> thought\nThe capital of France is Paris.`). <|channel>(100)
         // and <channel|>(101) are USER_DEFINED specials; the "thought\n" between
         // them encodes as ordinary text, reproducing the template's token stream.
-        s += "<|channel>thought\n<channel|>";
+        p.add_text("<|channel>thought\n<channel|>");
     }
-    return s;
+    if (content_out) *content_out = std::move(p.content);
+    return std::move(p.text);
 }
 
 // JSON-Schema (common subset) -> a TypeScript type string for a Harmony tool
@@ -2639,11 +2795,12 @@ static std::string harmony_schema_to_ts(const nlohmann::ordered_json& sch) {
 
 // Render the OpenAI `tools` array as a Harmony `namespace functions { … }` block
 // (appended to the DEVELOPER message). This is the form gpt-oss is trained to read.
-static void append_harmony_tools(std::string& dev, std::string_view tools_json) {
+// The descriptions, the names and the signatures (parameter names, enum values) are the request's text.
+static void append_harmony_tools(PromptPiece& dev, std::string_view tools_json) {
     nlohmann::ordered_json tools = nlohmann::ordered_json::parse(
         tools_json, nullptr, /*allow_exceptions=*/false);
     if (!tools.is_array() || tools.empty()) return;
-    dev += "# Tools\n\n## functions\n\nnamespace functions {\n\n";
+    dev.add_text("# Tools\n\n## functions\n\nnamespace functions {\n\n");
     for (const auto& t : tools) {
         const nlohmann::ordered_json* fn = nullptr;
         if (t.is_object() && t.contains("function")) fn = &t["function"];
@@ -2651,7 +2808,7 @@ static void append_harmony_tools(std::string& dev, std::string_view tools_json) 
         if (!fn || !fn->contains("name") || !(*fn)["name"].is_string()) continue;
         if (fn->contains("description") && (*fn)["description"].is_string() &&
             !(*fn)["description"].get<std::string>().empty()) {
-            dev += "// "; dev += (*fn)["description"].get<std::string>(); dev += "\n";
+            dev.add_text("// "); dev.add_content((*fn)["description"].get_ref<const std::string&>()); dev.add_text("\n");
         }
         std::string sig = "() => any;";
         if (fn->contains("parameters") && (*fn)["parameters"].is_object()) {
@@ -2659,15 +2816,16 @@ static void append_harmony_tools(std::string& dev, std::string_view tools_json) 
             if (p.contains("properties") && p["properties"].is_object() && !p["properties"].empty())
                 sig = "(_: " + harmony_schema_to_ts(p) + ") => any;";
         }
-        dev += "type "; dev += (*fn)["name"].get<std::string>(); dev += " = "; dev += sig; dev += "\n\n";
+        dev.add_text("type "); dev.add_content((*fn)["name"].get_ref<const std::string&>()); dev.add_text(" = "); dev.add_content(sig); dev.add_text("\n\n");
     }
-    dev += "} // namespace functions\n";
+    dev.add_text("} // namespace functions\n");
 }
 
 std::string build_harmony_prompt(std::span<const ChatTurn> turns,
                                  bool add_generation_prompt,
                                  std::string_view reasoning_effort,
-                                 std::string_view tools_json) {
+                                 std::string_view tools_json,
+                                 std::vector<std::pair<size_t, size_t>>* content_out) {
     // Current date for the canned system message (matches jinja strftime_now("%Y-%m-%d")).
     char date[16] = "1970-01-01";
     std::time_t now = std::time(nullptr);
@@ -2679,32 +2837,32 @@ std::string build_harmony_prompt(std::span<const ChatTurn> turns,
 #endif
     std::strftime(date, sizeof(date), "%Y-%m-%d", &tmv);
 
-    std::string s;
+    PromptPiece s;
     // Harmony SYSTEM message (always present).
-    s += "<|start|>system<|message|>";
-    s += "You are ChatGPT, a large language model trained by OpenAI.\n";
-    s += "Knowledge cutoff: 2024-06\n";
-    s += "Current date: "; s += date; s += "\n\n";
-    s += "Reasoning: "; s += reasoning_effort; s += "\n\n";
-    s += "# Valid channels: analysis, commentary, final. "
-         "Channel must be included for every message.";
+    s.add_text("<|start|>system<|message|>");
+    s.add_text("You are ChatGPT, a large language model trained by OpenAI.\n");
+    s.add_text("Knowledge cutoff: 2024-06\n");
+    s.add_text("Current date: "); s.add_text(date); s.add_text("\n\n");
+    s.add_text("Reasoning: "); s.add_content(reasoning_effort); s.add_text("\n\n");
+    s.add_text("# Valid channels: analysis, commentary, final. "
+               "Channel must be included for every message.");
     if (!tools_json.empty())
-        s += "\nCalls to these tools must go to the commentary channel.";
-    s += "<|end|>";
+        s.add_text("\nCalls to these tools must go to the commentary channel.");
+    s.add_text("<|end|>");
 
     // DEVELOPER message = caller instructions (a leading "system" turn) + the
     // tool namespace. Emitted when either is present.
     size_t i = 0;
     const size_t n = turns.size();
-    std::string dev;
+    PromptPiece dev;
     if (n > 0 && turns[0].role == "system") {
         if (!turns[0].content.empty()) {
-            dev += "# Instructions\n\n"; dev += turns[0].content; dev += "\n\n";
+            dev.add_text("# Instructions\n\n"); dev.add_content(turns[0].content); dev.add_text("\n\n");
         }
         i = 1;
     }
     if (!tools_json.empty()) append_harmony_tools(dev, tools_json);
-    if (!dev.empty()) { s += "<|start|>developer<|message|>"; s += dev; s += "<|end|>"; }
+    if (!dev.text.empty()) { s.add_text("<|start|>developer<|message|>"); s.add_piece(dev); s.add_text("<|end|>"); }
 
     // Remaining turns. Tracks the last called function so its tool RESULT can be
     // addressed back to the assistant on the commentary channel.
@@ -2712,7 +2870,7 @@ std::string build_harmony_prompt(std::span<const ChatTurn> turns,
     for (; i < n; ++i) {
         const auto& t = turns[i];
         if (t.role == "user") {
-            s += "<|start|>user<|message|>"; s += t.content; s += "<|end|>";
+            s.add_text("<|start|>user<|message|>"); s.add_content(t.content); s.add_text("<|end|>");
         } else if (t.role == "assistant") {
             // An assistant turn carrying <tool_call> blocks is a prior tool call:
             // re-render each on the commentary channel (closing with <|call|>).
@@ -2733,26 +2891,27 @@ std::string build_harmony_prompt(std::span<const ChatTurn> turns,
                         args = call["arguments"].is_string()
                                  ? call["arguments"].get<std::string>()
                                  : call["arguments"].dump();
-                    s += "<|start|>assistant<|channel|>commentary to=functions.";
-                    s += last_fn; s += " <|constrain|>json<|message|>"; s += args; s += "<|call|>";
+                    s.add_text("<|start|>assistant<|channel|>commentary to=functions.");
+                    s.add_content(last_fn); s.add_text(" <|constrain|>json<|message|>"); s.add_content(args); s.add_text("<|call|>");
                     any = true;
                 }
                 p = b + 12;
             }
             if (!any) {
-                s += "<|start|>assistant<|channel|>final<|message|>";
-                s += t.content; s += "<|end|>";
+                s.add_text("<|start|>assistant<|channel|>final<|message|>");
+                s.add_content(t.content); s.add_text("<|end|>");
             }
         } else if (t.role == "tool") {
             // Tool result → commentary channel, addressed back to the assistant.
-            s += "<|start|>functions.";
-            s += (last_fn.empty() ? std::string("tool") : last_fn);
-            s += " to=assistant<|channel|>commentary<|message|>";
-            s += t.content; s += "<|end|>";
+            s.add_text("<|start|>functions.");
+            if (last_fn.empty()) s.add_text("tool"); else s.add_content(last_fn);
+            s.add_text(" to=assistant<|channel|>commentary<|message|>");
+            s.add_content(t.content); s.add_text("<|end|>");
         }
     }
-    if (add_generation_prompt) s += "<|start|>assistant";
-    return s;
+    if (add_generation_prompt) s.add_text("<|start|>assistant");
+    if (content_out) *content_out = std::move(s.content);
+    return std::move(s.text);
 }
 
 }  // namespace ie

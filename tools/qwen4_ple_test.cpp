@@ -344,10 +344,41 @@ int main() {
                   "the IQ4_NL layout on a Q8_0 table is accepted (as before the fix) and reads different values (the old bug)");
         }
         check(qwen4_ple_row_bytes(DType::kIQ4_NL) == 90 && qwen4_ple_row_bytes(DType::kQ8_0) == 170 &&
-              qwen4_ple_row_bytes(DType::kF16) == 0, "row bytes: IQ4_NL 90, Q8_0 170, others 0");
+              qwen4_ple_row_bytes(DType::kQ4_0) == 90 && qwen4_ple_row_bytes(DType::kQ5_0) == 110 &&
+              qwen4_ple_row_bytes(DType::kQ5_1) == 120 && qwen4_ple_row_bytes(DType::kF16) == 320 &&
+              qwen4_ple_row_bytes(DType::kBF16) == 320 && qwen4_ple_row_bytes(DType::kF32) == 640 &&
+              qwen4_ple_row_bytes(DType::kQ4_K) == 0 && qwen4_ple_row_bytes(DType::kQ6_K) == 0,
+              "row bytes: IQ4_NL 90, Q4_0 90, Q5_0 110, Q5_1 120, Q8_0 170, F16 / BF16 320, F32 640; K-quants 0");
+        // 2026-11-07: the community tables' types gather row for row as the reference dequant of the same bytes (random
+        // block bytes: every byte pattern is a valid block in these formats; compared bit for bit, NaN patterns included)
+        for (DType tdt : {DType::kQ5_1, DType::kQ5_0, DType::kQ4_0, DType::kF16, DType::kBF16, DType::kF32}) {
+            const uint32_t rbt = qwen4_ple_row_bytes(tdt);
+            std::vector<uint8_t> tbl(size_t(T) * 16 * rbt);
+            std::mt19937 rg(uint32_t(rbt) * 7919u);
+            for (auto& b : tbl) b = uint8_t(rg());
+            std::vector<uint64_t> rws(size_t(T) * 16);
+            for (size_t i = 0; i < rws.size(); ++i) rws[i] = (i * 5 + 3) % rws.size();
+            std::vector<float> got(size_t(T) * 2560), want(160);
+            const std::string ge2 = qwen4_ple_gather(tbl.data(), tdt, rws.data(), T, got.data());
+            bool okt = ge2.empty();
+            for (uint32_t p = 0; p < T && okt; ++p)
+                for (uint32_t h = 0; h < 16 && okt; ++h) {
+                    const uint8_t* src = tbl.data() + rws[size_t(p) * 16 + h] * rbt;
+                    switch (tdt) {
+                        case DType::kQ5_1: ref::dequant_q5_1_buffer(src, 160, want.data()); break;
+                        case DType::kQ5_0: ref::dequant_q5_0_buffer(src, 160, want.data()); break;
+                        case DType::kQ4_0: ref::dequant_q4_0_buffer(src, 160, want.data()); break;
+                        case DType::kF16:  for (int i = 0; i < 160; ++i) want[i] = float(sycl::bit_cast<sycl::half>(reinterpret_cast<const uint16_t*>(src)[i])); break;
+                        case DType::kBF16: for (int i = 0; i < 160; ++i) want[i] = sycl::bit_cast<float>(uint32_t(reinterpret_cast<const uint16_t*>(src)[i]) << 16); break;
+                        default:           std::memcpy(want.data(), src, 160 * sizeof(float)); break;
+                    }
+                    okt = std::memcmp(got.data() + size_t(p) * 2560 + size_t(h) * 160, want.data(), 160 * sizeof(float)) == 0;
+                }
+            check(okt, (std::string(type_name(tdt)) + " table: every gathered row == the reference dequant of its bytes").c_str());
+        }
         std::vector<float> untouched(size_t(T) * kPleD, 7.f);
-        const std::string re = qwen4_ple_gather(table.data(), DType::kF16, rows.data(), T, untouched.data());
-        check(!re.empty() && re.find("F16") != std::string::npos, ("an F16 table is refused by name: " + re).c_str());
+        const std::string re = qwen4_ple_gather(table.data(), DType::kQ6_K, rows.data(), T, untouched.data());
+        check(!re.empty() && re.find("Q6_K") != std::string::npos, ("a K-quant table is refused by name: " + re).c_str());
         check(std::all_of(untouched.begin(), untouched.end(), [](float v) { return v == 7.f; }), "a refused gather writes nothing");
     }
 

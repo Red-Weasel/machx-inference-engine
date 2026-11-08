@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace ie {
@@ -30,9 +31,12 @@ struct Ds41PromptOptions {
 // "low" / "high" / "max" or a decimal 1..100; -1 with `err` set otherwise.
 int ds41_reasoning_effort_of(const std::string& s, std::string& err);
 
-// The prompt string for `msgs` (the model's own special-token text; tokenise with allow_special),
-// or "" with `err` set when a message needs something this port refuses.
-std::string ds41_encode_messages(const std::vector<Ds41ChatMessage>& msgs, const Ds41PromptOptions& o, std::string& err);
+// The prompt string for `msgs` (the model's own special-token text; tokenise with allow_special), or "" with `err` set
+// when a message needs something this port refuses. `content`, when given, receives the byte ranges of the prompt that
+// came from the request -- system / user / assistant text, reasoning, tool names, arguments, schemas and results -- for
+// Tokenizer::encode(text, true, content): a control-token spelling inside them stays text (known_bugs 45, 2026-11-04).
+std::string ds41_encode_messages(const std::vector<Ds41ChatMessage>& msgs, const Ds41PromptOptions& o, std::string& err,
+                                 std::vector<std::pair<size_t, size_t>>* content = nullptr);
 
 struct Ds41Completion {
     std::string content, reasoning_content, tool_calls_json, error;

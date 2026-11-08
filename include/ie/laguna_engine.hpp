@@ -25,4 +25,11 @@ struct LagunaBundle {
     bool                         reuse = true;   // --no-prompt-cache: every request reads its whole prompt
 };
 
+// The GGUF's chat template rendered natively (laguna_glm_thinking_v8; add_generation_prompt always on). `content`
+// (known_bugs 45): when given, receives the request-text ranges of the returned prompt (PromptPiece, tokenizer.hpp): the
+// request's system text (not the template's default), contents, reasoning, tool-call names / keys / values, tool
+// results, the tool schemas -- and none of the template's markers. The text is the same with or without it.
+std::string laguna_render_prompt(std::span<const ChatTurn> turns, std::string_view tools_json, bool thinking, std::string& err,
+                                 std::vector<std::pair<size_t, size_t>>* content = nullptr);
+
 }  // namespace ie

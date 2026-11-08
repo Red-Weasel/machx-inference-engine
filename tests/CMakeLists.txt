@@ -490,6 +490,11 @@ target_compile_options(deepseek4_tokenizer_test PRIVATE -UNDEBUG)
 add_test(NAME deepseek4_tokenizer_test COMMAND deepseek4_tokenizer_test)
 
 # Tool-call repair helpers (docs/deepseek41/107): header-only, host-only (no GPU, no model).
+# known_bugs 45 (2026-11-05): the after-the-fact content ranges of a rendered prompt (the families that render plain strings)
+add_executable(prompt_guard_test unit/prompt_guard_test.cpp)
+target_include_directories(prompt_guard_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME prompt_guard_test COMMAND prompt_guard_test)
+
 add_executable(tool_call_repair_test unit/tool_call_repair_test.cpp)
 target_link_libraries(tool_call_repair_test PRIVATE ie_sycl_flags)
 target_include_directories(tool_call_repair_test PRIVATE
@@ -664,6 +669,37 @@ add_test(NAME dn_ladder_test COMMAND dn_ladder_test)
 add_executable(glm5_server_test unit/glm5_server_test.cpp)
 target_link_libraries(glm5_server_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME glm5_server_test COMMAND glm5_server_test)
+# known_bugs 45: the MiMo-V2.6 chat renderer's own request-text ranges (host-only).
+add_executable(mimo26_chat_test unit/mimo26_chat_test.cpp)
+target_link_libraries(mimo26_chat_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME mimo26_chat_test COMMAND mimo26_chat_test)
+# known_bugs 45: the Laguna chat renderer's own request-text ranges (host-only).
+add_executable(laguna_chat_test unit/laguna_chat_test.cpp)
+target_link_libraries(laguna_chat_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME laguna_chat_test COMMAND laguna_chat_test)
+# known_bugs 45: the plain-string chat renderers' own request-text ranges (Llama-3, Mistral, R1, DS4, Granite, Gemma, Harmony).
+add_executable(chat_ranges_test unit/chat_ranges_test.cpp)
+target_link_libraries(chat_ranges_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME chat_ranges_test COMMAND chat_ranges_test)
+# Qwen 4 readiness: llama.cpp's merged tensors split into two views (include/ie/qwen4exp.hpp, host-only).
+add_executable(qwen4exp_split_test unit/qwen4exp_split_test.cpp)
+target_link_libraries(qwen4exp_split_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME qwen4exp_split_test COMMAND qwen4exp_split_test)
+# the MTP draft head's two file layouts (engine mtp-head.gguf, llama.cpp nextn export); IE_QWEN35_MTP_GGUF = a nextn export to
+# check the mapping against (skipped without one)
+add_executable(qwen4exp_mtp_layout_test unit/qwen4exp_mtp_layout_test.cpp)
+target_link_libraries(qwen4exp_mtp_layout_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME qwen4exp_mtp_layout_test COMMAND qwen4exp_mtp_layout_test)
+# the qwen4exp config reader on synthetic files: the layer schedule (recurrent_layers / interval default), nextn blocks,
+# uniform per-block arrays, the QSA block-of-4 limits
+add_executable(qwen4exp_schedule_test unit/qwen4exp_schedule_test.cpp)
+target_link_libraries(qwen4exp_schedule_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME qwen4exp_schedule_test COMMAND qwen4exp_schedule_test)
+# The "qwen35" pre-tokenizer against HF tokenizers' ids (tests/data/qwen35_pretok_*); needs a Flash-Next GGUF (IE_QWEN35_GGUF), else skips.
+add_executable(tokenizer_qwen35_golden_test unit/tokenizer_qwen35_golden_test.cpp)
+target_link_libraries(tokenizer_qwen35_golden_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME tokenizer_qwen35_golden_test COMMAND tokenizer_qwen35_golden_test)
+set_tests_properties(tokenizer_qwen35_golden_test PROPERTIES SKIP_RETURN_CODE 77)
 
 add_executable(glm5_config_test unit/glm5_config_test.cpp)
 target_link_libraries(glm5_config_test PRIVATE ie_core ie_sycl_flags)
@@ -957,6 +993,11 @@ target_link_libraries(ds41_prefill_plan_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME ds41_prefill_plan_test COMMAND ds41_prefill_plan_test)
 # Host-only (no GPU, no SYCL): the V4.1 serving rules at --parallel > 1 (include/ie/ds41_serve_rules.hpp, P4 B6b) -- the lane
 # choice (MiMo B4's reply room + the continuation preference) and the reply budget. Does NOT link ie_core.
+# 2026-11-05: the hugetlb pool report the V4.1 staging tier prints with its WARNING (who holds the pool)
+add_executable(hugetlb_pool_test unit/hugetlb_pool_test.cpp)
+target_include_directories(hugetlb_pool_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME hugetlb_pool_test COMMAND hugetlb_pool_test)
+
 add_executable(ds41_serve_rules_test unit/ds41_serve_rules_test.cpp)
 target_include_directories(ds41_serve_rules_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 add_test(NAME ds41_serve_rules_test COMMAND ds41_serve_rules_test)

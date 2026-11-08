@@ -78,8 +78,17 @@ std::string tool_name(Json f, const Json& tc) {
         throw std::runtime_error("invalid tool name");
     return ns.empty()?name:ns+"::"+name;
 }
-std::string render_tools(const std::string& raw) {
-    auto tools=array_json(raw); if(tools.empty()) return {};
+// A rendered span: its text and the byte ranges of it that came from the request (known_bugs 45): the template's own
+// markers go in through add_text, everything the client wrote through add_content.
+struct Piece {
+    std::string text;
+    std::vector<std::pair<size_t, size_t>> content;
+    void add_text(std::string_view s) { text += s; }
+    void add_content(std::string_view s) { if (!s.empty()) content.emplace_back(text.size(), text.size() + s.size()); text += s; }
+    void add(const Piece& p) { for (const auto& [b, e] : p.content) content.emplace_back(text.size() + b, text.size() + e); text += p.text; }
+};
+Piece render_tools(const std::string& raw) {
+    auto tools=array_json(raw); Piece out; if(tools.empty()) return out;
     std::string schemas;
     for(const auto& t:tools) {
         auto f=t.at("function");
@@ -117,16 +126,17 @@ __SCHEMAS__
 
 You MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.
 )TOOLS";
-    text.replace(text.find("__SCHEMAS__"), 11, schemas);
-    return text;
+    const auto at=text.find("__SCHEMAS__");
+    out.add_text(std::string_view(text).substr(0,at)); out.add_content(schemas); out.add_text(std::string_view(text).substr(at+11));
+    return out;
 }
-std::string render_calls(const std::string& raw) {
-    auto calls=array_json(raw); if(calls.empty()) return {};
-    std::string text="\n\n<｜DSML｜ calls>\n";
+Piece render_calls(const std::string& raw) {
+    auto calls=array_json(raw); Piece out; if(calls.empty()) return out;
+    out.add_text("\n\n<｜DSML｜ calls>\n");
     for(size_t i=0;i<calls.size();++i) {
         const auto& tc=calls[i]; const auto& f=tc.at("function");
-        if(i) text+='\n';
-        text+="<｜DSML｜ invoke name=\""+tool_name(f,tc)+"\">\n";
+        if(i) out.add_text("\n");
+        out.add_text("<｜DSML｜ invoke name=\""); out.add_content(tool_name(f,tc)); out.add_text("\">\n");
         auto args=f.at("arguments"); const auto original=args;
         for(int pass=0;pass<2 && args.is_string();++pass) {
             auto parsed=Json::parse(args.get<std::string>(),nullptr,false);
@@ -137,14 +147,16 @@ std::string render_calls(const std::string& raw) {
         bool first=true;
         for(auto it=args.begin();it!=args.end();++it) {
             if(it.key().find_first_of("\"<>\r\n")!=std::string::npos) throw std::runtime_error("invalid parameter name");
-            if(!first) text+='\n'; first=false;
-            text+="<｜DSML｜ parameter name=\""+it.key()+"\" string=\""+(it.value().is_string()?"true":"false")+"\">";
-            text+=it.value().is_string()?it.value().get<std::string>():py_json(it.value());
-            text+="</｜DSML｜ parameter>";
+            if(!first) out.add_text("\n"); first=false;
+            out.add_text("<｜DSML｜ parameter name=\""); out.add_content(it.key());
+            out.add_text(std::string("\" string=\"")+(it.value().is_string()?"true":"false")+"\">");
+            out.add_content(it.value().is_string()?it.value().get<std::string>():py_json(it.value()));
+            out.add_text("</｜DSML｜ parameter>");
         }
-        text+="\n</｜DSML｜ invoke>";
+        out.add_text("\n</｜DSML｜ invoke>");
     }
-    return text+"\n</｜DSML｜ calls>";
+    out.add_text("\n</｜DSML｜ calls>");
+    return out;
 }
 struct Block { bool tool; std::string id, text; };
 std::vector<Ds41ChatMessage> merge_messages(const std::vector<Ds41ChatMessage>& input) {
@@ -190,34 +202,34 @@ int last_user_index(const std::vector<Ds41ChatMessage>& m) {
     return -1;
 }
 
-std::string render(size_t idx, const std::vector<Ds41ChatMessage>& m, const Ds41PromptOptions& o) {
+Piece render(size_t idx, const std::vector<Ds41ChatMessage>& m, const Ds41PromptOptions& o) {
     const auto& msg = m[idx];
     const int last_user = last_user_index(m);
     // render_reasoning_effort: thinking mode, index 0 only
     std::string effort;
     if (idx == 0 && o.thinking)
         effort = "Reasoning Effort: " + std::to_string(o.reasoning_effort) + " (range 1-100, the higher the value, the more thorough the reasoning)\n\n";
-    std::string p = (idx == 0 && (!effort.empty() || msg.role == "system")) ? kSystem : "";
-    p += effort;
+    Piece p;
+    if (idx == 0 && (!effort.empty() || msg.role == "system")) p.add_text(kSystem);
+    p.add_text(effort);
     if (msg.role == "system") {
-        if (idx > 0) p += kSystem;                       // mid-conversation system message
-        p += msg.content;
+        if (idx > 0) p.add_text(kSystem);                // mid-conversation system message
+        p.add_content(msg.content);
         auto tools = render_tools(msg.tools_json);
-        if (!tools.empty()) p += "\n\n" + tools;
+        if (!tools.text.empty()) { p.add_text("\n\n"); p.add(tools); }
     } else if (msg.role == "user") {
-        p += kUser; p += msg.content;
-    } else {                                              // assistant
-        std::string thinking_part;
-        if (o.thinking && (!o.drop_thinking || int(idx) > last_user)) thinking_part = msg.reasoning_content + kThinkEnd;
-        p += thinking_part + msg.content + render_calls(msg.tool_calls_json) + kEos;          // assistant_msg_template: {reasoning}{content}{tool_calls}eos
+        p.add_text(kUser); p.add_content(msg.content);
+    } else {                                              // assistant: {reasoning}{content}{tool_calls}eos
+        if (o.thinking && (!o.drop_thinking || int(idx) > last_user)) { p.add_content(msg.reasoning_content); p.add_text(kThinkEnd); }
+        p.add_content(msg.content); p.add(render_calls(msg.tool_calls_json)); p.add_text(kEos);
     }
     // the transition tokens, only when what follows is an assistant turn (or nothing)
     if (idx + 1 < m.size() && m[idx + 1].role != "assistant") return p;
     if (msg.role == "user" || (msg.role == "system" && idx > 0)) {
-        p += kAssistant;
-        if (!o.drop_thinking && o.thinking)                       p += kThinkOpen;
-        else if (o.drop_thinking && o.thinking && int(idx) >= last_user) p += kThinkOpen;
-        else                                                       p += kThinkEnd;
+        p.add_text(kAssistant);
+        if (!o.drop_thinking && o.thinking)                       p.add_text(kThinkOpen);
+        else if (o.drop_thinking && o.thinking && int(idx) >= last_user) p.add_text(kThinkOpen);
+        else                                                       p.add_text(kThinkEnd);
     }
     return p;
 }
@@ -233,8 +245,10 @@ int ds41_reasoning_effort_of(const std::string& s, std::string& err) {
     return -1;
 }
 
-std::string ds41_encode_messages(const std::vector<Ds41ChatMessage>& msgs, const Ds41PromptOptions& options, std::string& err) {
+std::string ds41_encode_messages(const std::vector<Ds41ChatMessage>& msgs, const Ds41PromptOptions& options, std::string& err,
+                                 std::vector<std::pair<size_t, size_t>>* content) {
     err.clear();
+    if (content) content->clear();
     auto o=options;
     try {
     if (msgs.empty()) { err = "no messages"; return ""; }
@@ -265,9 +279,11 @@ std::string ds41_encode_messages(const std::vector<Ds41ChatMessage>& msgs, const
         for (size_t i = 0; i < full.size(); ++i)
             if (full[i].role == "assistant" && int(i) < last_user) full[i].reasoning_content.clear();
     }
-    std::string prompt = o.add_bos ? kBos : "";
-    for (size_t i = 0; i < full.size(); ++i) prompt += render(i, full, o);
-    return prompt;
+    Piece prompt;
+    if (o.add_bos) prompt.add_text(kBos);
+    for (size_t i = 0; i < full.size(); ++i) prompt.add(render(i, full, o));
+    if (content) *content = std::move(prompt.content);
+    return prompt.text;
     } catch(const std::exception& e) { err=std::string("deepseek41 prompt: ")+e.what(); return {}; }
 }
 

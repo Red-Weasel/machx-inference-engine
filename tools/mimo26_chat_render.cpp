@@ -27,7 +27,7 @@ int main(int argc, char** argv) {
             x.role = m.value("role", "");
             x.content = m.contains("content") && m["content"].is_string() ? m["content"].get<std::string>() : std::string();
             // P6.2: "images": N -- the server's kChatImageMarker in the content stands where each image part sat
-            if (m.contains("images") && m["images"].is_number_unsigned()) x.content = ie::mimo26_place_images(x.content, m["images"].get<size_t>());
+            if (m.contains("images") && m["images"].is_number_unsigned()) x.content = ie::mimo26_place_images(x.content, m["images"].get<size_t>(), &x.image_at);
             x.reasoning = m.contains("reasoning_content") && m["reasoning_content"].is_string() ? m["reasoning_content"].get<std::string>() : std::string();
             if (m.contains("tool_calls")) x.tool_calls_json = m["tool_calls"].dump();
             msgs.push_back(std::move(x));

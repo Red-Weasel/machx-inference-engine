@@ -68,6 +68,18 @@ int main() {
         CHECK(!j.is_discarded() && j["path"] == "a\\b", "escaped backslash kept");
         j = repaired("{\"a\": \"tail\\");                                          // lone trailing backslash then EOF: still unterminated
         CHECK(j.is_discarded(), "unterminated stays invalid");
+        // closers missing at the end: the DSML block bounds the value, so an unclosed container has one completion (2026-11-04:
+        // two of the five rejections the engine had ever logged were an `edits` array whose object never got its final `}`)
+        j = repaired("{\"edits\": [{\"new_string\": \"a\", \"old_string\": \"b\"}]");
+        CHECK(!j.is_discarded() && j["edits"].size() == 1 && j["edits"][0]["old_string"] == "b", "closer missing at the end");
+        j = repaired("{\"a\": {\"b\": [1, 2");                                        // several owed, in nesting order
+        CHECK(!j.is_discarded() && j["a"]["b"].size() == 2, "nested closers at the end");
+        j = repaired("[\"x\", \"y\"");
+        CHECK(!j.is_discarded() && j.size() == 2 && j[1] == "y", "array closer at the end");
+        j = repaired("{\"a\": 1, \"b\": {\"c\": \"line1\nline2\"");                  // together with another slip in the same text
+        CHECK(!j.is_discarded() && j["b"]["c"] == "line1\nline2", "closers after a control-char repair");
+        j = repaired("{\"a\": [1, 2, ]   ");                                          // trailing comma inside, closer missing outside
+        CHECK(!j.is_discarded() && j["a"].size() == 2, "trailing comma and a missing closer");
     }
 
     // ---- valid JSON passes through semantically unchanged (the repair is only ever applied after a strict failure, but must not
@@ -88,8 +100,11 @@ int main() {
     {
         const std::vector<std::string> unfixable = {
             "README.md",                       // a bare word where JSON was promised (the harness contract: never execute a guess)
-            "{\"a\": bare}", "{\"a\": 'single'}", "{\"a\": 1", "{\"a\": \"unterminated}", "{\"a\" 1}", "[1, 2",
+            "{\"a\": bare}", "{\"a\": 'single'}", "{\"a\": \"unterminated}", "{\"a\" 1}", "{\"a\": tru",
             "{\"a\": 1}}", "", "{\"a\": \"x\" \"b\": 2}",
+            // an unclosed container is completed only when nothing else is missing: not after `,` or `:`, not inside a string,
+            // not when a closer matched nothing
+            "{\"a\": 1,", "{\"a\":", "{\"a\": [1, 2,", "{\"a\": \"unterminated", "{\"a\": 1]", "[1, 2}",
         };
         for (const auto& u : unfixable) CHECK(repaired(u).is_discarded(), "should stay invalid: [%s]", u.c_str());
     }

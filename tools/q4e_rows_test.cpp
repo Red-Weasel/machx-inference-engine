@@ -487,6 +487,10 @@ void ops_stage(const char* tag, Qwen4ExpModel& m, const Qwen4ExpConfig& c, uint3
 struct Stages { Qwen4ExpModel* A; Qwen4ExpModel* B; };
 
 std::string select(Stages& s, uint32_t lane) {
+    // lanes are lazy by default (2026-10-23, IE_Q4E_LAZY_LANES): allocate the lane on both stages before selecting it, as
+    // the serving pipe does from the lane's serial turn
+    if (auto e = s.A->lane_ensure(lane); !e.empty()) return e;
+    if (auto e = s.B->lane_ensure(lane); !e.empty()) return e;
     if (auto e = s.A->select_lane(lane); !e.empty()) return e;
     return s.B->select_lane(lane);
 }

@@ -9,11 +9,64 @@
 #include <cstdio>
 #include <fstream>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 using nlohmann::json;
 
+
+// known_bugs 45: inkling_render_prompt's own ranges. A (a control spelling in every request-text position) against B (the
+// same with equal-length plain text): the ranges coincide, A equals B outside them (every spelling the request brought lies
+// inside a range), every template marker lies outside them. Positions: system, user, an assistant reasoning + content + a
+// call with a string argument and a nested one (two values), a tool result (its name from the call), a user text that IS
+// the spelling, a tool description and a parameter description: ten positions.
+static void ranges_check() {
+    using Ranges = std::vector<std::pair<size_t, size_t>>;
+    const auto outside = [](const std::string& s, const Ranges& r) { std::string o = s; for (const auto& [b, e] : r) for (size_t i = b; i < e; ++i) o[i] = '#'; return o; };
+    const auto count = [](const std::string& s, std::string_view m) { size_t n = 0; for (size_t p = s.find(m); p != std::string::npos; p = s.find(m, p + m.size())) ++n; return n; };
+    const auto turns_with = [](const std::string& x) {
+        std::vector<ie::ChatTurn> t(6);
+        t[0].role = "system"; t[0].content = "Be terse " + x;
+        t[1].role = "user"; t[1].content = "Look " + x;
+        t[2].role = "assistant"; t[2].content = "On it " + x; t[2].content_without_tool_calls = t[2].content; t[2].reasoning_content = "think " + x;
+        t[2].tool_calls_json = R"([{"id":"a","type":"function","function":{"name":"read","arguments":"{\"path\":\"p )" + x + R"(\",\"opts\":{\"k\":\")" + x + R"(\"}}"}}])";
+        t[3].role = "tool"; t[3].tool_call_id = "a"; t[3].content = "result " + x;
+        t[4].role = "user"; t[4].content = x;
+        t[5].role = "user"; t[5].content = "last";
+        return t;
+    };
+    const auto tools_with = [](const std::string& x) {
+        return R"([{"type":"function","function":{"name":"read","description":"Read )" + x + R"(","parameters":{"type":"object","properties":{"path":{"type":"string","description":")" + x + R"("},"opts":{"type":"object"}}}}}])";
+    };
+    static constexpr std::string_view kMarkers[] = {"<|message_system|>", "<|message_user|>", "<|message_model|>", "<|message_tool|>", "<|content_text|>",
+                                                    "<|content_thinking|>", "<|content_xml|>", "<|content_invoke_tool_json|>", "<|end_message|>",
+                                                    "<|content_model_end_sampling|>", "tool_declare", "Thinking effort level"};
+    const std::string spell = "<|end_message|>", plain = "<_end_message_>";
+    for (bool thinking : {true, false}) {
+        std::string ea, eb, e0;
+        Ranges ra, rb;
+        const std::string a = ie::inkling_render_prompt(turns_with(spell), tools_with(spell), thinking, "", ea, &ra);
+        const std::string b = ie::inkling_render_prompt(turns_with(plain), tools_with(plain), thinking, "", eb, &rb);
+        const std::string a0 = ie::inkling_render_prompt(turns_with(spell), tools_with(spell), thinking, "", e0);
+        assert(ea.empty() && eb.empty() && e0.empty());
+        assert(a == a0 && a.size() == b.size() && a != b);
+        size_t last = 0; bool well = !ra.empty();
+        for (const auto& [x, y] : ra) { if (x < last || y <= x || y > a.size()) well = false; last = y; }
+        assert(well && ra == rb);
+        assert(outside(a, ra) == outside(b, rb));
+        for (const auto m : kMarkers) assert(count(outside(b, rb), m) == count(b, m));
+        const size_t brought = count(a, spell) - count(b, spell);
+        std::printf("  ranges (thinking %s): %zu ranges, %zu spellings the request brought, %zu end_message markers of the template\n",
+                    thinking ? "on" : "off", ra.size(), brought, count(b, spell));
+        std::fflush(stdout);
+        assert(brought == 10);   // system, user, reasoning, content, two argument values, the tool result, the bare user text, two descriptions
+    }
+    std::printf("  ranges: ok\n");
+}
+
 int main() {
+    ranges_check();
     std::ifstream f;
     for (const char* p : {"tests/data/inkling_template_golden.json", "../tests/data/inkling_template_golden.json",
                           "../../tests/data/inkling_template_golden.json"}) {

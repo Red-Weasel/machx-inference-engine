@@ -12,6 +12,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace ie {
@@ -32,8 +33,13 @@ struct InklingBundle {
 
 // The GGUF's chat template rendered natively, add_generation_prompt on; thinking off = effort level 0, thinking on with no
 // effort = the template's 0.9. tests/unit/inkling_template_test.cpp checks it against the Jinja template's own output.
+// `content` (known_bugs 45): when given, receives the request-text ranges of the returned prompt (PromptPiece,
+// tokenizer.hpp): contents, reasoning, the tool names, the calls' names and arguments JSON, the tool results, the tool
+// declarations' description / name / parameters / type JSON -- and none of the template's markers (the effort message is
+// the template's). The text is the same with or without it.
 std::string inkling_render_prompt(std::span<const ChatTurn> turns, std::string_view tools_json, bool thinking,
-                                  std::string_view effort, std::string& err);
+                                  std::string_view effort, std::string& err,
+                                  std::vector<std::pair<size_t, size_t>>* content = nullptr);
 // A raw completion (markers included) -> its text blocks, thinking blocks and tool calls (OpenAI JSON, "[]" for none).
 struct InklingReply { std::string content, reasoning, tool_calls_json = "[]"; };
 InklingReply inkling_parse_reply(std::string_view raw);

@@ -7,15 +7,117 @@
 #include "ie/ops.hpp"
 #include "ie/quant_blocks.hpp"
 #include "ie/dp4a.hpp"
+#include "ie/dp4a_native.hpp"
+#include "ie/gemv_q8_soa_v2.hpp"
 
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <random>
 #include <vector>
 
 using namespace ie;
+
+// ---- the T=1 kernel Flash-Next runs (gemv_q8_0_soa_q8_g_nd) + bit-identical variants (2026-11-08) ------------
+// Every variant keeps nd's per-column chain: one subgroup per column, lane L takes K-blocks L, L+16, ... in order,
+// the exact integer dot, acc += dw * d8 * idot from 0.f, reduce_over_group, half store. Only the loads (VEC: two
+// 16-byte weight loads + four 8-byte activation loads a block), the block-loop unroll and the grid (NPW) move.
+template <int NPW, bool VEC, int UNR>
+static sycl::event nd_var(sycl::queue& q, const void* x_q8, const int8_t* qs_W, const uint16_t* d_W,
+                          sycl::half* y, uint32_t K, uint32_t N) {
+    constexpr int SG = 16, WGI = NPW * SG;
+    const auto* X8 = static_cast<const block_q8_1x*>(x_q8);
+    const uint32_t bpc = K / 32, n_wgs = (N + NPW - 1) / NPW;
+    return q.parallel_for(sycl::nd_range<1>(uint64_t(n_wgs) * WGI, WGI),
+                          [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+        const uint32_t lid = uint32_t(it.get_local_id(0)), sg_id = lid / SG, lane = lid % SG;
+        const uint32_t n = uint32_t(it.get_group(0)) * NPW + sg_id;
+        if (n >= N) return;
+        const int8_t* wcol = qs_W + uint64_t(n) * K;
+        const uint16_t* dcol = d_W + uint64_t(n) * bpc;
+        float acc = 0.f;
+        #pragma unroll UNR
+        for (uint32_t b = lane; b < bpc; b += SG) {
+            int32_t idot = 0;
+            if constexpr (VEC) {
+                const auto* w4 = reinterpret_cast<const sycl::vec<uint32_t, 4>*>(wcol + uint64_t(b) * 32);
+                const auto* x2 = reinterpret_cast<const sycl::vec<uint32_t, 2>*>(X8[b].qs);
+                const sycl::vec<uint32_t, 4> wa = w4[0], wb = w4[1];
+                const sycl::vec<uint32_t, 2> xa = x2[0], xb = x2[1], xc = x2[2], xd = x2[3];
+                idot = dp4a_ss_native(wa[0], xa[0], idot); idot = dp4a_ss_native(wa[1], xa[1], idot);
+                idot = dp4a_ss_native(wa[2], xb[0], idot); idot = dp4a_ss_native(wa[3], xb[1], idot);
+                idot = dp4a_ss_native(wb[0], xc[0], idot); idot = dp4a_ss_native(wb[1], xc[1], idot);
+                idot = dp4a_ss_native(wb[2], xd[0], idot); idot = dp4a_ss_native(wb[3], xd[1], idot);
+            } else {
+                const uint32_t* wq = reinterpret_cast<const uint32_t*>(wcol + uint64_t(b) * 32);
+                const uint32_t* xq = reinterpret_cast<const uint32_t*>(X8[b].qs);
+                #pragma unroll
+                for (int w = 0; w < 8; ++w) idot = dp4a_ss_native(wq[w], xq[w], idot);
+            }
+            acc += float(sycl::bit_cast<sycl::half>(dcol[b])) * float(X8[b].d) * float(idot);
+        }
+        acc = sycl::reduce_over_group(it.get_sub_group(), acc, sycl::plus<float>());
+        if (lane == 0) y[n] = sycl::half(acc);
+    });
+}
+
+// Random weights / activation, the production kernel vs each variant bit for bit, then every one over rotating
+// weight copies (>= 256 MB in all: DRAM-streamed as in the model).
+static void bench_nd_variants(sycl::queue& q, uint32_t K, uint32_t N, const char* what) {
+    const uint32_t bpc = K / 32;
+    const uint64_t wbytes = uint64_t(N) * K, dcount = uint64_t(N) * bpc, per = wbytes + dcount * 2;
+    std::mt19937 rng(K * 131u + N);
+    std::vector<int8_t> hq(wbytes);
+    for (auto& v : hq) v = int8_t(int(rng() % 255) - 127);
+    std::vector<uint16_t> hd(dcount);
+    for (auto& v : hd) { const sycl::half h = sycl::half(0.001f + 0.01f * float(rng() % 1000) / 1000.f); std::memcpy(&v, &h, 2); }
+    std::vector<block_q8_1x> hx(bpc);
+    for (auto& b : hx) { b.d = 0.01f + 0.02f * float(rng() % 1000) / 1000.f; b.s = 0.f; for (auto& c : b.qs) c = int8_t(int(rng() % 255) - 127); }
+    const int nb = int(std::min<uint64_t>(16, std::max<uint64_t>(2, (256ull << 20) / per + 1)));
+    std::vector<int8_t*> qsv(nb); std::vector<uint16_t*> dv(nb);
+    for (int b = 0; b < nb; ++b) {
+        qsv[b] = sycl::malloc_device<int8_t>(wbytes, q); dv[b] = sycl::malloc_device<uint16_t>(dcount, q);
+        q.memcpy(qsv[b], hq.data(), wbytes); q.memcpy(dv[b], hd.data(), dcount * 2);
+    }
+    auto* x = sycl::malloc_device<block_q8_1x>(bpc, q);
+    auto* y0 = sycl::malloc_device<sycl::half>(N, q);
+    auto* y1 = sycl::malloc_device<sycl::half>(N, q);
+    q.memcpy(x, hx.data(), bpc * sizeof(block_q8_1x)).wait();
+    gemv_q8_0_soa_q8_g_nd(q, x, qsv[0], dv[0], y0, K, N).wait();
+    std::vector<uint16_t> r0(N), r1(N);
+    q.memcpy(r0.data(), y0, N * 2).wait();
+    std::printf("  K=%6u N=%6u  %s  (%d weight copies, %.1f MB each)\n", K, N, what, nb, double(per) / 1e6);
+    auto run = [&](const char* name, auto fn) {
+        q.memset(y1, 0xff, N * 2).wait();
+        fn(qsv[0], dv[0], y1).wait();
+        q.memcpy(r1.data(), y1, N * 2).wait();
+        uint32_t diff = 0;
+        for (uint32_t n = 0; n < N; ++n) diff += r0[n] != r1[n];
+        for (int b = 0; b < nb; ++b) fn(qsv[b], dv[b], y1);
+        q.wait();
+        const int it2 = std::max(60, 3 * nb);
+        const auto t0 = std::chrono::steady_clock::now();
+        for (int i = 0; i < it2; ++i) fn(qsv[i % nb], dv[i % nb], y1);
+        q.wait();
+        const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / it2;
+        std::printf("    %-26s %8.1f us  %6.1f GB/s   bits differing from production: %u\n", name, us,
+                    double(per) / us / 1e3, diff);
+    };
+    run("production g_nd", [&](const int8_t* w, const uint16_t* d, sycl::half* y) { return gemv_q8_0_soa_q8_g_nd(q, x, w, d, y, K, N); });
+    run("NPW32 scalar  unroll1", [&](const int8_t* w, const uint16_t* d, sycl::half* y) { return nd_var<32, false, 1>(q, x, w, d, y, K, N); });
+    run("NPW32 vec     unroll1", [&](const int8_t* w, const uint16_t* d, sycl::half* y) { return nd_var<32, true, 1>(q, x, w, d, y, K, N); });
+    run("NPW32 vec     unroll4", [&](const int8_t* w, const uint16_t* d, sycl::half* y) { return nd_var<32, true, 4>(q, x, w, d, y, K, N); });
+    run("NPW32 scalar  unroll4", [&](const int8_t* w, const uint16_t* d, sycl::half* y) { return nd_var<32, false, 4>(q, x, w, d, y, K, N); });
+    run("NPW16 vec     unroll4", [&](const int8_t* w, const uint16_t* d, sycl::half* y) { return nd_var<16, true, 4>(q, x, w, d, y, K, N); });
+    run("NPW64 vec     unroll4", [&](const int8_t* w, const uint16_t* d, sycl::half* y) { return nd_var<64, true, 4>(q, x, w, d, y, K, N); });
+    run("NPW8  vec     unroll4", [&](const int8_t* w, const uint16_t* d, sycl::half* y) { return nd_var<8, true, 4>(q, x, w, d, y, K, N); });
+    for (int b = 0; b < nb; ++b) { sycl::free(qsv[b], q); sycl::free(dv[b], q); }
+    sycl::free(x, q); sycl::free(y0, q); sycl::free(y1, q);
+}
 
 
 // ---- prototype variants (bench-local): N_PER_WG + split-K sweep ------------
@@ -131,6 +233,27 @@ int main(int argc, char** argv) {
         const double gbs = double(wbytes + dbytes) / us / 1e3;
         std::printf("  K=%6u N=%6u  %-36s %8.1f us  %6.1f GB/s\n",
                     sh.K, sh.N, sh.what, us, gbs);
+        {   // 2026-11-08: the same kernel over rotating weight copies (>= 256 MB in all) -- every call streams from DRAM
+            // as in the model, where each layer's weights are distinct (one buffer leaves the shapes <= L2 cache-hot).
+            const uint64_t per = wbytes + dbytes;
+            const int nb = int(std::min<uint64_t>(16, std::max<uint64_t>(2, (256ull << 20) / per + 1)));
+            std::vector<int8_t*> qsv(nb); std::vector<uint16_t*> dv(nb);
+            for (int b = 0; b < nb; ++b) {
+                qsv[b] = sycl::malloc_device<int8_t>(wbytes, q); dv[b] = sycl::malloc_device<uint16_t>(dbytes / 2, q);
+                q.memset(qsv[b], 1, wbytes); q.memset(dv[b], 0x3c, dbytes);
+            }
+            q.wait();
+            for (int b = 0; b < nb; ++b) gemv_q8_0_soa_q8_g(q, x, qsv[b], dv[b], y, sh.K, sh.N);
+            q.wait();
+            const int it2 = std::max(50, 2 * nb);
+            const auto t2 = std::chrono::steady_clock::now();
+            for (int i = 0; i < it2; ++i) gemv_q8_0_soa_q8_g(q, x, qsv[i % nb], dv[i % nb], y, sh.K, sh.N);
+            q.wait();
+            const double us2 = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t2).count() / it2;
+            std::printf("    DRAM-stream (%2d copies)                        %8.1f us  %6.1f GB/s\n", nb, us2,
+                        double(per) / us2 / 1e3);
+            for (int b = 0; b < nb; ++b) { sycl::free(qsv[b], q); sycl::free(dv[b], q); }
+        }
         if (sh.K <= 6144) {
             bench_proto<32, 2>(q, x, qs, d, y, sh.K, sh.N, wbytes + dbytes);
             bench_proto<16, 1>(q, x, qs, d, y, sh.K, sh.N, wbytes + dbytes);
@@ -140,5 +263,11 @@ int main(int argc, char** argv) {
         }
         sycl::free(qs, q); sycl::free(d, q); sycl::free(x, q); sycl::free(y, q);
     }
+    std::printf("\n== gemv_q8_0_soa_q8_g_nd (the kernel Flash-Next's T=1 runs) vs bit-identical variants, DRAM-streamed\n");
+    bench_nd_variants(q, 2560, 10240, "dn qkv  (x36/tok)");
+    bench_nd_variants(q, 6144, 2560,  "dn out  (x36/tok)");
+    bench_nd_variants(q, 2560, 6144,  "dn gate / attn (x48/tok)");
+    bench_nd_variants(q, 2560, 2560,  "small square");
+    bench_nd_variants(q, 2560, 248320, "lm_head (x1/tok)");
     return 0;
 }

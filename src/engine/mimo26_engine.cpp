@@ -10,6 +10,7 @@
 #include "ie/mimo26_host_rules.hpp"
 #include "ie/ngram_draft.hpp"
 #include "ie/vitals.hpp"
+#include "ie/tokenizer.hpp"   // PromptPiece (known_bugs 45, 2026-11-05)
 #include "stb/stb_image.h"   // stbi_info_from_memory (the implementation is instantiated in qwen4_image.cpp)
 
 #include "../../third_party/nlohmann/json.hpp"
@@ -83,32 +84,48 @@ std::string render_value(const ojson& v) {
     std::string s; py_dump(v, s); return s;
 }
 
+constexpr std::string_view kMimo26ImagePlaceholder = "<|vision_start|><|image_pad|><|vision_end|>";   // the template's own
+
+// A message's content as request text, except the engine's image placeholders at `image_at` (the template's text).
+void emit_message_content(PromptPiece& p, const Mimo26Message& m) {
+    const std::string_view c = m.content;
+    size_t at = 0;
+    for (const size_t q : m.image_at) {
+        if (q < at || q + kMimo26ImagePlaceholder.size() > c.size() || c.substr(q, kMimo26ImagePlaceholder.size()) != kMimo26ImagePlaceholder) continue;
+        p.add_content(c.substr(at, q - at));
+        p.add_text(kMimo26ImagePlaceholder);
+        at = q + kMimo26ImagePlaceholder.size();
+    }
+    p.add_content(c.substr(at));
+}
+
 // One assistant turn's OpenAI tool_calls array in the template's XML form. The OpenAI `arguments` is a JSON string:
 // parsed into its object and rendered as <parameter=K>V</parameter> -- the form the model itself writes (the template's
-// dict branch); an arguments string that is not a JSON object goes in as it is (the template's string branch).
-std::string render_tool_calls(const std::string& tool_calls_json, std::string& err) {
-    if (tool_calls_json.empty()) return {};
+// dict branch); an arguments string that is not a JSON object goes in as it is (the template's string branch). The
+// names, the parameter names and the values are the request's text, the markers the template's.
+void render_tool_calls(PromptPiece& p, const std::string& tool_calls_json, std::string& err) {
+    if (tool_calls_json.empty()) return;
     ojson calls = ojson::parse(tool_calls_json, nullptr, false);
-    if (!calls.is_array()) { err = "tool_calls is not a JSON array"; return {}; }
-    std::string out;
+    if (!calls.is_array()) { err = "tool_calls is not a JSON array"; return; }
     for (const auto& tc0 : calls) {
         const ojson& tc = tc0.contains("function") ? tc0["function"] : tc0.contains("custom") ? tc0["custom"] : tc0;
-        out += "<tool_call><function=" + tc.value("name", std::string()) + ">";
+        p.add_text("<tool_call><function="); p.add_content(tc.value("name", std::string())); p.add_text(">");
         if (tc.contains("input") && tc["input"].is_string()) {
-            out += tc["input"].get<std::string>();
+            p.add_content(tc["input"].get_ref<const std::string&>());
         } else if (tc.contains("arguments")) {
             ojson args = tc["arguments"];
             if (args.is_string()) {
                 ojson parsed = ojson::parse(args.get<std::string>(), nullptr, false);
                 if (parsed.is_object()) args = parsed;
             }
-            if (args.is_string()) out += args.get<std::string>();
+            if (args.is_string()) p.add_content(args.get_ref<const std::string&>());
             else if (args.is_object())
-                for (auto it = args.begin(); it != args.end(); ++it) out += "<parameter=" + it.key() + ">" + render_value(it.value()) + "</parameter>";
+                for (auto it = args.begin(); it != args.end(); ++it) {
+                    p.add_text("<parameter="); p.add_content(it.key()); p.add_text(">"); p.add_content(render_value(it.value())); p.add_text("</parameter>");
+                }
         }
-        out += "</function></tool_call>";
+        p.add_text("</function></tool_call>");
     }
-    return out;
 }
 
 // A parameter's schema type in `tools` (the OpenAI array), "" when unknown.
@@ -193,29 +210,30 @@ std::string mimo26_tojson(const std::string& json_text, std::string& err) {
 }
 
 std::string mimo26_render_chat(const std::vector<Mimo26Message>& msgs, const std::string& tools_json, bool add_generation_prompt,
-                               bool thinking, std::string& err) {
-    std::string out;
+                               bool thinking, std::string& err, std::vector<std::pair<size_t, size_t>>* content_out) {
+    PromptPiece p;
     if (!tools_json.empty()) {
         ojson tools = ojson::parse(tools_json, nullptr, false);
         if (!tools.is_array()) { err = "tools is not a JSON array"; return {}; }
         if (!tools.empty()) {
-            out += "<|im_start|>system\nYou are provided with the following tools:\n\n<tools>";
-            for (const auto& t : tools) { out += '\n'; py_dump(t, out); }
-            out += "\n</tools><|im_end|>";
+            p.add_text("<|im_start|>system\nYou are provided with the following tools:\n\n<tools>");
+            for (const auto& t : tools) { p.add_text('\n'); std::string d; py_dump(t, d); p.add_content(d); }
+            p.add_text("\n</tools><|im_end|>");
         }
     }
     for (const auto& m : msgs) {
         if (m.role == "assistant") {
-            out += "<|im_start|>assistant\n<think>" + m.reasoning + "</think>" + m.content;
-            out += render_tool_calls(m.tool_calls_json, err);
+            p.add_text("<|im_start|>assistant\n<think>"); p.add_content(m.reasoning); p.add_text("</think>"); emit_message_content(p, m);
+            render_tool_calls(p, m.tool_calls_json, err);
             if (!err.empty()) return {};
-            out += "<|im_end|>";
+            p.add_text("<|im_end|>");
         } else {
-            out += "<|im_start|>" + m.role + "\n" + m.content + "<|im_end|>";
+            p.add_text("<|im_start|>"); p.add_content(m.role); p.add_text('\n'); emit_message_content(p, m); p.add_text("<|im_end|>");
         }
     }
-    if (add_generation_prompt) out += thinking ? "<|im_start|>assistant\n<think>" : "<|im_start|>assistant\n<think></think>";
-    return out;
+    if (add_generation_prompt) p.add_text(thinking ? "<|im_start|>assistant\n<think>" : "<|im_start|>assistant\n<think></think>");
+    if (content_out) *content_out = std::move(p.content);
+    return std::move(p.text);
 }
 
 Mimo26Parsed mimo26_parse_completion(const std::string& text, bool thinking, const std::string& tools_json) {
@@ -280,19 +298,21 @@ Mimo26Parsed mimo26_parse_completion(const std::string& text, bool thinking, con
 }
 
 // ---- P6.2: images (docs/mimo26/00_PORT_PLAN.md "P6.2 design") -------------------------------------------------------
-constexpr std::string_view kMimo26ImagePlaceholder = "<|vision_start|><|image_pad|><|vision_end|>";   // the template's own
 
-std::string mimo26_place_images(std::string text, size_t n_images) {
+std::string mimo26_place_images(std::string text, size_t n_images, std::vector<size_t>* at) {
+    if (at) at->clear();
     size_t markers = 0;
     for (size_t p = text.find(kChatImageMarker); p != std::string::npos; p = text.find(kChatImageMarker, p + kChatImageMarker.size())) ++markers;
     if (markers == n_images) {
-        for (size_t p = text.find(kChatImageMarker); p != std::string::npos; p = text.find(kChatImageMarker, p + kMimo26ImagePlaceholder.size()))
+        for (size_t p = text.find(kChatImageMarker); p != std::string::npos; p = text.find(kChatImageMarker, p + kMimo26ImagePlaceholder.size())) {
             text.replace(p, kChatImageMarker.size(), kMimo26ImagePlaceholder);
+            if (at) at->push_back(p);
+        }
         return text;
     }
     for (size_t p = text.find(kChatImageMarker); p != std::string::npos; p = text.find(kChatImageMarker)) text.erase(p, kChatImageMarker.size());
     std::string front;
-    for (size_t i = 0; i < n_images; ++i) front += kMimo26ImagePlaceholder;
+    for (size_t i = 0; i < n_images; ++i) { if (at) at->push_back(front.size()); front += kMimo26ImagePlaceholder; }
     return front + text;
 }
 
@@ -1357,11 +1377,12 @@ GenerateResult Engine::mimo26_chat(std::span<const ChatTurn> turns, const Sampli
     std::vector<Mimo26Message> msgs;
     for (const auto& t : turns) {
         std::string content = t.content_without_tool_calls.value_or(t.content);
+        std::vector<size_t> image_at;   // the engine's image placeholders in `content`: the template's text (known_bugs 45)
         if (!t.images.empty()) {
             if (auto why = mimo26_vision_refusal(b.vis_ready, b.vis_error, uint32_t(b.serve.lanes.size())); !why.empty()) {
                 r.finish_reason = "error: mimo_v2 image input: " + why; return r;
             }
-            content = mimo26_place_images(std::move(content), t.images.size());
+            content = mimo26_place_images(std::move(content), t.images.size(), &image_at);
             for (const auto& bytes : t.images) {
                 Img im; im.bytes = &bytes; im.hash = mimo26_image_hash(bytes);
                 uint32_t w = 0, h = 0;
@@ -1371,16 +1392,17 @@ GenerateResult Engine::mimo26_chat(std::span<const ChatTurn> turns, const Sampli
                 images.push_back(std::move(im));
             }
         }
-        msgs.push_back({t.role, std::move(content), t.reasoning_content.value_or(""), t.tool_calls_json});
+        msgs.push_back({t.role, std::move(content), t.reasoning_content.value_or(""), t.tool_calls_json, std::move(image_at)});
     }
     std::string err;
-    const std::string prompt = mimo26_render_chat(msgs, std::string(tools_json), true, enable_thinking, err);
+    std::vector<std::pair<size_t, size_t>> content_ranges;   // known_bugs 45: the renderer's own request-text ranges
+    const std::string prompt = mimo26_render_chat(msgs, std::string(tools_json), true, enable_thinking, err, &content_ranges);
     if (!err.empty()) { r.finish_reason = "error: mimo_v2 chat template: " + err; return r; }
     if (const char* dd = std::getenv("IE_MIMO26_DUMP_REQ"); dd && *dd) {   // (diagnostic) the rendered prompt, req_<n>.txt
         static int n_req = 0;
         std::ofstream(std::string(dd) + "/req_" + std::to_string(n_req++) + ".txt", std::ios::binary) << prompt;
     }
-    std::vector<int32_t> ids = b.tok.encode(prompt, /*allow_special=*/true);
+    std::vector<int32_t> ids = b.tok.encode(prompt, /*allow_special=*/true, content_ranges);   // a spelling in the request's text stays text
     if (!b.serve.lanes.empty())   // P4 B4: --parallel > 1 (images were refused above: the pipe runs text positions only)
         return mimo26_run_lanes(b, ids, sp, on_token, /*chat=*/true, enable_thinking, std::string(tools_json));
     if (images.empty()) return mimo26_run_ids(b, ids, sp, on_token, /*chat=*/true, enable_thinking, std::string(tools_json));

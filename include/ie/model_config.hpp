@@ -596,7 +596,11 @@ std::string read_hyv4_config(const GgufReader& g, Hyv4Config& out);
 //    no_mtp=True), so native-MTP spec decode cannot come from this file.
 struct Qwen4ExpConfig {
     // -- dims --------------------------------------------------------------
-    uint32_t n_layers  = 0;      // qwen4exp.block_count                      (48)
+    uint32_t n_layers  = 0;      // qwen4exp.block_count - nextn_predict_layers: the TRUNK (48)
+    // qwen4exp.nextn_predict_layers (optional, 0 when absent). llama.cpp counts the MTP draft block(s) in block_count: a main
+    // file converted without --no-mtp is 49 blocks, unsloth's MTP-only heads say 49 / 1 with no trunk tensors. The draft block,
+    // when a file carries one, is blk.<n_layers>.* with its fusion under blk.<n_layers>.nextn.* (load_mtp binds it).
+    uint32_t nextn_predict_layers = 0;
     uint32_t hidden    = 0;      // qwen4exp.embedding_length                 (2560)
     uint32_t vocab     = 0;      // tokenizer.ggml.tokens array length        (248320)
     uint32_t ctx_train = 0;      // qwen4exp.context_length                   (262144)
@@ -606,7 +610,11 @@ struct Qwen4ExpConfig {
     uint32_t n_q_heads  = 0;     // qwen4exp.attention.head_count             (24)
     uint32_t n_kv_heads = 0;     // qwen4exp.attention.head_count_kv          (2)
     uint32_t head_dim   = 0;     // qwen4exp.attention.key_length             (256; == value_length, enforced)
-    uint32_t full_attention_interval = 0;  // qwen4exp.full_attention_interval (4)
+    uint32_t full_attention_interval = 0;  // qwen4exp.full_attention_interval (4; the key defaults to 4 as in llama.cpp)
+    // qwen4exp.attention.recurrent_layers (optional; llama.cpp's hparams): per block, 1 = linear (Gated DeltaNet), 0 = full
+    // attention. When present it IS the schedule (the trunk's entries; a nextn entry may follow and is dropped); without it
+    // every full_attention_interval-th block is full attention (il % interval == interval - 1).
+    std::vector<uint8_t> recurrent_layers;
     uint32_t rope_dim   = 0;         // qwen4exp.rope.dimension_count         (64 of 256: partial 0.25)
     float    rope_theta = 10000.f;   // qwen4exp.rope.freq_base               (1e7)
     // Interleaved mrope; entries are HALF-dims (2*sum == rope_dim), trailing
@@ -654,12 +662,14 @@ struct Qwen4ExpConfig {
         return false;
     }
     bool is_full_attn(uint32_t il) const {
+        if (!recurrent_layers.empty()) return il < recurrent_layers.size() && recurrent_layers[il] == 0;
         return full_attention_interval && (il % full_attention_interval) == full_attention_interval - 1;
     }
-    // 12 on the real file (48/4; exact because interval divides n_layers —
-    // the reader rejects files where it does not).
+    // 12 on the real file (48 / 4).
     uint32_t n_full_attn_layers() const {
-        return full_attention_interval ? n_layers / full_attention_interval : 0;
+        uint32_t n = 0;
+        for (uint32_t il = 0; il < n_layers; ++il) n += is_full_attn(il) ? 1u : 0u;
+        return n;
     }
     uint32_t n_linear_layers() const { return n_layers - n_full_attn_layers(); }
     // The n-gram lookup width: per-head 160 x 8 heads x (3-1) tables = 2560
@@ -681,10 +691,14 @@ struct Qwen4ExpConfig {
 // hybrid, and a dense binding would take the full-attention geometry and
 // silently drop the DeltaNet/HC/MoE/PLE structure carrying ~99% of the
 // weights. REQUIRED: block_count, embedding_length, attention.head_count/
-// head_count_kv/key_length, full_attention_interval, rope.dimension_count,
-// all five ssm.* keys, hyper_connection.count/low_rank, expert_count/
-// used_count/feed_forward_length, tokens. The indexer keys and the PLE group
-// are each all-or-none. Returns "" on success or error text.
+// head_count_kv/key_length, rope.dimension_count, all five ssm.* keys,
+// hyper_connection.count/low_rank, expert_count/used_count/feed_forward_length,
+// tokens. The schedule: attention.recurrent_layers when present, else
+// full_attention_interval (default 4). head_count, head_count_kv and
+// expert_feed_forward_length may be per-block arrays whose entries agree
+// (llama.cpp's get_key_or_arr). nextn_predict_layers (MTP blocks counted in
+// block_count) is taken off n_layers. The indexer keys and the PLE group are
+// each all-or-none. Returns "" on success or error text.
 std::string read_qwen4exp_config(const GgufReader& g, Qwen4ExpConfig& out);
 
 // Fills `out` for `deepseek4`. Bespoke (no read_dense_config reuse) because the
