@@ -27,6 +27,8 @@
 #include <sycl/sycl.hpp>
 #include "ie/kernel_profiler.hpp"
 
+#include "exl3_codebook.hpp"
+
 #include <algorithm>
 #include <mutex>
 #include <vector>
@@ -35,21 +37,11 @@ namespace ie {
 
 namespace {
 
-// codebook.cuh:25-35, cb=0 — identical arithmetic to the host decode_cb0:
-// MCG hash, lop3 0x6a = (a&b)^c, then sum the two fp16 halves (rounded in fp16).
-inline float decode_cb0_dev(uint32_t code) {
-    uint32_t x = code * 89226354u + 64248484u;
-    x = (x & 0x8fff8fffu) ^ 0x3b603b60u;
-    const uint16_t lob = uint16_t(x & 0xffffu);
-    const uint16_t hib = uint16_t(x >> 16);
-    const sycl::half lo = sycl::bit_cast<sycl::half>(lob);
-    const sycl::half hi = sycl::bit_cast<sycl::half>(hib);
-    return float(sycl::half(float(lo) + float(hi)));
-}
 
 }  // namespace
 
-sycl::event gemv_exl3(sycl::queue& q,
+template <int CB>
+static sycl::event gemv_exl3_t(sycl::queue& q,
                       const sycl::half* A, const void* codes,
                       sycl::half* y,
                       uint32_t K, uint32_t N, uint32_t bits,
@@ -126,7 +118,7 @@ sycl::event gemv_exl3(sycl::queue& q,
                     const uint32_t b = codes_u32[base + i1w];
                     const uint64_t merged = (uint64_t(a) << 32) | b;   // funnel-shift
                     const uint32_t code = uint32_t(merged >> s0) & 0xffffu;
-                    accv[u] += float(A_slm[(ki + u) * 16 + r]) * decode_cb0_dev(code);
+                    accv[u] += float(A_slm[(ki + u) * 16 + r]) * exl3_decode_dev<CB>(code);
                 }
             }
             float acc = 0.f;
@@ -144,7 +136,8 @@ sycl::event gemv_exl3(sycl::queue& q,
 // leading row dimension: group(0)=row r, group(1)=tile-column ni. Each row reads
 // A[r,:K] and decodes the trellis of expert row_expert[r] (codes_base +
 // e*expert_stride_bytes) into y[r,:N]. `bits` is uniform across a layer's experts.
-sycl::event gemv_exl3_moe(sycl::queue& q,
+template <int CB>
+static sycl::event gemv_exl3_moe_t(sycl::queue& q,
                           const sycl::half* A, const void* codes_base,
                           uint64_t expert_stride_bytes,
                           const int32_t* row_expert,
@@ -222,7 +215,7 @@ sycl::event gemv_exl3_moe(sycl::queue& q,
                     const uint32_t b = codes_u32[bse + i1w];
                     const uint64_t merged = (uint64_t(a) << 32) | b;
                     const uint32_t code = uint32_t(merged >> s0) & 0xffffu;
-                    accv[u] += float(A_slm[(ki + u) * 16 + r]) * decode_cb0_dev(code);
+                    accv[u] += float(A_slm[(ki + u) * 16 + r]) * exl3_decode_dev<CB>(code);
                 }
             }
             float acc = 0.f;
@@ -267,7 +260,7 @@ sycl::event gemv_exl3_forward(sycl::queue& q,
                               const sycl::half* suh, const sycl::half* svh,
                               sycl::half* y,
                               uint32_t K, uint32_t N, uint32_t bits,
-                              const std::vector<sycl::event>& deps) {
+                              const std::vector<sycl::event>& deps, uint32_t cb) {
     sycl::half *xh, *acc;
     {
         std::lock_guard<std::mutex> lk(g_exl3_mu);
@@ -281,7 +274,7 @@ sycl::event gemv_exl3_forward(sycl::queue& q,
     //   acc = xh @ W_rot               (trellis decode-MAC)
     //   y   = had128(acc) ⊙ svh
     auto e1 = hadamard_transform(q, A, xh, K, /*pre=*/suh, /*post=*/nullptr, deps);
-    auto e2 = gemv_exl3(q, xh, codes, acc, K, N, bits, {e1});
+    auto e2 = gemv_exl3(q, xh, codes, acc, K, N, bits, {e1}, cb);
     return hadamard_transform(q, acc, y, N, /*pre=*/nullptr, /*post=*/svh, {e2});
 }
 
@@ -298,7 +291,7 @@ sycl::event gemv_exl3_forward(sycl::queue& q,
 //
 // WHY BATCH (the whole point of this kernel): the EXL3 trellis decode is a pure
 // ALU latency chain per weight — MCG hash → lop3 → 2×fp16 widen → add
-// (decode_cb0_dev above). At T==1 (decode) that ALU cost is unavoidable and the
+// (exl3_decode_dev, exl3_codebook.hpp). At T==1 (decode) that ALU cost is unavoidable and the
 // kernel is ALU-bound, not memory-bound. At PREFILL (T=256/512) the shipped path
 // loops the single-row forward T times, so it RE-DECODES the entire weight
 // tensor T times — T× redundant ALU on the exact bottleneck. A batched GEMM
@@ -334,7 +327,8 @@ namespace {
 // Batched EXL3 trellis-decode GEMM core: ACC[T,N] = Xh[T,K] @ W_rot[K,N].
 // Decode-once/MAC-many. T is split into T_TILE passes host-side (one launch
 // each); each launch writes ACC rows [t0, t0+tc).
-sycl::event gemm_exl3_core(sycl::queue& q,
+template <int CB>
+sycl::event gemm_exl3_core_t(sycl::queue& q,
                            const sycl::half* Xh, const void* codes,
                            sycl::half* ACC,
                            uint32_t T, uint32_t K, uint32_t N, uint32_t bits,
@@ -420,7 +414,7 @@ sycl::event gemm_exl3_core(sycl::queue& q,
                         const uint32_t b = codes_u32[base + i1w];
                         const uint64_t merged = (uint64_t(a) << 32) | b;
                         const uint32_t code = uint32_t(merged >> s0) & 0xffffu;
-                        const float wdec = decode_cb0_dev(code);   // ONCE per (lane,ki)
+                        const float wdec = exl3_decode_dev<CB>(code);   // ONCE per (lane,ki)
                         const uint32_t lk = kk * 16 + r;
                         // MAC the one decoded weight against all T_TILE rows;
                         // t≥tc is masked (acc[t] unused). Constant t → acc[] in regs.
@@ -447,6 +441,14 @@ sycl::event gemm_exl3_core(sycl::queue& q,
     return last;
 }
 
+sycl::event gemm_exl3_core(sycl::queue& q, const sycl::half* Xh, const void* codes, sycl::half* ACC,
+                           uint32_t T, uint32_t K, uint32_t N, uint32_t bits, uint32_t cb,
+                           const std::vector<sycl::event>& deps) {
+    if (cb == 2) return gemm_exl3_core_t<2>(q, Xh, codes, ACC, T, K, N, bits, deps);
+    if (cb == 1) return gemm_exl3_core_t<1>(q, Xh, codes, ACC, T, K, N, bits, deps);
+    return gemm_exl3_core_t<0>(q, Xh, codes, ACC, T, K, N, bits, deps);
+}
+
 }  // namespace
 
 sycl::event gemm_exl3(sycl::queue& q,
@@ -454,7 +456,7 @@ sycl::event gemm_exl3(sycl::queue& q,
                       const sycl::half* suh, const sycl::half* svh,
                       sycl::half* y,
                       uint32_t T, uint32_t K, uint32_t N, uint32_t bits,
-                      const std::vector<sycl::event>& deps) {
+                      const std::vector<sycl::event>& deps, uint32_t cb) {
     if (T == 0) return {};
 
     sycl::half *Xh, *ACC;
@@ -489,10 +491,38 @@ sycl::event gemm_exl3(sycl::queue& q,
     auto e1 = hadamard_transform_moe(q, A, Xh, K, T, zeros,
                                      /*pre=*/suh, /*post=*/nullptr, d);
     // 2. ACC = Xh @ W_rot  (decode-once/MAC-many, T-chunked).
-    auto e2 = gemm_exl3_core(q, Xh, codes, ACC, T, K, N, bits, {e1});
+    auto e2 = gemm_exl3_core(q, Xh, codes, ACC, T, K, N, bits, cb, {e1});
     // 3. y = had128(ACC) ⊙ svh per row.
     return hadamard_transform_moe(q, ACC, y, N, T, zeros,
                                   /*pre=*/nullptr, /*post=*/svh, {e2});
+}
+
+// The public entry points: dispatch on the codebook (exl3_codebook.hpp); cb 0 = the shipped kernels as one template instance.
+sycl::event gemv_exl3(sycl::queue& q, const sycl::half* A, const void* codes, sycl::half* y,
+                      uint32_t K, uint32_t N, uint32_t bits, const std::vector<sycl::event>& deps, uint32_t cb) {
+    if (cb == 2) return gemv_exl3_t<2>(q, A, codes, y, K, N, bits, deps);
+    if (cb == 1) return gemv_exl3_t<1>(q, A, codes, y, K, N, bits, deps);
+    return gemv_exl3_t<0>(q, A, codes, y, K, N, bits, deps);
+}
+
+sycl::event gemv_exl3_moe(sycl::queue& q, const sycl::half* A, const void* codes_base, uint64_t expert_stride_bytes,
+                          const int32_t* row_expert, sycl::half* y, uint32_t K, uint32_t N, uint32_t R, uint32_t bits,
+                          const std::vector<sycl::event>& deps, uint32_t cb) {
+    if (cb == 2) return gemv_exl3_moe_t<2>(q, A, codes_base, expert_stride_bytes, row_expert, y, K, N, R, bits, deps);
+    if (cb == 1) return gemv_exl3_moe_t<1>(q, A, codes_base, expert_stride_bytes, row_expert, y, K, N, R, bits, deps);
+    return gemv_exl3_moe_t<0>(q, A, codes_base, expert_stride_bytes, row_expert, y, K, N, R, bits, deps);
+}
+
+// Every 16-bit code through one codebook on the device (ie-exl3-codebook-test [F]: against exl3_decode_code_host).
+sycl::event exl3_decode_codes(sycl::queue& q, const uint16_t* codes, uint32_t n, uint32_t cb, sycl::half* out,
+                              const std::vector<sycl::event>& deps) {
+    return ie::ps(q, "exl3_decode_codes", [&](sycl::handler& h) {
+        h.depends_on(deps);
+        h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) {
+            const uint32_t c = codes[i];
+            out[i] = sycl::half(cb == 2 ? exl3_decode_dev<2>(c) : cb == 1 ? exl3_decode_dev<1>(c) : exl3_decode_dev<0>(c));
+        });
+    });
 }
 
 }  // namespace ie

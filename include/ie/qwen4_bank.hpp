@@ -45,6 +45,10 @@ sycl::event qwen4_bank_gemv(sycl::queue& q, BankQ kind,
 // Grouped gate+up over an expert-pick job list, one launch for all picks x both mats (gemv_q4_K_q8s_grouped_dual's
 // contract): jobs = [P x 3] int32 {vt, slot, ycell}; pick p reads the f16 activation row x + vt*K and the slices at
 // slot_base + slot*slot_bytes + gate_off / up_off; writes g_out[p*N ..] and u_out[p*N ..].
+// slot_tab (every grouped pick kernel here; null = the slot arithmetic): an address table [slot][3] {gate, up, down}, the
+// job's slot an index into it (a VRAM cache slot or an expert's slices in pinned host memory -- device routing's
+// read-through miss). The dual kernels read entries 0 / 1 of the slot's row; the single-matrix qwen4_bank_gemv_grouped
+// reads entry 0 of the row it is handed, so the down call passes slot_tab + 2.
 sycl::event qwen4_bank_gemv_grouped_dual(sycl::queue& q, BankQ kind,
                             const sycl::half* x,
                             const uint8_t* slot_base, uint64_t slot_bytes,
@@ -52,7 +56,8 @@ sycl::event qwen4_bank_gemv_grouped_dual(sycl::queue& q, BankQ kind,
                             const int32_t* jobs,
                             sycl::half* g_out, sycl::half* u_out,
                             uint32_t K, uint32_t N, uint32_t P,
-                            const std::vector<sycl::event>& deps = {});
+                            const std::vector<sycl::event>& deps = {},
+                            const uint8_t* const* slot_tab = nullptr);
 
 // The grouped dual gate/up with swiglu fused into the epilogue (2026-11-08, the decode host gap, option 1): the same
 // job list, h_out[p*N ..] = silu(f16(g)) * f16(u) exactly as swiglu() computes it from the dual kernel's f16 outputs.
@@ -64,7 +69,8 @@ sycl::event qwen4_bank_gemv_grouped_dual_swiglu(sycl::queue& q, BankQ kind,
                             const int32_t* jobs,
                             sycl::half* h_out,
                             uint32_t K, uint32_t N, uint32_t P,
-                            const std::vector<sycl::event>& deps = {});
+                            const std::vector<sycl::event>& deps = {},
+                            const uint8_t* const* slot_tab = nullptr);
 sycl::event qwen4_bank_gemv_grouped_dual_q8s_swiglu(sycl::queue& q, BankQ kind,
                             const void* x_q8s,
                             const uint8_t* slot_base, uint64_t slot_bytes,
@@ -72,7 +78,8 @@ sycl::event qwen4_bank_gemv_grouped_dual_q8s_swiglu(sycl::queue& q, BankQ kind,
                             const int32_t* jobs,
                             sycl::half* h_out,
                             uint32_t K, uint32_t N, uint32_t P,
-                            const std::vector<sycl::event>& deps = {});
+                            const std::vector<sycl::event>& deps = {},
+                            const uint8_t* const* slot_tab = nullptr);
 
 // Grouped down over the same job list (gemv_q5_1_grouped's contract): pick p reads h_rows + p*K and the slice at
 // slot_base + slot*slot_bytes + off; writes ystage + ycell*y_stride.
@@ -83,7 +90,8 @@ sycl::event qwen4_bank_gemv_grouped(sycl::queue& q, BankQ kind,
                             const int32_t* jobs,
                             sycl::half* ystage, uint32_t y_stride,
                             uint32_t K, uint32_t N, uint32_t P,
-                            const std::vector<sycl::event>& deps = {});
+                            const std::vector<sycl::event>& deps = {},
+                            const uint8_t* const* slot_tab = nullptr);
 
 // Grouped tiles for the prefill expert-major MoE (gemm_f16_grouped_tiles' contract): tile_jobs = [J x 4] int32
 // {x_row0, rows (<= 16), slot, y_row0}; row t of job j reads A_mega + (x_row0 + t)*K and writes out + (y_row0 + t)*N;
@@ -118,7 +126,8 @@ sycl::event qwen4_bank_gemv_grouped_dual_q8s(sycl::queue& q, BankQ kind,
                             const void* x_q8s, const uint8_t* slot_base, uint64_t slot_bytes,
                             uint64_t gate_off, uint64_t up_off, const int32_t* jobs,
                             sycl::half* g_out, sycl::half* u_out, uint32_t K, uint32_t N, uint32_t P,
-                            const std::vector<sycl::event>& deps = {});
+                            const std::vector<sycl::event>& deps = {},
+                            const uint8_t* const* slot_tab = nullptr);
 // The prefill tiles (qwen4_bank_gemv_grouped_tiles' tile_jobs contract, gate and up): x_q8s_mega = the gathered Q8_1s rows;
 // row t of job j reads row x_row0 + t. Per row bit-identical to qwen4_bank_gemv_q8s (the lane's packed weight words are
 // built once a super-block and dotted against every row).

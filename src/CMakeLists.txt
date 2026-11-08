@@ -68,6 +68,7 @@ add_library(ie_core
   ops/gemm_q4k_esimd.cpp
   ops/deepseek4_ops.cpp
   ops/qwen4_hc.cpp
+  ops/qwen4_route.cpp
   ops/qwen4_ple.cpp
   ops/ds4_decode_gemv.cpp
   ops/deepseek4_experts.cpp
@@ -189,6 +190,10 @@ set_source_files_properties(model/mimo26_vision.cpp PROPERTIES
 # P4 B21: the c32 K-quant GEMV serves T = 1 and the T-row lanes from one template; the precise model keeps the compiler
 # from re-associating a row's float fold differently per bucket (row t of T rows == the T = 1 call, bit for bit).
 set_source_files_properties(ops/gemv_kq_c32.cpp PROPERTIES
+  COMPILE_OPTIONS "-fp-model=precise")
+# The Flash-Next routing the host and the device compute bit for bit alike (include/ie/qwen4_route.hpp): no re-association,
+# no contraction, IEEE division on both sides.
+set_source_files_properties(ops/qwen4_route.cpp PROPERTIES
   COMPILE_OPTIONS "-fp-model=precise")
 set_source_files_properties(model/deepseek41_engram.cpp PROPERTIES
   COMPILE_OPTIONS "-fopenmp")

@@ -40,6 +40,10 @@ ModelArch detect_arch(const GgufReader& g) {
     // so tools report honestly; runtime port in progress —
     // docs/qwen4-flash-next-port-campaign.md.
     if (a == "qwen4exp")  return ModelArch::kQwen4Exp;
+    // (2026-11-08) Qwen 4 day one: a file named qwen4 / qwen4moe (llama.cpp's qwen35 / qwen35moe pattern) is read as this
+    // structure, its keys under its own prefix -- the reader then demands the hybrid's keys (ssm.*, hyper_connection.*) and
+    // names the first one missing, so a plain-transformer Qwen 4 is refused with that message, never misbound.
+    if (a == "qwen4" || a == "qwen4moe") return ModelArch::kQwen4Exp;
     // GLM-5.3-Flash: hybrid KDA (per-channel gated delta recurrence) + DSA/MLA
     // full attn (NOPE-only, lightning indexer w/ gated compressor) on a
     // per-layer head_count_kv MAP, Sinkhorn hyper-connections, 288-expert
@@ -833,18 +837,23 @@ std::string read_hyv4_config(const GgufReader& g, Hyv4Config& out) {
 std::string read_qwen4exp_config(const GgufReader& g, Qwen4ExpConfig& out) {
     // Bespoke reader (see the header comment): a dense binding would be
     // silently wrong on 36 of the 48 blocks. Helper idiom as read_glmdsa_config.
+    // Keys hang off the file's own arch name (2026-11-08, as read_glm5next_config): `qwen4exp.`, or `qwen4.` / `qwen4moe.`
+    // should a Qwen 4 GGUF carry this structure under llama.cpp's next name (the qwen35 / qwen35moe pattern).
+    const auto* arch_kv = g.find_kv("general.architecture");
+    const std::string arch = arch_kv ? std::string(arch_kv->as_string()) : std::string("qwen4exp");
+    const std::string P = (arch == "qwen4" || arch == "qwen4moe" ? arch : std::string("qwen4exp")) + ".";
     auto u32 = [&](const char* suffix, uint32_t& dst) -> bool {
-        const auto* kv = g.find_kv(std::string("qwen4exp.") + suffix);
+        const auto* kv = g.find_kv(P + suffix);
         if (!kv) return false;
         dst = uint32_t(kv->as_uint());
         return true;
     };
     auto f32 = [&](const char* suffix, float& dst) {
-        if (const auto* kv = g.find_kv(std::string("qwen4exp.") + suffix))
+        if (const auto* kv = g.find_kv(P + suffix))
             dst = float(kv->as_float());
     };
     auto arr_i32 = [&](const char* suffix, std::vector<int32_t>& dst) -> bool {
-        const auto* kv = g.find_kv(std::string("qwen4exp.") + suffix);
+        const auto* kv = g.find_kv(P + suffix);
         if (!kv || kv->type != GgufValueType::kArray) return false;
         const auto a = kv->as_pod_array<int32_t>();
         dst.assign(a.begin(), a.end());
@@ -852,7 +861,7 @@ std::string read_qwen4exp_config(const GgufReader& g, Qwen4ExpConfig& out) {
     };
     // A per-block array of flags (GGUF BOOL / U8 / I8 / U32 / I32 elements -> 0 or 1); false when absent or not an array.
     auto arr_flags = [&](const char* suffix, std::vector<uint8_t>& dst) -> bool {
-        const auto* kv = g.find_kv(std::string("qwen4exp.") + suffix);
+        const auto* kv = g.find_kv(P + suffix);
         if (!kv || kv->type != GgufValueType::kArray) return false;
         dst.clear();
         switch (kv->inner_type) {
@@ -869,7 +878,7 @@ std::string read_qwen4exp_config(const GgufReader& g, Qwen4ExpConfig& out) {
     // and expert_feed_forward_length); entries that differ are an error -- the kernels take one geometry for every block.
     // false = absent (err empty) or rejected (err set).
     auto u32_or_uniform = [&](const char* suffix, uint32_t& dst, std::string& err) -> bool {
-        const auto* kv = g.find_kv(std::string("qwen4exp.") + suffix);
+        const auto* kv = g.find_kv(P + suffix);
         if (!kv) return false;
         if (kv->type != GgufValueType::kArray) { dst = uint32_t(kv->as_uint()); return true; }
         std::vector<uint64_t> vals;
@@ -878,12 +887,12 @@ std::string read_qwen4exp_config(const GgufReader& g, Qwen4ExpConfig& out) {
             case GgufValueType::kU64: case GgufValueType::kI64: for (uint64_t v : kv->as_pod_array<uint64_t>()) vals.push_back(v); break;
             case GgufValueType::kU16: case GgufValueType::kI16: for (uint16_t v : kv->as_pod_array<uint16_t>()) vals.push_back(v); break;
             case GgufValueType::kU8:  case GgufValueType::kI8:  for (uint8_t  v : kv->as_pod_array<uint8_t>())  vals.push_back(v); break;
-            default: err = std::string("qwen4exp.") + suffix + ": an array of an unexpected element type"; return false;
+            default: err = P + suffix + ": an array of an unexpected element type"; return false;
         }
-        if (vals.empty()) { err = std::string("qwen4exp.") + suffix + ": an empty array"; return false; }
+        if (vals.empty()) { err = P + suffix + ": an empty array"; return false; }
         for (uint64_t v : vals)
             if (v != vals[0]) {
-                err = std::string("qwen4exp.") + suffix + " differs per block (" + std::to_string(vals[0]) + " vs " +
+                err = P + suffix + " differs per block (" + std::to_string(vals[0]) + " vs " +
                       std::to_string(v) + "); the kernels take one geometry for every block";
                 return false;
             }
@@ -892,7 +901,7 @@ std::string read_qwen4exp_config(const GgufReader& g, Qwen4ExpConfig& out) {
     };
     std::string uerr;
     auto arr_u64 = [&](const char* suffix, std::vector<uint64_t>& dst) -> bool {
-        const auto* kv = g.find_kv(std::string("qwen4exp.") + suffix);
+        const auto* kv = g.find_kv(P + suffix);
         if (!kv || kv->type != GgufValueType::kArray) return false;
         const auto a = kv->as_pod_array<uint64_t>();
         dst.assign(a.begin(), a.end());
@@ -951,12 +960,21 @@ std::string read_qwen4exp_config(const GgufReader& g, Qwen4ExpConfig& out) {
     }
     arr_i32("attention.compress_ratios", out.compress_ratios);
 
-    // MoE.
-    if (!u32("expert_count", out.n_experts))                return "missing qwen4exp.expert_count";
-    if (!u32("expert_used_count", out.n_experts_used))      return "missing qwen4exp.expert_used_count";
-    if (!u32_or_uniform("expert_feed_forward_length", out.expert_ffn, uerr))
-        return uerr.empty() ? "missing qwen4exp.expert_feed_forward_length" : uerr;
-    u32("expert_shared_feed_forward_length", out.shared_expert_ffn);
+    // MoE -- or (2026-11-08) a dense FFN: no expert_count key and a feed_forward_length (the Qwen4-27B reading, "dense, no
+    // MoE kernels"; llama.cpp's qwen35 dense / qwen35moe split). Neither = an error naming both.
+    if (g.find_kv(P + "expert_count")) {
+        if (!u32("expert_count", out.n_experts))                return "missing qwen4exp.expert_count";
+        if (!u32("expert_used_count", out.n_experts_used))      return "missing qwen4exp.expert_used_count";
+        if (!u32_or_uniform("expert_feed_forward_length", out.expert_ffn, uerr))
+            return uerr.empty() ? "missing qwen4exp.expert_feed_forward_length" : uerr;
+        u32("expert_shared_feed_forward_length", out.shared_expert_ffn);
+    } else {
+        if (!u32_or_uniform("feed_forward_length", out.dense_ffn, uerr))
+            return uerr.empty() ? "missing qwen4exp.expert_count (MoE) and qwen4exp.feed_forward_length (dense FFN)" : uerr;
+        if (out.dense_ffn == 0) return "qwen4exp: feed_forward_length 0";
+        if (out.dense_ffn % 32) return "qwen4exp: feed_forward_length " + std::to_string(out.dense_ffn) +
+                                       " is not a multiple of 32 (the down projection's row blocks)";
+    }
 
     // PLE — all-or-none, keyed on ple.layers (the convert script omits the
     // whole group when HF ple_layer_ids is empty).
@@ -1015,7 +1033,7 @@ std::string read_qwen4exp_config(const GgufReader& g, Qwen4ExpConfig& out) {
         return "qwen4exp: ssm.inner_size != time_step_rank * state_size";
     if (out.ssm_k_heads == 0 || out.ssm_v_heads % out.ssm_k_heads)
         return "qwen4exp: ssm.time_step_rank not a multiple of ssm.group_count";
-    if (out.n_experts == 0 || out.n_experts_used == 0 || out.expert_ffn == 0)
+    if (!out.is_dense_ffn() && (out.n_experts == 0 || out.n_experts_used == 0 || out.expert_ffn == 0))
         return "qwen4exp: zero expert_count/used_count/ffn";
     if (out.n_experts_used > out.n_experts)
         return "qwen4exp: expert_used_count > expert_count";
@@ -1051,6 +1069,21 @@ std::string read_qwen4exp_config(const GgufReader& g, Qwen4ExpConfig& out) {
         for (size_t i = 1; i < heads; ++i)
             if (out.ple_head_offsets[i] != out.ple_head_offsets[i - 1] + out.ple_head_vocab_sizes[i - 1])
                 return "qwen4exp: ple.head_offsets not the cumulative sum of head_vocab_sizes";
+        // (2026-11-08) The PLE kernels take Flash-Next's geometry (qwen4_ple.hpp): trigram hashes over 8 heads a gram of
+        // 160 wide rows, a 4-tap conv, 4 streams. Another geometry is refused by name, not read with the wrong layout.
+        if (out.ple_ngram != 3 || out.ple_heads_per_ngram != 8 || out.ple_embed_per_input != 160 ||
+            out.ple_conv_kernel != 4 || out.hc_count != 4)
+            return "qwen4exp: PLE geometry ngram " + std::to_string(out.ple_ngram) + ", " +
+                   std::to_string(out.ple_heads_per_ngram) + " heads a gram, " + std::to_string(out.ple_embed_per_input) +
+                   " per head, conv " + std::to_string(out.ple_conv_kernel) + ", " + std::to_string(out.hc_count) +
+                   " streams; the PLE kernels take Flash-Next's (3, 8, 160, 4, 4)";
+        // More than one PLE block: in the reference every PLE block has its own n-gram table and hash constants
+        // (ple_layer_index offsets the primes and the multiplier seed), and the GGUF carries one table and one hash set --
+        // no converter writes a multi-block layout yet (llama.cpp's breaks on it). Refused rather than every block reading
+        // the first block's table.
+        if (out.ple_layers.size() > 1)
+            return "qwen4exp: ple.layers lists " + std::to_string(out.ple_layers.size()) + " blocks; each PLE block has its "
+                   "own n-gram table and hash constants and this GGUF layout carries one (no multi-block PLE layout exists yet)";
     }
     return {};
 }

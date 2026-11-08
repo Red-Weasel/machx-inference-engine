@@ -34,6 +34,7 @@ CONFIG_JSON = os.path.expanduser("~/references/qwen38-flash-next/hf-modeling/con
 # lacks it; vllm-xpu's site-packages carries gguf 2.2.6).  Appended (not prepended),
 # so the venv's own numpy/torch always win.
 GGUF_FALLBACK_PATHS = [
+    os.path.expanduser("~/.local/lib/python3.12/site-packages"),   # (2026-11-08: the vllm-xpu env is gone)
     os.path.expanduser("~/vllm-xpu/lib/python3.12/site-packages"),
     os.path.expanduser("~/vllm-env/lib/python3.12/site-packages"),
 ]

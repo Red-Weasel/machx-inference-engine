@@ -267,7 +267,7 @@ void ops_stage(const char* tag, Qwen4ExpModel& m, const Qwen4ExpConfig& c, uint3
     };
     // HC mix: `mixed` rows (out = mixed) or inject-logit rows (out = inj); chunks <= 4 (the rows path) or unchunked
     auto hcop = [&](const std::string& nm, const float* norm, const sycl::half* down, const sycl::half* up, const float* inj,
-                    bool want_inj, bool chunked) {
+                    bool want_inj, bool chunked, const Qwen4HcQ8* w8 = nullptr) {
         if (want_inj && !inj) return;
         const size_t rb = want_inj ? size_t(HC) * 4 : size_t(H) * 2;
         B.run(T + nm + (want_inj ? " (inject logits)" : " (mixed)") + (chunked ? " chunks<=4 vs T=1" : " UNCHUNKED vs T=1"), rb,
@@ -279,7 +279,7 @@ void ops_stage(const char* tag, Qwen4ExpModel& m, const Qwen4ExpConfig& c, uint3
                       sycl::half* mixed = want_inj ? S16 + size_t(r) * H : reinterpret_cast<sycl::half*>(out) + size_t(r) * H;
                       float* il = inj ? (want_inj ? reinterpret_cast<float*>(out) + size_t(r) * HC : S32 + size_t(r) * HC) : nullptr;
                       qwen4_hc_mix_v2(q, W32 + size_t(r) * D, norm, down, up, inj, xn + size_t(r) * D, lo + size_t(r) * R, mixed,
-                                      il, n, H, HC, R, eps);
+                                      il, n, H, HC, R, eps, {}, w8);
                   }
               }, /*report_only=*/!chunked);
     };
@@ -336,10 +336,16 @@ void ops_stage(const char* tag, Qwen4ExpModel& m, const Qwen4ExpConfig& c, uint3
         hcop(nm, nrm, dn, up, ij, false, true);
         hcop(nm, nrm, dn, up, ij, true, true);
         hcop(nm, nrm, dn, up, ij, false, false);
+        if (const Qwen4HcQ8* w8 = m.hc8_site(dn)) {   // the file's Q8_0 blocks (IE_Q4E_HC_Q8): what decode reads
+            hcop(nm + " 8-bit", nrm, dn, up, ij, false, true, w8);
+            hcop(nm + " 8-bit", nrm, dn, up, ij, true, true, w8);
+        }
     }
     if (tail) {
         hcop("final merge", m.out_hc_norm, m.out_hc_down, m.out_hc_up, nullptr, false, true);
         hcop("final merge", m.out_hc_norm, m.out_hc_down, m.out_hc_up, nullptr, false, false);
+        if (const Qwen4HcQ8* w8 = m.hc8_site(m.out_hc_down))
+            hcop("final merge 8-bit", m.out_hc_norm, m.out_hc_down, m.out_hc_up, nullptr, false, true, w8);
         q8op("head (vocab)", m.lmh_q8, H, V, false);
         f16op("head (vocab, F16)", m.lmh_q8.qs ? nullptr : m.lm_head, H, V, false);
     }

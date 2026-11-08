@@ -24,6 +24,7 @@
 #include "ie/kv_cache.hpp"
 #include "ie/model_config.hpp"
 #include "ie/qwen4_bank.hpp"
+#include "ie/qwen4_hc.hpp"
 #include "ie/qwen4_ple.hpp"
 
 #include <sycl/sycl.hpp>
@@ -31,6 +32,7 @@
 #include <string_view>
 
 #include <thread>
+#include <unordered_map>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -89,6 +91,10 @@ struct Qwen4ExpLayer {
     // plane is the documented 125x-wrong trap).
     struct Q8W { int8_t* qs = nullptr; uint16_t* d = nullptr;
                  uint16_t* dt = nullptr; };
+    // The HC mixing matrices' Q8_0 blocks as the file stores them (IE_Q4E_HC_Q8, 2026-11-08): the decode / verify mixes read
+    // these (qwen4_hc_mix_v2's Qwen4HcQ8) instead of the F16 copies above. Empty when the file's tensor is not Q8_0.
+    // The up planes are lane-interleaved (qwen4_hc_q8_interleave_up); their dt plane is unused.
+    Q8W hc_attn_down_q8, hc_attn_up_q8, hc_ffn_down_q8, hc_ffn_up_q8;
 
     // -- Gated DeltaNet (spec 13; linear blocks only) -----------------------
     sycl::half* attn_qkv  = nullptr;   // [2560 -> 10240] fused Q|K|V (F16 fallback)
@@ -176,8 +182,11 @@ struct Qwen4ExpLayer {
 // eh_proj columns [0,H) = fc_embedding and [H,2H) = fc_hidden within Q8_0 rounding.
 // The nextn block index of a reader, or -1 when the file is not in layout (b).
 inline int qwen4exp_mtp_nextn_block(const GgufReader& g) {
-    const KvRef* bc = g.find_kv("qwen4exp.block_count");
-    const KvRef* nn = g.find_kv("qwen4exp.nextn_predict_layers");
+    const KvRef* ak = g.find_kv("general.architecture");
+    const std::string a = ak ? std::string(ak->as_string()) : std::string("qwen4exp");
+    const std::string P = (a == "qwen4" || a == "qwen4moe" ? a : std::string("qwen4exp")) + ".";   // (2026-11-08: the file's prefix)
+    const KvRef* bc = g.find_kv(P + "block_count");
+    const KvRef* nn = g.find_kv(P + "nextn_predict_layers");
     if (!bc || !nn || nn->as_uint() == 0 || nn->as_uint() >= bc->as_uint()) return -1;
     const int b = int(bc->as_uint() - nn->as_uint());
     return g.find_tensor("blk." + std::to_string(b) + ".nextn.eh_proj.weight") ? b : -1;
@@ -238,6 +247,8 @@ public:
 
     const Qwen4ExpConfig& config() const noexcept { return cfg_; }
     const Qwen4ExpLayer&  layer(uint32_t il) const { return layers_[il]; }
+    // The 8-bit HC weights a mixing site reads at decode (IE_Q4E_HC_Q8), by the site's F16 down matrix; null = F16.
+    const Qwen4HcQ8* hc8_site(const sycl::half* down) const { return hc8_for(down); }
 
     // Globals (device, F16/F32 as noted).
     sycl::half* token_embd = nullptr;   // [vocab, 2560] row-gather source
@@ -247,6 +258,7 @@ public:
     sycl::half* out_hc_down = nullptr;  // [10240 -> 320]
     sycl::half* out_hc_up_t   = nullptr;  // [K, N] copies (prefill mix gemm)
     sycl::half* out_hc_down_t = nullptr;
+    Qwen4ExpLayer::Q8W out_hc_down_q8, out_hc_up_q8;   // the file's Q8_0 blocks (IE_Q4E_HC_Q8)
     float*      out_hc_norm = nullptr;  // [10240]
     const GgufTensorInfo* ple_table = nullptr;  // [160, 320001536] IQ4_NL or Q8_0 (community GGUFs), host
     DType                 ple_dt    = DType::kIQ4_NL;   // its dtype (checked at load; the gather's row layout)
@@ -589,6 +601,16 @@ private:
     std::vector<Qwen4ExpLayer> layers_;
     std::vector<void*> owned_;
     std::deque<GgufTensorInfo> tensor_views_;   // the halves of merged tensors (qwen4exp_split_merged); stable addresses
+    // (2026-11-08) a fused ffn_gate_up_exps bank's halves: view -> (the fused tensor, 0 = gate / 1 = up). The view's data is
+    // the fused base and NOT contiguous per expert -- prepare_bank_views splits it while it copies the bank to pinned host.
+    std::unordered_map<const GgufTensorInfo*, std::pair<const GgufTensorInfo*, uint32_t>> fused_half_;
+    // The 8-bit HC weights of each mixing site, keyed by the site's F16 down matrix (built at load; empty = F16 everywhere).
+    std::unordered_map<const void*, Qwen4HcQ8> hc8_;
+    const Qwen4HcQ8* hc8_for(const sycl::half* down) const {
+        if (hc8_.empty() || !down) return nullptr;
+        const auto it = hc8_.find(down);
+        return it == hc8_.end() ? nullptr : &it->second;
+    }
     uint64_t dev_bytes_  = 0;
     uint64_t host_bytes_ = 0;
     std::vector<PlacementRow> placement_;
@@ -716,6 +738,45 @@ private:
         std::vector<uint64_t> last_use;       // [C] LRU stamps
     };
     std::vector<ECache> ecache_;
+    // 2026-11-08 device routing (option 2 phase 3; default on, IE_Q4E_DEV_ROUTE=0 = off; docs/research/2026-11-08-flashnext-device-routing-design.md):
+    // the decode / verify MoE layers route on the device (qwen4_route_jobs_dev) and the grouped pick kernels read through a
+    // slot address table -- rows [0, S) the layer's VRAM cache slots, rows [S, S + E) every expert's slices in the pinned host
+    // banks (a miss reads its expert over PCIe in place) -- so no layer waits for the host. The host keeps the LRU one forward
+    // late: dr_settle (the next forward's start, the queue idle) reads each layer's picks, stamps the hits, and for a miss
+    // evicts a victim (its device map entry -1 on q, before any later routing), fills the slot on copyq_ and, once that fill
+    // is done, writes the expert's map entry on q behind the fill's event (the engine's cross-queue order for every fill).
+    // A host-routed forward (prefill, lanes off this path, a layer whose banks are not all pinned raw) first runs
+    // dr_host_path: pending picks settled, q ordered behind copyq_, every fill mapped.
+    struct DevRoute {
+        bool ok = false;                       // this layer routes on the device
+        int16_t* slot_of = nullptr;            // device [E]: the device's map (an expert being filled stays -1)
+        const uint8_t** tab = nullptr;         // device [(S + E) * 3] {gate, up, down}
+        uint32_t tab_rows = 0;                 // rows allocated (a shrink rebuilds within them)
+        int32_t* ids = nullptr;                // device [16 * NU]: the last device routing's experts
+        int32_t* h_ids = nullptr;              // pinned host mirror (D2H behind the routing)
+        int16_t* h_map = nullptr;              // pinned host [E]: the source of every map write (stable until the next settle)
+        uint32_t pend_T = 0;                   // rows whose picks dr_settle has not yet read
+        std::vector<uint32_t> fill_e, fill_s;  // fills on copyq_ whose map entry is not yet written
+        std::vector<sycl::event> fill_ev;
+        std::vector<uint8_t> filling;          // [S] a slot with a fill in flight (never a victim)
+        bool dirty = false;                    // the host path changed slot_of: upload it before the next device routing
+    };
+    std::vector<DevRoute> droute_;             // [n_layers]; empty = off
+    std::string dr_init();                     // after init_ecache / ecache_shrink
+    void dr_settle();                          // device-routing forward start
+    void dr_host_path();                       // host-routed forward start
+    void dr_stamp(ECache& ec, uint32_t L, uint32_t sl, uint32_t e);
+    void dr_map_layer(DevRoute& d, const ECache& ec, sycl::queue& q);   // this forward: the layer's fills' map entries
+    bool dr_choose(bool eligible);             // settle, then: route this forward on the device? (the miss-rate EMA)
+    bool dr_fwd_ = false;                      // this forward's decode / verify layers route on the device
+    // Adaptive (2026-11-08, gate 40: two cards +5.6 %, one card with a cold cache -28 %): a forward routes on the device
+    // only while the decode / verify miss rate's EMA is at most IE_Q4E_DEV_ROUTE_MISS (default 0.02); otherwise on the host,
+    // through qwen4_route_host -- the device's numerics bit for bit, so which side routed never changes a token.
+    double   dr_miss_ema_ = 1.0;               // start on the host until decode has been measured
+    uint64_t dr_h0_ = 0, dr_m0_ = 0;
+    bool     dr_last_dv_ = false;              // the last forward was a decode / verify one (its counts feed the EMA)
+    uint64_t dr_fwd_dev_ = 0, dr_fwd_host_ = 0;
+    uint64_t dr_reads_host_ = 0;               // picks read through host memory (perf counter)
     // 2026-10-22: slots pinned for one prefill pass (IE_Q4E_PF_RING): a hit keeps the pin stamp instead of the clock
     std::vector<uint8_t> pf_pin_mask_;
     uint64_t ecache_clock_ = 0;
@@ -759,6 +820,7 @@ private:
     std::unique_ptr<sycl::queue> copyq_;
 public:
     uint64_t ecache_hits = 0, ecache_misses = 0;   // perf counters (host)
+    uint64_t dr_host_reads() const noexcept { return dr_reads_host_; }   // device routing: picks read from the pinned bank
     // Decode router-sync breakdown (grouped T=1 path): time blocked in the
     // per-layer logits D2H .wait() vs host routing + job build + H2D submit.
     double t_route_wait = 0, t_route_host = 0, t_moe_submit = 0;

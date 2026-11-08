@@ -161,7 +161,7 @@ sycl::event gemv_k(sycl::queue& q, const sycl::half* A, const void* Wv, sycl::ha
 template <BankQ Q>
 sycl::event grouped_dual_k(sycl::queue& q, const sycl::half* x, const uint8_t* slot_base, uint64_t slot_bytes,
                            uint64_t gate_off, uint64_t up_off, const int32_t* jobs, sycl::half* g_out, sycl::half* u_out,
-                           uint32_t K, uint32_t N, uint32_t P, const std::vector<sycl::event>& deps) {
+                           uint32_t K, uint32_t N, uint32_t P, const std::vector<sycl::event>& deps, const uint8_t* const* slot_tab) {
     const uint64_t cb = col_bytes_of<Q>(K);
     const uint32_t n_wgs = (N + N_PER_WG - 1) / N_PER_WG;
     return ie::ps(q, "q4e_bank_grp_dual", [&](sycl::handler& h) {
@@ -177,7 +177,8 @@ sycl::event grouped_dual_k(sycl::queue& q, const sycl::half* x, const uint8_t* s
             const uint32_t n = wgid * N_PER_WG + sg_id;
             const uint32_t vt = uint32_t(jobs[pk * 3 + 0]), slot = uint32_t(jobs[pk * 3 + 1]);
             const sycl::half* A = x + uint64_t(vt) * K;
-            const uint8_t* W = slot_base + uint64_t(slot) * slot_bytes + (is_up ? up_off : gate_off);
+            const uint8_t* W = slot_tab ? slot_tab[uint64_t(slot) * 3 + (is_up ? 1 : 0)]
+                                        : slot_base + uint64_t(slot) * slot_bytes + (is_up ? up_off : gate_off);
             for (uint32_t i = lid; i < K; i += WG_ITEMS) A_slm[i] = A[i];
             sycl::group_barrier(it.get_group());
             if (n >= N) return;
@@ -198,7 +199,7 @@ sycl::event grouped_dual_k(sycl::queue& q, const sycl::half* x, const uint8_t* s
 template <BankQ Q>
 sycl::event grouped_dual_swiglu_k(sycl::queue& q, const sycl::half* x, const uint8_t* slot_base, uint64_t slot_bytes,
                                   uint64_t gate_off, uint64_t up_off, const int32_t* jobs, sycl::half* h_out,
-                                  uint32_t K, uint32_t N, uint32_t P, const std::vector<sycl::event>& deps) {
+                                  uint32_t K, uint32_t N, uint32_t P, const std::vector<sycl::event>& deps, const uint8_t* const* slot_tab) {
     const uint64_t cb = col_bytes_of<Q>(K);
     const uint32_t n_wgs = (N + N_PER_WG - 1) / N_PER_WG;
     return ie::ps(q, "q4e_bank_grp_dual_sw", [&](sycl::handler& h) {
@@ -217,10 +218,12 @@ sycl::event grouped_dual_swiglu_k(sycl::queue& q, const sycl::half* x, const uin
             sycl::group_barrier(it.get_group());
             if (n >= N) return;
             float acc_g = 0.f, acc_u = 0.f;
-            walk_col<Q>(sb + gate_off + uint64_t(n) * cb, K, lane, [&](uint32_t klo, float wlo, uint32_t khi, float whi) {
+            const uint8_t* wg = slot_tab ? slot_tab[uint64_t(slot) * 3 + 0] : sb + gate_off;
+            const uint8_t* wu = slot_tab ? slot_tab[uint64_t(slot) * 3 + 1] : sb + up_off;
+            walk_col<Q>(wg + uint64_t(n) * cb, K, lane, [&](uint32_t klo, float wlo, uint32_t khi, float whi) {
                 acc_g += float(A_slm[klo]) * wlo + float(A_slm[khi]) * whi;
             });
-            walk_col<Q>(sb + up_off + uint64_t(n) * cb, K, lane, [&](uint32_t klo, float wlo, uint32_t khi, float whi) {
+            walk_col<Q>(wu + uint64_t(n) * cb, K, lane, [&](uint32_t klo, float wlo, uint32_t khi, float whi) {
                 acc_u += float(A_slm[klo]) * wlo + float(A_slm[khi]) * whi;
             });
             acc_g = sycl::reduce_over_group(it.get_sub_group(), acc_g, sycl::plus<float>());
@@ -237,7 +240,7 @@ sycl::event grouped_dual_swiglu_k(sycl::queue& q, const sycl::half* x, const uin
 template <BankQ Q>
 sycl::event grouped_k(sycl::queue& q, const sycl::half* h_rows, const uint8_t* slot_base, uint64_t slot_bytes, uint64_t off,
                       const int32_t* jobs, sycl::half* ystage, uint32_t y_stride, uint32_t K, uint32_t N, uint32_t P,
-                      const std::vector<sycl::event>& deps) {
+                      const std::vector<sycl::event>& deps, const uint8_t* const* slot_tab) {
     const uint64_t cb = col_bytes_of<Q>(K);
     const uint32_t n_wgs = (N + N_PER_WG - 1) / N_PER_WG;
     return ie::ps(q, "q4e_bank_grp", [&](sycl::handler& h) {
@@ -251,7 +254,7 @@ sycl::event grouped_k(sycl::queue& q, const sycl::half* h_rows, const uint8_t* s
             const uint32_t n = wgid * N_PER_WG + sg_id;
             const uint32_t slot = uint32_t(jobs[p * 3 + 1]), ycell = uint32_t(jobs[p * 3 + 2]);
             const sycl::half* A = h_rows + uint64_t(p) * K;
-            const uint8_t* W = slot_base + uint64_t(slot) * slot_bytes + off;
+            const uint8_t* W = slot_tab ? slot_tab[uint64_t(slot) * 3] : slot_base + uint64_t(slot) * slot_bytes + off;
             for (uint32_t i = lid; i < K; i += WG_ITEMS) A_slm[i] = A[i];
             sycl::group_barrier(it.get_group());
             if (n >= N) return;
@@ -369,24 +372,24 @@ sycl::event qwen4_bank_gemv(sycl::queue& q, BankQ kind, const sycl::half* A, con
 sycl::event qwen4_bank_gemv_grouped_dual(sycl::queue& q, BankQ kind, const sycl::half* x, const uint8_t* slot_base,
                             uint64_t slot_bytes, uint64_t gate_off, uint64_t up_off, const int32_t* jobs,
                             sycl::half* g_out, sycl::half* u_out, uint32_t K, uint32_t N, uint32_t P,
-                            const std::vector<sycl::event>& deps) {
-#define IE_BANK_CALL(Q) grouped_dual_k<Q>(q, x, slot_base, slot_bytes, gate_off, up_off, jobs, g_out, u_out, K, N, P, deps)
+                            const std::vector<sycl::event>& deps, const uint8_t* const* slot_tab) {
+#define IE_BANK_CALL(Q) grouped_dual_k<Q>(q, x, slot_base, slot_bytes, gate_off, up_off, jobs, g_out, u_out, K, N, P, deps, slot_tab)
     IE_BANK_DISPATCH(kind, IE_BANK_CALL)
 #undef IE_BANK_CALL
 }
 
 sycl::event qwen4_bank_gemv_grouped_dual_swiglu(sycl::queue& q, BankQ kind, const sycl::half* x, const uint8_t* slot_base,
                             uint64_t slot_bytes, uint64_t gate_off, uint64_t up_off, const int32_t* jobs,
-                            sycl::half* h_out, uint32_t K, uint32_t N, uint32_t P, const std::vector<sycl::event>& deps) {
-#define IE_BANK_CALL(Q) grouped_dual_swiglu_k<Q>(q, x, slot_base, slot_bytes, gate_off, up_off, jobs, h_out, K, N, P, deps)
+                            sycl::half* h_out, uint32_t K, uint32_t N, uint32_t P, const std::vector<sycl::event>& deps, const uint8_t* const* slot_tab) {
+#define IE_BANK_CALL(Q) grouped_dual_swiglu_k<Q>(q, x, slot_base, slot_bytes, gate_off, up_off, jobs, h_out, K, N, P, deps, slot_tab)
     IE_BANK_DISPATCH(kind, IE_BANK_CALL)
 #undef IE_BANK_CALL
 }
 
 sycl::event qwen4_bank_gemv_grouped(sycl::queue& q, BankQ kind, const sycl::half* h_rows, const uint8_t* slot_base,
                             uint64_t slot_bytes, uint64_t off, const int32_t* jobs, sycl::half* ystage, uint32_t y_stride,
-                            uint32_t K, uint32_t N, uint32_t P, const std::vector<sycl::event>& deps) {
-#define IE_BANK_CALL(Q) grouped_k<Q>(q, h_rows, slot_base, slot_bytes, off, jobs, ystage, y_stride, K, N, P, deps)
+                            uint32_t K, uint32_t N, uint32_t P, const std::vector<sycl::event>& deps, const uint8_t* const* slot_tab) {
+#define IE_BANK_CALL(Q) grouped_k<Q>(q, h_rows, slot_base, slot_bytes, off, jobs, ystage, y_stride, K, N, P, deps, slot_tab)
     IE_BANK_DISPATCH(kind, IE_BANK_CALL)
 #undef IE_BANK_CALL
 }
@@ -627,7 +630,7 @@ sycl::event gemv_q8s_k(sycl::queue& q, const void* x_q8s, const void* Wv, sycl::
 template <BankQ Q>
 sycl::event grouped_dual_q8s_k(sycl::queue& q, const void* x_q8s, const uint8_t* slot_base, uint64_t slot_bytes,
                                uint64_t gate_off, uint64_t up_off, const int32_t* jobs, sycl::half* g_out, sycl::half* u_out,
-                               uint32_t K, uint32_t N, uint32_t P, const std::vector<sycl::event>& deps) {
+                               uint32_t K, uint32_t N, uint32_t P, const std::vector<sycl::event>& deps, const uint8_t* const* slot_tab) {
     constexpr int NPW = 32, WGI = NPW * SG_SIZE;
     const uint64_t cb = col_bytes_of<Q>(K);
     const uint32_t n_wgs = (N + NPW - 1) / NPW, q8_blocks = K / 32;
@@ -645,7 +648,8 @@ sycl::event grouped_dual_q8s_k(sycl::queue& q, const void* x_q8s, const uint8_t*
             const uint32_t n = wgid * NPW + sg_id;
             if (n >= N) return;
             const uint32_t vt = uint32_t(jobs[pk * 3 + 0]), slot = uint32_t(jobs[pk * 3 + 1]);
-            const uint8_t* W = slot_base + uint64_t(slot) * slot_bytes + (is_up ? up_off : gate_off);
+            const uint8_t* W = slot_tab ? slot_tab[uint64_t(slot) * 3 + (is_up ? 1 : 0)]
+                                        : slot_base + uint64_t(slot) * slot_bytes + (is_up ? up_off : gate_off);
             uint32_t* st = stage.get_multi_ptr<sycl::access::decorated::no>().get() + sg_id * 128;
             float acc = q8dot_col<Q>(it.get_sub_group(), lane, W + uint64_t(n) * cb, K, X8 + uint64_t(vt) * q8_blocks, st);
             acc = sycl::reduce_over_group(it.get_sub_group(), acc, sycl::plus<float>());
@@ -660,7 +664,7 @@ sycl::event grouped_dual_q8s_k(sycl::queue& q, const void* x_q8s, const uint8_t*
 template <BankQ Q>
 sycl::event grouped_dual_q8s_swiglu_k(sycl::queue& q, const void* x_q8s, const uint8_t* slot_base, uint64_t slot_bytes,
                                       uint64_t gate_off, uint64_t up_off, const int32_t* jobs, sycl::half* h_out,
-                                      uint32_t K, uint32_t N, uint32_t P, const std::vector<sycl::event>& deps) {
+                                      uint32_t K, uint32_t N, uint32_t P, const std::vector<sycl::event>& deps, const uint8_t* const* slot_tab) {
     constexpr int NPW = 32, WGI = NPW * SG_SIZE;
     const uint64_t cb = col_bytes_of<Q>(K);
     const uint32_t n_wgs = (N + NPW - 1) / NPW, q8_blocks = K / 32;
@@ -679,8 +683,10 @@ sycl::event grouped_dual_q8s_swiglu_k(sycl::queue& q, const void* x_q8s, const u
             const uint8_t* sb = slot_base + uint64_t(slot) * slot_bytes;
             const block_q8_1s* xrow = X8 + uint64_t(vt) * q8_blocks;
             uint32_t* st = stage.get_multi_ptr<sycl::access::decorated::no>().get() + sg_id * 128;
-            float acc_g = q8dot_col<Q>(it.get_sub_group(), lane, sb + gate_off + uint64_t(n) * cb, K, xrow, st);
-            float acc_u = q8dot_col<Q>(it.get_sub_group(), lane, sb + up_off   + uint64_t(n) * cb, K, xrow, st);
+            const uint8_t* wg = slot_tab ? slot_tab[uint64_t(slot) * 3 + 0] : sb + gate_off;
+            const uint8_t* wu = slot_tab ? slot_tab[uint64_t(slot) * 3 + 1] : sb + up_off;
+            float acc_g = q8dot_col<Q>(it.get_sub_group(), lane, wg + uint64_t(n) * cb, K, xrow, st);
+            float acc_u = q8dot_col<Q>(it.get_sub_group(), lane, wu + uint64_t(n) * cb, K, xrow, st);
             acc_g = sycl::reduce_over_group(it.get_sub_group(), acc_g, sycl::plus<float>());
             acc_u = sycl::reduce_over_group(it.get_sub_group(), acc_u, sycl::plus<float>());
             if (lane == 0) {
@@ -719,10 +725,10 @@ sycl::event qwen4_bank_gemv_grouped_tiles_q8s(sycl::queue& q, BankQ kind, const 
 sycl::event qwen4_bank_gemv_grouped_dual_q8s(sycl::queue& q, BankQ kind, const void* x_q8s, const uint8_t* slot_base,
                                              uint64_t slot_bytes, uint64_t gate_off, uint64_t up_off, const int32_t* jobs,
                                              sycl::half* g_out, sycl::half* u_out, uint32_t K, uint32_t N, uint32_t P,
-                                             const std::vector<sycl::event>& deps) {
+                                             const std::vector<sycl::event>& deps, const uint8_t* const* slot_tab) {
     switch (kind) {
-        case BankQ::kQ5_K: return grouped_dual_q8s_k<BankQ::kQ5_K>(q, x_q8s, slot_base, slot_bytes, gate_off, up_off, jobs, g_out, u_out, K, N, P, deps);
-        case BankQ::kQ6_K: return grouped_dual_q8s_k<BankQ::kQ6_K>(q, x_q8s, slot_base, slot_bytes, gate_off, up_off, jobs, g_out, u_out, K, N, P, deps);
+        case BankQ::kQ5_K: return grouped_dual_q8s_k<BankQ::kQ5_K>(q, x_q8s, slot_base, slot_bytes, gate_off, up_off, jobs, g_out, u_out, K, N, P, deps, slot_tab);
+        case BankQ::kQ6_K: return grouped_dual_q8s_k<BankQ::kQ6_K>(q, x_q8s, slot_base, slot_bytes, gate_off, up_off, jobs, g_out, u_out, K, N, P, deps, slot_tab);
         default: return {};
     }
 }
@@ -730,10 +736,10 @@ sycl::event qwen4_bank_gemv_grouped_dual_q8s(sycl::queue& q, BankQ kind, const v
 sycl::event qwen4_bank_gemv_grouped_dual_q8s_swiglu(sycl::queue& q, BankQ kind, const void* x_q8s, const uint8_t* slot_base,
                                                     uint64_t slot_bytes, uint64_t gate_off, uint64_t up_off, const int32_t* jobs,
                                                     sycl::half* h_out, uint32_t K, uint32_t N, uint32_t P,
-                                                    const std::vector<sycl::event>& deps) {
+                                                    const std::vector<sycl::event>& deps, const uint8_t* const* slot_tab) {
     switch (kind) {
-        case BankQ::kQ5_K: return grouped_dual_q8s_swiglu_k<BankQ::kQ5_K>(q, x_q8s, slot_base, slot_bytes, gate_off, up_off, jobs, h_out, K, N, P, deps);
-        case BankQ::kQ6_K: return grouped_dual_q8s_swiglu_k<BankQ::kQ6_K>(q, x_q8s, slot_base, slot_bytes, gate_off, up_off, jobs, h_out, K, N, P, deps);
+        case BankQ::kQ5_K: return grouped_dual_q8s_swiglu_k<BankQ::kQ5_K>(q, x_q8s, slot_base, slot_bytes, gate_off, up_off, jobs, h_out, K, N, P, deps, slot_tab);
+        case BankQ::kQ6_K: return grouped_dual_q8s_swiglu_k<BankQ::kQ6_K>(q, x_q8s, slot_base, slot_bytes, gate_off, up_off, jobs, h_out, K, N, P, deps, slot_tab);
         default: return {};
     }
 }

@@ -476,7 +476,7 @@ sycl::event gemv_q4_K_q8s_grouped_dual(sycl::queue& q,
                          const int32_t* jobs,
                          sycl::half* g_out, sycl::half* u_out,
                          uint32_t K, uint32_t N, uint32_t P,
-                         const std::vector<sycl::event>& deps) {
+                         const std::vector<sycl::event>& deps, const uint8_t* const* slot_tab) {
     constexpr int SG_SIZE  = 16;
     constexpr int N_PER_WG = 32;
     constexpr int WG_ITEMS = N_PER_WG * SG_SIZE;
@@ -505,8 +505,8 @@ sycl::event gemv_q4_K_q8s_grouped_dual(sycl::queue& q,
             const uint32_t slot = uint32_t(jobs[pk * 3 + 1]);
             const block_q8_1s* xrow = X8 + uint64_t(vt) * q8_blocks;
             const auto* W = reinterpret_cast<const block_q4_K*>(
-                slot_base + uint64_t(slot) * slot_bytes +
-                (is_up ? up_off : gate_off));
+                slot_tab ? slot_tab[uint64_t(slot) * 3 + (is_up ? 1 : 0)]
+                         : slot_base + uint64_t(slot) * slot_bytes + (is_up ? up_off : gate_off));
             sycl::half* y = (is_up ? u_out : g_out) + uint64_t(pk) * N;
 
             const int sub  = int(lane) >> 1;
@@ -568,7 +568,7 @@ sycl::event gemv_q4_K_q8s_grouped_dual_swiglu(sycl::queue& q,
                          const int32_t* jobs,
                          sycl::half* h_out,
                          uint32_t K, uint32_t N, uint32_t P,
-                         const std::vector<sycl::event>& deps) {
+                         const std::vector<sycl::event>& deps, const uint8_t* const* slot_tab) {
     constexpr int SG_SIZE  = 16;
     constexpr int N_PER_WG = 32;
     constexpr int WG_ITEMS = N_PER_WG * SG_SIZE;
@@ -595,8 +595,10 @@ sycl::event gemv_q4_K_q8s_grouped_dual_swiglu(sycl::queue& q,
             const uint32_t slot = uint32_t(jobs[pk * 3 + 1]);
             const block_q8_1s* xrow = X8 + uint64_t(vt) * q8_blocks;
             const uint8_t* sb = slot_base + uint64_t(slot) * slot_bytes;
-            const auto* Wg = reinterpret_cast<const block_q4_K*>(sb + gate_off) + uint64_t(n) * blocks_per_col;
-            const auto* Wu = reinterpret_cast<const block_q4_K*>(sb + up_off)   + uint64_t(n) * blocks_per_col;
+            const uint8_t* wg = slot_tab ? slot_tab[uint64_t(slot) * 3 + 0] : sb + gate_off;
+            const uint8_t* wu = slot_tab ? slot_tab[uint64_t(slot) * 3 + 1] : sb + up_off;
+            const auto* Wg = reinterpret_cast<const block_q4_K*>(wg) + uint64_t(n) * blocks_per_col;
+            const auto* Wu = reinterpret_cast<const block_q4_K*>(wu) + uint64_t(n) * blocks_per_col;
 
             const int sub  = int(lane) >> 1;
             const int half = int(lane) & 1;

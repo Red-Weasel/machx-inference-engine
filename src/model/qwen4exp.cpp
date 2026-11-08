@@ -5,6 +5,7 @@
 // top of it (campaign P2) so the placement can gate first (alpha-omega).
 
 #include "ie/qwen4exp.hpp"
+#include "ie/qwen4_route.hpp"
 #include <chrono>
 #include <sys/mman.h>
 #include <unordered_map>
@@ -36,6 +37,56 @@ namespace ie {
 
 namespace {
 
+// Device routing helpers (the header's DevRoute note). Default ON since gate 41 (adaptive: two cards 47.05 -> 49.66 tok/s, a
+// cold one-card cache stays on the host); IE_Q4E_DEV_ROUTE=0 = the host routing with route_from_logits, as before.
+static bool q4e_dev_route() {
+    static const bool on = [] { const char* v = std::getenv("IE_Q4E_DEV_ROUTE"); return !(v && v[0] == '0'); }();
+    return on;
+}
+// IE_Q4E_ROUTER_DUMP=<file> (2026-11-08): the host-routed decode / verify rows' F16 router logits appended to <file> (rows x
+// n_experts halves, at most IE_Q4E_ROUTER_DUMP_ROWS rows, default 40000) -- ie-qwen4-route-test's real-row input: device vs
+// host routing bit for bit, and how often today's route_from_logits picks a different set.
+static void q4e_router_dump(const sycl::half* r16, uint32_t rows, uint32_t E) {
+    static FILE* f = [] { const char* p = std::getenv("IE_Q4E_ROUTER_DUMP"); return p ? std::fopen(p, "wb") : nullptr; }();
+    static uint64_t left = [] {
+        const char* m = std::getenv("IE_Q4E_ROUTER_DUMP_ROWS");
+        return m ? std::strtoull(m, nullptr, 10) : 40000ull;
+    }();
+    if (!f || !left) return;
+    const uint64_t n = std::min<uint64_t>(rows, left);
+    std::fwrite(r16, sizeof(sycl::half), n * E, f);
+    std::fflush(f);
+    left -= n;
+}
+// qwen4_route_host as the host path's pick list (ascending id, the weights): the device routing's numerics bit for bit.
+static void q4e_route_host_pairs(const sycl::half* row, uint32_t E, uint32_t k, std::vector<std::pair<uint32_t, float>>& out) {
+    int32_t ids[kQwen4RouteMaxK];
+    float w[kQwen4RouteMaxK];
+    qwen4_route_host(row, E, k, ids, w);
+    out.clear();
+    for (uint32_t j = 0; j < k; ++j) out.emplace_back(uint32_t(ids[j]), w[j]);
+}
+// The switches whose paths need the host's picks (the opt-in expert-major body, the per-pick decode, the bisect alternates).
+static bool q4e_dr_host_only() {
+    static const bool v = [] {
+        const char* g = std::getenv("IE_Q4E_DECODE_GROUPED");
+        return std::getenv("IE_Q4E_MOE_EXPMAJOR") || std::getenv("IE_Q4E_SV_NO_G1") || std::getenv("IE_Q4E_SV_NO_G2") ||
+               std::getenv("IE_Q4E_SV_NO_RED") || (g && g[0] == '0');
+    }();
+    return v;
+}
+
+// The HC mixing matrices read as the file's Q8_0 blocks at the decode / verify shapes (2026-11-08): qwen4_hc_mix_v2's 8-bit
+// down / up instead of the F16 copies the loader dequantizes to -- about half the bytes of the 97 mixes a step, and the
+// file's own values (the F16 copy rounds every q * d to 11 bits; ie-qwen4-hc-test: max error vs fp64 4.8e-4 vs 1.8e-3).
+// Only when the tensor is Q8_0 on disk (Unsloth's and the converter's files). IE_Q4E_HC_Q8=0 = the F16 copies.
+// PLE's flat width (2026-11-08): kPleStreams streams of the model's hidden (Flash-Next 4 x 2560 = q4e_ple_si(cfg_)). The n-gram
+// embedding E stays kPleD (16 x 160) wide whatever the hidden: the ple_key / ple_value projections' K.
+static uint64_t q4e_ple_si(const Qwen4ExpConfig& c) { return uint64_t(kPleStreams) * c.hidden; }
+static bool q4e_hc_q8() {
+    static const bool v = [] { const char* e = std::getenv("IE_Q4E_HC_Q8"); return !(e && e[0] == '0'); }();
+    return v;
+}
 inline float bf16_to_fp32(uint16_t v) {
     uint32_t u = uint32_t(v) << 16;
     float f;
@@ -129,6 +180,12 @@ void Qwen4ExpModel::load_expert_pins(const char* path) {
 }
 
 void Qwen4ExpModel::free_all() {
+    if (!droute_.empty() && dr_fwd_dev_ + dr_fwd_host_)
+        std::fprintf(stderr, "[qwen4exp] device routing: %llu of %llu decode / verify forwards on the device, %llu picks read "
+                             "from the pinned bank, decode miss-rate EMA %.4f (IE_Q4E_DEV_ROUTE_MISS)\n",
+                     (unsigned long long)dr_fwd_dev_, (unsigned long long)(dr_fwd_dev_ + dr_fwd_host_),
+                     (unsigned long long)dr_reads_host_, dr_miss_ema_);
+    droute_.clear();
     if (!expert_hist_.empty()) {   // IE_Q4E_EXPERT_HIST: the per-layer pick histogram and its coverage figures
         if (const char* hp = std::getenv("IE_Q4E_EXPERT_HIST"); hp && *hp) {
             if (FILE* f = std::fopen(hp, "w")) {
@@ -196,7 +253,7 @@ std::string Qwen4ExpModel::load(DeviceAllocator& alloc, const GgufReader& g,
     //  kTransKN  — transposed to [K, N] row-major for gemv_fp16
     //  kSsmPad64 — qwen35 ssm alpha/beta [K, 64]-padded transpose
     enum class Lay { kNative, kTransKN, kSsmPad64, kConvKMajor, kQ8Soa,
-                     kQ8Requant };
+                     kQ8Requant, kQ8SoaHcUp };   // kQ8SoaHcUp: kQ8Soa, then qwen4_hc_q8_interleave_up (the HC up's lanes layout)
     struct Job {
         const GgufTensorInfo* t;
         void**  dst_h;     // exactly one of dst_h / dst_f / dst_q8 is set
@@ -255,6 +312,16 @@ std::string Qwen4ExpModel::load(DeviceAllocator& alloc, const GgufReader& g,
         jobs.push_back({t, reinterpret_cast<void**>(h), f, nullptr, lay});
         return true;
     };
+    // The HC down / up matrices' raw Q8_0 blocks beside their F16 copy (q4e_hc_q8): only when the file stores them Q8_0.
+    auto want_hc8 = [&](const GgufTensorInfo* t, Qwen4ExpLayer::Q8W* dst, bool up) {
+        if (!q4e_hc_q8() || !t || t->dtype != DType::kQ8_0 || t->n_dims != 2 || (t->shape[0] % 32) != 0) return;
+        if (up && (t->shape[1] % 16) != 0) return;
+        const uint64_t K = t->shape[0], N = t->shape[1];
+        const uint64_t bytes = N * K + 2 * N * (K / 32) * 2;
+        projected += bytes;
+        placement_.push_back({std::string(t->name), "device", "Q8soa", bytes});
+        jobs.push_back({t, nullptr, nullptr, dst, up ? Lay::kQ8SoaHcUp : Lay::kQ8Soa});
+    };
     // A pair of tensors that llama.cpp's converter may have written merged (qwen4exp_split_merged): the separate ones when
     // the file has them, else two views into the merged one. Absent both ways -> null, and want()'s missing-tensor error.
     auto Tsplit = [&](uint32_t L, const char* merged, const char* a, const char* b, uint64_t n_a,
@@ -271,11 +338,23 @@ std::string Qwen4ExpModel::load(DeviceAllocator& alloc, const GgufReader& g,
     auto host_bank = [&](uint32_t L, const char* n,
                          const GgufTensorInfo** dst) -> bool {
         const GgufTensorInfo* t = Tl(L, n);
-        if (!t && std::string(n) == "ffn_gate_exps.weight" && Tl(L, "ffn_gate_up_exps.weight")) {
-            err = "qwen4exp load: blk." + std::to_string(L) + ".ffn_gate_up_exps.weight is a fused gate/up expert bank "
-                  "(llama.cpp --fuse-gate-up-exps); this engine streams the separate ffn_gate_exps / ffn_up_exps banks: "
-                  "convert without the flag";
-            return false;
+        const bool gate = std::string(n) == "ffn_gate_exps.weight", up = std::string(n) == "ffn_up_exps.weight";
+        if (!t && (gate || up)) {
+            // 2026-11-08: a fused gate/up bank (llama.cpp --fuse-gate-up-exps; [K, 2F, E], each expert's F gate rows then
+            // its F up rows -- HF's gate_up_proj order) is taken as two half views; prepare_bank_views splits it per expert
+            // into the ordinary gate and up banks while it copies them to pinned host (before 11-08: refused).
+            if (const GgufTensorInfo* f = Tl(L, "ffn_gate_up_exps.weight")) {
+                if (f->n_dims != 3 || (f->shape[1] % 2) != 0 || (f->nbytes % (f->shape[1] * f->shape[2])) != 0) {
+                    err = "qwen4exp load: blk." + std::to_string(L) + ".ffn_gate_up_exps.weight is not a [K, 2F, E] bank";
+                    return false;
+                }
+                GgufTensorInfo h = *f;
+                h.shape[1] = f->shape[1] / 2;
+                h.nbytes = f->nbytes / 2;
+                tensor_views_.push_back(h);
+                t = &tensor_views_.back();
+                fused_half_[t] = {f, gate ? 0u : 1u};
+            }
         }
         if (!t) { err = std::string("qwen4exp load: missing expert bank blk.") +
                         std::to_string(L) + "." + n; return false; }
@@ -295,6 +374,8 @@ std::string Qwen4ExpModel::load(DeviceAllocator& alloc, const GgufReader& g,
                      &lm_head, Lay::kTransKN)) return err;
         if (!want(g.find_tensor("output_hc_up.weight"), "output_hc_up.weight", &out_hc_up, nullptr)) return err;
         if (!want(g.find_tensor("output_hc_down.weight"), "output_hc_down.weight", &out_hc_down, nullptr)) return err;
+        want_hc8(g.find_tensor("output_hc_up.weight"), &out_hc_up_q8, true);
+        want_hc8(g.find_tensor("output_hc_down.weight"), &out_hc_down_q8, false);
         if (!want(g.find_tensor("output_hc_norm.weight"), "output_hc_norm.weight", nullptr, &out_hc_norm)) return err;
     }
     bool own_ple = false;
@@ -367,6 +448,18 @@ std::string Qwen4ExpModel::load(DeviceAllocator& alloc, const GgufReader& g,
         if (!want(hc_f_down, "hc_ffn_down", &w.hc_ffn_down, nullptr)) return err;
         if (!want(Tl(L, "hc_ffn_norm.weight"), "hc_ffn_norm", nullptr, &w.hc_ffn_norm)) return err;
         if (!want(hc_f_inj, "hc_ffn_inject", nullptr, &w.hc_ffn_inject)) return err;
+        want_hc8(Tl(L, "hc_attn_up.weight"), &w.hc_attn_up_q8, true);
+        want_hc8(hc_a_down, &w.hc_attn_down_q8, false);
+        want_hc8(Tl(L, "hc_ffn_up.weight"), &w.hc_ffn_up_q8, true);
+        want_hc8(hc_f_down, &w.hc_ffn_down_q8, false);
+        if (cfg.is_dense_ffn()) {
+            // Dense FFN (2026-11-08): the block's one SwiGLU MLP (blk.N.ffn_gate / ffn_up / ffn_down) binds into the
+            // shared-expert slots -- the same Q8 SoA residency and int-dot / s8-GEMM paths; run_block's dense branch runs
+            // it with no gate and no routed experts. No router, no banks, no expert cache.
+            if (!want_q8(Tl(L, "ffn_gate.weight"), "ffn_gate", &w.shg_q8, &w.ffn_gate_shexp, Lay::kTransKN)) return err;
+            if (!want_q8(Tl(L, "ffn_up.weight"),   "ffn_up",   &w.shu_q8, &w.ffn_up_shexp,   Lay::kTransKN)) return err;
+            if (!want_q8(Tl(L, "ffn_down.weight"), "ffn_down", &w.shd_q8, &w.ffn_down_shexp, Lay::kTransKN)) return err;
+        } else {
         // MoE device side — every block.
         if (!want(Tl(L, "ffn_gate_inp.weight"), "ffn_gate_inp", &w.ffn_gate_inp, nullptr, Lay::kTransKN)) return err;
         if (!want(Tl(L, "ffn_gate_inp_shexp.weight"), "ffn_gate_inp_shexp", &w.ffn_gate_inp_shexp, nullptr)) return err;
@@ -380,6 +473,7 @@ std::string Qwen4ExpModel::load(DeviceAllocator& alloc, const GgufReader& g,
         if (!host_bank(L, "ffn_gate_exps.weight", &w.gate_exps)) return err;
         if (!host_bank(L, "ffn_up_exps.weight",   &w.up_exps))   return err;
         if (!host_bank(L, "ffn_down_exps.weight", &w.down_exps)) return err;
+        }
 
         if (cfg.is_full_attn(L)) {
             if (!want_q8(Tl(L, "attn_q.weight"),   "attn_q",      &w.q_q8,
@@ -390,10 +484,15 @@ std::string Qwen4ExpModel::load(DeviceAllocator& alloc, const GgufReader& g,
                          &w.attn_output, Lay::kTransKN)) return err;
             if (!want(Tl(L, "attn_q_norm.weight"), "attn_q_norm", nullptr, &w.attn_q_norm)) return err;
             if (!want(Tl(L, "attn_k_norm.weight"), "attn_k_norm", nullptr, &w.attn_k_norm)) return err;
-            if (!want(Tl(L, "indexer.q_proj.weight"), "indexer.q_proj", &w.idx_q_proj, nullptr, Lay::kTransKN)) return err;
-            if (!want(Tl(L, "indexer.k_proj.weight"), "indexer.k_proj", &w.idx_k_proj, nullptr, Lay::kTransKN)) return err;
-            if (!want(Tl(L, "indexer.q_norm.weight"), "indexer.q_norm", nullptr, &w.idx_q_norm)) return err;
-            if (!want(Tl(L, "indexer.k_norm.weight"), "indexer.k_norm", nullptr, &w.idx_k_norm)) return err;
+            // The QSA indexer only when the file has its keys (2026-11-08): without them the runtime attends densely over
+            // every cached token (dense_ok = no limit) -- the exact attention QSA approximates past 2051 tokens. The
+            // Qwen4-27B reading (llama.cpp #31072): "QSA kernels present, no QSA weights".
+            if (cfg.indexer_top_k) {
+                if (!want(Tl(L, "indexer.q_proj.weight"), "indexer.q_proj", &w.idx_q_proj, nullptr, Lay::kTransKN)) return err;
+                if (!want(Tl(L, "indexer.k_proj.weight"), "indexer.k_proj", &w.idx_k_proj, nullptr, Lay::kTransKN)) return err;
+                if (!want(Tl(L, "indexer.q_norm.weight"), "indexer.q_norm", nullptr, &w.idx_q_norm)) return err;
+                if (!want(Tl(L, "indexer.k_norm.weight"), "indexer.k_norm", nullptr, &w.idx_k_norm)) return err;
+            }
         } else {
             // (attn_qkv | attn_gate and ssm_beta | ssm_alpha arrive merged from the current llama.cpp converter)
             const GgufTensorInfo *qkv_t = nullptr, *gate_t = nullptr, *beta_t = nullptr, *alpha_t = nullptr;
@@ -457,7 +556,7 @@ std::string Qwen4ExpModel::load(DeviceAllocator& alloc, const GgufReader& g,
         return {};
     };
     for (const Job& j : jobs) {
-        if (j.lay == Lay::kQ8Soa) {
+        if (j.lay == Lay::kQ8Soa || j.lay == Lay::kQ8SoaHcUp) {
             // COPY of qwen35_split build_split's Q8_0 SoA repack (layout must
             // match gemv_q8_0_soa_q8_*): qs[n*K+b*32+i], d[n*bpc+b].
             const uint32_t K = uint32_t(j.t->shape[0]), N = uint32_t(j.t->shape[1]);
@@ -472,6 +571,13 @@ std::string Qwen4ExpModel::load(DeviceAllocator& alloc, const GgufReader& g,
                     for (int i2 = 0; i2 < 32; ++i2)
                         qs[nn * K + uint64_t(b) * 32 + i2] = blk.qs[i2];
                 }
+            if (j.lay == Lay::kQ8SoaHcUp) {   // the fast HC up kernel's layout (N rows of K = r); dt is unused for these
+                std::vector<int8_t> qi(qs.size());
+                std::vector<uint16_t> di(dd.size());
+                qwen4_hc_q8_interleave_up(qs.data(), dd.data(), N, K, qi.data(), di.data());
+                qs.swap(qi);
+                dd.swap(di);
+            }
             if (auto e = upload_q8(qs, dd, N, bpc, j.dst_q8); !e.empty()) return e;
             continue;
         }
@@ -641,14 +747,15 @@ static bool q4e_hoist_shexp() {
     return v;
 }
 // The QSA attention's key split at the decode / verify shapes (2026-11-08): IE_Q4E_QSA_TILES = tiles a head (16 = the original
-// grid: n_q x 16 subgroups, 128 keys each at 2048 selected keys, latency-bound at ~390 us a layer; more tiles = more subgroups
-// and shorter per-tile chains). Prefill groups (Tg > 16) keep 16. The cross-tile merge is reassociated by the tile count, so a
-// value other than 16 is a numerics change -- the same for verify and decode (bvs holds), gated by decode PPL before any
-// default change. Clamped to [16, 128]; the partial scratch holds 128.
+// grid: n_q x 16 subgroups, 128 keys each at 2048 selected keys, latency-bound; more tiles = more subgroups and shorter per-tile
+// chains). Prefill groups (Tg > 16) keep 16. The cross-tile merge is reassociated by the tile count, the same for verify and
+// decode (bvs holds). DEFAULT 64 (2026-11-08): 32 keys a tile at 2048 selected keys, -0.9 ms a step at ctx ~3100, decode PPL 5.7971 -> 5.8039
+// on 3072 tokens, the greedy text identical. IE_Q4E_QSA_TILES=16 = the v0.2.36 sums bit for bit. Clamped to [16, 128]; the
+// partial scratch holds 128.
 static uint32_t q4e_qsa_tiles() {
     static const uint32_t v = [] {
         const char* e = std::getenv("IE_Q4E_QSA_TILES");
-        int t = e ? std::atoi(e) : 16;
+        int t = e ? std::atoi(e) : 64;
         if (t < 16) t = 16;
         if (t > 128) t = 128;
         return uint32_t(t);
@@ -1319,6 +1426,7 @@ static void ram_pin_warn(uint64_t nbytes) {
 }
 
 std::string Qwen4ExpModel::prepare_bank_views() {
+    if (cfg_.is_dense_ffn()) return {};   // (2026-11-08: a dense FFN has no expert banks)
     // Bank donor (replicated multi-GPU topologies): reuse another instance's
     // prepared views — pinned host USM is context-scoped, and the fleet's
     // shared sycl::context makes it legal on every card. Avoids double-
@@ -1351,6 +1459,9 @@ std::string Qwen4ExpModel::prepare_bank_views() {
         const bool legacy_fast = (!is_down && t->dtype == DType::kQ4_K) || (is_down && t->dtype == DType::kQ5_1);
         const bool kq_fast = !legacy_fast && raw_kq && qwen4_bank_kind(t->dtype, K, kq_kind);
         const bool fast = !force_f16 && (legacy_fast || kq_fast);
+        // a fused gate/up bank's half (host_bank): its rows are split out of the fused tensor below
+        const auto fh = fused_half_.find(t);
+        const bool fused = fh != fused_half_.end();
         // PINNED host copies by default: q.memcpy from mmap (non-USM) memory
         // takes the driver's slow per-call staging path — measured as the
         // process drowning in enqueueUSMMemcpy submissions (2026-08-27,
@@ -1360,12 +1471,21 @@ std::string Qwen4ExpModel::prepare_bank_views() {
         static const bool pin_banks =
             std::getenv("IE_Q4E_NO_PIN_BANKS") == nullptr;
         if (fast) {
-            if (pin_banks) {
+            if (pin_banks || fused) {   // (a fused half is always copied: its rows are not contiguous in the file)
                 if (!ram_can_pin(t->nbytes))   // P4 B61: a warning, the pin goes on as asked
                     ram_pin_warn(t->nbytes);
                 void* pin = sycl::malloc_host(t->nbytes, alloc_->queue());
                 if (!pin) return "qwen4exp: bank pin alloc failed";
-                std::memcpy(pin, t->data, t->nbytes);
+                if (fused) {
+                    // expert e of the fused bank: 2N rows, gate rows [0, N) then up rows [N, 2N)
+                    const uint64_t row = t->nbytes / (uint64_t(N) * E);
+                    const uint8_t* src = fh->second.first->data + uint64_t(fh->second.second) * N * row;
+                    for (uint32_t e = 0; e < E; ++e)
+                        std::memcpy(static_cast<uint8_t*>(pin) + uint64_t(e) * N * row, src + uint64_t(e) * 2 * N * row,
+                                    uint64_t(N) * row);
+                } else {
+                    std::memcpy(pin, t->data, t->nbytes);
+                }
                 owned_.push_back(pin);
                 bv.raw = static_cast<const uint8_t*>(pin);
             } else {
@@ -1378,7 +1498,14 @@ std::string Qwen4ExpModel::prepare_bank_views() {
         }
         // Universal fallback: dequant whole bank -> F16 [E][K*N] transposed.
         std::vector<float> f32;
-        if (auto e = dequant_tensor_fp32(t, f32); !e.empty()) return e;
+        if (fused) {   // the fused bank whole, then this half's N rows of every expert
+            std::vector<float> all;
+            if (auto e = dequant_tensor_fp32(fh->second.first, all); !e.empty()) return e;
+            f32.resize(uint64_t(E) * N * K);
+            for (uint32_t e = 0; e < E; ++e)
+                std::memcpy(f32.data() + uint64_t(e) * N * K,
+                            all.data() + (uint64_t(e) * 2 + fh->second.second) * N * K, uint64_t(N) * K * sizeof(float));
+        } else if (auto e = dequant_tensor_fp32(t, f32); !e.empty()) return e;
         sycl::half* dst;
         if (pin_banks) {
             const uint64_t need = uint64_t(E) * K * N * sizeof(sycl::half);
@@ -1505,6 +1632,25 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
         out_hc_up_t   = tpose(out_hc_up, D, r);
         tq.wait();
     }
+    {   // The 8-bit HC sites (q4e_hc_q8): a site reads its Q8_0 blocks when both its down and up have them.
+        hc8_.clear();
+        auto add_hc8 = [&](const sycl::half* down, const Qwen4ExpLayer::Q8W& dn, const Qwen4ExpLayer::Q8W& up) {
+            if (!down || !dn.qs || !dn.d || !up.qs || !up.d) return;
+            Qwen4HcQ8 h8;
+            h8.down_q = dn.qs; h8.down_d = dn.d; h8.up_q = up.qs; h8.up_d = up.d;
+            h8.up_lanes = true;   // the loader repacked every up (kQ8SoaHcUp)
+            hc8_[down] = h8;
+        };
+        for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
+            const Qwen4ExpLayer& wl = layers_[L];
+            add_hc8(wl.hc_attn_down, wl.hc_attn_down_q8, wl.hc_attn_up_q8);
+            add_hc8(wl.hc_ffn_down, wl.hc_ffn_down_q8, wl.hc_ffn_up_q8);
+        }
+        add_hc8(out_hc_down, out_hc_down_q8, out_hc_up_q8);
+        if (!hc8_.empty())
+            std::fprintf(stderr, "[qwen4exp] HC mixing weights: %zu sites read the file's Q8_0 blocks at decode "
+                         "(IE_Q4E_HC_Q8=0 = the F16 copies)\n", hc8_.size());
+    }
     mixed_ = ah(uint64_t(MT) * H);
     inj_   = af(uint64_t(MT) * cfg_.hc_count);
     blockout_ = ah(uint64_t(MT) * H);
@@ -1518,6 +1664,14 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
     dn_out_ = af(uint64_t(MT) * SI);
     dn_z_ = ah(uint64_t(MT) * SI); dn_gn_ = ah(uint64_t(MT) * SI);
     const uint32_t Nq = cfg_.n_q_heads * cfg_.head_dim;          // 6144
+    // The widest dense-matmul input (K) and output (N) of this model (2026-11-08): the activation-quantization buffers
+    // were sized ssm_inner wide and the prefill scratch 12288 (Flash-Next's attn_q) -- a Qwen 4 with hidden > ssm_inner,
+    // more query heads, a dense FFN, or hc * hidden > 12288 (hidden 5120: the HC prefill's 20480) wrote past them.
+    const uint32_t KMAX = std::max({H, SI, Nq, cfg_.shared_expert_ffn, cfg_.expert_ffn, cfg_.dense_ffn});
+    const uint32_t NMAX = std::max({12288u, cfg_.hc_count * H, CC, SI, 2u * Nq, H, cfg_.shared_expert_ffn,
+                                    cfg_.expert_ffn, cfg_.dense_ffn, cfg_.n_experts});
+    const uint64_t DQMAX = std::max({uint64_t(H) * 12288u, uint64_t(H) * 2u * Nq, uint64_t(H) * CC, uint64_t(SI) * H,
+                                     uint64_t(Nq) * H, uint64_t(H) * cfg_.shared_expert_ffn, uint64_t(H) * cfg_.dense_ffn});
     qg_ = ah(uint64_t(MT) * Nq * 2);
     aq_ = ah(uint64_t(MT) * Nq); agate_ = ah(uint64_t(MT) * Nq);
     ak_ = ah(uint64_t(MT) * cfg_.n_kv_heads * cfg_.head_dim);
@@ -1544,7 +1698,7 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
         if (!ag_.qh || !ag_.s || !ag_.p || !ag_.o || !ag_.l || !ag_.mask) return "qwen4exp runtime: attention scratch alloc failed";
     }
     router_out_ = ah(cfg_.n_experts);
-    act_q8_ = alloc_->malloc((SI / 32) * sizeof(block_q8_1x)); owned_.push_back(act_q8_);
+    act_q8_ = alloc_->malloc((KMAX / 32) * sizeof(block_q8_1x)); owned_.push_back(act_q8_);
     moe_g_ = ah(cfg_.expert_ffn); moe_u_ = ah(cfg_.expert_ffn); moe_h_ = ah(cfg_.expert_ffn);
     moe_y_ = ah(H);
     sh_g_ = ah(cfg_.shared_expert_ffn); sh_u_ = ah(cfg_.shared_expert_ffn);
@@ -1570,7 +1724,7 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
         sh.idx_head_dim = cfg_.indexer_top_k ? cfg_.indexer_head_dim : 0;
         sh.v_heads = cfg_.ssm_v_heads; sh.state = cfg_.ssm_state;
         sh.conv_channels = CC; sh.conv_kernel = cfg_.ssm_conv_kernel;
-        sh.ple_conv_floats = (cfg_.has_ple() && own_ple) ? uint64_t(kPleStateRows) * kPleSI : 0;
+        sh.ple_conv_floats = (cfg_.has_ple() && own_ple) ? uint64_t(kPleStateRows) * q4e_ple_si(cfg_) : 0;
         lane_bytes_ = q4e_lane_bytes(sh, lctx);
         lane_lctx_ = lctx; lane_nf_ = uint32_t(nf); lane_nl_ = uint32_t(nl); lane_cc_ = CC; lane_ple_floats_ = sh.ple_conv_floats;
         mtp_lane_bytes_ = mtp_.loaded ? mtp_lane_bytes(lctx) : 0;
@@ -1594,11 +1748,11 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
     ecache_deferred_ = defer_cache;
     if (!defer_cache) if (auto e = init_ecache(vram_share); !e.empty()) return e;
     if (cfg_.has_ple() && own_ple) {
-        e16_ = ah(uint64_t(MT) * H);
+        e16_ = ah(uint64_t(MT) * kPleD);   // E (16 x 160 wide), whatever the hidden
         ple_key_out_ = ah(uint64_t(MT) * D);
         ple_v_out_   = ah(uint64_t(MT) * H);
-        ple_conv_state_ = af(uint64_t(kPleStateRows) * kPleSI);
-        ple_ws_ = af(qwen4_ple_workspace_floats(MT));
+        ple_conv_state_ = af(uint64_t(kPleStateRows) * q4e_ple_si(cfg_));
+        ple_ws_ = af(qwen4_ple_workspace_floats(MT, cfg_.hidden));
     }
     if (cfg_.indexer_top_k) {
         const uint32_t nf2 = uint32_t(nf);
@@ -1635,13 +1789,13 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
         // of the expert cache; one lane (and the eager load) allocates it here as before
         if (!lanes_lazy_) if (auto e = mtp_lane_alloc(0); !e.empty()) return e;
     }
-    gemm_c_     = af(uint64_t(MT) * 12288);
+    gemm_c_     = af(uint64_t(MT) * NMAX);
     // T>16 dense-Q8 prefill: dequant-once scratch for the largest dense mat
     // (attn_q [H, 12288]); the batched int-dot would re-read the weight
     // ceil(T/16) times per chunk (the pp 143 -> 123 regression).
-    if (qwen4exp_dense_q8()) dq_ws_ = ah(uint64_t(H) * 12288);
+    if (qwen4exp_dense_q8()) dq_ws_ = ah(DQMAX);
     router_all_ = ah(uint64_t(MT) * cfg_.n_experts);
-    act_q8T_    = alloc_->malloc(uint64_t(MT) * (SI / 32) * sizeof(block_q8_1x));
+    act_q8T_    = alloc_->malloc(uint64_t(MT) * (KMAX / 32) * sizeof(block_q8_1x));
     owned_.push_back(act_q8T_);
     moe_accT_   = af(uint64_t(MT) * H);
     // Mega (pick-major) sizing: the grouped prefill path stages EVERY pick's
@@ -1649,11 +1803,13 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
     // stage per layer) — ~+95 MB device vs the per-expert chunk sizing.
     // (floor: the decode / verify / lanes pick table is 3*16*NU + 16 ints followed by up to 16*NU pick weights)
     const uint64_t PICKS = std::max<uint64_t>(uint64_t(MT) * cfg_.n_experts_used, 64u * cfg_.n_experts_used + 32);
-    moe_gT_ = ah(PICKS * cfg_.expert_ffn);
-    moe_uT_ = ah(PICKS * cfg_.expert_ffn);
+    // (2026-11-08: a dense FFN's gate / up / h rows ride these buffers: MT rows of dense_ffn)
+    const uint64_t DFF = uint64_t(MT) * cfg_.dense_ffn;
+    moe_gT_ = ah(std::max<uint64_t>(PICKS * cfg_.expert_ffn, DFF));
+    moe_uT_ = ah(std::max<uint64_t>(PICKS * cfg_.expert_ffn, DFF));
     // +16 rows of slack: the dpas down kernel's M-group-1 tile loads a full
     // 8 rows past the last job's rows.
-    moe_hT_ = ah((PICKS + 16) * cfg_.expert_ffn);
+    moe_hT_ = ah(std::max<uint64_t>((PICKS + 16) * cfg_.expert_ffn, DFF));
     moe_rsum_ = af((PICKS + 16) * (cfg_.expert_ffn / 32));
     moe_yT_ = ah(PICKS * H);
     moe_tok_idx_ = ai(PICKS);
@@ -1680,8 +1836,8 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
     h_cells_.resize(PICKS + MT);
     xg_q8_ = alloc_->malloc(PICKS * (H / 32) * sizeof(block_q8_1x));
     owned_.push_back(xg_q8_);
-    act_q8s_  = alloc_->malloc(uint64_t(SI / 32) * sizeof(block_q8_1s));
-    act_q8sT_ = alloc_->malloc(uint64_t(MT) * (SI / 32) * sizeof(block_q8_1s));
+    act_q8s_  = alloc_->malloc(uint64_t(KMAX / 32) * sizeof(block_q8_1s));
+    act_q8sT_ = alloc_->malloc(uint64_t(MT) * (KMAX / 32) * sizeof(block_q8_1s));
     xg_q8s_   = alloc_->malloc(PICKS * (H / 32) * sizeof(block_q8_1s));
     owned_.push_back(act_q8s_); owned_.push_back(act_q8sT_); owned_.push_back(xg_q8s_);
     xg16_  = ah(PICKS * H);
@@ -1702,6 +1858,7 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
 // gate on fewer cards than stages). A real N-card box sizes each stage at its init_runtime, as before.
 std::string Qwen4ExpModel::init_ecache(uint32_t vram_share) {
     if (!alloc_) return "qwen4exp runtime: load() first";
+    if (cfg_.is_dense_ffn()) return {};   // (2026-11-08: a dense FFN has no expert cache)
     if (ecache_slots_) return {};   // sized already
     {   // MoE VRAM expert cache: C slots/layer within IE_Q4E_ECACHE_GB
         // (default 10 GiB). C is derived from the summed per-layer slot sizes.
@@ -1878,7 +2035,7 @@ std::string Qwen4ExpModel::init_ecache(uint32_t vram_share) {
         // slots: last_use = UINT64_MAX, which no victim scan takes.
         ecache_alias_test();
     }
-    return {};
+    return dr_init();
 }
 
 // 2026-10-23: the P4 B49 page-alias self-test over this stage's cache buffers (init_runtime, and again after
@@ -2194,7 +2351,7 @@ std::string Qwen4ExpModel::ecache_shrink(uint32_t d) {
     std::fprintf(stderr, "[qwen4exp] expert cache: %u -> %u slots/layer, %u residents dropped (they stream back in); %.0f ms with the "
                          "alias test\n", C, N, residents,
                  std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
-    return {};
+    return dr_init();   // the slot table follows the new buffers
 }
 
 std::string Qwen4ExpModel::vck_alloc(bool ple) {
@@ -2208,7 +2365,7 @@ std::string Qwen4ExpModel::vck_alloc(bool ple) {
     owned_.push_back(vck_dn_state_);
     owned_.push_back(vck_dn_conv_);
     if (ple) {
-        vck_ple_conv_ = static_cast<float*>(alloc_->malloc(uint64_t(CAP) * kPleStateRows * kPleSI * sizeof(float)));
+        vck_ple_conv_ = static_cast<float*>(alloc_->malloc(uint64_t(CAP) * kPleStateRows * q4e_ple_si(cfg_) * sizeof(float)));
         if (!vck_ple_conv_) return "qwen4exp: verify ple ckpt alloc failed";
         owned_.push_back(vck_ple_conv_);
     }
@@ -2251,6 +2408,8 @@ std::string Qwen4ExpModel::load_mtp(const GgufReader& mg,
     // dequant_tensor_fp32 reads -- unsloth's are Q8_0 with BF16 indexer projections; 2026-11-07). 2-D projections transpose
     // to the gemv_fp16 [K, N] layout, HC mats stay GGUF-native (kernel contract), expert banks go device-resident (Q8_0 SoA
     // by default) with per-expert [K, N] transpose.
+    if (cfg_.is_dense_ffn())
+        return "qwen4exp MTP: the draft head binds a MoE block; a dense-FFN model's head is not wired yet (plain decode runs)";
     sycl::queue& q = alloc_->queue();
     if (!token_embd && main_g) {
         // Tail-of-pipeline stage: pull token_embd for the MTP embed path.
@@ -2371,10 +2530,27 @@ std::string Qwen4ExpModel::load_mtp(const GgufReader& mg,
     // cache-slot compute path's F16 branch (gemv_fp16) consumes them.
     auto up_bank = [&](const char* n, Qwen4ExpLayer::BankView& bv) -> std::string {
         const GgufTensorInfo* t = find(n);
+        // (2026-11-08) a fused gate/up bank ([K, 2F, E], each expert's gate rows then its up rows) gives either half
+        uint32_t half = UINT32_MAX;
+        if (!t) {
+            const std::string s(n);
+            const bool g = s == "mtp.ffn_gate_exps.weight", u = s == "mtp.ffn_up_exps.weight";
+            if ((g || u) && (t = find("mtp.ffn_gate_up_exps.weight")) != nullptr) {
+                if (t->n_dims != 3 || (t->shape[1] % 2) != 0) return "mtp: ffn_gate_up_exps is not a [K, 2F, E] bank";
+                half = g ? 0u : 1u;
+            }
+        }
         if (!t) return std::string("mtp: missing ") + n;
         if (auto e2 = dequant_tensor_fp32(t, f32); !e2.empty()) return e2;
-        const uint32_t K = uint32_t(t->shape[0]), N = uint32_t(t->shape[1]);
+        const uint32_t K = uint32_t(t->shape[0]), N = uint32_t(t->shape[1]) / (half == UINT32_MAX ? 1u : 2u);
         const uint32_t E = uint32_t(t->shape[2]);
+        if (half != UINT32_MAX) {   // keep this half's N rows of every expert: [E][N][K], the separate bank's layout
+            std::vector<float> h(uint64_t(E) * N * K);
+            for (uint32_t ex = 0; ex < E; ++ex)
+                std::memcpy(h.data() + uint64_t(ex) * N * K, f32.data() + (uint64_t(ex) * 2 + half) * N * K,
+                            uint64_t(N) * K * sizeof(float));
+            f32.swap(h);
+        }
         // 2026-10-22: Q8_0 SoA by default (IE_Q4E_MTP_EXPERTS=f16 = the F16 bank): per expert, each output row's K
         // values in blocks of 32 with an fp16 scale (amax / 127), the natural [N][K] order the SoA GEMV reads. The F16
         // bank cost the tail card 4.8 GiB = 81 expert slots at ctx 262000 (a ~10 % slower plain step); this is half.
@@ -2852,7 +3028,7 @@ std::string Qwen4ExpModel::stash_slot(SlotStateT<Buf>& s, uint32_t depth) {
         q.memcpy(s.dnc.data(), dn_.conv_state_ptr(), cb);
     }
     if (ple_conv_state_) {
-        const uint64_t pb = uint64_t(kPleStateRows) * kPleSI * sizeof(float);
+        const uint64_t pb = uint64_t(kPleStateRows) * q4e_ple_si(cfg_) * sizeof(float);
         if (!q4e_slot_resize(s.ple, pb)) return "qwen4exp stash: host buffer alloc failed (ple)";
         q.memcpy(s.ple.data(), ple_conv_state_, pb);
     }
@@ -2904,7 +3080,7 @@ std::string Qwen4ExpModel::unstash_slot(const SlotStateT<Buf>& s) {
     }
     if (ple_conv_state_ && !s.ple.empty())
         q.memcpy(ple_conv_state_, s.ple.data(),
-                 uint64_t(kPleStateRows) * kPleSI * sizeof(float));
+                 uint64_t(kPleStateRows) * q4e_ple_si(cfg_) * sizeof(float));
     q.wait();
     ple_hist_ = s.hist;
     blk_done_ = s.blk_done;
@@ -2930,7 +3106,7 @@ std::string Qwen4ExpModel::snapshot(uint32_t depth) {
         owned_.push_back(snap_dn_conv_);
         if (ple_conv_state_) {
             snap_ple_conv_ = static_cast<float*>(
-                alloc_->malloc(uint64_t(kPleStateRows) * kPleSI * sizeof(float)));
+                alloc_->malloc(uint64_t(kPleStateRows) * q4e_ple_si(cfg_) * sizeof(float)));
             if (!snap_ple_conv_) return "qwen4exp snapshot: ple alloc failed";
             owned_.push_back(snap_ple_conv_);
         }
@@ -2939,7 +3115,7 @@ std::string Qwen4ExpModel::snapshot(uint32_t depth) {
     q.memcpy(snap_dn_conv_, dn_.conv_state_ptr(), ce * sizeof(sycl::half));
     if (ple_conv_state_)
         q.memcpy(snap_ple_conv_, ple_conv_state_,
-                 uint64_t(kPleStateRows) * kPleSI * sizeof(float));
+                 uint64_t(kPleStateRows) * q4e_ple_si(cfg_) * sizeof(float));
     q.wait();
     snap_ple_hist_ = ple_hist_;
     snap_blk_done_ = blk_done_;
@@ -2956,7 +3132,7 @@ std::string Qwen4ExpModel::restore() {
     q.memcpy(dn_.conv_state_ptr(), snap_dn_conv_, ce * sizeof(sycl::half));
     if (ple_conv_state_ && snap_ple_conv_)
         q.memcpy(ple_conv_state_, snap_ple_conv_,
-                 uint64_t(kPleStateRows) * kPleSI * sizeof(float));
+                 uint64_t(kPleStateRows) * q4e_ple_si(cfg_) * sizeof(float));
     q.wait();
     ple_hist_ = snap_ple_hist_;
     blk_done_ = snap_blk_done_;
@@ -2979,14 +3155,14 @@ std::string Qwen4ExpModel::look_snapshot(uint32_t depth) {
         owned_.push_back(look_dn_state_);
         owned_.push_back(look_dn_conv_);
         if (ple_conv_state_) {
-            look_ple_conv_ = static_cast<float*>(alloc_->malloc(uint64_t(kPleStateRows) * kPleSI * sizeof(float)));
+            look_ple_conv_ = static_cast<float*>(alloc_->malloc(uint64_t(kPleStateRows) * q4e_ple_si(cfg_) * sizeof(float)));
             if (!look_ple_conv_) return "qwen4exp look_snapshot: ple alloc failed";
             owned_.push_back(look_ple_conv_);
         }
     }
     q.memcpy(look_dn_state_, dn_.state_ptr(), se * sizeof(float));
     q.memcpy(look_dn_conv_, dn_.conv_state_ptr(), ce * sizeof(sycl::half));
-    if (ple_conv_state_) q.memcpy(look_ple_conv_, ple_conv_state_, uint64_t(kPleStateRows) * kPleSI * sizeof(float));
+    if (ple_conv_state_) q.memcpy(look_ple_conv_, ple_conv_state_, uint64_t(kPleStateRows) * q4e_ple_si(cfg_) * sizeof(float));
     q.wait();
     look_ple_hist_ = ple_hist_;
     look_blk_done_ = blk_done_;
@@ -3003,7 +3179,7 @@ std::string Qwen4ExpModel::look_restore() {
     q.memcpy(dn_.state_ptr(), look_dn_state_, se * sizeof(float));
     q.memcpy(dn_.conv_state_ptr(), look_dn_conv_, ce * sizeof(sycl::half));
     if (ple_conv_state_ && look_ple_conv_)
-        q.memcpy(ple_conv_state_, look_ple_conv_, uint64_t(kPleStateRows) * kPleSI * sizeof(float));
+        q.memcpy(ple_conv_state_, look_ple_conv_, uint64_t(kPleStateRows) * q4e_ple_si(cfg_) * sizeof(float));
     q.wait();
     ple_hist_ = look_ple_hist_;
     blk_done_ = look_blk_done_;
@@ -3017,7 +3193,7 @@ std::string Qwen4ExpModel::state_save(StateCopy& c, uint32_t depth) {
     sycl::queue& q = alloc_->queue();
     const uint64_t se = dn_.state_elems_per_layer() * dn_.config().n_layers_linear * sizeof(float);
     const uint64_t ce = dn_.conv_elems_per_layer() * dn_.config().n_layers_linear * sizeof(sycl::half);
-    const uint64_t pe = ple_conv_state_ ? uint64_t(kPleStateRows) * kPleSI * sizeof(float) : 0;
+    const uint64_t pe = ple_conv_state_ ? uint64_t(kPleStateRows) * q4e_ple_si(cfg_) * sizeof(float) : 0;
     c.depth = 0;
     c.dn_state.bind(&q); c.dn_conv.bind(&q); c.ple_conv.bind(&q);
     if ((se && !c.dn_state.resize(se)) || (ce && !c.dn_conv.resize(ce)) || (pe && !c.ple_conv.resize(pe)))
@@ -3060,8 +3236,8 @@ std::string Qwen4ExpModel::commit_verify(uint32_t n_commit) {
              ce_all * sizeof(sycl::half));
     if (ple_conv_state_ && vck_ple_conv_)
         q.memcpy(ple_conv_state_,
-                 vck_ple_conv_ + s * uint64_t(kPleStateRows) * kPleSI,
-                 uint64_t(kPleStateRows) * kPleSI * sizeof(float));
+                 vck_ple_conv_ + s * uint64_t(kPleStateRows) * q4e_ple_si(cfg_),
+                 uint64_t(kPleStateRows) * q4e_ple_si(cfg_) * sizeof(float));
     q.wait();
     if (cfg_.has_ple()) {
         // Adopt the history AFTER the committed row; the conv_state handle
@@ -3129,7 +3305,7 @@ void Qwen4ExpModel::reset_state() {
     if (cfg_.has_ple() && ple_conv_state_) {
         ple_hist_.reset(cfg_.ple_eos_token);
         ple_hist_.conv_state = ple_conv_state_;
-        q.memset(ple_conv_state_, 0, uint64_t(kPleStateRows) * kPleSI * 4).wait();
+        q.memset(ple_conv_state_, 0, uint64_t(kPleStateRows) * q4e_ple_si(cfg_) * 4).wait();
     }
 }
 
@@ -3529,28 +3705,29 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             } else {
                 qwen4_ple_hash(pc, tokens_host, T, ple_hist_, rows.data());
             }
-            std::vector<float> E(uint64_t(T) * H);
+            std::vector<float> E(uint64_t(T) * kPleD);
             if (auto e = qwen4_ple_gather(ple_table->data, ple_dt, rows.data(), T, E.data()); !e.empty()) { block_err_ = e; return; }
             std::vector<sycl::half> E16(E.size());
             for (size_t i = 0; i < E.size(); ++i) E16[i] = sycl::half(E[i]);
             q.memcpy(e16_, E16.data(), E16.size() * 2).wait();
-            proj(e16_, w.ple_key, ple_key_out_, H, D);
-            proj(e16_, w.ple_value, ple_v_out_, H, H);
+            proj(e16_, w.ple_key, ple_key_out_, kPleD, D);
+            proj(e16_, w.ple_value, ple_v_out_, kPleD, H);
             qwen4_ple_layer(q, ple_key_out_, ple_v_out_, wide_,
                             w.ple_norm_key, w.ple_norm_query, w.ple_norm_conv,
                             w.ple_conv, ple_conv_state_,
-                            ple_ws_, T, eps);
+                            ple_ws_, T, eps, {}, cfg_.hidden);
             if (sv && vck_ple_conv_ && vck_cap_ >= T) {
                 // Per-position conv-state snapshot: the state after row s is
                 // a pure index remap of (u, pre-chunk state_in), both still
                 // live in ple_ws_ — same remap the layer's own state-update
                 // kernel applies for the LAST position (qwen4_ple.cpp:194).
                 const float* u  = ple_ws_;
-                const float* si = ple_ws_ + uint64_t(T) * kPleSI * 2 +
+                const float* si = ple_ws_ + uint64_t(T) * q4e_ple_si(cfg_) * 2 +
                                   uint64_t(T) * kPleStreams;
                 float* ck = vck_ple_conv_ +
-                    uint64_t(vck_base_) * kPleStateRows * kPleSI;
-                constexpr uint32_t SR = kPleStateRows, PS = kPleSI;
+                    uint64_t(vck_base_) * kPleStateRows * q4e_ple_si(cfg_);
+                constexpr uint32_t SR = kPleStateRows;
+                const uint32_t PS = uint32_t(q4e_ple_si(cfg_));
                 q.submit([&](sycl::handler& h) {
                     h.parallel_for(sycl::range<3>(T, SR, PS), [=](sycl::id<3> id) {
                         const uint32_t s = uint32_t(id[0]);
@@ -3578,14 +3755,14 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             for (uint32_t r0 = 0; r0 < T; r0 += 4)
                 qwen4_hc_mix_v2(q, wide_ + uint64_t(r0) * Dw, norm, down, up, inject, xn_ws_ + uint64_t(r0) * Dw,
                                 lo_ws_ + uint64_t(r0) * R, mixed_ + uint64_t(r0) * H, inj_ + uint64_t(r0) * cfg_.hc_count,
-                                std::min(4u, T - r0), H, cfg_.hc_count, R, eps);
+                                std::min(4u, T - r0), H, cfg_.hc_count, R, eps, {}, hc8_for(down));
         };
         auto hc_mix_sv_xn = [&](const sycl::half* down, const sycl::half* up, const float* inject) {   // on a pre-normed xn_ws_
             const uint32_t Dw = cfg_.hc_count * H, R = cfg_.hc_low_rank;
             for (uint32_t r0 = 0; r0 < T; r0 += 4)
                 qwen4_hc_mix_v2_xn(q, xn_ws_ + uint64_t(r0) * Dw, down, up, inject, lo_ws_ + uint64_t(r0) * R,
                                    mixed_ + uint64_t(r0) * H, inj_ + uint64_t(r0) * cfg_.hc_count,
-                                   std::min(4u, T - r0), H, cfg_.hc_count, R);
+                                   std::min(4u, T - r0), H, cfg_.hc_count, R, {}, hc8_for(down));
         };
         // The previous block's combine+norm may have left this block's attention-site normed state in xn_ws_
         const bool attn_xn = hc_xn_layer_ == L && hc_xn_T_ == T && !cap;
@@ -3603,13 +3780,13 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             hc_mix_sv_xn(w.hc_attn_down, w.hc_attn_up, w.hc_attn_inject);
         else if (attn_xn)
             qwen4_hc_mix_v2_xn(q, xn_ws_, w.hc_attn_down, w.hc_attn_up, w.hc_attn_inject, lo_ws_, mixed_, inj_,
-                               T, H, cfg_.hc_count, cfg_.hc_low_rank);
+                               T, H, cfg_.hc_count, cfg_.hc_low_rank, {}, hc8_for(w.hc_attn_down));
         else if (sv && T > 4)
             hc_mix_sv(w.hc_attn_norm, w.hc_attn_down, w.hc_attn_up, w.hc_attn_inject);
         else
             qwen4_hc_mix_v2(q, wide_, w.hc_attn_norm, w.hc_attn_down, w.hc_attn_up,
                      w.hc_attn_inject, xn_ws_, lo_ws_, mixed_, inj_,
-                     T, H, cfg_.hc_count, cfg_.hc_low_rank, eps);
+                     T, H, cfg_.hc_count, cfg_.hc_low_rank, eps, {}, hc8_for(w.hc_attn_down));
         if (cap) grab(cap->mixed_attn, mixed_);
         pf(Q4ePfProf::kHc);
         {   // IE_Q4E_SEL_CHECK=1 (P4 B49 diagnostic): the first chunk's attn-site input per layer -- NaN count and the
@@ -4048,13 +4225,13 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             hc_mix_sv_xn(w.hc_ffn_down, w.hc_ffn_up, w.hc_ffn_inject);
         else if (ffn_xn)
             qwen4_hc_mix_v2_xn(q, xn_ws_, w.hc_ffn_down, w.hc_ffn_up, w.hc_ffn_inject, lo_ws_, mixed_, inj_,
-                               T, H, cfg_.hc_count, cfg_.hc_low_rank);
+                               T, H, cfg_.hc_count, cfg_.hc_low_rank, {}, hc8_for(w.hc_ffn_down));
         else if (sv && T > 4)
             hc_mix_sv(w.hc_ffn_norm, w.hc_ffn_down, w.hc_ffn_up, w.hc_ffn_inject);
         else
             qwen4_hc_mix_v2(q, wide_, w.hc_ffn_norm, w.hc_ffn_down, w.hc_ffn_up,
                      w.hc_ffn_inject, xn_ws_, lo_ws_, mixed_, inj_,
-                     T, H, cfg_.hc_count, cfg_.hc_low_rank, eps);
+                     T, H, cfg_.hc_count, cfg_.hc_low_rank, eps, {}, hc8_for(w.hc_ffn_down));
         if (cap) grab(cap->mixed_ffn, mixed_);
         pf(Q4ePfProf::kHc);
         // T=1 decode rides the spec-verify grouped MoE body (ONE launch each
@@ -4068,7 +4245,23 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             return !(v && v[0] == '0');
         }();
         const bool dg1 = decode_grouped && T == 1 && !cap;
-        if (T == 1 && !dg1) {
+        if (cfg_.is_dense_ffn()) {
+            // ---- dense FFN (2026-11-08): one SwiGLU MLP, no router, no gate (the reference's Qwen4ExpTextMLP); its
+            // weights sit in the shared-expert slots (the loader's note). q8_proj takes the int-dot GEMV at T = 1, the
+            // batched rows at T <= 16 and the s8 GEMM at prefill -- the dense projections' own routes.
+            const uint32_t F = cfg_.dense_ffn;
+            if (w.shg_q8.qs) {
+                q8_proj(mixed_, w.shg_q8, moe_gT_, H, F);
+                q8_proj(mixed_, w.shu_q8, moe_uT_, H, F);
+                swiglu(q, moe_gT_, moe_uT_, moe_hT_, uint64_t(T) * F);
+                q8_proj(moe_hT_, w.shd_q8, blockout_, F, H);
+            } else {
+                proj(mixed_, w.ffn_gate_shexp, moe_gT_, H, F);
+                proj(mixed_, w.ffn_up_shexp,   moe_uT_, H, F);
+                swiglu(q, moe_gT_, moe_uT_, moe_hT_, uint64_t(T) * F);
+                proj(moe_hT_, w.ffn_down_shexp, blockout_, F, H);
+            }
+        } else if (T == 1 && !dg1) {
             // ---- decode: per-token routed experts from the VRAM cache ------
             const sycl::half* x = mixed_;
             gemv_fp16(q, x, w.ffn_gate_inp, router_out_, H, cfg_.n_experts);
@@ -4168,11 +4361,25 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             // routes and resolves the slots. The in-order queue keeps the MoE kernels behind it; none of it reads an
             // expert slot, and everything before the copy has completed when the wait returns, so the copyq_ miss fills
             // below stay race-free as before. (=0: wait first, the old order.)
-            sycl::event route_ev = q.memcpy(r16, router_all_, uint64_t(T) * cfg_.n_experts * 2);
+            // Device routing (IE_Q4E_DEV_ROUTE, the header's DevRoute note): the routing kernel writes the job table, the
+            // weights and the counts the kernels below read, and the picks' experts for dr_settle; the host never waits.
+            DevRoute* drt = (dr_fwd_ && L < droute_.size() && droute_[L].ok) ? &droute_[L] : nullptr;
+            sycl::event route_ev;
+            if (drt) {
+                if (!drt->fill_ev.empty()) dr_map_layer(*drt, ec, q);   // the fills this forward's settle issued
+                qwen4_route_jobs_dev(q, router_all_, T, cfg_.n_experts, NU, drt->slot_of, ecache_slots_, moe_tok_idx_,
+                                     3u * 16 * NU, 3u * 16 * NU + 16, drt->ids);
+                q.memcpy(drt->h_ids, drt->ids, uint64_t(T) * NU * sizeof(int32_t));
+                drt->pend_T = T;
+            } else {
+                route_ev = q.memcpy(r16, router_all_, uint64_t(T) * cfg_.n_experts * 2);
+            }
+            const uint8_t* const* stab  = drt ? drt->tab : nullptr;       // gate / up rows
+            const uint8_t* const* stabd = drt ? drt->tab + 2 : nullptr;   // the down entries
             std::chrono::steady_clock::time_point trw1;
             auto wait_route = [&] {
                 const auto trw0 = std::chrono::steady_clock::now();
-                route_ev.wait();
+                if (!drt) route_ev.wait();
                 trw1 = std::chrono::steady_clock::now();
                 t_route_wait += std::chrono::duration<double>(trw1 - trw0).count();
             };
@@ -4233,11 +4440,16 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
             t_moe_submit += std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - tms0).count();
             if (hoist) wait_route();
+            if (!drt) q4e_router_dump(r16, T, cfg_.n_experts);
             std::vector<std::vector<std::pair<uint32_t, float>>> tk(T);
-            for (uint32_t vt = 0; vt < T; ++vt) {
-                for (uint32_t e = 0; e < cfg_.n_experts; ++e)
-                    rout32[e] = float(r16[uint64_t(vt) * cfg_.n_experts + e]);
-                route_from_logits(rout32.data(), cfg_.n_experts, NU, tk[vt]);
+            for (uint32_t vt = 0; vt < T && !drt; ++vt) {
+                if (!droute_.empty()) {   // device routing on: the host routes with the device's numerics (dr_choose)
+                    q4e_route_host_pairs(r16 + uint64_t(vt) * cfg_.n_experts, cfg_.n_experts, NU, tk[vt]);
+                } else {
+                    for (uint32_t e = 0; e < cfg_.n_experts; ++e)
+                        rout32[e] = float(r16[uint64_t(vt) * cfg_.n_experts + e]);
+                    route_from_logits(rout32.data(), cfg_.n_experts, NU, tk[vt]);
+                }
                 hist_add(L, tk[vt]);
             }
             t_route_host += std::chrono::duration<double>(
@@ -4257,7 +4469,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 // simultaneously or later resolves evict earlier jobs'
                 // slots. K=3 verify unions (<=41) fit every observed config;
                 // fail fast rather than corrupt if a K/cache combo doesn't.
-                {
+                if (!drt) {   // (device routing: a miss reads in place, any union fits)
                     std::vector<char> seen(cfg_.n_experts, 0);
                     uint32_t uni = 0;
                     for (uint32_t vt = 0; vt < T; ++vt)
@@ -4293,12 +4505,12 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 std::vector<int16_t> slot_of(cfg_.n_experts, -1);
                 if (tp_sync_ && tp_cell_owner_.size() < uint64_t(T) * NU)
                     tp_cell_owner_.assign(uint64_t(T) * NU, 0);
-                uint32_t P = 0;
+                uint32_t P = drt ? T * NU : 0;   // (device routing: every pick a job, the table written on the device)
                 // One H2D copy a layer (2026-11-08): the pick weights ride behind the pick table and the per-row counts,
                 // at int offset W0 of the same pinned buffer; the reduce reads them from moe_tok_idx_ + W0.
                 const uint32_t W0 = 3u * 16 * NU + 16;
                 float* hw = reinterpret_cast<float*>(h_tok_idx_ + W0);
-                for (uint32_t vt = 0; vt < T; ++vt) {
+                for (uint32_t vt = 0; vt < T && !drt; ++vt) {
                     h_tok_idx_[3u * 16 * NU + vt] = int32_t(tk[vt].size());
                     for (uint32_t k = 0; k < uint32_t(tk[vt].size()); ++k) {
                         const uint32_t e = tk[vt][k].first;
@@ -4326,7 +4538,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                     q.ext_oneapi_submit_barrier(
                         {copyq_->ext_oneapi_submit_barrier()});
                 }
-                q.memcpy(moe_tok_idx_, h_tok_idx_, (W0 + uint64_t(T) * NU) * sizeof(int32_t));
+                if (!drt) q.memcpy(moe_tok_idx_, h_tok_idx_, (W0 + uint64_t(T) * NU) * sizeof(int32_t));
                 static const bool no_g1  = std::getenv("IE_Q4E_SV_NO_G1") != nullptr;
                 static const bool no_g2  = std::getenv("IE_Q4E_SV_NO_G2") != nullptr;
                 static const bool no_red = std::getenv("IE_Q4E_SV_NO_RED") != nullptr;
@@ -4334,21 +4546,21 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 if (gate_kq8 && q4e_fused_swiglu()) {
                     qwen4_bank_gemv_grouped_dual_q8s_swiglu(q, w.gate_bv.kind, act_q8sT_,
                         static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                        ec.gate_off, ec.up_off, moe_tok_idx_, moe_hT_, H, EF, P);
+                        ec.gate_off, ec.up_off, moe_tok_idx_, moe_hT_, H, EF, P, {}, stab);
                     sw_done = true;
                 } else if (gate_kq8) {
                     qwen4_bank_gemv_grouped_dual_q8s(q, w.gate_bv.kind, act_q8sT_,
                         static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                        ec.gate_off, ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P);
+                        ec.gate_off, ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P, {}, stab);
                 } else if (gate_kq && q4e_fused_swiglu()) {
                     qwen4_bank_gemv_grouped_dual_swiglu(q, w.gate_bv.kind, mixed_,
                         static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                        ec.gate_off, ec.up_off, moe_tok_idx_, moe_hT_, H, EF, P);
+                        ec.gate_off, ec.up_off, moe_tok_idx_, moe_hT_, H, EF, P, {}, stab);
                     sw_done = true;
                 } else if (gate_kq) {
                     qwen4_bank_gemv_grouped_dual(q, w.gate_bv.kind, mixed_,
                         static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                        ec.gate_off, ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P);
+                        ec.gate_off, ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P, {}, stab);
                 } else if (!gate_q8) {
                     // F16 gate/up banks (pre-dequantized at load): per-pick
                     // decode leaves on the slot's F16 slices.
@@ -4381,19 +4593,19 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                     gemv_q4_K_q8s_grouped_dual_swiglu(q, act_q8sT_,
                         static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
                         ec.gate_off, ec.up_off, moe_tok_idx_,
-                        moe_hT_, H, EF, P);
+                        moe_hT_, H, EF, P, {}, stab);
                     sw_done = true;
                 } else {
                     gemv_q4_K_q8s_grouped_dual(q, act_q8sT_,
                         static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
                         ec.gate_off, ec.up_off, moe_tok_idx_,
-                        moe_gT_, moe_uT_, H, EF, P);
+                        moe_gT_, moe_uT_, H, EF, P, {}, stab);
                 }
                 if (!sw_done) swiglu(q, moe_gT_, moe_uT_, moe_hT_, uint64_t(P) * EF);
                 if (down_kq) {
                     qwen4_bank_gemv_grouped(q, w.down_bv.kind, moe_hT_,
                         static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                        ec.down_off, moe_tok_idx_, moe_yT_, H, EF, H, P);
+                        ec.down_off, moe_tok_idx_, moe_yT_, H, EF, H, P, {}, stabd);
                 } else if (!down_q51) {
                     for (uint32_t pk = 0; pk < P; ++pk) {
                         const uint8_t* slot = static_cast<uint8_t*>(ec.base) +
@@ -4415,7 +4627,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 } else {
                     gemv_q5_1_grouped(q, moe_hT_,
                         static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                        ec.down_off, moe_tok_idx_, moe_yT_, H, EF, H, P);
+                        ec.down_off, moe_tok_idx_, moe_yT_, H, EF, H, P, {}, stabd);
                 }
                 if (tp_sync_) tp_sync_(L);
                 // Ordered reduce: each row's top-k axpy sequence in k order —
@@ -4969,6 +5181,224 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
         pf(Q4ePfProf::kHc);
 }
 
+// ============== device routing (option 2 phase 3): the header's DevRoute note ==============
+
+std::string Qwen4ExpModel::dr_init() {
+    if (!q4e_dev_route() || ecache_.empty() || ecache_slots_ == 0) return {};
+    sycl::queue& q = alloc_->queue();
+    const sycl::context ctx = q.get_context();
+    const uint32_t E = cfg_.n_experts, NU = cfg_.n_experts_used, S = ecache_slots_;
+    if (droute_.size() != cfg_.n_layers) droute_.assign(cfg_.n_layers, DevRoute{});
+    uint32_t n_ok = 0, n_moe = 0;
+    try {
+        for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
+            ECache& ec = ecache_[L];
+            DevRoute& d = droute_[L];
+            d.ok = false;
+            if (!ec.base) continue;
+            ++n_moe;
+            const Qwen4ExpLayer& w = layers_[L];
+            // every bank streamed raw from pinned host USM of this queue's context: the kernels read a miss there
+            const auto pinned = [&](const Qwen4ExpLayer::BankView& bv) {
+                return bv.raw != nullptr && sycl::get_pointer_type(bv.raw, ctx) == sycl::usm::alloc::host;
+            };
+            if (!pinned(w.gate_bv) || !pinned(w.up_bv) || !pinned(w.down_bv)) continue;
+            if (!d.tab || d.tab_rows < S + E) {
+                void* p = alloc_->malloc(uint64_t(S + E) * 3 * sizeof(void*));
+                if (!p) return "qwen4exp device routing: the slot table alloc failed";
+                owned_.push_back(p);
+                d.tab = static_cast<const uint8_t**>(p);
+                d.tab_rows = S + E;
+            }
+            if (!d.slot_of) {
+                void* p = alloc_->malloc(uint64_t(E) * sizeof(int16_t));
+                if (!p) return "qwen4exp device routing: the map alloc failed";
+                owned_.push_back(p);
+                d.slot_of = static_cast<int16_t*>(p);
+            }
+            if (!d.ids) {
+                void* p = alloc_->malloc(uint64_t(16) * NU * sizeof(int32_t));
+                if (!p) return "qwen4exp device routing: the ids alloc failed";
+                owned_.push_back(p);
+                d.ids = static_cast<int32_t*>(p);
+            }
+            if (!d.h_ids) {
+                void* p = sycl::malloc_host(uint64_t(16) * NU * sizeof(int32_t), q);
+                if (!p) return "qwen4exp device routing: the pinned ids alloc failed";
+                owned_.push_back(p);
+                d.h_ids = static_cast<int32_t*>(p);
+            }
+            if (!d.h_map) {
+                void* p = sycl::malloc_host(uint64_t(E) * sizeof(int16_t), q);
+                if (!p) return "qwen4exp device routing: the pinned map alloc failed";
+                owned_.push_back(p);
+                d.h_map = static_cast<int16_t*>(p);
+            }
+            std::vector<const uint8_t*> t(uint64_t(S + E) * 3);
+            const uint8_t* base = static_cast<const uint8_t*>(ec.base);
+            for (uint32_t s = 0; s < S; ++s) {
+                t[uint64_t(s) * 3 + 0] = base + uint64_t(s) * ec.slot_bytes + ec.gate_off;
+                t[uint64_t(s) * 3 + 1] = base + uint64_t(s) * ec.slot_bytes + ec.up_off;
+                t[uint64_t(s) * 3 + 2] = base + uint64_t(s) * ec.slot_bytes + ec.down_off;
+            }
+            for (uint32_t e = 0; e < E; ++e) {
+                t[uint64_t(S + e) * 3 + 0] = w.gate_bv.raw + uint64_t(e) * w.gate_bv.slice_bytes;
+                t[uint64_t(S + e) * 3 + 1] = w.up_bv.raw   + uint64_t(e) * w.up_bv.slice_bytes;
+                t[uint64_t(S + e) * 3 + 2] = w.down_bv.raw + uint64_t(e) * w.down_bv.slice_bytes;
+            }
+            q.memcpy(d.tab, t.data(), t.size() * sizeof(void*)).wait();
+            std::copy(ec.slot_of.begin(), ec.slot_of.end(), d.h_map);
+            q.memcpy(d.slot_of, d.h_map, uint64_t(E) * sizeof(int16_t)).wait();
+            d.pend_T = 0;
+            d.fill_e.clear(); d.fill_s.clear(); d.fill_ev.clear();
+            d.filling.assign(S, 0);
+            d.dirty = false;
+            d.ok = true;
+            ++n_ok;
+        }
+    } catch (const sycl::exception& x) {
+        return std::string("qwen4exp device routing init: ") + x.what();
+    }
+    std::fprintf(stderr, "[qwen4exp] device routing (IE_Q4E_DEV_ROUTE=0 = off): %u of %u MoE layers can route on the device "
+                         "(decode / verify; a miss reads its expert from the pinned bank in place, the cache refills one "
+                         "forward late)\n", n_ok, n_moe);
+    return {};
+}
+
+// One pick's LRU stamp, as ensure_slot_on stamps it (the prefill ring's pin, the pin set).
+void Qwen4ExpModel::dr_stamp(ECache& ec, uint32_t L, uint32_t sl, uint32_t e) {
+    ec.last_use[sl] = ++ecache_clock_;
+    if (sl < pf_pin_mask_.size() && pf_pin_mask_[sl]) ec.last_use[sl] = UINT64_MAX - 1;
+    if (!expert_pin_.empty() && expert_pin_[uint64_t(L) * cfg_.n_experts + e]) ec.last_use[sl] = UINT64_MAX - 2;
+}
+
+void Qwen4ExpModel::dr_settle() {
+    if (droute_.empty()) return;
+    sycl::queue& q = alloc_->queue();
+    sycl::queue& fq = copyq_ ? *copyq_ : q;
+    const uint32_t E = cfg_.n_experts, NU = cfg_.n_experts_used;
+    bool pend = false;
+    for (uint32_t L = layer_lo_; L < layer_hi_; ++L) pend = pend || (droute_[L].ok && droute_[L].pend_T);
+    if (pend) q.wait();   // the picks' D2H (a forward that returned on an error did not drain the queue)
+    bool dirty = false;
+    for (uint32_t L = layer_lo_; L < layer_hi_; ++L) dirty = dirty || (droute_[L].ok && droute_[L].dirty);
+    if (dirty && copyq_)   // a host-routed forward's fills (its own barriers ordered its kernels, not this upload)
+        q.ext_oneapi_submit_barrier({copyq_->ext_oneapi_submit_barrier()});
+    for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
+        DevRoute& d = droute_[L];
+        if (!d.ok) continue;
+        ECache& ec = ecache_[L];
+        const Qwen4ExpLayer& w = layers_[L];
+        if (d.dirty) {   // the host path moved experts: the device map follows (async; h_map untouched until the next settle)
+            std::copy(ec.slot_of.begin(), ec.slot_of.end(), d.h_map);
+            q.memcpy(d.slot_of, d.h_map, uint64_t(E) * sizeof(int16_t));
+            d.dirty = false;
+        }
+        // a fill mapped during the last forward (dr_map_layer: q waited on its event) is done: only the unmapped stay filling
+        std::fill(d.filling.begin(), d.filling.end(), uint8_t(0));
+        for (const uint32_t fs : d.fill_s) d.filling[fs] = 1;
+        // 1. fills that are done: the expert's map entry, on q behind the fill's event
+        if (!d.fill_ev.empty()) {
+            size_t keep = 0;
+            for (size_t i = 0; i < d.fill_ev.size(); ++i) {
+                const bool done = d.fill_ev[i].get_info<sycl::info::event::command_execution_status>() ==
+                                  sycl::info::event_command_status::complete;
+                if (done) {
+                    const uint32_t e = d.fill_e[i], s = d.fill_s[i];
+                    d.filling[s] = 0;
+                    if (ec.expert_in[s] == int32_t(e)) {
+                        d.h_map[e] = int16_t(s);
+                        q.memcpy(d.slot_of + e, d.h_map + e, sizeof(int16_t), d.fill_ev[i]);
+                    }
+                } else {
+                    d.fill_e[keep] = d.fill_e[i]; d.fill_s[keep] = d.fill_s[i]; d.fill_ev[keep] = d.fill_ev[i];
+                    ++keep;
+                }
+            }
+            d.fill_e.resize(keep); d.fill_s.resize(keep); d.fill_ev.resize(keep);
+        }
+        // 2. the last device-routed forward's picks: hits stamped, misses get a victim and a fill
+        if (d.pend_T) {
+            const uint32_t n = d.pend_T * NU;
+            std::vector<std::pair<uint32_t, float>> hp;
+            if (!expert_hist_.empty()) hp.reserve(n);
+            for (uint32_t p = 0; p < n; ++p) {
+                const uint32_t e = uint32_t(d.h_ids[p]);
+                if (e >= E) continue;
+                if (!expert_hist_.empty()) hp.emplace_back(e, 0.f);
+                int32_t sl = ec.slot_of[e];
+                if (sl >= 0 && !d.filling[uint32_t(sl)]) { ++ecache_hits; dr_stamp(ec, L, uint32_t(sl), e); continue; }
+                ++dr_reads_host_;
+                if (sl >= 0) { ++ecache_hits; dr_stamp(ec, L, uint32_t(sl), e); continue; }   // its fill is in flight
+                ++ecache_misses;
+                uint32_t v = UINT32_MAX; uint64_t best = UINT64_MAX;
+                for (uint32_t c2 = 0; c2 < ecache_slots_; ++c2)
+                    if (!d.filling[c2] && ec.last_use[c2] < best) { best = ec.last_use[c2]; v = c2; }
+                if (v == UINT32_MAX) continue;   // every slot filling or quarantined: stay a host read
+                if (const int32_t old = ec.expert_in[v]; old >= 0) {
+                    ec.slot_of[old] = -1;
+                    d.h_map[old] = -1;
+                    q.memcpy(d.slot_of + old, d.h_map + old, sizeof(int16_t));   // before any later routing (in order)
+                }
+                ec.expert_in[v] = int32_t(e);
+                ec.slot_of[e] = int16_t(v);
+                dr_stamp(ec, L, v, e);
+                uint8_t* dst = static_cast<uint8_t*>(ec.base) + uint64_t(v) * ec.slot_bytes;
+                fq.memcpy(dst + ec.gate_off, w.gate_bv.raw + uint64_t(e) * w.gate_bv.slice_bytes, w.gate_bv.slice_bytes);
+                fq.memcpy(dst + ec.up_off,   w.up_bv.raw   + uint64_t(e) * w.up_bv.slice_bytes,   w.up_bv.slice_bytes);
+                sycl::event ev = fq.memcpy(dst + ec.down_off, w.down_bv.raw + uint64_t(e) * w.down_bv.slice_bytes,
+                                           w.down_bv.slice_bytes);
+                d.filling[v] = 1;
+                d.fill_e.push_back(e); d.fill_s.push_back(v); d.fill_ev.push_back(ev);
+            }
+            if (!hp.empty()) hist_add(L, hp);
+            d.pend_T = 0;
+        }
+    }
+}
+
+void Qwen4ExpModel::dr_host_path() {
+    if (droute_.empty()) return;
+    dr_settle();
+    sycl::queue& q = alloc_->queue();
+    bool any = false;
+    for (uint32_t L = layer_lo_; L < layer_hi_; ++L) any = any || (droute_[L].ok && !droute_[L].fill_ev.empty());
+    if (any && copyq_) q.ext_oneapi_submit_barrier({copyq_->ext_oneapi_submit_barrier()});
+    for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
+        DevRoute& d = droute_[L];
+        if (!d.ok) continue;
+        d.fill_e.clear(); d.fill_s.clear(); d.fill_ev.clear();
+        std::fill(d.filling.begin(), d.filling.end(), uint8_t(0));
+        d.dirty = true;   // the host path's ensure_slot_on moves experts; the next settle uploads the map
+    }
+}
+
+// The layer's fills from this forward's settle get their map entries now, on q behind each fill's event, just before the
+// layer's routing: the expert is a VRAM hit in this forward already (no second read from the host bank). The fills run
+// in layer order on copyq_ while the earlier layers compute, so q rarely waits here.
+void Qwen4ExpModel::dr_map_layer(DevRoute& d, const ECache& ec, sycl::queue& q) {
+    for (size_t i = 0; i < d.fill_ev.size(); ++i) {
+        const uint32_t e = d.fill_e[i], s = d.fill_s[i];
+        if (ec.expert_in[s] != int32_t(e)) continue;
+        d.h_map[e] = int16_t(s);
+        q.memcpy(d.slot_of + e, d.h_map + e, sizeof(int16_t), d.fill_ev[i]);
+    }
+    d.fill_e.clear(); d.fill_s.clear(); d.fill_ev.clear();   // (filling[] clears at the next settle)
+}
+
+bool Qwen4ExpModel::dr_choose(bool eligible) {
+    dr_settle();   // the last forward's picks counted first (a device-routed forward counts at the settle)
+    const uint64_t h = ecache_hits - dr_h0_, m = ecache_misses - dr_m0_;
+    if (dr_last_dv_ && h + m) dr_miss_ema_ = 0.7 * dr_miss_ema_ + 0.3 * double(m) / double(h + m);
+    dr_h0_ = ecache_hits;
+    dr_m0_ = ecache_misses;
+    dr_last_dv_ = eligible;
+    static const double mx = [] { const char* v = std::getenv("IE_Q4E_DEV_ROUTE_MISS"); return v ? std::atof(v) : 0.02; }();
+    const bool dev = eligible && dr_miss_ema_ <= mx;
+    if (eligible) ++(dev ? dr_fwd_dev_ : dr_fwd_host_);
+    return dev;
+}
+
 std::string Qwen4ExpModel::run_block_parity(uint32_t L, const float* wide_in_host,
                                              uint32_t T, const int32_t* tokens_host,
                                              float* wide_out_host, ParityCapture* cap) {
@@ -4984,6 +5414,7 @@ std::string Qwen4ExpModel::run_block_parity(uint32_t L, const float* wide_in_hos
         for (uint32_t t = 0; t < T; ++t) pos[t] = int32_t(t);
         q.memcpy(d_pos_, pos.data(), T * sizeof(int32_t)).wait();
     }
+    if (!droute_.empty()) { dr_fwd_ = false; dr_host_path(); }
     hc_xn_layer_ = UINT32_MAX;
     run_block(L, T, /*start_pos=*/0, tokens_host, cap);
     if (!block_err_.empty()) {
@@ -5091,6 +5522,12 @@ std::string Qwen4ExpModel::forward_range(const int32_t* tokens_host, uint32_t T,
         }
     }
 
+    if (!droute_.empty()) {
+        // device routing (the header's DevRoute note): decode on the grouped body and verify; anything else routes on the
+        // host and first settles the device-routed state (q4e_dr_host_only: the switches whose paths need the host's picks)
+        dr_fwd_ = dr_choose(!q4e_dr_host_only() && !tp_sync_ && (T == 1 || (spec_verify_ && T <= 16)));
+        if (!dr_fwd_) dr_host_path();
+    }
     hc_xn_layer_ = UINT32_MAX;   // no pre-normed state carries into this forward's first block
     for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
         run_block(L, T, start_pos, tokens_host, nullptr);
@@ -5139,11 +5576,11 @@ std::string Qwen4ExpModel::forward_range(const int32_t* tokens_host, uint32_t T,
         for (uint32_t r0 = 0; r0 < T; r0 += 4)
             qwen4_hc_mix_v2(q, wide_ + uint64_t(r0) * Dw, out_hc_norm, out_hc_down, out_hc_up, nullptr,
                             xn_ws_ + uint64_t(r0) * Dw, lo_ws_ + uint64_t(r0) * R, mixed_ + uint64_t(r0) * H, nullptr,
-                            std::min(4u, T - r0), H, cfg_.hc_count, R, eps);
+                            std::min(4u, T - r0), H, cfg_.hc_count, R, eps, {}, hc8_for(out_hc_down));
     } else
         qwen4_hc_mix_v2(q, wide_, out_hc_norm, out_hc_down, out_hc_up, nullptr,
                  xn_ws_, lo_ws_, mixed_, nullptr, T, H, cfg_.hc_count,
-                 cfg_.hc_low_rank, eps);
+                 cfg_.hc_low_rank, eps, {}, hc8_for(out_hc_down));
     static const bool use_q8_lmh = qwen4exp_dense_q8();
     if (use_q8_lmh && lmh_q8.qs && dense_a16()) {
         gemv_q8_0_soa_f16_g(q, mixed_ + uint64_t(T - 1) * H, lmh_q8.qs,
@@ -5202,6 +5639,7 @@ std::string Qwen4ExpModel::rows_off_reason() const {
     r.n_lanes = n_lanes();
     r.slots_per_layer = ecache_slots_;
     r.top_k = cfg_.n_experts_used;
+    r.dense_ffn = cfg_.is_dense_ffn();
     std::string why = q4e_rows_route_refusal(r);
     // (2026-10-23: the MTP head no longer refuses the rows: its state is per lane and forward_rows never touches it; the
     // lanes' rounds run on the per-lane pipe path in spec-verify mode, which forward_rows refuses below)
@@ -5216,6 +5654,10 @@ std::string Qwen4ExpModel::forward_rows(const uint32_t* lanes, const int32_t* id
     if (G < 2 || G > kMaxRows || G > rows_max() || G > max_chunk_)
         return who + std::to_string(G) + " rows (2.." + std::to_string(std::min<uint32_t>(rows_max(), kMaxRows)) + " here)";
     if (spec_verify_) return who + "refused in spec-verify mode";
+    if (!droute_.empty()) {   // the lanes body routes on the device like the decode body (lanes == decode either way)
+        dr_fwd_ = dr_choose(!q4e_dr_host_only() && !tp_sync_);
+        if (!dr_fwd_) dr_host_path();
+    }
     const bool tail = layer_hi_ == cfg_.n_layers;
     bool own_ple = false;
     for (int32_t l : cfg_.ple_layers)
@@ -5277,7 +5719,7 @@ std::string Qwen4ExpModel::forward_rows(const uint32_t* lanes, const int32_t* id
     for (uint32_t r0 = 0; r0 < G; r0 += 4)
         qwen4_hc_mix_v2(q, wide_ + uint64_t(r0) * D, out_hc_norm, out_hc_down, out_hc_up, nullptr,
                         xn_ws_ + uint64_t(r0) * D, lo_ws_ + uint64_t(r0) * R, mixed_ + uint64_t(r0) * H, nullptr,
-                        std::min(4u, G - r0), H, cfg_.hc_count, R, cfg_.rms_eps);
+                        std::min(4u, G - r0), H, cfg_.hc_count, R, cfg_.rms_eps, {}, hc8_for(out_hc_down));
     const uint32_t V = cfg_.vocab;
     if (qwen4exp_dense_q8() && lmh_q8.qs) {
         quantize_q8_1(q, mixed_, act_q8T_, G * H);
@@ -5319,7 +5761,7 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
         for (uint32_t r0 = 0; r0 < G; r0 += 4)
             qwen4_hc_mix_v2(q, wide_ + uint64_t(r0) * D, norm, down, up, inject, xn_ws_ + uint64_t(r0) * D,
                             lo_ws_ + uint64_t(r0) * R, mixed_ + uint64_t(r0) * H, inj_ + uint64_t(r0) * HC,
-                            std::min(4u, G - r0), H, HC, R, eps);
+                            std::min(4u, G - r0), H, HC, R, eps, {}, hc8_for(down));
     };
 
     // ---- PLE (its block's first op): the hash, the history and the conv state are the lane's ----
@@ -5330,16 +5772,16 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
         pc.eos = cfg_.ple_eos_token;
         std::vector<uint64_t> rows(uint64_t(G) * 16);
         for (uint32_t i = 0; i < G; ++i) qwen4_ple_hash(pc, ids + i, 1, *lr[i].ple_hist, rows.data() + uint64_t(i) * 16);
-        std::vector<float> E(uint64_t(G) * H);
+        std::vector<float> E(uint64_t(G) * kPleD);
         if (auto e = qwen4_ple_gather(ple_table->data, ple_dt, rows.data(), G, E.data()); !e.empty()) { block_err_ = e; return; }
         std::vector<sycl::half> E16(E.size());
         for (size_t i = 0; i < E.size(); ++i) E16[i] = sycl::half(E[i]);
         q.memcpy(e16_, E16.data(), E16.size() * 2).wait();
-        f16_rows(e16_, H, w.ple_key, ple_key_out_, D);
-        f16_rows(e16_, H, w.ple_value, ple_v_out_, H);
+        f16_rows(e16_, kPleD, w.ple_key, ple_key_out_, D);
+        f16_rows(e16_, kPleD, w.ple_value, ple_v_out_, H);
         for (uint32_t i = 0; i < G; ++i)
             qwen4_ple_layer(q, ple_key_out_ + uint64_t(i) * D, ple_v_out_ + uint64_t(i) * H, wide_ + uint64_t(i) * D,
-                            w.ple_norm_key, w.ple_norm_query, w.ple_norm_conv, w.ple_conv, lr[i].ple_conv, ple_ws_, 1, eps);
+                            w.ple_norm_key, w.ple_norm_query, w.ple_norm_conv, w.ple_conv, lr[i].ple_conv, ple_ws_, 1, eps, {}, cfg_.hidden);
     }
 
     // ---- attn site: HC mix -> token mixer -> HC combine ----
@@ -5495,11 +5937,23 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
         // 2026-11-08 (IE_Q4E_HOIST_SHEXP): the router copy is enqueued, the routing-independent work (the shared expert, its
         // gate, the MoE activation quantization) is queued behind it, THEN the host waits -- the GPU runs that work during
         // the host's routing bubble (see the verify body for the race argument; =0 waits first)
-        sycl::event route_ev = q.memcpy(r16, router_all_, uint64_t(G) * cfg_.n_experts * 2);
+        DevRoute* drt = (dr_fwd_ && L < droute_.size() && droute_[L].ok) ? &droute_[L] : nullptr;   // as run_block
+        sycl::event route_ev;
+        if (drt) {
+            if (!drt->fill_ev.empty()) dr_map_layer(*drt, ec, q);
+            qwen4_route_jobs_dev(q, router_all_, G, cfg_.n_experts, NU, drt->slot_of, ecache_slots_, moe_tok_idx_,
+                                 3u * 16 * NU, 3u * 16 * NU + 16, drt->ids);
+            q.memcpy(drt->h_ids, drt->ids, uint64_t(G) * NU * sizeof(int32_t));
+            drt->pend_T = G;
+        } else {
+            route_ev = q.memcpy(r16, router_all_, uint64_t(G) * cfg_.n_experts * 2);
+        }
+        const uint8_t* const* stab  = drt ? drt->tab : nullptr;
+        const uint8_t* const* stabd = drt ? drt->tab + 2 : nullptr;
         std::chrono::steady_clock::time_point trw1;
         auto wait_route = [&] {
             const auto trw0 = std::chrono::steady_clock::now();
-            route_ev.wait();
+            if (!drt) route_ev.wait();
             trw1 = std::chrono::steady_clock::now();
             t_route_wait += std::chrono::duration<double>(trw1 - trw0).count();
         };
@@ -5534,14 +5988,19 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
         t_moe_submit += std::chrono::duration<double>(std::chrono::steady_clock::now() - tms0).count();
         if (hoist) wait_route();
         std::vector<std::vector<std::pair<uint32_t, float>>> tk(G);
-        for (uint32_t vt = 0; vt < G; ++vt) {
+        for (uint32_t vt = 0; vt < G && !drt; ++vt) {
+            if (!droute_.empty()) {   // device routing on: the device's numerics (as run_block)
+                q4e_route_host_pairs(r16 + uint64_t(vt) * cfg_.n_experts, cfg_.n_experts, NU, tk[vt]);
+                hist_add(L, tk[vt]);
+                continue;
+            }
             for (uint32_t e = 0; e < cfg_.n_experts; ++e) rout32[e] = float(r16[uint64_t(vt) * cfg_.n_experts + e]);
             route_from_logits(rout32.data(), cfg_.n_experts, NU, tk[vt]);
             hist_add(L, tk[vt]);
         }
         t_route_host += std::chrono::duration<double>(std::chrono::steady_clock::now() - trw1).count();
         const auto tms1 = std::chrono::steady_clock::now();
-        {
+        if (!drt) {
             std::vector<char> seen(cfg_.n_experts, 0);
             uint32_t uni = 0;
             for (uint32_t vt = 0; vt < G; ++vt)
@@ -5555,10 +6014,10 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
         }
         const uint64_t misses_before = ecache_misses;
         std::vector<int16_t> slot_of(cfg_.n_experts, -1);
-        uint32_t P = 0;
+        uint32_t P = drt ? G * NU : 0;
         const uint32_t W0 = 3u * 16 * NU + 16;   // the pick weights behind the pick table: one H2D copy a layer
         float* hw = reinterpret_cast<float*>(h_tok_idx_ + W0);
-        for (uint32_t vt = 0; vt < G; ++vt) {
+        for (uint32_t vt = 0; vt < G && !drt; ++vt) {
             h_tok_idx_[3u * 16 * NU + vt] = int32_t(tk[vt].size());
             for (uint32_t k = 0; k < uint32_t(tk[vt].size()); ++k) {
                 const uint32_t e = tk[vt][k].first;
@@ -5574,22 +6033,23 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
         }
         if (misses_before != ecache_misses && copyq_)   // q waits for the copyq_ fills (q drained at the router wait)
             q.ext_oneapi_submit_barrier({copyq_->ext_oneapi_submit_barrier()});
-        q.memcpy(moe_tok_idx_, h_tok_idx_, (W0 + uint64_t(G) * NU) * sizeof(int32_t));
+        if (!drt) q.memcpy(moe_tok_idx_, h_tok_idx_, (W0 + uint64_t(G) * NU) * sizeof(int32_t));
         bool sw_done = false;   // the fused-epilogue kernels write moe_hT_ themselves (IE_Q4E_FUSED_SWIGLU)
         if (gate_kq8 && q4e_fused_swiglu()) {   // raw Q5_K / Q6_K gate/up banks: the int-dot A8 kernel, swiglu fused
             qwen4_bank_gemv_grouped_dual_q8s_swiglu(q, w.gate_bv.kind, act_q8sT_, static_cast<const uint8_t*>(ec.base),
-                                                    ec.slot_bytes, ec.gate_off, ec.up_off, moe_tok_idx_, moe_hT_, H, EF, P);
+                                                    ec.slot_bytes, ec.gate_off, ec.up_off, moe_tok_idx_, moe_hT_, H, EF, P,
+                                                    {}, stab);
             sw_done = true;
         } else if (gate_kq8) {   // raw Q5_K / Q6_K gate/up banks through the int-dot A8 kernel (IE_Q4E_KQ_INTDOT=1)
             qwen4_bank_gemv_grouped_dual_q8s(q, w.gate_bv.kind, act_q8sT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                                             ec.gate_off, ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P);
+                                             ec.gate_off, ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P, {}, stab);
         } else if (w.gate_bv.kq && q4e_fused_swiglu()) {   // raw Q8_0 / Q5_K / Q6_K gate/up banks: A16 dual, swiglu fused
             qwen4_bank_gemv_grouped_dual_swiglu(q, w.gate_bv.kind, mixed_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                                                ec.gate_off, ec.up_off, moe_tok_idx_, moe_hT_, H, EF, P);
+                                                ec.gate_off, ec.up_off, moe_tok_idx_, moe_hT_, H, EF, P, {}, stab);
             sw_done = true;
         } else if (w.gate_bv.kq) {   // raw Q8_0 / Q5_K / Q6_K gate/up banks: the A16 grouped dual kernel
             qwen4_bank_gemv_grouped_dual(q, w.gate_bv.kind, mixed_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                                         ec.gate_off, ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P);
+                                         ec.gate_off, ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P, {}, stab);
         } else if (!gate_q8) {   // F16 gate/up banks (dequantized at load): the per-pick decode leaves
             for (uint32_t pk = 0; pk < P; ++pk) {
                 const uint32_t vt = uint32_t(h_tok_idx_[3u * pk + 0]);
@@ -5600,16 +6060,16 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
             }
         } else if (q4e_fused_swiglu()) {
             gemv_q4_K_q8s_grouped_dual_swiglu(q, act_q8sT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes, ec.gate_off,
-                                              ec.up_off, moe_tok_idx_, moe_hT_, H, EF, P);
+                                              ec.up_off, moe_tok_idx_, moe_hT_, H, EF, P, {}, stab);
             sw_done = true;
         } else {
             gemv_q4_K_q8s_grouped_dual(q, act_q8sT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes, ec.gate_off,
-                                       ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P);
+                                       ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P, {}, stab);
         }
         if (!sw_done) swiglu(q, moe_gT_, moe_uT_, moe_hT_, uint64_t(P) * EF);
         if (w.down_bv.kq) {   // raw Q8_0 / Q5_0 / Q4_0 down bank: the A16 grouped kernel
             qwen4_bank_gemv_grouped(q, w.down_bv.kind, moe_hT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                                    ec.down_off, moe_tok_idx_, moe_yT_, H, EF, H, P);
+                                    ec.down_off, moe_tok_idx_, moe_yT_, H, EF, H, P, {}, stabd);
         } else if (!down_q51) {
             for (uint32_t pk = 0; pk < P; ++pk) {
                 const uint8_t* slot = static_cast<uint8_t*>(ec.base) + uint64_t(h_tok_idx_[3u * pk + 1]) * ec.slot_bytes;
@@ -5618,7 +6078,7 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
             }
         } else {
             gemv_q5_1_grouped(q, moe_hT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes, ec.down_off, moe_tok_idx_,
-                              moe_yT_, H, EF, H, P);
+                              moe_yT_, H, EF, H, P, {}, stabd);
         }
         if (q4e_fused_reduce()) {   // the ordered reduce + the shared expert's gated add + the f16 cast, one launch (see the
                                     // verify body); each row's picks in k order (the decode body's fp32 add chain)

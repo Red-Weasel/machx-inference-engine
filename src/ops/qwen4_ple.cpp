@@ -92,8 +92,6 @@ std::string qwen4_ple_gather(const void* table, DType dt,
 // ---------------------------------------------------------------------------
 namespace {
 
-constexpr uint32_t D  = kPleD;         // 2560
-constexpr uint32_t SI = kPleSI;        // 10240
 constexpr uint32_t HC = kPleStreams;   // 4
 constexpr uint32_t SR = kPleStateRows; // 9
 
@@ -109,7 +107,10 @@ sycl::event qwen4_ple_layer(sycl::queue& q,
                             float* conv_state,
                             float* ws,
                             uint32_t T, float eps,
-                            const std::vector<sycl::event>& deps) {
+                            const std::vector<sycl::event>& deps,
+                            uint32_t hidden) {
+    const uint32_t D  = hidden;          // one stream's width (Flash-Next 2560)
+    const uint32_t SI = HC * hidden;     // the flat width (Flash-Next 10240)
     // Workspace carve (qwen4_ple_workspace_floats).
     float* u        = ws;                              // [T, SI]
     float* gated    = u + size_t(T) * SI;              // [T, SI]

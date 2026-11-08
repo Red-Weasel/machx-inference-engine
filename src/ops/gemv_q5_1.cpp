@@ -101,7 +101,7 @@ sycl::event gemv_q5_1_grouped(sycl::queue& q,
                       const int32_t* jobs,
                       sycl::half* ystage, uint32_t y_stride,
                       uint32_t K, uint32_t N, uint32_t P,
-                      const std::vector<sycl::event>& deps) {
+                      const std::vector<sycl::event>& deps, const uint8_t* const* slot_tab) {
     constexpr int SG_SIZE  = 16;
     constexpr int N_PER_WG = 16;
     constexpr int WG_ITEMS = N_PER_WG * SG_SIZE;       // 256
@@ -125,7 +125,7 @@ sycl::event gemv_q5_1_grouped(sycl::queue& q,
             const uint32_t ycell = uint32_t(jobs[p * 3 + 2]);
             const sycl::half* A = h_rows + uint64_t(p) * K;
             const auto* W = reinterpret_cast<const block_q5_1*>(
-                slot_base + uint64_t(slot) * slot_bytes + down_off);
+                slot_tab ? slot_tab[uint64_t(slot) * 3] : slot_base + uint64_t(slot) * slot_bytes + down_off);
 
             for (uint32_t i = lid; i < K; i += WG_ITEMS) A_slm[i] = A[i];
             sycl::group_barrier(it.get_group());

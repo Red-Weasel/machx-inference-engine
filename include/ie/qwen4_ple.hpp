@@ -26,9 +26,10 @@ namespace ie {
 // Fixed qwen4exp PLE geometry (GGUF-verified, spec §1).
 inline constexpr uint32_t kPleHeads     = 16;     // 8 bigram + 8 trigram
 inline constexpr uint32_t kPleHeadDim   = 160;    // embedding_length_per_layer_input
-inline constexpr uint32_t kPleD         = 2560;   // 16*160, one stream's width
+inline constexpr uint32_t kPleD         = 2560;   // 16*160: the n-gram embedding E's width (HF ple_embed_dim) -- and
+                                                  // Flash-Next's hidden, which the layer math takes as a parameter
 inline constexpr uint32_t kPleStreams   = 4;      // hc wide-residual streams
-inline constexpr uint32_t kPleSI        = 10240;  // 4*2560 flat group-norm width
+inline constexpr uint32_t kPleSI        = 10240;  // 4*2560: Flash-Next's flat group-norm width (kPleStreams * hidden)
 inline constexpr uint32_t kPleConvK     = 4;      // ple.conv_kernel
 inline constexpr uint32_t kPleConvDil   = 3;      // token-axis dilation
 inline constexpr uint32_t kPleStateRows = 9;      // (K-1)*dil conv history columns
@@ -104,11 +105,11 @@ std::string qwen4_ple_gather(const void* table, DType dt,
                              const uint64_t* rows /* [T, 16] */, uint32_t T,
                              float* E_out /* [T, 2560] */);
 
-// Device workspace for qwen4_ple_layer, in floats (caller allocates USM):
-// u [T,10240] + gated [T,10240] + g [T,4] + state_in [9,10240].
-inline constexpr size_t qwen4_ple_workspace_floats(uint32_t T) {
-    return size_t(T) * kPleSI * 2 + size_t(T) * kPleStreams
-         + size_t(kPleStateRows) * kPleSI;
+// Device workspace for qwen4_ple_layer, in floats (caller allocates USM), SI = kPleStreams * hidden:
+// u [T,SI] + gated [T,SI] + g [T,4] + state_in [9,SI].
+inline constexpr size_t qwen4_ple_workspace_floats(uint32_t T, uint32_t hidden = kPleD) {
+    return size_t(T) * kPleStreams * hidden * 2 + size_t(T) * kPleStreams
+         + size_t(kPleStateRows) * kPleStreams * hidden;
 }
 
 // blk.1 PLE layer math AFTER the two projections (spec §3):
@@ -135,6 +136,10 @@ sycl::event qwen4_ple_layer(sycl::queue& q,
                             float* conv_state,
                             float* ws,
                             uint32_t T, float eps,
-                            const std::vector<sycl::event>& deps = {});
+                            const std::vector<sycl::event>& deps = {},
+                            uint32_t hidden = kPleD);
+// (2026-11-08: `hidden` is the model's hidden size -- the per-stream group, v's width, and SI = 4 * hidden for key, H,
+// the gammas, conv_w and conv_state; the widths above are Flash-Next's 2560 / 10240. E's width (16*160, the
+// ple_key / ple_value projections' K) does not depend on it. A Qwen 4 with hidden 5120 read past every buffer here.)
 
 }  // namespace ie

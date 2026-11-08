@@ -20,11 +20,12 @@
 > [!IMPORTANT]
 > ## 🚀 Qwen 4 — ready to run on Intel Arc the day it is released
 >
-> **We will have Qwen 4 up on Mach X the same day it drops.** Qwen3.8-Flash-Next is the public preview of Qwen 4's architecture (`qwen4exp`: QSA sparse attention + Gated DeltaNet, a 512-expert MoE, hyper-connections, per-layer n-gram embeddings, an MTP draft head), and Mach X already runs it on Arc Pro B70 cards. In v0.2.36 we built ahead of time everything a Qwen 4 release is expected to ship with:
+> **We will have Qwen 4 up on Mach X the same day it drops.** Qwen3.8-Flash-Next is the public preview of Qwen 4's architecture (`qwen4exp`: QSA sparse attention + Gated DeltaNet, a 512-expert MoE, hyper-connections, per-layer n-gram embeddings, an MTP draft head), and Mach X already runs it on Arc Pro B70 cards. In v0.2.36 and v0.2.37 we built ahead of time everything a Qwen 4 release is expected to ship with:
 >
 > - **Every community quant on its own kernels:** Q4_K, Q5_K, Q6_K, Q8_0, Q5_0 and Q4_0 expert banks stream as they lie on disk (no host F16 copy). Unsloth's UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 Flash-Next builds were downloaded, loaded and checked against an fp64 reference, then perplexity, lossless speculation and speed.
 > - **The draft head and the config the way the converters write them:** the MTP head in llama.cpp's `nextn` layout (Unsloth's `MTP/*.gguf` or inside the model), the hyperparameters llama.cpp reads (per-block attention schedule, per-block arrays), and the `qwen35` pre-tokenizer (30 of 30 lines identical to the HF tokenizer).
-> - **Fast where it counts:** integer-dot and XMX (DPAS) kernels for the K-quant and Q8_0 banks, and a faster decode step (two cards 41.1 → 44.4 tok/s, the long-context step 26.2 → 21.0 ms of GPU time), all with identical output.
+> - **Whatever shape Qwen 4 ships in:** a dense model with no experts, hidden size 5120, 4 KV heads, no sparse-attention indexer, fused gate/up expert banks, the `qwen4` / `qwen4moe` arch names. Each was built as a small random model from the Hugging Face reference code, written as a GGUF in llama.cpp's layout and run through the engine end to end: **15 shapes match the reference's output**. Four failed before v0.2.37 (hidden 5120 lost the GPU; dense and indexer-less files were refused) and are fixed.
+> - **Fast where it counts:** integer-dot and XMX (DPAS) kernels for the K-quant and Q8_0 banks, and a faster decode step (two cards 41.1 → 49.7 tok/s over v0.2.36 and v0.2.37, the long-context step 26.2 → 20.1 ms of GPU time), all with identical output.
 >
 > <table>
 > <tr><th align="left">Qwen 4 on Mach X</th><th align="left">Status</th></tr>
@@ -33,10 +34,11 @@
 > <tr><td>Decode / prompt reading, 1 and 2 × Arc Pro B70</td><td><b>release day</b> — measured, not estimated</td></tr>
 > </table>
 >
-> <sub>Placeholder: this box is replaced with the measured numbers the day Qwen 4 is out. If the release changes the preview architecture (other sizes, other head counts), the config reader already takes llama.cpp's hyperparameters and names any limit instead of guessing.</sub>
+> <sub>Placeholder: this box is replaced with the measured numbers the day Qwen 4 is out. If the release changes the preview architecture (other sizes, other head counts), the config reader already takes llama.cpp's hyperparameters, 15 such shapes already run against the reference, and anything the engine cannot run yet is refused by name instead of guessed.</sub>
 
 **Latest**
 
+- **v0.2.37, November 8 — Qwen 4's possible shapes tested before the weights exist, and Flash-Next decodes 12 % faster:** a new [mini end-to-end check](#new-in-v0237) builds small random models from the Hugging Face reference code in 15 shapes a Qwen 4 tier may take (dense, hidden 5120, 4 KV heads, no sparse-attention indexer, fused expert banks, …), writes them in llama.cpp's layout and compares the engine's output with the reference. It found that hidden 5120 lost the GPU and that dense and indexer-less files were refused; all fixed. Fused gate/up expert banks load. Flash-Next's hyper-connection mixing reads 8-bit and its expert routing runs on the GPU when that pays: two cards **44.4 → 49.7 tok/s**, the tokens unchanged. [Details](#new-in-v0237)
 - **v0.2.36, November 8 — Qwen 4 day-one readiness, Flash-Next decodes faster, and a request can no longer forge a control token:** every community quant of [Flash-Next](#new-in-v0236) (the Qwen 4 preview architecture) streams on its own kernels — Q8_0, Q5_K, Q6_K, Q5_0 and Q4_0 expert banks beside Q4_K — proven on Unsloth's UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 builds; the MTP head loads in llama.cpp's layout; integer-dot and XMX kernels for the bigger quants (the Q8_0 build reads 87.4 → 103.9 tok/s on two cards). The decode step lost launches, a 3× faster sparse attention and a 4× faster router GEMV: two cards **41.1 → 44.4 tok/s**, the step at ~3K context 26.2 → 21.0 ms of GPU time, the output identical. Every chat renderer now keeps a control-token spelling inside a request's own text as text (a fetched page could open a turn or a tool call), a tool call whose JSON lost its last bracket is repaired, and DeepSeek-V4.1 serves with the expert ranking profiled on its own traffic (code-writing replies 7.8 → 12.8 tok/s). [Details](#new-in-v0236)
 - **v0.2.35, November 2 — Flash-Next on N cards, and community GGUFs read right:** `ie serve --gpus N` runs [Flash-Next](#new-in-v0235) as an N-stage layer split (stage s owns layers [s·48/N, (s+1)·48/N)), with the request lanes, the draft head's rounds, the prompt cache, the restart points and the pictures all going through one chain, so no path can skip a stage; on this two-card box the 4-stage chain was proven byte-identical to the 2-stage one by running two stages per card (`IE_Q4E_LOGICAL_CARDS=2`), the way DeepSeek-V4.1's 4-card split was. The per-layer-embedding table of a community Q8_0 / UD-Q6_K_XL GGUF was read with the converter's IQ4_NL layout (garbage replies); it is read by its dtype now, and anything else is refused by name. The P2P context takes every card. An opt-in pinned-memory path for the expert uploads is there for boxes whose copy engine faults on the file mapping; here it cost 14–23 % of decode and made the first token 47 % later, so it is off by default.
 - **v0.2.34, October 29 — Nanbeige4.3-33B, and the dense path three times faster with a prompt cache and prompt-lookup speculation:** [Nanbeige4.3-33B](https://huggingface.co/Nanbeige/Nanbeige4.3-33B) (a plain Llama-architecture dense model, Apache 2.0, 512K context, Qwen's ChatML `<think>` template) serves at **28.7 / 27.8 tok/s on two cards** at 0.9K / 5.3K of context in 65K (6.3 / 2.6 before the port), 19.3 on one card. The shared dense path (every K-quant `llama` / `qwen3` dense GGUF) got its Q6_K projections on the c32 int-dot kernel, the fa2 decode attention under tensor parallel, a prompt cache (turn 2 of a 5.4K-token conversation prefills in 1.7 s instead of 21.4, the reply byte-identical) and prompt-lookup `--spec` (a repeated passage at **78 tok/s** on two cards, 50 on one, the texts byte-identical to plain). The Nanbeige file is our own build from the authors' release. [Details](#new-in-v0234)
@@ -214,6 +216,36 @@ class ([New in v0.2.6](#new-in-v026)).
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
 
 ---
+
+<a id="new-in-v0237"></a>
+## 🆕 New in v0.2.37
+
+### Qwen 4, day one: the shapes it may ship in, tested before the weights exist
+
+Qwen 4's tiers are not out, and the rumoured ones differ from Flash-Next in size and layout. The new mini end-to-end check, [`scripts/qwen4exp_oracle/mini_gate.sh`](scripts/qwen4exp_oracle/README.md), builds a 4-block model with seeded random weights from the Hugging Face reference classes, writes it as a GGUF in llama.cpp's `qwen4exp` layout with every converter transform applied, runs the engine on it three ways (token-by-token decode, one prefill, a prefill split in two) and scores the logits against the reference's. It needs no download and takes about 30 s a shape. A negative control (one wrong norm transform in one block) must fail, and does.
+
+- **Found and fixed:** hidden 5120 lost the GPU (the per-layer-embedding kernels and the dense-matmul scratch were sized for Flash-Next's 2560); a file without the QSA indexer was refused (it now attends densely); a dense model (no experts, a SwiGLU FFN in every block) was refused and now runs through the int-dot GEMV, the batched rows and the s8 GEMM; the `qwen4` / `qwen4moe` arch names read with the file's own key prefix.
+- **15 shapes match the reference:** Flash-Next's own, 4 KV heads, no indexer, hidden 5120, dense at 2560 and at 5120 (with 4 KV heads and no indexer), head_dim 128, 32 Q / 8 KV heads, 64 experts top-8, 32 DeltaNet value heads, no per-layer embedding, 8 hyper-connection streams, low rank 512, a fused gate/up bank and the `qwen4` arch name. Decode rows and a prefill split in two reach cosine ≥ 0.999, a one-shot prefill ≥ 0.9998; rows where the reference's router scores nearly tie are held to 0.995, because F16 routing may pick the other expert there.
+- The dense and hidden-5120 shapes, given the real tokenizer, pass `ie preflight` and answer a chat through `ie serve` on one card and on a two-card split.
+- **Fused gate/up expert banks** (llama.cpp's `--fuse-gate-up-exps`, `ffn_gate_up_exps`) load, in the model and in an MTP head file: each expert's halves are split while the bank is copied to pinned host memory, so every kernel is unchanged, and the logits are byte-identical to the separate-bank file's. They were refused before.
+- **On four cards:** checked on a 4-stage chain, two stages per card here (`ie-qwen4exp-run2 <file> 4 2`, the `--gpus 4` split): the real Flash-Next file and 8-block mini models with Q8_0 expert banks (Flash-Next's shape, dense, hidden 5120, fused banks) give logits bit-identical to one card, and `ie serve` of the dense shape on four stages answers exactly as on one card and on two.
+- The real Flash-Next file's output is bit-identical before and after these changes.
+
+### Flash-Next decodes faster again, with the same tokens
+
+- **The hyper-connection mixing reads the file's 8-bit blocks** at decode and verify instead of F16 copies (half the bytes at 97 sites a step): the mixing 3.24 → 2.19 ms a step, two cards 44.3 → 47.2 tok/s. `IE_Q4E_HC_Q8=0` is the F16 path.
+- **Expert routing on the GPU when it pays:** while the decode miss rate stays at or below 2 %, a MoE layer routes on the device straight into the expert-job table, and a missed expert is read from pinned host memory in place. The host routes with the device's arithmetic bit for bit, so the side never changes a token. Two cards 47.1 → 49.7 tok/s; a cold one-card cache stays on the host. `IE_Q4E_DEV_ROUTE=0` is host routing.
+- **The QSA decode attention splits a head's keys into 64 tiles** (was 16): 131 → 44 µs a layer, the one-card step at ~3.1K context 21.0 → 20.1 ms of GPU time. `IE_Q4E_QSA_TILES=16` gives v0.2.36's sums bit for bit.
+- Two cards **44.4 → 49.7 tok/s** over v0.2.36 (`ie-prompt-bench`, UD-Q4_K_XL, measured at each step). Every step was checked with the batched-verify probe, lossless speculation and the greedy text.
+
+### EXL3: all three exllamav3 codebooks
+
+turboderp's Flash-Next EXL3 quants use the `mul1` codebook, and the EXL3 kernels decoded only the default one (3INST), so they would have read such tensors as wrong values without a word. The kernels now decode 3INST, mcg and mul1 (device == host on all 65,536 codes of each). The importer refuses an `.mcg` / `.mul1` tensor by name until the GGUF carries its codebook. Flash-Next itself has no EXL3 path yet.
+
+### What is still not checked
+- A dense model's MTP draft head is refused (serving uses lookup drafts), and a dense model's request lanes decode one at a time (no row batching).
+- A per-layer embedding on more than one block, or with a geometry other than Flash-Next's, is refused by name: no converter writes one yet.
+- Tensor names a release adds that nobody has published cannot be tested before the files exist.
 
 <a id="new-in-v0236"></a>
 ## 🆕 New in v0.2.36

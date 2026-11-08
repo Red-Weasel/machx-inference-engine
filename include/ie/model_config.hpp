@@ -643,6 +643,12 @@ struct Qwen4ExpConfig {
     uint32_t n_experts_used    = 0;  // qwen4exp.expert_used_count            (10)
     uint32_t expert_ffn        = 0;  // qwen4exp.expert_feed_forward_length   (640)
     uint32_t shared_expert_ffn = 0;  // qwen4exp.expert_shared_feed_forward_length (640; 0 = none)
+    // -- dense FFN (2026-11-08, the Qwen4-27B reading: "dense, no MoE kernels") -------------------------------------
+    // qwen4exp.feed_forward_length when the file has NO expert keys: every block's FFN is one SwiGLU MLP of this width
+    // (blk.N.ffn_gate / ffn_up / ffn_down, the reference's Qwen4ExpTextMLP) and n_experts / n_experts_used /
+    // expert_ffn stay 0. 0 = MoE (the expert keys are then required, as before).
+    uint32_t dense_ffn = 0;
+    bool is_dense_ffn() const { return dense_ffn != 0; }
 
     // -- PLE n-gram embeddings (absent group = no PLE) ---------------------
     std::vector<int32_t> ple_layers;   // qwen4exp.ple.layers                 ([1], 0-based)

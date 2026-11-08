@@ -47,6 +47,26 @@ sycl::event qwen4_hc_expand_streams(sycl::queue& q,
                                     uint32_t T, uint32_t H, uint32_t hc,
                                     const std::vector<sycl::event>& deps = {});
 
+// 8-bit HC mixing weights (2026-11-08): the GGUF's Q8_0 blocks of hc_*_down / hc_*_up as they lie on disk, split SoA the
+// way qwen4exp's Q8W holds dense weights -- q[n*K + k] int8 and one F16 scale (raw bits) per 32 along each row,
+// d[n*(K/32) + b]. down: r rows of K = D; up: D rows of K = r. qwen4_hc_mix_v2 / _xn read them at T <= 4 instead of the F16
+// copy: about half the bytes, and the file's own values (the F16 copy rounds every q*d to 11 bits). Needs D % 16 == 0,
+// r % 64 == 0, H % 4 == 0; otherwise (or T > 4) the F16 path runs.
+struct Qwen4HcQ8 {
+    const int8_t*   down_q = nullptr;   // [r][D]
+    const uint16_t* down_d = nullptr;   // [r][D/32] F16 bits
+    const int8_t*   up_q   = nullptr;   // [D][r], or lane-interleaved (up_lanes)
+    const uint16_t* up_d   = nullptr;   // [D][r/32] F16 bits, or lane-interleaved (up_lanes)
+    bool up_lanes = false;              // up_q / up_d in qwen4_hc_q8_interleave_up's layout (the fast up kernel)
+    bool ok() const { return down_q && down_d && up_q && up_d; }
+};
+
+// The up matrix's planes [D][r] int8 / [D][r/32] F16 bits repacked lane-interleaved (host side, at load): rows in groups of
+// 16, a group's 16-byte chunks lane-major -- qi[((g*(r/16) + c)*16 + l)*16 + u] = row (16g + l)'s byte 16c + u,
+// di[(g*(r/32) + b)*16 + l] = row (16g + l)'s block-b scale. A lane then owns one row and a subgroup's 16 lanes read 256
+// contiguous bytes a step. Needs D % 16 == 0, r % 32 == 0.
+void qwen4_hc_q8_interleave_up(const int8_t* q, const uint16_t* d, uint32_t D, uint32_t r, int8_t* qi, uint16_t* di);
+
 // MIX (and, with w_inject == nullptr, the FINAL MERGE).  Two kernel launches:
 //   1. grouped RMS norm + down GEMV + silu   -> xn_ws [T, D], lo_ws [T, r]
 //   2. up GEMV + sigmoid gate + mean collapse + inject GEMV
@@ -83,7 +103,8 @@ sycl::event qwen4_hc_mix_v2(sycl::queue& q,
                             sycl::half* mixed, float* inj_logits,
                             uint32_t T, uint32_t H, uint32_t hc, uint32_t r,
                             float eps,
-                            const std::vector<sycl::event>& deps = {});
+                            const std::vector<sycl::event>& deps = {},
+                            const Qwen4HcQ8* w8 = nullptr);   // the 8-bit down/up at T <= 4 (see Qwen4HcQ8)
 
 sycl::event qwen4_hc_combine(sycl::queue& q,
                              float* res,                  // F32 [T, hc, H], in-place
@@ -109,7 +130,8 @@ sycl::event qwen4_hc_mix_v2_xn(sycl::queue& q,
                                const float* w_inject,
                                float* lo_ws, sycl::half* mixed, float* inj_logits,
                                uint32_t T, uint32_t H, uint32_t hc, uint32_t r,
-                               const std::vector<sycl::event>& deps = {});
+                               const std::vector<sycl::event>& deps = {},
+                               const Qwen4HcQ8* w8 = nullptr);
 
 // PREFILL MIX (T > 16): qwen4_hc_mix_v2's math with the two low-rank
 // projections routed through gemm_fp16 over [K, N]-TRANSPOSED weight copies

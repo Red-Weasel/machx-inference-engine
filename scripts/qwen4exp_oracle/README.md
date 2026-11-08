@@ -225,3 +225,54 @@ decoder-layer forward executes:
   dequantized UD-Q4_K_XL values in fp32, run through fp32 reference math.  That is
   exactly what the engine computes against, but do not compare these dumps to a
   bf16 HF checkpoint run.
+
+## Mini end-to-end gate (2026-11-08, Qwen 4 day-one shapes)
+
+`mini_model.py` + `tools/q4e_mini_logits.cpp` + `mini_gate.sh`: the WHOLE forward (embedding, every block, the HC
+mixer, lm_head) of a tiny random model built from the reference classes, against the engine on the same weights.
+
+* `mini_model.py build --variant V --out-dir D` instantiates 4 blocks (3 Gated DeltaNet + 1 full attention, PLE on
+  block 1, 16 experts top-4, vocab 4096) with seeded random weights, writes `D/mini.gguf` in llama.cpp's qwen4exp
+  layout (every transform `gguf_weights.py` inverts, applied forward: zero-centred gammas +1, `ssm_a = -exp(A_log)`,
+  the V-head tiling, squeezed convs, the split indexer / expert banks, the squeezed shared-expert gate), and saves the
+  reference's fp32 logits for 24 token ids (one EOS mid-sequence). Weights stored Q8_0 are quantized -> dequantized in
+  the HF model before it runs, F16 ones rounded to fp16, so both sides use the same weights.
+* `ie-q4e-mini-logits D/mini.gguf D/ids.i32 D/engine_logits.f32` loads it on one card and writes token-by-token decode
+  logits for every position plus the last row of a full prefill and of a two-chunk prefill.
+* `mini_model.py compare --out-dir D`: PASS = decode cosine >= 0.999 on every row and on the two-chunk prefill's last row
+  (its second chunk reads the cached prefix through the small-batch int8 kernels, as decode does: at 8 blocks that path
+  measures 1 - cos ~2e-4 on every shape, flat over positions), the one-shot prefill row >= 0.9998, argmax equal on all but
+  at most one decode row. Two kinds of tie are held apart (both measured on the reference): a row whose
+  k-th and (k+1)-th router logits are within 0.02 in some layer (`ref_router_gap.f32`; the engine's F16 routing may pick
+  the other expert there -- the first sweep's only "failure" was such a row, gap 0.0025, no fault) is held to cosine
+  >= 0.995; an argmax difference only counts where the reference's top-1 leads by > 0.05 x the row's std.
+* Negative control `neg_qknorm` (the full-attention q / k norm gammas written without the converter's +1, one wrong
+  transform in one block) must FAIL: it scores prefill 0.9985 against 0.99989-0.99998 for the correct shapes.
+* `mini_gate.sh <out-dir> [variant ...]` runs build + engine + compare for each variant (default all).
+
+Variants (each a shape a Qwen 4 may ship; the Qwen4-27B reading is "dense, hidden 5120, 24 Q / 4 KV heads, no QSA
+weights"): `flashnext` (Flash-Next's own shape), `kv4`, `noqsa` (no indexer keys or tensors: dense attention),
+`h5120`, `dense2560` and `dense` (a dense SwiGLU FFN, `feed_forward_length` + `ffn_gate/up/down`, no expert keys;
+`dense` = hidden 5120, 4 KV heads, no QSA, FFN 13824), `arch_qwen4` (Flash-Next's shape in a file named `qwen4`, its keys
+under `qwen4.`: llama.cpp's qwen35 / qwen35moe naming, should Qwen 4 follow it), and the wider sweep -- `hd128` (head_dim
+128), `q32kv8` (32 Q / 8 KV heads), `moe64` (64 experts top-8, expert FFN 1024), `ssm32` (32 DeltaNet value heads),
+`nople` (no PLE), `hc8` (8 HC streams), `lowrank512` (HC low rank 512). All 14 PASS (2026-11-08, card 1).
+
+`build --tokenizer-from <real.gguf>` copies the real model's `tokenizer.*` keys (Flash-Next: 248320 tokens, the chat
+template) and sizes the vocabulary to match: the mini file then loads in `ie preflight` / `ie serve` -- the engine-level
+smoke for a shape (the replies are random-weight text; the point is that the server loads, splits and answers).
+
+`build --cycles 2` repeats the 4-block layer cycle (8 blocks): enough for an N-stage chain, which needs two blocks a
+stage. With `--tokenizer-from` (the chain gate's token ids reach ~200K) the file goes through
+`ie-qwen4exp-run2 <mini.gguf> 4 2` -- a 4-stage chain, i.e. `--gpus 4`, run here with two stages per card and checked
+bit for bit against one card -- and `IE_Q4E_LOGICAL_CARDS=2 ie serve --gpus 2` serves the same 4-stage chain.
+
+First results (2026-11-08): every variant PASS; decode min cosine 0.9994-0.9999, prefill 0.99998. The first run
+found hidden 5120 lost the device (the PLE kernels and the dense-matmul scratch took Flash-Next's 2560 / 12288 as
+constants) and refused no-QSA and dense files; all fixed and gated.
+
+What it does not prove: anything about trained weights' accuracy or about speed (4 blocks of random weights). The
+dense variant's reference swaps `Qwen4ExpTextMLP` into each block -- the natural dense form of this architecture
+(Qwen3.5's dense / MoE split), an assumption until a Qwen 4 modeling file exists. A PLE on more than one block is
+refused by the engine (each block has its own table and hash set in the reference; no GGUF layout carries more than
+one yet), so no variant covers it.

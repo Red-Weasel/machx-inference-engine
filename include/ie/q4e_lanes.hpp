@@ -116,6 +116,7 @@ struct Q4eRowsRoute {
     bool moe_alt = false;          // IE_Q4E_MOE_EXPMAJOR / IE_Q4E_SV_NO_G1 / _NO_G2 / _NO_RED (non-default MoE routes)
     bool tp = false;               // verify-only expert parallelism is set
     bool dn_mixed = false;         // some DeltaNet layer has qkv and gate in different dtypes (the T == 1 gate reuses qkv's act)
+    bool dense_ffn = false;        // (2026-11-08) a dense-FFN model: the rows path runs the MoE body
     uint32_t n_lanes = 1;
     uint32_t slots_per_layer = 0, top_k = 0;
 };
@@ -128,6 +129,7 @@ inline std::string q4e_rows_route_refusal(const Q4eRowsRoute& r) {
     if (r.moe_alt) return "a non-default MoE route (IE_Q4E_MOE_EXPMAJOR / IE_Q4E_SV_NO_*)";
     if (r.tp) return "verify expert parallelism";
     if (r.dn_mixed) return "a DeltaNet layer's qkv and gate differ in dtype";
+    if (r.dense_ffn) return "a dense FFN (the rows path runs the MoE body; each lane steps on its own)";
     if (q4e_rows_max_group(r.slots_per_layer, r.top_k) < 2)
         return "the expert cache's " + std::to_string(r.slots_per_layer) + " slots/layer hold fewer than 2 rows' top-" +
                std::to_string(r.top_k);

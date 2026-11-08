@@ -28,6 +28,7 @@ public:
     void kv_string_array(const std::string& key, const std::vector<std::string>& v);
     void kv_i32_array(const std::string& key, const std::vector<int32_t>& v);
     void kv_bool_array(const std::string& key, const std::vector<bool>& v);
+    void kv_u64_array(const std::string& key, const std::vector<uint64_t>& v);   // (the PLE hash constants' type)
     void kv_f32_array(const std::string& key, const std::vector<float>& v);
 
     // `data` is NON-OWNING and must outlive write(). nbytes must equal the GGUF

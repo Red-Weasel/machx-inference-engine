@@ -21,6 +21,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
+#include <cstring>
 #include <random>
 #include <vector>
 
@@ -81,8 +83,11 @@ struct RefMix {
 // CPU fp64 reference of the MIX spec math.  Weights are passed as the SAME
 // f16/f32 values the GPU consumes (converted to double), so the only error
 // left is precision/accumulation-order.
+inline double wv(sycl::half h) { return double(float(h)); }
+inline double wv(double v) { return v; }
+template <class W>
 RefMix ref_mix(uint32_t T, const std::vector<float>& x, const std::vector<float>& gamma,
-               const std::vector<sycl::half>& w_down, const std::vector<sycl::half>& w_up,
+               const std::vector<W>& w_down, const std::vector<W>& w_up,
                const std::vector<float>& w_inject) {
     RefMix o;
     o.xn.assign(size_t(T) * D, 0.0);
@@ -108,15 +113,15 @@ RefMix ref_mix(uint32_t T, const std::vector<float>& x, const std::vector<float>
         // lo = silu((W_down . xn) / hc)
         for (uint32_t i = 0; i < R; ++i) {
             double acc = 0.0;
-            const sycl::half* wr = w_down.data() + size_t(i) * D;
-            for (uint32_t j = 0; j < D; ++j) acc += double(float(wr[j])) * xnt[j];
+            const W* wr = w_down.data() + size_t(i) * D;
+            for (uint32_t j = 0; j < D; ++j) acc += wv(wr[j]) * xnt[j];
             lo[i] = d_silu(acc / double(HC));
         }
         // gate = sigmoid(W_up . lo)
         for (uint32_t d = 0; d < D; ++d) {
             double acc = 0.0;
-            const sycl::half* wr = w_up.data() + size_t(d) * R;
-            for (uint32_t k = 0; k < R; ++k) acc += double(float(wr[k])) * lo[k];
+            const W* wr = w_up.data() + size_t(d) * R;
+            for (uint32_t k = 0; k < R; ++k) acc += wv(wr[k]) * lo[k];
             gate[d] = d_sigmoid(acc);
         }
         // mixed = mean_s(xn . gate)
@@ -145,7 +150,8 @@ T2* dcopy(sycl::queue& q, const std::vector<T2>& v) {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    const bool perf = argc > 1 && std::strcmp(argv[1], "--perf") == 0;
     sycl::queue q{sycl::gpu_selector_v};
     std::printf("\n\033[1mqwen4exp hyper-connections gate\033[0m  device: %s\n",
                 q.get_device().get_info<sycl::info::device::name>().c_str());
@@ -440,6 +446,161 @@ int main() {
         for (auto* p : {(void*)d_x, (void*)d_g1, (void*)d_xn, (void*)d_lo,
                         (void*)d_mixed, (void*)d_inj})
             sycl::free(p, q);
+    }
+
+    // ---- 8-bit HC weights (Qwen4HcQ8, 2026-11-08): the file's Q8_0 blocks read raw at T <= 4 ----------------------------
+    // The weights ARE Q8_0 (int8 + an F16 scale per 32 along each row, as the GGUF stores hc_*_down / hc_*_up); the fp64
+    // reference uses their exact values q * d. The F16 path runs on the loader's copy half(q * d) -- its error vs the same
+    // reference is printed beside the 8-bit path's. Gates: 8-bit vs fp64 within the v2 tolerance, and no worse than the
+    // F16 copy; each row bit-identical at T = 1 / 3 / 4 (verify == decode); mix_v2_xn == mix_v2 on the 8-bit path.
+    {
+        std::printf("\n\033[1m8-bit HC weights (Qwen4HcQ8)\033[0m\n");
+        std::mt19937 rq(4242);
+        auto blocks = [&](uint32_t N, uint32_t K, std::vector<int8_t>& qv, std::vector<uint16_t>& dv,
+                          std::vector<double>& exact, std::vector<sycl::half>& f16) {
+            qv.resize(size_t(N) * K); dv.resize(size_t(N) * (K / 32)); exact.resize(qv.size()); f16.resize(qv.size());
+            std::uniform_int_distribution<int> qi(-127, 127);
+            std::uniform_real_distribution<float> dd(1.0e-4f, 4.0e-4f);
+            for (size_t b = 0; b < dv.size(); ++b) {
+                const sycl::half dh(dd(rq));
+                std::memcpy(&dv[b], &dh, 2);
+                for (int k = 0; k < 32; ++k) {
+                    const size_t e = b * 32 + size_t(k);
+                    qv[e] = int8_t(qi(rq));
+                    exact[e] = double(qv[e]) * double(float(dh));
+                    f16[e] = sycl::half(float(qv[e]) * float(dh));   // the loader: dequant to fp32, then F16
+                }
+            }
+        };
+        std::vector<int8_t> dq, uq; std::vector<uint16_t> dd2, ud2; std::vector<double> dx, ux; std::vector<sycl::half> df, uf;
+        blocks(R, D, dq, dd2, dx, df);
+        blocks(D, R, uq, ud2, ux, uf);
+        int8_t* d_dq = dcopy(q, dq); uint16_t* d_dd = dcopy(q, dd2);
+        int8_t* d_uq = dcopy(q, uq); uint16_t* d_ud = dcopy(q, ud2);
+        sycl::half* d_df = dcopy(q, df); sycl::half* d_uf = dcopy(q, uf);
+        Qwen4HcQ8 w8; w8.down_q = d_dq; w8.down_d = d_dd; w8.up_q = d_uq; w8.up_d = d_ud;
+        // the lane-interleaved up planes (what the model loads): the fast up kernel
+        std::vector<int8_t> uqi(uq.size()); std::vector<uint16_t> udi(ud2.size());
+        qwen4_hc_q8_interleave_up(uq.data(), ud2.data(), D, R, uqi.data(), udi.data());
+        int8_t* d_uqi = dcopy(q, uqi); uint16_t* d_udi = dcopy(q, udi);
+        Qwen4HcQ8 w8i = w8; w8i.up_q = d_uqi; w8i.up_d = d_udi; w8i.up_lanes = true;
+        const uint32_t T4 = 4;
+        std::mt19937 rx(99);
+        std::vector<float> x(size_t(T4) * D);
+        for (auto& v : x) v = std::uniform_real_distribution<float>(-1.f, 1.f)(rx);
+        const RefMix ref = ref_mix(T4, x, gamma, dx, ux, w_inject);
+        float* d_x = dcopy(q, x);
+        float* d_xn = sycl::malloc_device<float>(size_t(T4) * D, q);
+        float* d_lo = sycl::malloc_device<float>(size_t(T4) * R, q);
+        sycl::half* d_m = sycl::malloc_device<sycl::half>(size_t(T4) * H, q);
+        float* d_i = sycl::malloc_device<float>(size_t(T4) * HC, q);
+        std::vector<sycl::half> m8(size_t(T4) * H), m16(size_t(T4) * H), mt(size_t(T4) * H);
+        std::vector<float> i8(size_t(T4) * HC), i16(size_t(T4) * HC), it2(size_t(T4) * HC);
+        qwen4_hc_mix_v2(q, d_x, d_gamma, d_df, d_uf, d_winj, d_xn, d_lo, d_m, d_i, T4, H, HC, R, EPS).wait();
+        q.memcpy(m16.data(), d_m, m16.size() * 2).wait(); q.memcpy(i16.data(), d_i, i16.size() * 4).wait();
+        qwen4_hc_mix_v2(q, d_x, d_gamma, d_df, d_uf, d_winj, d_xn, d_lo, d_m, d_i, T4, H, HC, R, EPS, {}, &w8).wait();
+        q.memcpy(m8.data(), d_m, m8.size() * 2).wait(); q.memcpy(i8.data(), d_i, i8.size() * 4).wait();
+        const double e8 = max_rel(m8.data(), ref.mixed.data(), m8.size());
+        const double e16 = max_rel(m16.data(), ref.mixed.data(), m16.size());
+        // mean |err| as well: the max is dominated by the F16 output rounding both paths share
+        double s8 = 0, s16 = 0;
+        for (size_t k = 0; k < m8.size(); ++k) {
+            s8 += std::fabs(double(float(m8[k])) - ref.mixed[k]);
+            s16 += std::fabs(double(float(m16[k])) - ref.mixed[k]);
+        }
+        std::printf("  mixed vs fp64 on the file's values: 8-bit max_rel %.3e mean_abs %.3e | F16 copy max_rel %.3e mean_abs %.3e\n",
+                    e8, s8 / double(m8.size()), e16, s16 / double(m16.size()));
+        check_tol(e8, 2e-3, "8-bit: mixed vs fp64 (exact Q8_0 values)");
+        check_tol(max_rel(i8.data(), ref.inj.data(), i8.size()), 2e-3, "8-bit: inj_logits vs fp64");
+        check(s8 <= s16, "8-bit: mean error no worse than the F16 copy's");
+        bool inj_same = std::memcmp(i8.data(), i16.data(), i8.size() * 4) == 0;
+        check(inj_same, "8-bit: inj_logits bit-identical to the F16 path (the inject rows are v3's dot)");
+        // each row bit-identical at T = 1 and 3 (vs the T = 4 rows): verify == decode
+        bool rows_ok = true;
+        for (uint32_t Tn : {1u, 3u}) {
+            for (uint32_t t0 = 0; t0 + Tn <= T4; t0 += Tn) {
+                qwen4_hc_mix_v2(q, d_x + size_t(t0) * D, d_gamma, d_df, d_uf, d_winj, d_xn, d_lo, d_m, d_i, Tn, H, HC, R, EPS,
+                                {}, &w8).wait();
+                q.memcpy(mt.data(), d_m, size_t(Tn) * H * 2).wait(); q.memcpy(it2.data(), d_i, size_t(Tn) * HC * 4).wait();
+                rows_ok = rows_ok && std::memcmp(mt.data(), m8.data() + size_t(t0) * H, size_t(Tn) * H * 2) == 0 &&
+                          std::memcmp(it2.data(), i8.data() + size_t(t0) * HC, size_t(Tn) * HC * 4) == 0;
+            }
+        }
+        check(rows_ok, "8-bit: every row bit-identical at T = 1 / 3 / 4");
+        // mix_v2_xn on the normed rows == mix_v2
+        qwen4_hc_mix_v2(q, d_x, d_gamma, d_df, d_uf, d_winj, d_xn, d_lo, d_m, d_i, T4, H, HC, R, EPS, {}, &w8).wait();
+        qwen4_hc_mix_v2_xn(q, d_xn, d_df, d_uf, d_winj, d_lo, d_m, d_i, T4, H, HC, R, {}, &w8).wait();
+        q.memcpy(mt.data(), d_m, mt.size() * 2).wait(); q.memcpy(it2.data(), d_i, it2.size() * 4).wait();
+        check(std::memcmp(mt.data(), m8.data(), mt.size() * 2) == 0 && std::memcmp(it2.data(), i8.data(), it2.size() * 4) == 0,
+              "8-bit: mix_v2_xn bit-identical to mix_v2");
+        {   // the interleaved up (the model's layout)
+            std::vector<sycl::half> mi(size_t(T4) * H);
+            std::vector<float> ii(size_t(T4) * HC);
+            qwen4_hc_mix_v2(q, d_x, d_gamma, d_df, d_uf, d_winj, d_xn, d_lo, d_m, d_i, T4, H, HC, R, EPS, {}, &w8i).wait();
+            q.memcpy(mi.data(), d_m, mi.size() * 2).wait(); q.memcpy(ii.data(), d_i, ii.size() * 4).wait();
+            double si = 0;
+            for (size_t k = 0; k < mi.size(); ++k) si += std::fabs(double(float(mi[k])) - ref.mixed[k]);
+            const double ei = max_rel(mi.data(), ref.mixed.data(), mi.size());
+            std::printf("  interleaved up: max_rel %.3e mean_abs %.3e\n", ei, si / double(mi.size()));
+            check_tol(ei, 2e-3, "8-bit interleaved up: mixed vs fp64");
+            check(si <= s16, "8-bit interleaved up: mean error no worse than the F16 copy's");
+            check(std::memcmp(ii.data(), i8.data(), ii.size() * 4) == 0, "8-bit interleaved up: inj_logits = the down kernel's");
+            bool rows_i = true;
+            for (uint32_t Tn : {1u, 3u}) {
+                for (uint32_t t0 = 0; t0 + Tn <= T4; t0 += Tn) {
+                    qwen4_hc_mix_v2(q, d_x + size_t(t0) * D, d_gamma, d_df, d_uf, d_winj, d_xn, d_lo, d_m, d_i, Tn, H, HC, R, EPS,
+                                    {}, &w8i).wait();
+                    q.memcpy(mt.data(), d_m, size_t(Tn) * H * 2).wait();
+                    rows_i = rows_i && std::memcmp(mt.data(), mi.data() + size_t(t0) * H, size_t(Tn) * H * 2) == 0;
+                }
+            }
+            check(rows_i, "8-bit interleaved up: every row bit-identical at T = 1 / 3 / 4");
+            qwen4_hc_mix_v2(q, d_x, d_gamma, d_df, d_uf, d_winj, d_xn, d_lo, d_m, d_i, T4, H, HC, R, EPS, {}, &w8i).wait();
+            qwen4_hc_mix_v2_xn(q, d_xn, d_df, d_uf, d_winj, d_lo, d_m, d_i, T4, H, HC, R, {}, &w8i).wait();
+            q.memcpy(mt.data(), d_m, mt.size() * 2).wait();
+            check(std::memcmp(mt.data(), mi.data(), mt.size() * 2) == 0, "8-bit interleaved up: mix_v2_xn bit-identical to mix_v2");
+        }
+
+        if (perf) {
+            // DRAM-streamed timing: NW distinct weight sets (> L2) rotated, as the model's 97 mixes a step are.
+            constexpr int NW = 24, ITERS = 480;
+            std::vector<int8_t*> pdq(NW), puq(NW), puqi(NW); std::vector<uint16_t*> pdd(NW), pud(NW), pudi(NW);
+            std::vector<sycl::half*> pdf(NW), puf(NW);
+            for (int k = 0; k < NW; ++k) {
+                pdq[k] = dcopy(q, dq); pdd[k] = dcopy(q, dd2); puq[k] = dcopy(q, uq); pud[k] = dcopy(q, ud2);
+                puqi[k] = dcopy(q, uqi); pudi[k] = dcopy(q, udi);
+                pdf[k] = dcopy(q, df); puf[k] = dcopy(q, uf);
+            }
+            for (uint32_t Tn : {1u, 4u}) {
+                for (int mode = 0; mode < 3; ++mode) {
+                    auto run = [&](int n) {
+                        for (int k = 0; k < n; ++k) {
+                            const int w = k % NW;
+                            Qwen4HcQ8 wk; wk.down_q = pdq[w]; wk.down_d = pdd[w]; wk.up_q = puq[w]; wk.up_d = pud[w];
+                            if (mode == 2) { wk.up_q = puqi[w]; wk.up_d = pudi[w]; wk.up_lanes = true; }
+                            qwen4_hc_mix_v2_xn(q, d_xn, pdf[w], puf[w], d_winj, d_lo, d_m, d_i, Tn, H, HC, R, {},
+                                               mode ? &wk : nullptr);
+                        }
+                        q.wait();
+                    };
+                    run(NW);
+                    const auto t0 = std::chrono::steady_clock::now();
+                    run(ITERS);
+                    const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / ITERS;
+                    const double mb = mode ? (double(R) * D * (1 + 2.0 / 32) * 2) / 1e6 : (double(R) * D * 2 * 2) / 1e6;
+                    std::printf("  perf T=%u %-12s down+up %6.1f us a mix (%.1f MB weights, %.0f GB/s incl. launch gaps)\n",
+                                Tn, mode == 0 ? "F16" : mode == 1 ? "8-bit" : "8-bit lanes", us, mb, mb * 1e3 / us);
+                }
+            }
+            for (int k = 0; k < NW; ++k)
+                for (void* pp : {(void*)pdq[k], (void*)pdd[k], (void*)puq[k], (void*)pud[k], (void*)puqi[k], (void*)pudi[k],
+                                 (void*)pdf[k], (void*)puf[k]})
+                    sycl::free(pp, q);
+        }
+        for (void* pp : {(void*)d_dq, (void*)d_dd, (void*)d_uq, (void*)d_ud, (void*)d_uqi, (void*)d_udi, (void*)d_df, (void*)d_uf,
+                         (void*)d_x, (void*)d_xn,
+                         (void*)d_lo, (void*)d_m, (void*)d_i})
+            sycl::free(pp, q);
     }
 
     sycl::free(d_gamma, q);

@@ -235,6 +235,9 @@ set_target_properties(ie_qwen3moe_test PROPERTIES OUTPUT_NAME "ie-qwen3moe-test"
 add_executable(ie_exl3_test ie_exl3_test.cpp)
 target_link_libraries(ie_exl3_test PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_exl3_test PROPERTIES OUTPUT_NAME "ie-exl3-test")
+add_executable(ie_exl3_codebook_test exl3_codebook_test.cpp)
+target_link_libraries(ie_exl3_codebook_test PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_exl3_codebook_test PROPERTIES OUTPUT_NAME "ie-exl3-codebook-test")
 
 # In-engine spec-decode A/B: lossless + speedup vs plain greedy via Engine::generate.
 add_executable(ie_spec_engine_ab ie_spec_engine_ab.cpp)
@@ -383,6 +386,9 @@ set_target_properties(ie_q4e_bank_ab PROPERTIES OUTPUT_NAME "ie-q4e-bank-ab")
 add_executable(ie_qwen4_hc_test qwen4_hc_test.cpp)
 target_link_libraries(ie_qwen4_hc_test PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_qwen4_hc_test PROPERTIES OUTPUT_NAME "ie-qwen4-hc-test")
+add_executable(ie_qwen4_route_test qwen4_route_test.cpp)
+target_link_libraries(ie_qwen4_route_test PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_qwen4_route_test PROPERTIES OUTPUT_NAME "ie-qwen4-route-test")
 
 # Phase 1b (agent serving): in-process slot-stash suspend/resume byte-exactness
 # harness for the 27B 2-GPU split path (cross-restart greedy is nondeterministic,
@@ -417,6 +423,12 @@ set_target_properties(ie_qwen4_ple_test PROPERTIES OUTPUT_NAME "ie-qwen4-ple-tes
 add_executable(ie_qwen4exp_fwd_test qwen4exp_fwd_test.cpp)
 target_link_libraries(ie_qwen4exp_fwd_test PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_qwen4exp_fwd_test PROPERTIES OUTPUT_NAME "ie-qwen4exp-fwd-test")
+
+# Mini qwen4exp end-to-end oracle, the engine half (2026-11-08): a mini GGUF from scripts/qwen4exp_oracle/mini_model.py
+# run three ways (decode, prefill, split prefill), logits written for mini_model.py compare.
+add_executable(ie_q4e_mini_logits q4e_mini_logits.cpp)
+target_link_libraries(ie_q4e_mini_logits PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_q4e_mini_logits PROPERTIES OUTPUT_NAME "ie-q4e-mini-logits")
 
 # Qwen3.8-Flash-Next greedy generation smoke (tokenize + forward + decode).
 add_executable(ie_qwen4exp_gen qwen4exp_gen.cpp)

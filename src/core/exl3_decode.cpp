@@ -1,4 +1,4 @@
-// src/core/exl3_decode.cpp — EXL3 host reference decode (cb=0).
+// src/core/exl3_decode.cpp — EXL3 host reference decode (codebooks 0 3INST, 1 mcg, 2 mul1).
 // Ported bit-for-bit from exllamav3 (file:line in docs/exl3_format_notes.md):
 //   - bit extraction: exl3_dq.cuh:15-31  (tail-biting, two u32 funnel-shift)
 //   - codebook cb=0:  codebook.cuh:25-35 (x*mul+add ; (x&m)^c ; f16(lo)+f16(hi))
@@ -8,6 +8,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include <cmath>
 #include <cstring>
 
 namespace ie {
@@ -28,6 +29,35 @@ inline float decode_cb0(uint32_t code) {
     return float(h);
 }
 
+// fp16 bits <-> double, exact (h2d) and round-to-nearest-even (d2h, normal / subnormal / overflow): the reference for the
+// codebooks' single fp16 rounding, independent of sycl::half's host conversion.
+double h2d(uint16_t h) {
+    const int sg = h >> 15, e = (h >> 10) & 31, m = h & 1023;
+    double v;
+    if (e == 0) v = std::ldexp(double(m), -24);
+    else if (e == 31) v = m ? NAN : INFINITY;
+    else v = std::ldexp(double(1024 + m), e - 25);
+    return sg ? -v : v;
+}
+uint16_t d2h(double v) {
+    uint16_t sg = 0;
+    if (std::signbit(v)) { sg = 0x8000; v = -v; }
+    if (std::isnan(v)) return 0x7e00;
+    if (v == 0.0) return sg;
+    int e;
+    std::frexp(v, &e);                         // v = f * 2^e, f in [0.5, 1)
+    int ex = e - 1 + 15;                       // biased fp16 exponent
+    const double q = ex <= 0 ? std::ldexp(v, 24) : std::ldexp(v, 11 - e);   // v in units of the target ulp
+    double fl = std::floor(q);
+    const double rem = q - fl;
+    if (rem > 0.5 || (rem == 0.5 && std::fmod(fl, 2.0) != 0.0)) fl += 1.0;
+    uint32_t mant = uint32_t(fl);
+    if (ex <= 0) return mant >= 1024 ? uint16_t(sg | 0x0400 | (mant - 1024)) : uint16_t(sg | mant);
+    if (mant >= 2048) { mant >>= 1; ++ex; }
+    if (ex >= 31) return uint16_t(sg | 0x7c00);
+    return uint16_t(sg | (uint32_t(ex) << 10) | (mant - 1024));
+}
+
 // quantize.py:21-48 — tensor_core_perm: lane index t (0..255) → row-major (r*16+c).
 void build_perm(int* perm) {
     for (int t = 0; t < 32; ++t) {
@@ -46,8 +76,21 @@ void build_perm(int* perm) {
 
 }  // namespace
 
+// exllamav3 codebook.cuh decode_3inst<cb> (master bd1f519), exactly: integer math, then one fp16 rounding (RNE) of an exact
+// double -- cb 0/1 sum two fp16 halves, cb 2 (mul1) is an fp16 fma of (1024 + bytesum) with 0x1eee and 0xc931.
+uint16_t exl3_decode_code_host(uint32_t code, uint32_t cb) {
+    if (cb == 2) {
+        const uint32_t x = code * 0x83DCD12Du;
+        const uint32_t sum = (x & 0xffu) + ((x >> 8) & 0xffu) + ((x >> 16) & 0xffu) + (x >> 24) + 0x6400u;
+        return d2h(h2d(uint16_t(sum)) * h2d(0x1eee) + h2d(0xc931));
+    }
+    uint32_t x = cb == 1 ? code * 0xCBAC1FEDu : code * 89226354u + 64248484u;
+    x = (x & 0x8fff8fffu) ^ 0x3b603b60u;
+    return d2h(h2d(uint16_t(x & 0xffffu)) + h2d(uint16_t(x >> 16)));
+}
+
 std::string exl3_decode_host(const Exl3Tensor& t, float* out) {
-    if (t.cb != 0)                 return "exl3_decode_host: only cb=0 supported";
+    if (t.cb > 2)                  return "exl3_decode_host: codebook out of range (0 3INST, 1 mcg, 2 mul1)";
     if (t.bits < 1 || t.bits > 8)  return "exl3_decode_host: bits out of range";
     if (!out)                      return "exl3_decode_host: null out";
     const uint32_t bits = t.bits, TK = t.tile_k, TN = t.tile_n, N = t.N;
@@ -77,7 +120,7 @@ std::string exl3_decode_host(const Exl3Tensor& t, float* out) {
                 const uint32_t b = words[i1 % psz];
                 const uint64_t merged = (uint64_t(a) << 32) | b;   // fshift: (a<<32)|b
                 const uint32_t code = uint32_t(merged >> s0) & 0xffffu;
-                const float val = decode_cb0(code);
+                const float val = t.cb == 0 ? decode_cb0(code) : float(h2d(exl3_decode_code_host(code, t.cb)));
                 const int p = perm[tt];
                 out[size_t(ki * 16 + p / 16) * N + (ni * 16 + p % 16)] = val;
             }

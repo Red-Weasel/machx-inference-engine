@@ -6,10 +6,14 @@
 //   2. the grouped down kernel, the grouped dual gate/up kernel, the grouped tiles (rows 1 / 5 / 16, both mats) and the
 //      batched rows (M = 33) BIT-IDENTICAL to the solo kernel per output, over a synthetic [K, N, E] bank addressed by
 //      expert slot (slot_base + slot * slot_bytes + off);
-//   3. qwen4_bank_kind's table: the dtypes and the K alignment each kind takes.
+//   3. qwen4_bank_kind's table: the dtypes and the K alignment each kind takes;
+//   4. (device routing phase 2) every grouped pick kernel -- these kinds' dual / dual+swiglu / down / int-dot, the Q4_K
+//      int-dot dual / dual+swiglu, the Q5_1 down -- through the slot address table, its rows a VRAM copy of the slots and
+//      three pinned host banks: bit-identical to the slot form.
 // Rel err denominator: max(|ref|, 0.01 * max|ref| over the output) for the random-x GEMVs; max(|ref|, 1e-6) otherwise.
 // usage: ie-qwen4-bank-test          exit 0 = GATE PASSED, 1 = FAILED
 #include "ie/qwen4_bank.hpp"
+#include "ie/qwen4_quant.hpp"
 #include "ie/dequant_ref.hpp"
 #include "ie/ops.hpp"
 #include "ie/quant_blocks.hpp"
@@ -78,6 +82,47 @@ struct Dev {
     template <class T> T* alloc(size_t n) { return static_cast<T*>(sycl::malloc_shared(n * sizeof(T), q)); }
     void free(void* p) { sycl::free(p, q); }
 };
+
+// Device routing phase 2 (2026-11-08): the grouped pick kernels read through a slot address table [row][3] {gate, up, down}.
+// The fixture: rows [0, E) = a device (VRAM) copy of the test's slots, rows [E, 2E) = three PINNED HOST banks laid out as
+// the model keeps its experts (one expert-major array per matrix; a kernel reads them over PCIe -- the read-through miss).
+// The table-form jobs send even picks to the VRAM row of their slot and odd picks to the host row (E + slot): every kernel
+// must return the slot form's bits. A matrix the slot layout lacks (off = UINT64_MAX) gets a null entry.
+struct TabFixture {
+    uint8_t* dslots = nullptr;
+    uint8_t* hbank[3] = {nullptr, nullptr, nullptr};
+    const uint8_t** tab = nullptr;   // device memory, [2E][3]
+    int32_t* jobs = nullptr;         // [P][3]
+    void release(Dev& dev) {
+        dev.free(dslots); for (auto* h : hbank) if (h) dev.free(h); dev.free(tab); dev.free(jobs);
+    }
+};
+TabFixture make_tab(Dev& dev, const uint8_t* slots, uint64_t slot_bytes, const uint64_t off[3], uint64_t slice, uint32_t E,
+                    const int32_t* jobs_h, uint32_t P) {
+    TabFixture f;
+    f.dslots = sycl::malloc_device<uint8_t>(slot_bytes * E, dev.q);
+    dev.q.memcpy(f.dslots, slots, slot_bytes * E).wait();
+    std::vector<const uint8_t*> t(uint64_t(2) * E * 3, nullptr);
+    for (int m = 0; m < 3; ++m) {
+        if (off[m] == UINT64_MAX) continue;
+        f.hbank[m] = sycl::malloc_host<uint8_t>(slice * E, dev.q);
+        for (uint32_t e = 0; e < E; ++e) {
+            std::memcpy(f.hbank[m] + uint64_t(e) * slice, slots + uint64_t(e) * slot_bytes + off[m], slice);
+            t[uint64_t(e) * 3 + m]       = f.dslots + uint64_t(e) * slot_bytes + off[m];
+            t[uint64_t(E + e) * 3 + m]   = f.hbank[m] + uint64_t(e) * slice;
+        }
+    }
+    f.tab = sycl::malloc_device<const uint8_t*>(t.size(), dev.q);
+    dev.q.memcpy(f.tab, t.data(), t.size() * sizeof(t[0])).wait();
+    f.jobs = dev.alloc<int32_t>(uint64_t(P) * 3);
+    for (uint32_t p = 0; p < P; ++p) {
+        f.jobs[p * 3 + 0] = jobs_h[p * 3 + 0];
+        f.jobs[p * 3 + 1] = jobs_h[p * 3 + 1] + ((p & 1) ? int32_t(E) : 0);
+        f.jobs[p * 3 + 2] = jobs_h[p * 3 + 2];
+    }
+    return f;
+}
+bool same_bits(const sycl::half* a, const sycl::half* b, uint64_t n) { return std::memcmp(a, b, n * 2) == 0; }
 
 // One kind at one (K, N): the solo vs fp64 reference, then every variant vs the solo.
 void run_kind(Dev& dev, BankQ kind, uint32_t K, uint32_t N, std::mt19937& rng) {
@@ -332,6 +377,39 @@ void run_kind(Dev& dev, BankQ kind, uint32_t K, uint32_t N, std::mt19937& rng) {
         check(ok, tag + "grouped down == solo, bit for bit, every pick (ycell-indexed)");
         dev.free(ys);
     }
+    {   // the slot address table (device routing phase 2): VRAM rows and pinned host rows == the slot form, bit for bit
+        const uint64_t offs[3] = {gate_off, up_off, down_off};
+        TabFixture tf = make_tab(dev, slots, slot_bytes, offs, slice, E, jobs_h.data(), P);
+        const uint64_t PN = uint64_t(P) * N;
+        sycl::half* g = dev.alloc<sycl::half>(PN); sycl::half* u = dev.alloc<sycl::half>(PN);
+        sycl::half* h0 = dev.alloc<sycl::half>(PN); sycl::half* h1 = dev.alloc<sycl::half>(PN);
+        qwen4_bank_gemv_grouped_dual(dev.q, kind, rows, nullptr, 0, 0, 0, tf.jobs, g, u, K, N, P, {}, tf.tab).wait();
+        bool ok = true;
+        for (uint32_t p = 0; p < P; ++p) ok = ok && same(g + uint64_t(p) * N, solo_g[p]) && same(u + uint64_t(p) * N, solo_u[p]);
+        qwen4_bank_gemv_grouped_dual_swiglu(dev.q, kind, rows, slots, slot_bytes, gate_off, up_off, jobs, h0, K, N, P).wait();
+        qwen4_bank_gemv_grouped_dual_swiglu(dev.q, kind, rows, nullptr, 0, 0, 0, tf.jobs, h1, K, N, P, {}, tf.tab).wait();
+        ok = ok && same_bits(h0, h1, PN);
+        const uint32_t y_stride = N + 8;
+        sycl::half* ys = dev.alloc<sycl::half>(uint64_t(P) * y_stride);
+        qwen4_bank_gemv_grouped(dev.q, kind, rows, nullptr, 0, 0, tf.jobs, ys, y_stride, K, N, P, {}, tf.tab + 2).wait();
+        for (uint32_t p = 0; p < P; ++p) ok = ok && same(ys + uint64_t(jobs_h[p * 3 + 2]) * y_stride, solo_d[p]);
+        if (qwen4_bank_has_q8dot(kind)) {
+            block_q8_1s* xq = dev.alloc<block_q8_1s>(uint64_t(P) * (K / 32));
+            quantize_q8_1s(dev.q, rows, xq, uint64_t(P) * K).wait();
+            sycl::half* g2 = dev.alloc<sycl::half>(PN); sycl::half* u2 = dev.alloc<sycl::half>(PN);
+            qwen4_bank_gemv_grouped_dual_q8s(dev.q, kind, xq, slots, slot_bytes, gate_off, up_off, jobs, g, u, K, N, P).wait();
+            qwen4_bank_gemv_grouped_dual_q8s(dev.q, kind, xq, nullptr, 0, 0, 0, tf.jobs, g2, u2, K, N, P, {}, tf.tab).wait();
+            ok = ok && same_bits(g, g2, PN) && same_bits(u, u2, PN);
+            qwen4_bank_gemv_grouped_dual_q8s_swiglu(dev.q, kind, xq, slots, slot_bytes, gate_off, up_off, jobs, h0, K, N, P).wait();
+            qwen4_bank_gemv_grouped_dual_q8s_swiglu(dev.q, kind, xq, nullptr, 0, 0, 0, tf.jobs, h1, K, N, P, {}, tf.tab).wait();
+            ok = ok && same_bits(h0, h1, PN);
+            dev.free(xq); dev.free(g2); dev.free(u2);
+        }
+        check(ok, tag + "slot address table (VRAM + pinned host rows): dual, dual+swiglu, down" +
+                  (qwen4_bank_has_q8dot(kind) ? ", int-dot dual + swiglu" : "") + " == the slot form, bit for bit");
+        dev.free(g); dev.free(u); dev.free(h0); dev.free(h1); dev.free(ys);
+        tf.release(dev);
+    }
     {   // grouped tiles: jobs of 1, 5 and 16 rows over a mega row buffer, both mats; then the batched rows (M = 33)
         const uint32_t M = 33;
         sycl::half* mega = dev.alloc<sycl::half>(uint64_t(M) * K);
@@ -532,7 +610,57 @@ void run_q4k_fused(Dev& dev, std::mt19937& rng) {
     }
     std::printf("\nQ4_K int-dot grouped dual (the daily file's decode kernel), K=%u N=%u P=%u\n", K, N, P);
     check(ok && nz > uint64_t(P) * N / 2, "Q4_K fused swiglu epilogue == int-dot dual + swiglu, bit for bit, every pick");
+    {   // the slot address table (device routing phase 2)
+        std::vector<int32_t> jh(jobs, jobs + P * 3);
+        const uint64_t offs[3] = {0, slice, UINT64_MAX};
+        TabFixture tf = make_tab(dev, slots, slot_bytes, offs, slice, E, jh.data(), P);
+        const uint64_t PN = uint64_t(P) * N;
+        sycl::half* g2 = dev.alloc<sycl::half>(PN); sycl::half* u2 = dev.alloc<sycl::half>(PN); sycl::half* h2 = dev.alloc<sycl::half>(PN);
+        gemv_q4_K_q8s_grouped_dual(dev.q, xq, nullptr, 0, 0, 0, tf.jobs, g2, u2, K, N, P, {}, tf.tab).wait();
+        gemv_q4_K_q8s_grouped_dual_swiglu(dev.q, xq, nullptr, 0, 0, 0, tf.jobs, h2, K, N, P, {}, tf.tab).wait();
+        check(same_bits(g, g2, PN) && same_bits(u, u2, PN) && same_bits(hf, h2, PN),
+              "Q4_K slot address table (VRAM + pinned host rows): int-dot dual and dual+swiglu == the slot form, bit for bit");
+        dev.free(g2); dev.free(u2); dev.free(h2);
+        tf.release(dev);
+    }
     dev.free(slots); dev.free(rows); dev.free(xq); dev.free(jobs); dev.free(g); dev.free(u); dev.free(hs); dev.free(hf);
+}
+
+// The Q5_1 grouped down (gemv_q5_1.cpp, the daily UD-Q4_K_XL's decode down kernel) through the slot address table == its
+// slot form, bit for bit: 9 picks over 12 slots, K = 640 (the down bank's K), N = 64; slots [gate | up | down] with the down
+// slice at 2*slice (the gate/up bytes are filler -- only the down entry is read).
+void run_q51_tab(Dev& dev, std::mt19937& rng) {
+    const uint32_t K = 640, N = 64, P = 9, E = 12, nblk = K / 32;
+    const uint64_t slice = uint64_t(N) * nblk * sizeof(block_q5_1), slot_bytes = 3 * slice;
+    uint8_t* slots = dev.alloc<uint8_t>(slot_bytes * E);
+    std::uniform_real_distribution<float> dsc(0.01f, 1.0f), ux(-1.f, 1.f);
+    std::uniform_int_distribution<int> byte(0, 255);
+    for (uint64_t b = 0; b < (slot_bytes * E) / sizeof(block_q5_1); ++b) {
+        auto* k = reinterpret_cast<block_q5_1*>(slots) + b;
+        k->d = half_bits(dsc(rng) * 0.05f); k->m = half_bits(-dsc(rng) * 0.05f);
+        for (auto& v : k->qh) v = uint8_t(byte(rng));
+        for (auto& v : k->qs) v = uint8_t(byte(rng));
+    }
+    sycl::half* rows = dev.alloc<sycl::half>(uint64_t(P) * K);
+    for (uint64_t i = 0; i < uint64_t(P) * K; ++i) rows[i] = sycl::half(ux(rng));
+    std::vector<int32_t> jh(P * 3);
+    for (uint32_t p = 0; p < P; ++p) { jh[p * 3 + 0] = int32_t(p); jh[p * 3 + 1] = int32_t((p * 5 + 1) % E); jh[p * 3 + 2] = int32_t(P - 1 - p); }
+    int32_t* jobs = dev.alloc<int32_t>(P * 3);
+    std::memcpy(jobs, jh.data(), P * 3 * sizeof(int32_t));
+    const uint64_t offs[3] = {0, slice, 2 * slice};
+    TabFixture tf = make_tab(dev, slots, slot_bytes, offs, slice, E, jh.data(), P);
+    const uint32_t y_stride = N + 8;
+    sycl::half* y0 = dev.alloc<sycl::half>(uint64_t(P) * y_stride); sycl::half* y1 = dev.alloc<sycl::half>(uint64_t(P) * y_stride);
+    std::memset(y0, 0, uint64_t(P) * y_stride * 2); std::memset(y1, 0, uint64_t(P) * y_stride * 2);
+    gemv_q5_1_grouped(dev.q, rows, slots, slot_bytes, 2 * slice, jobs, y0, y_stride, K, N, P).wait();
+    gemv_q5_1_grouped(dev.q, rows, nullptr, 0, 0, tf.jobs, y1, y_stride, K, N, P, {}, tf.tab + 2).wait();
+    uint64_t nz = 0;
+    for (uint64_t i = 0; i < uint64_t(P) * y_stride; ++i) { uint16_t a; std::memcpy(&a, &y0[i], 2); nz += (a != 0); }
+    std::printf("\nQ5_1 grouped down (the daily file's decode kernel), K=%u N=%u P=%u\n", K, N, P);
+    check(same_bits(y0, y1, uint64_t(P) * y_stride) && nz > uint64_t(P) * N / 2,
+          "Q5_1 slot address table (VRAM + pinned host rows): grouped down == the slot form, bit for bit");
+    tf.release(dev);
+    dev.free(slots); dev.free(rows); dev.free(jobs); dev.free(y0); dev.free(y1);
 }
 
 // IE_BANK_BENCH=1: the Q4_K decode gate/up at the daily shape (10 picks, K 2560, N 640, 48 layers walking a 64-expert bank):
@@ -605,6 +733,7 @@ int main() {
         run_kind(dev, kind, 512, 7, rng);
     }
     run_q4k_fused(dev, rng);
+    run_q51_tab(dev, rng);
     if (const char* b = std::getenv("IE_BANK_BENCH"); b && *b == '1') {   // timing, not a gate: the dual kernels at the gate/up shape
         for (BankQ kind : {BankQ::kQ5_K, BankQ::kQ6_K, BankQ::kQ8_0}) bench_dual(dev, kind, rng);
         for (BankQ kind : {BankQ::kQ5_K, BankQ::kQ6_K, BankQ::kQ8_0}) bench_tiles(dev, kind, rng);

@@ -406,6 +406,12 @@ void test_q4e_rules() {
         refused([](ie::Q4eRowsRoute& x) { x.moe_alt = true; }, "a non-default MoE route");
         refused([](ie::Q4eRowsRoute& x) { x.tp = true; }, "verify expert parallelism");
         refused([](ie::Q4eRowsRoute& x) { x.dn_mixed = true; }, "a mixed-dtype DeltaNet layer");
+        refused([](ie::Q4eRowsRoute& x) { x.dense_ffn = true; x.slots_per_layer = 0; x.top_k = 0; }, "a dense FFN (2026-11-08)");
+        {   // a dense model names the dense FFN, not "0 slots/layer hold fewer than 2 rows' top-0"
+            ie::Q4eRowsRoute d = r; d.dense_ffn = true; d.slots_per_layer = 0; d.top_k = 0;
+            check(ie::q4e_rows_route_refusal(d).find("dense FFN") != std::string::npos,
+                  "q4e_rows_route_refusal: a dense model's reason names the dense FFN");
+        }
         refused([](ie::Q4eRowsRoute& x) { x.slots_per_layer = 19; }, "19 slots/layer (< 2 x top-10)");
         ie::Q4eRowsRoute y = r;
         y.slots_per_layer = 20;

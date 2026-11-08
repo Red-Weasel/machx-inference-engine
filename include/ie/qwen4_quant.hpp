@@ -39,6 +39,8 @@ sycl::event gemv_q5_1(sycl::queue& q,
 // Grouped expert-pick variant (spec-verify MoE): one launch for ALL picks;
 // per (pick, column) the solo body runs verbatim -> bit-identical to the
 // per-pick gemv_q5_1 calls. jobs = [P x 3] int32 {vt, slot, ycell}.
+// slot_tab (null = slot_base + slot*slot_bytes + down_off): the [slot][3] address table of include/ie/qwen4_bank.hpp; this
+// kernel reads entry 0 of the row it is handed, so the caller passes slot_tab + 2 (the down entries).
 sycl::event gemv_q5_1_grouped(sycl::queue& q,
                       const sycl::half* h_rows,
                       const uint8_t* slot_base, uint64_t slot_bytes,
@@ -46,7 +48,8 @@ sycl::event gemv_q5_1_grouped(sycl::queue& q,
                       const int32_t* jobs,
                       sycl::half* ystage, uint32_t y_stride,
                       uint32_t K, uint32_t N, uint32_t P,
-                      const std::vector<sycl::event>& deps = {});
+                      const std::vector<sycl::event>& deps = {},
+                      const uint8_t* const* slot_tab = nullptr);
 
 // Grouped-tiles down-proj for the prefill expert-major MoE: one launch per
 // layer; per (job, column) each row runs the gemv_q5_1 body verbatim ->

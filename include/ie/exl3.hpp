@@ -22,7 +22,7 @@ struct Exl3Tensor {
     uint32_t K = 0;       // in_features  (= tile_k * 16)
     uint32_t N = 0;       // out_features (= tile_n * 16)
     uint32_t bits = 0;    // bpw 1..8 (= trellis.shape[-1] / 16)
-    uint32_t cb = 0;      // codebook id (0 = default; 1/2 not yet supported)
+    uint32_t cb = 0;      // codebook: 0 = 3INST (default), 1 = mcg, 2 = mul1 (the `.mcg` / `.mul1` marker tensors)
     uint32_t tile_k = 0;  // K / 16
     uint32_t tile_n = 0;  // N / 16
     // Raw trellis: int16 reinterpreted as uint16, row-major [tile_k, tile_n, 16*bits].
@@ -32,7 +32,11 @@ struct Exl3Tensor {
 // Decode `t.trellis` into `out` = W_rot[K, N] row-major (fp16 values widened to
 // float). `out` must hold K*N floats. Returns "" on success, else an error string.
 // Trellis decode + tensor-core un-permute only (the "incoherent"/rotated weights);
-// the Hadamard + suh/svh reconstruction is a separate forward step. cb=0 only.
+// the Hadamard + suh/svh reconstruction is a separate forward step. Codebooks 0 / 1 / 2.
 std::string exl3_decode_host(const Exl3Tensor& t, float* out);
+
+// One 16-bit trellis window through codebook cb (0 3INST, 1 mcg, 2 mul1) -> fp16 bits, exactly as exllamav3's
+// decode_3inst<cb> (one RNE fp16 rounding of an exact value). The device twin is exl3_decode_dev (src/ops/exl3_codebook.hpp).
+uint16_t exl3_decode_code_host(uint32_t code, uint32_t cb);
 
 }  // namespace ie

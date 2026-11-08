@@ -558,6 +558,13 @@ std::string import_exl3_to_gguf(const std::string& hf_dir, const std::string& ou
             if (t.shape.size() != 3) return "trellis not 3D: " + hf;
             const int64_t TK = t.shape[0], TN = t.shape[1], wbits = t.shape[2];
             if (wbits % 16 != 0) return "trellis last dim not /16: " + hf;
+            // The codebook rides on marker tensors (exllamav3: none = 3INST, `.mcg`, `.mul1`). The kernels read all three
+            // (gemv_exl3's cb), but the imported GGUF has no field for it yet and the forward passes cb 0: a marked tensor
+            // would decode to the wrong values without a word. Refuse it by name until the codebook is carried through.
+            if (st.find(base + ".mcg") || st.find(base + ".mul1"))
+                return "exl3 import: " + base + " uses the " + std::string(st.find(base + ".mul1") ? "mul1" : "mcg") +
+                       " codebook; this import carries codebook 0 (3INST) only (turboderp's newer quants, e.g. "
+                       "Qwen3.8-Flash-Next, are mul1)";
             // verbatim EXL3 codes; GGUF ne = {16*bits, N/16, K/16}.
             emit(gw, DType::kEXL3, {uint64_t(wbits), uint64_t(TN), uint64_t(TK)},
                  copy_bytes(t.data, t.nbytes));
@@ -736,6 +743,11 @@ std::string import_exl3_qwen3next_to_gguf(const std::string& hf_dir, const std::
         const auto* sv = need(hf_base + ".svh");
         if (!tr || !su || !sv) return;
         if (tr->shape.size() != 3) { if (err.empty()) err = "trellis not 3D: " + hf_base; return; }
+        if ((st.find(hf_base + ".mcg") || st.find(hf_base + ".mul1")) && err.empty()) {   // see the dense import's note
+            err = "exl3 import: " + hf_base + " uses the " + std::string(st.find(hf_base + ".mul1") ? "mul1" : "mcg") +
+                  " codebook; this import carries codebook 0 (3INST) only";
+            return;
+        }
         const uint64_t TK = tr->shape[0], TN = tr->shape[1], wbits = tr->shape[2];
         add_verbatim(groot + ".weight", DType::kEXL3, {wbits, TN, TK}, tr);
         add_verbatim(groot + ".suh", DType::kF16, {uint64_t(su->shape[0])}, su);
@@ -753,6 +765,14 @@ std::string import_exl3_qwen3next_to_gguf(const std::string& hf_dir, const std::
         }
         if (!trs[0] || !sus[0] || !svs[0]) return;
         if (trs[0]->shape.size() != 3) { if (err.empty()) err = "expert trellis not 3D"; return; }
+        {
+            const std::string e0 = base + "0." + hf_proj;
+            if ((st.find(e0 + ".mcg") || st.find(e0 + ".mul1")) && err.empty()) {   // see the dense import's note
+                err = "exl3 import: " + e0 + " uses the " + std::string(st.find(e0 + ".mul1") ? "mul1" : "mcg") +
+                      " codebook; this import carries codebook 0 (3INST) only";
+                return;
+            }
+        }
         const uint64_t TK = trs[0]->shape[0], TN = trs[0]->shape[1], wbits = trs[0]->shape[2];
         for (uint32_t e = 1; e < n_expert; ++e)
             if (trs[e] && trs[e]->shape[2] != int64_t(wbits) && err.empty()) {

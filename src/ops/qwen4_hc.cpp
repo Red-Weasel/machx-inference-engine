@@ -424,13 +424,195 @@ static sycl::event q4hc2_up_v3(sycl::queue& q, sycl::event e2,
     });
 }
 
+// The 8-bit down / up (Qwen4HcQ8: the GGUF's Q8_0 blocks, SoA), the v3 grids' shapes. down: a 128-lane WG per (t, row); a lane
+// takes half-blocks hb = lid, lid + 128, ... (16 int8 + the block's scale), the 16 products summed in fp32 then scaled. The
+// inject rows (i >= r) are v3's fp32 dot verbatim. Each (t, row) runs the same chain at any T (bvs: verify == decode).
+static sycl::event q4hc2_down_q8(sycl::queue& q, sycl::event e1,
+                                 const float* xn_ws, const Qwen4HcQ8 w8,
+                                 const float* w_inject, float* lo_ws,
+                                 float* inj_logits,
+                                 uint32_t T, uint32_t D, uint32_t hc,
+                                 uint32_t r) {
+    constexpr int SG = 16, WGL = 128;
+    const uint32_t rows2 = r + (w_inject ? hc : 0);
+    const int8_t* wq = w8.down_q;
+    const sycl::half* wd = reinterpret_cast<const sycl::half*>(w8.down_d);
+    return ie::ps(q, "q4hc2_down8", [&](sycl::handler& h) {
+        h.depends_on({e1});
+        sycl::local_accessor<float, 1> part(WGL / SG, h);
+        h.parallel_for(sycl::nd_range<1>(uint64_t(T) * rows2 * WGL, WGL),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const uint32_t g2 = uint32_t(it.get_group(0));
+            const uint32_t t = g2 / rows2, i = g2 % rows2;
+            const uint32_t lid = uint32_t(it.get_local_id(0));
+            auto sg = it.get_sub_group();
+            const float* xn = xn_ws + uint64_t(t) * D;
+            float p = 0.f;
+            if (i < r) {
+                const int8_t* wr = wq + uint64_t(i) * D;
+                const sycl::half* dr = wd + uint64_t(i) * (D / 32);
+                for (uint32_t hb = lid; hb < D / 16; hb += WGL) {
+                    const sycl::vec<int8_t, 16> v = *reinterpret_cast<const sycl::vec<int8_t, 16>*>(wr + uint64_t(hb) * 16);
+                    const auto* x4 = reinterpret_cast<const sycl::vec<float, 4>*>(xn + uint64_t(hb) * 16);
+                    float s = 0.f;
+                    #pragma unroll
+                    for (int c = 0; c < 4; ++c) {
+                        const sycl::vec<float, 4> xx = x4[c];
+                        #pragma unroll
+                        for (int u2 = 0; u2 < 4; ++u2) s += float(v[c * 4 + u2]) * xx[u2];
+                    }
+                    p += float(dr[hb >> 1]) * s;
+                }
+            } else {
+                const uint32_t s2 = i - r;
+                const auto* wi4 = reinterpret_cast<const sycl::vec<float, 4>*>(
+                    w_inject + uint64_t(s2) * D);
+                const auto* xn4 = reinterpret_cast<const sycl::vec<float, 4>*>(xn);
+                for (uint32_t j4 = lid; j4 < D / 4; j4 += WGL) {
+                    const sycl::vec<float, 4> a = wi4[j4], b = xn4[j4];
+                    #pragma unroll
+                    for (int u2 = 0; u2 < 4; ++u2) p += a[u2] * b[u2];
+                }
+            }
+            const float ps2 = sycl::reduce_over_group(sg, p, sycl::plus<float>());
+            if (sg.get_local_id()[0] == 0) part[sg.get_group_id()[0]] = ps2;
+            sycl::group_barrier(it.get_group());
+            if (lid != 0) return;
+            float acc = 0.f;
+            for (int j = 0; j < WGL / SG; ++j) acc += part[j];
+            if (i < r) {
+                acc /= float(hc);
+                lo_ws[uint64_t(t) * r + i] = acc / (1.f + sycl::exp(-acc));
+            } else {
+                inj_logits[uint64_t(t) * hc + (i - r)] = acc;
+            }
+        });
+    });
+}
+
+// up: a WG of hc subgroups per (t, HH consecutive channels); subgroup s reads the HH contiguous rows s*H + hh0 .. + HH-1
+// (HH * r bytes), a lane taking 4-byte chunks c = lane, lane + 16, ... of each row (the chunk's block scale c / 8). Each row's
+// chain is the same at any HH and T; the collapse over the streams is v3's (s ascending).
+template <int HH>
+static sycl::event q4hc2_up_q8(sycl::queue& q, sycl::event e2,
+                               const float* xn_ws, const Qwen4HcQ8 w8,
+                               const float* lo_ws, sycl::half* mixed,
+                               uint32_t T, uint32_t H, uint32_t hc, uint32_t r) {
+    constexpr int SG = 16;
+    const uint32_t WGL = hc * SG;
+    const uint32_t NB = H / HH;
+    const int8_t* wq = w8.up_q;
+    const sycl::half* wd = reinterpret_cast<const sycl::half*>(w8.up_d);
+    return ie::ps(q, "q4hc2_up8", [&](sycl::handler& h) {
+        h.depends_on({e2});
+        sycl::local_accessor<float, 1> sd(hc * HH, h);
+        h.parallel_for(sycl::nd_range<1>(uint64_t(T) * NB * WGL, WGL),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const uint32_t g2 = uint32_t(it.get_group(0));
+            const uint32_t t = g2 / NB, hh0 = (g2 % NB) * HH;
+            const uint32_t lid = uint32_t(it.get_local_id(0));
+            auto sg = it.get_sub_group();
+            const uint32_t s2 = uint32_t(sg.get_group_id()[0]);
+            const uint32_t lane = uint32_t(sg.get_local_id()[0]);
+            const uint32_t D = hc * H;
+            const uint64_t row0 = uint64_t(s2) * H + hh0;
+            const float* lo = lo_ws + uint64_t(t) * r;
+            #pragma unroll
+            for (int rr = 0; rr < HH; ++rr) {
+                const int8_t* wr = wq + (row0 + rr) * r;
+                const sycl::half* dr = wd + (row0 + rr) * (r / 32);
+                float p = 0.f;
+                for (uint32_t c = lane; c < r / 4; c += SG) {
+                    const sycl::vec<int8_t, 4> v = *reinterpret_cast<const sycl::vec<int8_t, 4>*>(wr + uint64_t(c) * 4);
+                    const sycl::vec<float, 4> l4 = *reinterpret_cast<const sycl::vec<float, 4>*>(lo + uint64_t(c) * 4);
+                    float s = 0.f;
+                    #pragma unroll
+                    for (int u2 = 0; u2 < 4; ++u2) s += float(v[u2]) * l4[u2];
+                    p += float(dr[c >> 3]) * s;
+                }
+                const float d = sycl::reduce_over_group(sg, p, sycl::plus<float>());
+                if (lane == 0) sd[s2 * HH + rr] = d;
+            }
+            sycl::group_barrier(it.get_group());
+            if (lid >= uint32_t(HH)) return;
+            const uint32_t hh = hh0 + lid;
+            const float* xn = xn_ws + uint64_t(t) * D;
+            float m = 0.f;
+            for (uint32_t ss = 0; ss < hc; ++ss) {
+                const float gt = 1.f / (1.f + sycl::exp(-sd[ss * HH + lid]));
+                m += xn[uint64_t(ss) * H + hh] * gt;
+            }
+            mixed[uint64_t(t) * H + hh] = sycl::half(m / float(hc));
+        });
+    });
+}
+
+// up over the lane-interleaved planes (Qwen4HcQ8::up_lanes): a WG of hc subgroups per (t, 16 channels); subgroup s, lane l
+// owns row s*H + 16*hg + l and walks it alone (16-byte chunks, the block scale every second chunk, lo from SLM) -- no
+// cross-lane reduction; its gate goes to SLM, then 16 lanes collapse the streams (s ascending, as v3).
+static sycl::event q4hc2_up_q8i(sycl::queue& q, sycl::event e2,
+                                const float* xn_ws, const Qwen4HcQ8 w8,
+                                const float* lo_ws, sycl::half* mixed,
+                                uint32_t T, uint32_t H, uint32_t hc, uint32_t r) {
+    constexpr int SG = 16;
+    const uint32_t WGL = hc * SG;
+    const uint32_t NG = H / 16;
+    const uint32_t CH = r / 16;
+    const int8_t* wq = w8.up_q;
+    const sycl::half* wd = reinterpret_cast<const sycl::half*>(w8.up_d);
+    return ie::ps(q, "q4hc2_up8i", [&](sycl::handler& h) {
+        h.depends_on({e2});
+        sycl::local_accessor<float, 1> slo(r, h);
+        sycl::local_accessor<float, 1> gsh(hc * SG, h);
+        h.parallel_for(sycl::nd_range<1>(uint64_t(T) * NG * WGL, WGL),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const uint32_t g2 = uint32_t(it.get_group(0));
+            const uint32_t t = g2 / NG, hg = g2 % NG;
+            const uint32_t lid = uint32_t(it.get_local_id(0));
+            auto sg = it.get_sub_group();
+            const uint32_t s2 = uint32_t(sg.get_group_id()[0]);
+            const uint32_t lane = uint32_t(sg.get_local_id()[0]);
+            const float* lo = lo_ws + uint64_t(t) * r;
+            for (uint32_t k = lid; k < r; k += WGL) slo[k] = lo[k];
+            sycl::group_barrier(it.get_group());
+            const uint64_t grp = (uint64_t(s2) * H) / 16 + hg;
+            const int8_t* gq = wq + grp * uint64_t(CH) * 256;
+            const sycl::half* gd = wd + grp * uint64_t(r / 32) * 16;
+            float p = 0.f;
+            #pragma unroll 4
+            for (uint32_t c = 0; c < CH; ++c) {
+                const sycl::vec<int8_t, 16> v = *reinterpret_cast<const sycl::vec<int8_t, 16>*>(gq + (uint64_t(c) * 16 + lane) * 16);
+                float sacc = 0.f;
+                #pragma unroll
+                for (int u2 = 0; u2 < 16; ++u2) sacc += float(v[u2]) * slo[c * 16 + u2];
+                p += float(gd[(c >> 1) * 16 + lane]) * sacc;
+            }
+            gsh[s2 * SG + lane] = 1.f / (1.f + sycl::exp(-p));
+            sycl::group_barrier(it.get_group());
+            if (lid >= uint32_t(SG)) return;
+            const uint32_t D = hc * H;
+            const uint32_t hh = hg * 16 + lid;
+            const float* xn = xn_ws + uint64_t(t) * D;
+            float m = 0.f;
+            for (uint32_t ss = 0; ss < hc; ++ss) m += xn[uint64_t(ss) * H + hh] * gsh[ss * SG + lid];
+            mixed[uint64_t(t) * H + hh] = sycl::half(m / float(hc));
+        });
+    });
+}
+
 // The mix after the norm (L2 + L3; the v3 grids at T <= 4): qwen4_hc_mix_v2's tail, shared with qwen4_hc_mix_v2_xn.
 static sycl::event mix_v2_tail(sycl::queue& q, sycl::event e1,
                                const sycl::half* w_down, const sycl::half* w_up, const float* w_inject,
                                const float* xn_ws, float* lo_ws, sycl::half* mixed, float* inj_logits,
-                               uint32_t T, uint32_t H, uint32_t hc, uint32_t r) {
+                               uint32_t T, uint32_t H, uint32_t hc, uint32_t r, const Qwen4HcQ8* w8) {
     const uint32_t D = hc * H;
     constexpr int SG = 16;
+    if (w8 && w8->ok() && T <= 4 && (D % 16) == 0 && (r % 64) == 0 && (H % 4) == 0) {
+        auto e2 = q4hc2_down_q8(q, e1, xn_ws, *w8, w_inject, lo_ws, inj_logits, T, D, hc, r);
+        if (w8->up_lanes && (H % 16) == 0 && (r % 32) == 0)
+            return q4hc2_up_q8i(q, e2, xn_ws, *w8, lo_ws, mixed, T, H, hc, r);
+        return q4hc2_up_q8<4>(q, e2, xn_ws, *w8, lo_ws, mixed, T, H, hc, r);
+    }
     static const bool v3_on = [] {
         const char* v = std::getenv("IE_Q4E_HC_V3");
         return !(v && v[0] == '0');
@@ -525,6 +707,18 @@ static sycl::event mix_v2_tail(sycl::queue& q, sycl::event e1,
     });
 }
 
+void qwen4_hc_q8_interleave_up(const int8_t* q8, const uint16_t* d, uint32_t D, uint32_t r, int8_t* qi, uint16_t* di) {
+    const uint32_t CH = r / 16, NB = r / 32;
+    for (uint32_t row = 0; row < D; ++row) {
+        const uint32_t g = row / 16, l = row % 16;
+        for (uint32_t c = 0; c < CH; ++c)
+            for (uint32_t u = 0; u < 16; ++u)
+                qi[((uint64_t(g) * CH + c) * 16 + l) * 16 + u] = q8[uint64_t(row) * r + c * 16 + u];
+        for (uint32_t b = 0; b < NB; ++b)
+            di[(uint64_t(g) * NB + b) * 16 + l] = d[uint64_t(row) * NB + b];
+    }
+}
+
 sycl::event qwen4_hc_mix_v2(sycl::queue& q,
                             const float* x, const float* gamma,
                             const sycl::half* w_down, const sycl::half* w_up,
@@ -533,9 +727,10 @@ sycl::event qwen4_hc_mix_v2(sycl::queue& q,
                             sycl::half* mixed, float* inj_logits,
                             uint32_t T, uint32_t H, uint32_t hc, uint32_t r,
                             float eps,
-                            const std::vector<sycl::event>& deps) {
+                            const std::vector<sycl::event>& deps,
+                            const Qwen4HcQ8* w8) {
     auto e1 = qwen4_hc_norm_l1(q, x, gamma, xn_ws, T, H, hc, eps, deps);
-    return mix_v2_tail(q, e1, w_down, w_up, w_inject, xn_ws, lo_ws, mixed, inj_logits, T, H, hc, r);
+    return mix_v2_tail(q, e1, w_down, w_up, w_inject, xn_ws, lo_ws, mixed, inj_logits, T, H, hc, r, w8);
 }
 
 sycl::event qwen4_hc_mix_v2_xn(sycl::queue& q,
@@ -544,9 +739,10 @@ sycl::event qwen4_hc_mix_v2_xn(sycl::queue& q,
                                const float* w_inject,
                                float* lo_ws, sycl::half* mixed, float* inj_logits,
                                uint32_t T, uint32_t H, uint32_t hc, uint32_t r,
-                               const std::vector<sycl::event>& deps) {
+                               const std::vector<sycl::event>& deps,
+                               const Qwen4HcQ8* w8) {
     const sycl::event e1 = deps.empty() ? sycl::event{} : q.ext_oneapi_submit_barrier(deps);
-    return mix_v2_tail(q, e1, w_down, w_up, w_inject, xn_ws, lo_ws, mixed, inj_logits, T, H, hc, r);
+    return mix_v2_tail(q, e1, w_down, w_up, w_inject, xn_ws, lo_ws, mixed, inj_logits, T, H, hc, r, w8);
 }
 
 sycl::event qwen4_hc_mix_prefill(sycl::queue& q,

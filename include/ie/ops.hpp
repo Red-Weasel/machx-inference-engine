@@ -437,7 +437,11 @@ sycl::event gemv_q4_K_q8s_grouped_dual(sycl::queue& q,
                          const int32_t* jobs,
                          sycl::half* g_out, sycl::half* u_out,
                          uint32_t K, uint32_t N, uint32_t P,
-                         const std::vector<sycl::event>& deps = {});
+                         const std::vector<sycl::event>& deps = {},
+                         const uint8_t* const* slot_tab = nullptr);
+// slot_tab (2026-11-08, device routing phase 2; null = the slot arithmetic above): an address table [slot][3] {gate, up, down}
+// -- a job's slot indexes the table, so a pick can read a VRAM cache slot or an expert's slices in pinned host memory (the
+// read-through miss). The dual kernels read entries 0 and 1 of the slot's row; same bytes, same results.
 // The same with swiglu fused into the epilogue: writes h_out[p*N ..] = silu(f16(g)) * f16(u), bit-identical to
 // gemv_q4_K_q8s_grouped_dual followed by swiglu() over P x N (the decode host gap, option 1, 2026-11-08).
 sycl::event gemv_q4_K_q8s_grouped_dual_swiglu(sycl::queue& q,
@@ -447,7 +451,8 @@ sycl::event gemv_q4_K_q8s_grouped_dual_swiglu(sycl::queue& q,
                          const int32_t* jobs,
                          sycl::half* h_out,
                          uint32_t K, uint32_t N, uint32_t P,
-                         const std::vector<sycl::event>& deps = {});
+                         const std::vector<sycl::event>& deps = {},
+                         const uint8_t* const* slot_tab = nullptr);
 sycl::event gemv_q4_K_q8s_grouped_tiles(sycl::queue& q,
                          const void* x_q8s_mega,
                          const uint8_t* slot_base, uint64_t slot_bytes,
@@ -1377,15 +1382,16 @@ sycl::event gemm_q6_K(sycl::queue& q,
                       uint32_t M, uint32_t K, uint32_t N,
                       const std::vector<sycl::event>& deps = {});
 
-// EXL3 (QTIP-based, cb=0) trellis-decode GEMV: y[1,N] = A[1,K] @ W_rot[K,N],
+// EXL3 (QTIP-based) trellis-decode GEMV: y[1,N] = A[1,K] @ W_rot[K,N],
 // W_rot decoded on the fly from the EXL3 tail-biting trellis `codes` (raw int16
 // bytes, [K/16, N/16, 16*bits]). DECODE-ONLY — the Hadamard incoherence + suh/svh
-// scales wrap this kernel (see gemv_exl3_forward). K, N multiples of 16. cb=0.
+// scales wrap this kernel (see gemv_exl3_forward). K, N multiples of 16. cb = the codebook (0 3INST, 1 mcg, 2 mul1 --
+// src/ops/exl3_codebook.hpp; cb 0 decodes with the expression the engine shipped).
 sycl::event gemv_exl3(sycl::queue& q,
                       const sycl::half* A, const void* codes,
                       sycl::half* y,
                       uint32_t K, uint32_t N, uint32_t bits,
-                      const std::vector<sycl::event>& deps = {});
+                      const std::vector<sycl::event>& deps = {}, uint32_t cb = 0);
 
 // Full EXL3 linear forward (the engine entry point): y = had128(A⊙suh) @ W_rot,
 // then had128(·)⊙svh. Manages per-device scratch internally. suh is F16[K], svh
@@ -1395,20 +1401,20 @@ sycl::event gemv_exl3_forward(sycl::queue& q,
                               const sycl::half* suh, const sycl::half* svh,
                               sycl::half* y,
                               uint32_t K, uint32_t N, uint32_t bits,
-                              const std::vector<sycl::event>& deps = {});
+                              const std::vector<sycl::event>& deps = {}, uint32_t cb = 0);
 
 // BATCHED EXL3 linear forward (PREFILL entry point): the T-row analog of
 // gemv_exl3_forward. A is [T,K] row-major, y is [T,N]. Same forward composition
 // per row (had128(A⊙suh) → trellis decode-MAC → had128(acc)⊙svh). The prize is
 // to decode each trellis tile once and MAC it against all T activation rows.
 // The trellis decode is ALU-bound, so amortizing it over the batch is the win
-// (see docs/exl3_expansion_handoff_2026-07-07.md). cb=0.
+// (see docs/exl3_expansion_handoff_2026-07-07.md). cb as gemv_exl3.
 sycl::event gemm_exl3(sycl::queue& q,
                       const sycl::half* A, const void* codes,
                       const sycl::half* suh, const sycl::half* svh,
                       sycl::half* y,
                       uint32_t T, uint32_t K, uint32_t N, uint32_t bits,
-                      const std::vector<sycl::event>& deps = {});
+                      const std::vector<sycl::event>& deps = {}, uint32_t cb = 0);
 
 // Row-batched EXL3 trellis-decode GEMV for fused MoE: for each row r∈[0,R),
 // y[r, :N] = A[r, :K] @ W_rot(expert = row_expert[r]), where expert e's trellis
@@ -1422,7 +1428,12 @@ sycl::event gemv_exl3_moe(sycl::queue& q,
                           const int32_t* row_expert,
                           sycl::half* y,
                           uint32_t K, uint32_t N, uint32_t R, uint32_t bits,
-                          const std::vector<sycl::event>& deps = {});
+                          const std::vector<sycl::event>& deps = {}, uint32_t cb = 0);
+
+// Every 16-bit EXL3 code through codebook cb on the device (the decode the GEMVs inline; ie-exl3-codebook-test [F] checks all
+// 65536 x 3 against exl3_decode_code_host).
+sycl::event exl3_decode_codes(sycl::queue& q, const uint16_t* codes, uint32_t n, uint32_t cb, sycl::half* out,
+                              const std::vector<sycl::event>& deps = {});
 
 // 128-point Sylvester Walsh–Hadamard transform (norm 1/sqrt(128)) applied
 // block-wise to `x` (length `n`, a multiple of 128) → `y`. EXL3's runtime
