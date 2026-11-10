@@ -1060,3 +1060,19 @@ add_executable(idle_spin_test
 target_include_directories(idle_spin_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
 target_link_libraries(idle_spin_test PRIVATE Threads::Threads)
 add_test(NAME idle_spin_test COMMAND idle_spin_test)
+
+# 2026-11-08: read_qwen35moe_config -- the owner's 35B-A3B files read back QwenConfig's defaults exactly (header parse, no
+# GPU; absent files skip). See tests/unit/qwen35moe_config_test.cpp.
+add_executable(qwen35moe_config_test unit/qwen35moe_config_test.cpp)
+target_link_libraries(qwen35moe_config_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME qwen35moe_config_test COMMAND qwen35moe_config_test)
+
+# 2026-11-10: the request lanes' restart points -- the record / slot rules (host-only). See include/ie/q4e_lane_ladder.hpp.
+add_executable(q4e_lane_ladder_test unit/q4e_lane_ladder_test.cpp)
+target_include_directories(q4e_lane_ladder_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+add_test(NAME q4e_lane_ladder_test COMMAND q4e_lane_ladder_test)
+
+# 2026-11-10 (known_bugs 51): ie::moe_router on every router shape against a host reference (GPU).
+add_executable(moe_router_any_test unit/moe_router_any_test.cpp)
+target_link_libraries(moe_router_any_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME moe_router_any_test COMMAND moe_router_any_test)

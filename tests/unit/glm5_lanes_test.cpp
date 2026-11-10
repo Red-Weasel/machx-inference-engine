@@ -558,7 +558,10 @@ int main() {
             if (lane != 0) return;
             bool tk = true;
             if (pos0 == 0) seen.push_back("resub:" + pipe.submit(0, ids, 1, pos0 + T));   // B is in flight behind it
-            else seen.push_back("ahead-in-cb:" + pipe.submit_ahead(0, ids, 1, pos0 + T, tk) + (tk ? "taken" : "not taken"));
+            else {   // (two statements: the call writes tk, and operands of + have no fixed order -- g++ read tk first)
+                const std::string r = pipe.submit_ahead(0, ids, 1, pos0 + T, tk);
+                seen.push_back("ahead-in-cb:" + r + (tk ? "taken" : "not taken"));
+            }
         };
         auto wait_for = [](std::atomic<bool>& f) { for (int i = 0; i < 2000 && !f.load(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(1)); return f.load(); };
         check(pipe.start(2, stage, done).empty(), "start (lookahead rules)");

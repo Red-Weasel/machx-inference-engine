@@ -725,10 +725,27 @@ inline DenseQuantPtr upload_quant_dense_permuted(DeviceAllocator& alloc,
         out.p = d; out.dt = DType::kF16;
         return out;
     }
+    // Q5_K / Q8_0 / the host-fallback quants (2026-11-08, found by the generic mini oracle: every Llama / Mistral / Granite
+    // Q8_0 or Q5_K file was refused here): the same byte-exact row shuffle (each output row is a contiguous whole-block
+    // span), then the upload every other weight of that dtype takes (LQ -> upload_quant_dense_auto) -- what the
+    // tensor-parallel row_slice_perm above already did.
+    if (t->dtype == DType::kQ5_K || t->dtype == DType::kQ8_0 || is_host_fallback_dtype(t->dtype)) {
+        const uint64_t rb = t->nbytes / N;
+        if (rb * N != t->nbytes) {
+            err = std::string("permute upload '") + std::string(t->name) + "': nbytes not divisible by N rows";
+            return out;
+        }
+        std::vector<uint8_t> staging(t->nbytes);
+        for (uint64_t i = 0; i < N; ++i)
+            std::memcpy(staging.data() + i * rb, t->data + uint64_t(perm[i]) * rb, rb);
+        GgufTensorInfo sp = *t;
+        sp.data = staging.data();   // host buffer; upload_quant_dense_auto copies it before staging goes out of scope
+        return upload_quant_dense_auto(alloc, &sp, owned, err, c32);
+    }
     if (t->dtype != DType::kQ4_K && t->dtype != DType::kQ6_K) {
         err = std::string("permute upload '") + std::string(t->name) +
               "': dtype " + std::string(type_name(t->dtype)) +
-              " unsupported (Q4_K/Q6_K/F16)";
+              " unsupported (Q4_K/Q5_K/Q6_K/Q8_0/F16 and the host-fallback quants)";
         return out;
     }
     const uint64_t row_bytes = t->nbytes / N;

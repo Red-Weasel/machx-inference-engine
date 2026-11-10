@@ -17,6 +17,8 @@
 //    spec 12 §6).
 #pragma once
 
+#include <cstdio>
+
 #include "ie/prefill_gemm.hpp"       // AttnGemmScratch (P4 B49)
 #include "ie/allocator.hpp"
 #include "ie/deltanet_state.hpp"
@@ -736,7 +738,37 @@ private:
         std::vector<int16_t>  slot_of;        // [n_experts] -> slot or -1
         std::vector<int32_t>  expert_in;      // [C] -> expert id or -1
         std::vector<uint64_t> last_use;       // [C] LRU stamps
+        std::vector<uint8_t>  prot;           // [C] IE_Q4E_ECACHE_SLRU: 1 = protected (used again since it was loaded)
+        uint32_t n_prot = 0;
     };
+    // IE_Q4E_ECACHE_SLRU=1 (2026-11-10, OPT-IN experiment; scripts/q4e_cache_sim.py measures what it would miss on a real
+    // trace): segmented LRU with what the cache already keeps -- a last-use stamp a slot and one flag. A slot enters on
+    // probation; a second use protects it; above (slots - slots / 5) protected slots the least recent one loses the flag.
+    // A miss takes the least recent PROBATION slot that this layer's forward has not used (`since`: its picks are being
+    // read), and falls back to the LRU rule when there is none. Off (the default): exactly the LRU scan as before. Host
+    // routing only (the device routing's settle keeps its own LRU scan, so SLRU turns the device routing off).
+    bool ecache_slru_ = false;
+    void ecache_use(ECache& ec, uint32_t sl) {   // a use of a resident slot
+        if (!ecache_slru_ || ec.prot[sl]) return;
+        ec.prot[sl] = 1;
+        const uint32_t cap = ecache_slots_ - std::max<uint32_t>(1u, ecache_slots_ / 5u);
+        if (++ec.n_prot <= cap) return;
+        uint32_t d = UINT32_MAX; uint64_t best = UINT64_MAX;
+        for (uint32_t c = 0; c < ecache_slots_; ++c)
+            if (ec.prot[c] && c != sl && ec.last_use[c] < best) { best = ec.last_use[c]; d = c; }
+        if (d != UINT32_MAX) { ec.prot[d] = 0; --ec.n_prot; }
+    }
+    uint32_t ecache_victim(ECache& ec, uint64_t since) {
+        uint32_t v = 0; uint64_t best = UINT64_MAX; bool found = false;
+        if (ecache_slru_)
+            for (uint32_t c = 0; c < ecache_slots_; ++c)
+                if (!ec.prot[c] && ec.last_use[c] <= since && ec.last_use[c] < best) { best = ec.last_use[c]; v = c; found = true; }
+        if (!found)
+            for (uint32_t c = 0; c < ecache_slots_; ++c)
+                if (ec.last_use[c] < best) { best = ec.last_use[c]; v = c; }
+        if (ecache_slru_ && ec.prot[v]) { ec.prot[v] = 0; --ec.n_prot; }
+        return v;
+    }
     std::vector<ECache> ecache_;
     // 2026-11-08 device routing (option 2 phase 3; default on, IE_Q4E_DEV_ROUTE=0 = off; docs/research/2026-11-08-flashnext-device-routing-design.md):
     // the decode / verify MoE layers route on the device (qwen4_route_jobs_dev) and the grouped pick kernels read through a
@@ -820,6 +852,20 @@ private:
     std::unique_ptr<sycl::queue> copyq_;
 public:
     uint64_t ecache_hits = 0, ecache_misses = 0;   // perf counters (host)
+    // IE_Q4E_PICK_TRACE=<prefix> (2026-11-10): every host-routed expert access as a uint32 ((layer << 16) | expert) appended
+    // to <prefix>.layers<lo>-<hi>.u32, in order, each layer's forward opened by a marker (bit 31 | layer << 16 | rows) -- the input of scripts/q4e_cache_sim.py (what another eviction policy or
+    // slot count would miss on real traffic). Run with IE_Q4E_DEV_ROUTE=0 so every forward routes on the host.
+    std::FILE* pick_trace_ = nullptr;
+    void trace_mark(uint32_t L, uint32_t rows) {   // a layer's forward begins: bit 31, the layer, the rows (<= 16: decode / verify)
+        if (!pick_trace_) return;
+        const uint32_t r = 0x80000000u | (L << 16) | (rows < 0xFFFFu ? rows : 0xFFFFu);
+        std::fwrite(&r, sizeof r, 1, pick_trace_);
+    }
+    void trace_pick(uint32_t L, uint32_t e) {
+        if (!pick_trace_) return;
+        const uint32_t r = (L << 16) | (e & 0xFFFFu);
+        std::fwrite(&r, sizeof r, 1, pick_trace_);
+    }
     uint64_t dr_host_reads() const noexcept { return dr_reads_host_; }   // device routing: picks read from the pinned bank
     // Decode router-sync breakdown (grouped T=1 path): time blocked in the
     // per-layer logits D2H .wait() vs host routing + job build + H2D submit.

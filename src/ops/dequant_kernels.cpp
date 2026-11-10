@@ -433,10 +433,11 @@ sycl::event dequant_mxfp4_to_Bt(sycl::queue& q, const void* packed_in,
 
     return ie::ps(q, "dequant_mxfp4_bt", [&](sycl::handler& h) {
         h.depends_on(deps);
-        h.parallel_for(sycl::nd_range<2>({blocks_per_col, N}, {1, WG}),
+        h.parallel_for(sycl::nd_range<2>({blocks_per_col, (N + WG - 1) / WG * WG}, {1, WG}),   // any N: whole work-groups (2026-11-08)
                        [=](sycl::nd_item<2> it) {
             const uint32_t b = uint32_t(it.get_group(0));
             const uint32_t n = uint32_t(it.get_global_id(1));
+            if (n >= N) return;
             const int lut[16] = {0, 1, 2, 3, 4, 6, 8, 12,
                                  0, -1, -2, -3, -4, -6, -8, -12};
             const block_mxfp4& blk = W[uint64_t(n) * blocks_per_col + b];
@@ -461,10 +462,11 @@ sycl::event dequant_q6_K_to_Bt(sycl::queue& q, const void* packed_in,
 
     return ie::ps(q, "dequant_q6k_bt", [&](sycl::handler& h) {
         h.depends_on(deps);
-        h.parallel_for(sycl::nd_range<2>({blocks_per_col, N}, {1, WG}),
+        h.parallel_for(sycl::nd_range<2>({blocks_per_col, (N + WG - 1) / WG * WG}, {1, WG}),   // any N: whole work-groups (2026-11-08)
                        [=](sycl::nd_item<2> it) {
             const uint32_t b = uint32_t(it.get_group(0));
             const uint32_t n = uint32_t(it.get_global_id(1));
+            if (n >= N) return;
             const block_q6_K& blk = W[uint64_t(n) * blocks_per_col + b];
             sycl::half* dst = out + uint64_t(b) * 256 * N + n;
 
@@ -529,10 +531,11 @@ sycl::event dequant_q6_K_soa_to_Bt(sycl::queue& q, const void* soa_bank_expert_s
 
     return ie::ps(q, "dequant_q6k_soa_bt", [&](sycl::handler& h) {
         h.depends_on(deps);
-        h.parallel_for(sycl::nd_range<2>({blocks_per_col, N}, {1, WG}),
+        h.parallel_for(sycl::nd_range<2>({blocks_per_col, (N + WG - 1) / WG * WG}, {1, WG}),   // any N: whole work-groups (2026-11-08)
                        [=](sycl::nd_item<2> it) {
             const uint32_t b = uint32_t(it.get_group(0));
             const uint32_t n = uint32_t(it.get_global_id(1));
+            if (n >= N) return;
             const uint64_t bi = uint64_t(n) * blocks_per_col + b;
 
             // Per-block plane slices (strides: ql 128, qh 64, scales 16, d 2).
@@ -592,10 +595,11 @@ sycl::event dequant_q4_moe_soa_to_Bt(sycl::queue& q, const void* soa_bank_expert
 
     return ie::ps(q, "dequant_q4moe_soa_bt", [&](sycl::handler& h) {
         h.depends_on(deps);
-        h.parallel_for(sycl::nd_range<2>({blocks_per_col, N}, {1, WG}),
+        h.parallel_for(sycl::nd_range<2>({blocks_per_col, (N + WG - 1) / WG * WG}, {1, WG}),   // any N: whole work-groups (2026-11-08)
                        [=](sycl::nd_item<2> it) {
             const uint32_t b = uint32_t(it.get_group(0));
             const uint32_t n = uint32_t(it.get_global_id(1));
+            if (n >= N) return;
             const uint64_t bi = uint64_t(n) * blocks_per_col + b;
 
             const uint8_t* qs     = qs_plane + bi * 128u;
@@ -727,10 +731,11 @@ sycl::event dequant_q8_0_to_Bt(sycl::queue& q, const void* packed_in,
 
     return ie::ps(q, "dequant_q8_0_bt", [&](sycl::handler& h) {
         h.depends_on(deps);
-        h.parallel_for(sycl::nd_range<2>({blocks_per_col, N}, {1, WG}),
+        h.parallel_for(sycl::nd_range<2>({blocks_per_col, (N + WG - 1) / WG * WG}, {1, WG}),   // any N: whole work-groups (2026-11-08)
                        [=](sycl::nd_item<2> it) {
             const uint32_t b = uint32_t(it.get_group(0));
             const uint32_t n = uint32_t(it.get_global_id(1));
+            if (n >= N) return;
             const block_q8_0& blk = W[uint64_t(n) * blocks_per_col + b];
             sycl::half* dst = out + uint64_t(b) * 32 * N + n;
             const float d = dev_fp16_to_fp32(blk.d);

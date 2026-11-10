@@ -33,7 +33,8 @@ sycl::event dequant_q6_K(sycl::queue& q, const void* packed_in,
 // (docs/prefill_attack_plan_2026-06-09.md, E1).  Input W is the usual
 // GGUF packed layout: N output columns, each with K/256 super-blocks along K.
 // Output is B^T fp16 [K, N] row-major (out[k*N + n]) — the layout gemm_fp16
-// consumes directly.  Requires K % 256 == 0 and N % 64 == 0.
+// consumes directly.  Requires K % 256 == 0; any N (Q6_K since 2026-11-08: the grid is rounded up to whole
+// work-groups and the padding items return; Q4_K has its per-column fallback).
 sycl::event dequant_q4_K_to_Bt(sycl::queue& q, const void* packed_in,
                                sycl::half* out, uint32_t K, uint32_t N,
                                const std::vector<sycl::event>& deps = {});
@@ -47,7 +48,7 @@ sycl::event dequant_mxfp4(sycl::queue& q, const void* packed_in,
                           sycl::half* out, size_t n_elements,
                           const std::vector<sycl::event>& deps = {});
 // MXFP4 → B^T fp16 [K,N] (out[k*N+n]) — feeds the per-expert oneDNN MoE GEMM,
-// mirroring dequant_q4_K_to_Bt. K % 32 == 0, N % 64 == 0.
+// mirroring dequant_q4_K_to_Bt. K % 32 == 0, any N (2026-11-08).
 sycl::event dequant_mxfp4_to_Bt(sycl::queue& q, const void* packed_in,
                                 sycl::half* out, uint32_t K, uint32_t N,
                                 const std::vector<sycl::event>& deps = {});
@@ -65,7 +66,7 @@ sycl::event dequant_mxfp4_soa_to_Bt(sycl::queue& q,
 // `soa_bank_expert_slice` is the per-expert region base (bank + e*expert_stride);
 // the kernel reads the four de-interleaved planes (ql|qh|scales|d) at the
 // q6k_soa_offsets within that region. Bit-identical output to dequant_q6_K_to_Bt
-// on the same weight (the SoA repack is a pure byte reorder). K%256==0, N%64==0.
+// on the same weight (the SoA repack is a pure byte reorder). K%256==0, any N (2026-11-08).
 sycl::event dequant_q6_K_soa_to_Bt(sycl::queue& q, const void* soa_bank_expert_slice,
                                    sycl::half* out, uint32_t K, uint32_t N,
                                    const std::vector<sycl::event>& deps = {});
@@ -74,7 +75,7 @@ sycl::event dequant_q6_K_soa_to_Bt(sycl::queue& q, const void* soa_bank_expert_s
 // the three de-interleaved planes (qs|scales|dm) at q4k_soa_offsets; scales stay the
 // PACKED 6-bit get_scale_min_k4 form (NOT the dense-unpacked layout that
 // dequant_q4_soa_to_Bt expects) and dm = {d,dmin} fp16 pairs. Bit-identical output to
-// dequant_q4_K_to_Bt on the same weight (pure byte reorder). K%256==0, N%64==0.
+// dequant_q4_K_to_Bt on the same weight (pure byte reorder). K%256==0, any N (2026-11-08).
 sycl::event dequant_q4_moe_soa_to_Bt(sycl::queue& q, const void* soa_bank_expert_slice,
                                      sycl::half* out, uint32_t K, uint32_t N,
                                      const std::vector<sycl::event>& deps = {});

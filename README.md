@@ -39,6 +39,7 @@
 
 **Latest**
 
+- **v0.2.39, November 10 — long conversations stop re-reading themselves:** on the request lanes (`--parallel N`) one changed token anywhere in a conversation's history used to re-read the whole prompt — 53 times and 7,711 seconds in one 37-hour session. Every lane now keeps [restart points](#new-in-v0239): a prompt with one word changed 85 % in reads in **14.6 s instead of 38.3 s**, a rewritten last turn reads 30 tokens instead of 33,609, replies byte-identical. Also: a reference check for [any architecture and any quant](#new-in-v0239) that found and fixed five engine defects, dense models on Intel GPUs without a matrix engine, and a 40-minute soak gate.
 - **v0.2.38, November 8 — Flash-Next on four cards reads prompts up to 60 % faster:** on three or more cards every stage of the [layer split](#new-in-v0238) now reads its part of the prompt on its own thread; before, stages 1 … N − 1 read one after another. A 12,069-token prompt on four stages (two per card here) reads **572 → 910 tok/s**, and **610 → 975** with the request lanes, with byte-identical replies. The scheduling is a small header with its own race test, and two cards are unchanged. [Details](#new-in-v0238)
 - **v0.2.37, November 8 — Qwen 4's possible shapes tested before the weights exist, and Flash-Next decodes 12 % faster:** a new [mini end-to-end check](#new-in-v0237) builds small random models from the Hugging Face reference code in 15 shapes a Qwen 4 tier may take (dense, hidden 5120, 4 KV heads, no sparse-attention indexer, fused expert banks, …), writes them in llama.cpp's layout and compares the engine's output with the reference. It found that hidden 5120 lost the GPU and that dense and indexer-less files were refused; all fixed. Fused gate/up expert banks load. Flash-Next's hyper-connection mixing reads 8-bit and its expert routing runs on the GPU when that pays: two cards **44.4 → 49.7 tok/s**, the tokens unchanged. [Details](#new-in-v0237)
 - **v0.2.36, November 8 — Qwen 4 day-one readiness, Flash-Next decodes faster, and a request can no longer forge a control token:** every community quant of [Flash-Next](#new-in-v0236) (the Qwen 4 preview architecture) streams on its own kernels — Q8_0, Q5_K, Q6_K, Q5_0 and Q4_0 expert banks beside Q4_K — proven on Unsloth's UD-Q5_K_XL, UD-Q6_K_XL and Q8_0 builds; the MTP head loads in llama.cpp's layout; integer-dot and XMX kernels for the bigger quants (the Q8_0 build reads 87.4 → 103.9 tok/s on two cards). The decode step lost launches, a 3× faster sparse attention and a 4× faster router GEMV: two cards **41.1 → 44.4 tok/s**, the step at ~3K context 26.2 → 21.0 ms of GPU time, the output identical. Every chat renderer now keeps a control-token spelling inside a request's own text as text (a fetched page could open a turn or a tool call), a tool call whose JSON lost its last bracket is repaired, and DeepSeek-V4.1 serves with the expert ranking profiled on its own traffic (code-writing replies 7.8 → 12.8 tok/s). [Details](#new-in-v0236)
@@ -216,6 +217,54 @@ class ([New in v0.2.6](#new-in-v026)).
 
 ![DeepSeek-V4.1-Flash running locally in the Dream Agent Harness, served by Mach X on two Arc Pro B70 cards](docs/images/dream-deepseek-v41.png)
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
+
+---
+
+<a id="new-in-v0239"></a>
+## 🆕 New in v0.2.39
+
+### Long conversations stop re-reading themselves (Flash-Next, request lanes)
+
+With `--parallel N` a lane's prompt cache was all or nothing: one changed token anywhere in the history re-read the whole prompt. In one 37-hour session at `--parallel 4 --spec`, ctx 262000, that happened 53 times and cost 7,711 seconds — the worst single read took 332 s for 215,566 tokens.
+
+- **Restart points on every lane.** While a prompt is read, every stage keeps copies of its recurrent state: every 8,192 tokens and at the last four turn boundaries, in pinned system RAM, allocated on first use. A prompt that changed its history is read from the copy below the change; the KV rows under it never left.
+- **Gated byte-identical** to `IE_Q4E_LANE_LADDER=0` on a 33.6K-token prompt at 2 cards, 4 lanes, `--spec`: alone, with a second lane decoding the whole time (the read goes through the lane pipe), and on a 4-stage chain.
+
+  | Request | Before | Now |
+  |---|---|---|
+  | One word changed 85 % into the prompt | 38.3 s (33,584 tokens read) | 14.6 s (9,008 read) |
+  | The last assistant turn rewritten | a full re-read | 30 tokens read |
+  | The first word changed | a full read | a full read (nothing can be reused) |
+
+- **A restart point never steals a lane.** It makes a lane the prompt's own only when the prompt is that lane's conversation — about as long as it, or sharing at least half of it.
+- **The log names the cause.** `[q4e lanes] lane L: the prompt (N tokens) leaves the lane's conversation (S tokens) at token X (P % in), after "…": the conversation went on "…", the prompt goes on "…"`. `IE_Q4E_DIVERGE_LOG=0` drops the text.
+- **Soaked** for 40 minutes on that launch (`scripts/soak/`): 116 turns up to 118K tokens with 36 in-place history edits, a repeated greedy job whose reply never changed, client disconnects and bursts — no GPU fault, no error line, 972,064 tokens not re-read.
+
+### A reference check for any architecture and any quant
+
+`scripts/mini_oracle/generic_mini.py` builds a tiny random model with transformers, converts it with llama.cpp's own converter (or re-quantizes it with `llama-quantize`), runs the engine on it and compares every step's logits with the reference — about a minute a shape, no download, and a planted bug must fail each check. What it found:
+
+| Found | Now |
+|---|---|
+| A matrix width that is not a multiple of 64 aborted the load (10 kernels) | Fixed, with a regression test |
+| Every Llama / Mistral / Granite file in Q8_0 or Q5_K was refused | Fixed |
+| `qwen35moe` read no shape from the file | The shape is read; a shape other than 35B-A3B's is refused with a message naming both |
+| `moe_router` did nothing for any shape but 256 experts / top-8 | A general router, unit-tested on 7 shapes |
+| The shared expert ran at the routed experts' width | Its own width |
+
+Passing against the reference: qwen3, qwen2, llama, mistral, granite, qwen35 (Q8_0); llama Q4_K_M, qwen3 Q5_K_M, qwen2 IQ4_XS, qwen3moe Q4_K_M / Q6_K. Still refused: a Q8_0 token embedding on qwen3moe / qwen3next, and `qwen35moe` shapes other than 35B-A3B (their decode rows still leave the reference on random-weight models).
+
+### Intel GPUs without a matrix engine
+
+A GPU with no XMX (an integrated Xe-LPG, for one) now serves the dense models (qwen3 / qwen2 / llama family) with no switch: the engine sees the missing capability and takes its SIMD kernels. On an Arrow Lake integrated GPU a 2-layer test model matches the reference (cosine 0.999998). Other architectures still need XMX.
+
+### Stability and tooling
+
+- `IE_Q4E_NO_PIN_BANKS=1` (the low-RAM mode) stages expert uploads through pinned memory by itself, so the copy engine never reads pageable file memory. No speed cost in that mode (347 vs 357 tok/s reading); replies identical. `IE_Q4E_PINNED_UPLOADS=0` keeps the old direct copies.
+- `scripts/soak/soak.sh` — the traffic gate above, for any launch line.
+- `scripts/ci/host_tests.sh` and a GitHub Actions workflow: the 19 unit tests that need no GPU, built with plain g++ on every push.
+- `scripts/compare/head_to_head.sh` — Mach X against llama.cpp builds on the same box and the same file, losses included.
+- `IE_Q4E_PICK_TRACE` + `scripts/q4e_cache_sim.py` — record the expert accesses of real traffic and replay them through other cache policies. First result: an opt-in segmented LRU (`IE_Q4E_ECACHE_SLRU=1`) would miss 31–39 % fewer decode accesses on mixed four-lane traffic, and measured no decode gain in a single conversation (37.5 vs 37.2 tok/s) — so it stays off.
 
 ---
 

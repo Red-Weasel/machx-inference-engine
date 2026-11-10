@@ -18,6 +18,7 @@
 #include <future>
 #include "ie/qwen4exp.hpp"
 #include "ie/deep_pipe.hpp"
+#include "ie/q4e_lane_ladder.hpp"
 #include "ie/q4e_lanes.hpp"
 #include "ie/q35m_lanes.hpp"
 #include "ie/q27_lanes.hpp"
@@ -805,9 +806,13 @@ public:
           pipe_(make_pipe(this, b, n_lanes, q4e_plan_max_rows(pf_chunk, pipeline_), rows, max_group, group_cap)) {
         stop_[0] = tok.eos_token_id(); stop_[1] = stop_ids[0]; stop_[2] = stop_ids[1];
         tool_[0] = tool_ids[0]; tool_[1] = tool_ids[1];
+        lad_init();
     }
     ~Q4eLanesModel() override {
         (void)pipe_.stop();
+        if (lad_step_)
+            std::fprintf(stderr, "[qwen4exp] lane restart points: %llu copies taken, %llu restarts, %llu tokens not re-read\n",
+                         (unsigned long long)lad_copies_, (unsigned long long)lad_restores_, (unsigned long long)lad_saved_);
         if (rows_) {   // P4 B17: how the decode steps grouped (groups that finished every stage, by size)
             const std::vector<uint64_t> gs = pipe_.group_sizes();
             std::string line;
@@ -1017,12 +1022,16 @@ public:
     uint32_t n_lanes() const override { return uint32_t(snap_.size()); }
     // the engine's rule: a prompt must be below ctx - 8, and the reply fits in ctx - 8 - prompt
     uint32_t lane_cap(uint32_t lane) const override { const uint32_t c = b_.A.lane_ctx(lane); return c > 8 ? c - 8 : 0; }
-    uint32_t own_match(uint32_t lane, std::span<const int32_t> ids) const override { return q4e_snap_match(snap_[lane], ids); }
+    uint32_t own_match(uint32_t lane, std::span<const int32_t> ids) const override {
+        const uint32_t s = q4e_snap_match(snap_[lane], ids);
+        return std::max(s, lad_own(lane, ids));   // (2026-11-10: the lane's restart points, for a prompt that is this lane's conversation)
+    }
     bool occupied(uint32_t lane) const override { return !snap_[lane].empty(); }
     uint32_t last_end(uint32_t lane) const override { return uint32_t(snap_[lane].size()); }
 
     std::string prefix_prepare(uint32_t lane, const LanesRequest& rq, uint32_t& reused, std::string& source) override {
         reused = 0;
+        if (lane < lad_pt_.size()) { std::lock_guard<std::mutex> g(lad_mu_); lad_pt_[lane] = uint32_t(rq.ids->size()); }
         // 2026-10-23: a lazy lane's state (and lane 0's head state) on its first request -- out of the expert cache
         if (auto e = b_.each_stage([lane](Qwen4ExpModel& M) { return M.lane_ensure(lane); }); !e.empty()) return e;
         if (auto e = select(lane); !e.empty()) return e;
@@ -1037,6 +1046,7 @@ public:
             b_.reset_all();   // (drops the staging of an earlier image request too)
             b_.each_stage_v([](Qwen4ExpModel& M) { M.drop_snapshot(); });
             snap_[lane].clear();
+            lad_reset(lane);
             head_sync(lane, 0);
             for (uint32_t st = 0; st < b_.n_stages(); ++st)   // (the serial turn's prefill runs on this staging)
                 if (auto e = stage_vision(b_.stage(st), st, v); !e.empty()) return e;
@@ -1044,6 +1054,40 @@ public:
         }
         // --parallel 1's rule: restore only when the snapshot's tokens are a STRICT prefix of the prompt (all or nothing)
         const uint32_t D = q4e_snap_match(snap_[lane], *rq.ids);
+        if (D == 0) diverge_note(lane, *rq.ids);   // 2026-11-10: a long conversation the prompt does not extend: say where it leaves
+        // 2026-11-10: the lane's in-place restart points (ie/q4e_lane_ladder.hpp). The snapshot rule above is all or nothing (the recurrent state cannot
+        // be truncated), so ONE changed token anywhere in the history re-read the whole prompt -- the owner's 37 h session:
+        // 53 full re-reads, 7,711 s, up to 332 s for 215K tokens. The KV / indexer rows below the change are still in place;
+        // a copy of the recurrent state at a depth below it (taken while the prompt was read, and at the turn boundaries) lets
+        // the read start there. Deeper than the lane's snapshot and at least what the shared store holds, or not taken.
+        if (lad_step_) {
+            int sl = -1;
+            const uint32_t c = lad_best(lane, *rq.ids, &sl);
+            if (c > D && sl >= 0 && c >= cache_peek(rq)) {
+                const auto t0 = std::chrono::steady_clock::now();
+                if (std::string e = b_.lad_restore(lad_base(lane) + uint32_t(sl)); e.empty()) {
+                    reused = c; source = "restart point";
+                    b_.each_stage_v([](Qwen4ExpModel& M) { M.drop_snapshot(); M.clear_vision(); });
+                    snap_[lane].clear();
+                    head_sync(lane, c);   // (the head's record rewinds with the lane when it covers c; else plain steps)
+                    lad_keep(lane, c);
+                    ++lad_restores_; lad_saved_ += c;
+                    std::fprintf(stderr, "[q4e lanes] lane %u: restart point at %u of %zu (the lane's snapshot would give %u): %zu tokens "
+                                         "to read instead of %zu (%.1f ms)\n", lane, c, rq.ids->size(), D, rq.ids->size() - c, rq.ids->size(),
+                                 std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+                    return {};
+                } else {   // a stage may hold the copy's state and another not: a new sequence
+                    std::fprintf(stderr, "[q4e lanes] lane %u restart point at %u: %s; full prefill\n", lane, c, e.c_str());
+                    source = "none";
+                    b_.reset_all();
+                    b_.each_stage_v([](Qwen4ExpModel& M) { M.drop_snapshot(); });
+                    snap_[lane].clear();
+                    lad_reset(lane);
+                    head_sync(lane, 0);
+                    return {};
+                }
+            }
+        }
         // P4 B15: a longer SHARED prefix (another lane's, from the host store) is copied in whole: KV rows, indexer caches,
         // DeltaNet / PLE state -- the lane's own snapshot is void after (its KV rows are overwritten)
         if (SharedEntry* se = shared_best(*rq.ids, b_.A.lane_ctx(lane)); se && !se->st.empty() && se->st[0].depth > D) {
@@ -1056,6 +1100,7 @@ public:
                 b_.each_stage_v([](Qwen4ExpModel& M) { M.drop_snapshot(); });
                 snap_[lane].clear();
                 b_.each_stage_v([](Qwen4ExpModel& M) { M.clear_vision(); });
+                lad_reset(lane);   // (the stash overwrote the lane's rows)
                 if (lane < hr_.size()) hr_[lane] = {false, 0};   // (2026-10-23: the stash holds no head state: plain steps)
                 std::fprintf(stderr, "[q4e lanes] lane %u: shared prefix %u restored (%.1f ms)\n", lane, reused,
                              std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
@@ -1067,6 +1112,7 @@ public:
             b_.reset_all();
             b_.each_stage_v([](Qwen4ExpModel& M) { M.drop_snapshot(); });
             snap_[lane].clear();
+            lad_reset(lane);
             head_sync(lane, 0);
             return {};
         }
@@ -1075,12 +1121,14 @@ public:
                 reused = D; source = "snapshot";
                 b_.each_stage_v([](Qwen4ExpModel& M) { M.clear_vision(); });
                 head_sync(lane, D);   // (2026-10-23: the head's record rewinds with the lane when it covers D)
+                lad_keep(lane, D);
                 return {};
             } else std::fprintf(stderr, "[q4e lanes] lane %u restore: %s\n", lane, e.c_str());
         }
         source = "none";
         b_.reset_all();   // a new sequence (drops the lane's snapshot)
         snap_[lane].clear();
+        lad_reset(lane);
         head_sync(lane, 0);
         return {};
     }
@@ -1150,6 +1198,7 @@ public:
         if (!rq.vision && rq.snap_at > reused && Tp == rq.snap_at) {   // --parallel 1's snapshot at the stable conversation depth
             if (auto e = b_.snap(Tp); e.empty()) snap_[lane].assign(ids.begin(), ids.begin() + Tp);
             else { snap_[lane].clear(); std::fprintf(stderr, "[q4e lanes] lane %u snapshot: %s\n", lane, e.c_str()); }
+            lad_turn(lane, Tp);   // 2026-11-10: the turn boundary's copy outlives the next turn's snapshot
         }
         if (Tp < T) {
             std::vector<LanesChunk> rest;
@@ -1170,6 +1219,7 @@ public:
         if (lane < hr_.size()) hr_[lane] = {};
         if (lane < vis_.size()) vis_[lane] = nullptr;
         snap_[lane].clear();
+        lad_reset(lane);
         if (!b_.A.lane_ready(lane)) return pe;   // (2026-10-23: a lazy lane that never woke holds nothing)
         try {
             if (auto e = select(lane); !e.empty()) return e;
@@ -1438,6 +1488,9 @@ private:
                 if (auto e = stage_vision(M, s, *vis_[st.lane]); !e.empty()) return e;
         }
         if (round) M.set_spec_verify(true);
+        // 2026-11-10: a prompt piece read here (other lanes are busy) takes the lane's restart points as the serial turn does
+        int lsl = -1;
+        const bool lpiece = !round && lad_pipe_piece(s, st, lsl);
         std::string e;
         try {
             e = M.forward_range(st.ids, st.T, st.pos0, s == 0 ? nullptr : st.wide, last ? nullptr : st.wide, nullptr);
@@ -1448,6 +1501,8 @@ private:
             if (round) forget_round(st.lane);
             return e;
         }
+        if (lpiece && lsl >= 0) (void)M.state_save(b_.lad[s][lad_base(st.lane) + size_t(lsl)], st.pos0 + st.T);   // (a failed copy leaves depth 0)
+        if (lpiece && last) lad_pipe_commit(st, lsl);
         if (last) {
             if (round) {
                 if (auto m = M.logits_rows(st.T, rl_[st.lane]); !m.empty()) { forget_round(st.lane); return "round logits: " + m; }
@@ -1492,6 +1547,21 @@ private:
     std::string run_chunks(uint32_t lane, const int32_t* ids, std::span<const LanesChunk> ch, const std::function<bool()>& stop,
                            size_t& done) {
         done = 0;
+        // 2026-11-10: the lane's restart points: where a chunk passes a multiple of the step every stage copies its recurrent
+        // state right after ITS part of the chunk (the pipeline is not cut: fwd_pipelined's P4 B62 rule). Only while the record
+        // is whole up to the first chunk (a prompt part read through the lane pipe leaves a gap: no copies past it).
+        const bool lad = lad_step_ && lane < lad_.size() && !ch.empty() && !(lane < vis_.size() && vis_[lane]) &&
+                         lad_whole_to(lane, ch[0].first);
+        const uint32_t lbase = lad_base(lane);
+        std::vector<int> lsl(ch.size(), -1);   // [chunk] the slot its copy went to (-1 = none)
+        auto lad_slot = [&](size_t k) -> int {   // stage 0's copy of chunk k, taken on this thread after A's part
+            if (!lad) return -1;
+            int s;
+            { std::lock_guard<std::mutex> g(lad_mu_); s = lad_[lane].regular_slot(ch[k].first, ch[k].second); if (s >= 0) lad_[lane].depth[size_t(s)] = 0; }
+            if (s < 0) return -1;
+            for (uint32_t st = 1; st < b_.n_stages(); ++st) b_.lad[st][lbase + uint32_t(s)].depth = 0;
+            return b_.A.state_save(b_.lad[0][lbase + uint32_t(s)], ch[k].first + ch[k].second).empty() ? s : -1;
+        };
         if (!b_.mid.empty() && Q4eBundle::deep_pipe_on()) {   // 2026-11-08: three or more stages, each on its own thread
             const uint32_t N = b_.n_stages();
             DeepPipe pipe(N);
@@ -1502,15 +1572,18 @@ private:
                 if (auto e = pipe.slot_free(k); !e.empty()) { err = e; break; }
                 float* wb = b_.deep_slot(uint32_t(k), b_.wide.size());
                 if (auto e = b_.A.forward_range(ids + p0, n, p0, nullptr, wb, nullptr); !e.empty()) { err = "A: " + e; break; }
+                const int sl = lsl[k] = lad_slot(k);
                 const int32_t* bt = ids + p0;
-                pipe.enqueue([this, lane, wb, bt, n, p0, N](uint32_t s) -> std::string {
+                pipe.enqueue([this, lane, wb, bt, n, p0, N, sl, lbase](uint32_t s) -> std::string {
                     if (auto e = b_.deep_part(s, wb, bt, n, p0); !e.empty()) return e;
+                    if (sl >= 0) (void)b_.stage(s).state_save(b_.lad[s][lbase + size_t(sl)], p0 + n);   // (a failed copy leaves depth 0)
                     if (s + 1 == N) head_feed(lane, bt, n, p0);   // (the head's record reads every chunk; the tail's thread)
                     return {};
                 });
             }
             if (const std::string e = pipe.drain(); err.empty()) err = e;
             done = pipe.done();
+            if (lad) lad_commit(lane, ids, ch, done, lsl);
             return err;
         }
         float* wb2[2] = {b_.wide.data(), b_.wide_b.data()};
@@ -1522,6 +1595,7 @@ private:
             const auto [p0, n] = ch[k];
             float* wb = wb2[k & 1];
             if (auto e = b_.A.forward_range(ids + p0, n, p0, nullptr, wb, nullptr); !e.empty()) { err = "A: " + e; break; }
+            const int sl = lsl[k] = lad_slot(k);
             if (bfut.valid()) {
                 if (auto e = bfut.get(); !e.empty()) { err = "B: " + e; break; }
                 ++done;
@@ -1530,12 +1604,13 @@ private:
             for (auto& M : b_.mid) rest.push_back(M.get());
             rest.push_back(&b_.B);
             const int32_t* bt = ids + p0;
-            bfut = std::async(std::launch::async, [this, rest, wb, n, p0, bt, lane]() {
+            bfut = std::async(std::launch::async, [this, rest, wb, n, p0, bt, lane, sl, lbase]() {
                 std::string e;
                 for (size_t i = 0; i < rest.size() && e.empty(); ++i) {
                     const bool last = i + 1 == rest.size();
                     e = rest[i]->forward_range(last ? nullptr : bt, n, p0, wb, last ? nullptr : wb, nullptr);
                     if (!e.empty()) e = "stage " + std::to_string(i + 1) + ": " + e;
+                    else if (sl >= 0) (void)rest[i]->state_save(b_.lad[i + 1][lbase + size_t(sl)], p0 + n);   // (a failed copy leaves depth 0)
                 }
                 if (e.empty()) head_feed(lane, bt, n, p0);   // (2026-10-23: the head's record reads every chunk; B's thread)
                 return e;
@@ -1546,7 +1621,144 @@ private:
             if (e.empty()) ++done;
             else if (err.empty()) err = "B: " + e;
         }
+        if (lad) lad_commit(lane, ids, ch, done, lsl);
         return err;
+    }
+
+    // ---- 2026-11-10: the lanes' in-place restart points (the one-lane path's P4 B62 and the crown lanes' P4 B59, here) -------
+    // ie/q4e_lane_ladder.hpp holds the rules (the record, the slots' depths; gated on the host by q4e_lane_ladder_test); here
+    // are the copies: Qwen4ExpModel::StateCopy per stage in b_.lad, slot lad_base(lane) + s, pinned host RAM allocated on a
+    // slot's first use. Everything that sets a lane's state to a depth calls lad_keep (the record and the slots above go) or
+    // lad_reset. own_match reads the rules on a request thread, the rest runs on the serial worker: lad_mu_.
+    static constexpr uint32_t kLadRegular = 32, kLadTurns = 4;
+    uint32_t lad_step_ = 0;                  // 0 = off
+    std::vector<Q4eLaneLadder> lad_;         // [lane]
+    mutable std::mutex lad_mu_;
+    uint64_t lad_restores_ = 0, lad_saved_ = 0, lad_copies_ = 0;
+    bool diverge_text_ = true;
+    // the lane pipe's side (a prompt read beside other lanes' steps): the prompt's length (a step below it is a prompt piece),
+    // the end of the pieces stage 0 has taken in order, and the pieces in flight with the slot stage 0 chose for them
+    std::vector<uint32_t> lad_pt_, lad_admit_;
+    struct LadPend { uint32_t pos0; int slot; };
+    std::vector<std::vector<LadPend>> lad_pend_;
+    uint32_t lad_base(uint32_t lane) const { return lane * (kLadRegular + kLadTurns); }
+    // stage `s` meets a step of the pipe: is it a prompt piece that continues the lane's record, and which slot (or -1)
+    // does its copy go to? Stage 0 decides and reserves; the later stages look the piece up.
+    bool lad_pipe_piece(uint32_t s, const Glm5LanePipe::Step& st, int& slot) {
+        slot = -1;
+        if (!lad_step_ || st.lane >= lad_.size() || (st.lane < vis_.size() && vis_[st.lane])) return false;
+        std::lock_guard<std::mutex> g(lad_mu_);
+        if (st.pos0 + st.T > lad_pt_[st.lane]) return false;   // a decode step
+        auto& pend = lad_pend_[st.lane];
+        if (s == 0) {
+            if (lad_admit_[st.lane] != st.pos0) return false;   // not the next piece of a whole record
+            lad_admit_[st.lane] = st.pos0 + st.T;
+            const int sl = lad_[st.lane].regular_slot(st.pos0, st.T);
+            if (sl >= 0) {
+                lad_[st.lane].depth[size_t(sl)] = 0;
+                for (uint32_t k = 0; k < b_.n_stages(); ++k) b_.lad[k][lad_base(st.lane) + size_t(sl)].depth = 0;
+            }
+            pend.push_back({st.pos0, sl});
+            slot = sl;
+            return true;
+        }
+        for (const auto& pe : pend) if (pe.pos0 == st.pos0) { slot = pe.slot; return true; }
+        return false;
+    }
+    // the last stage finished the piece: it joins the record, its copy counts once every stage holds it
+    void lad_pipe_commit(const Glm5LanePipe::Step& st, int slot) {
+        std::lock_guard<std::mutex> g(lad_mu_);
+        auto& pend = lad_pend_[st.lane];
+        for (size_t i = 0; i < pend.size(); ++i) if (pend[i].pos0 == st.pos0) { pend.erase(pend.begin() + long(i)); break; }
+        Q4eLaneLadder& l = lad_[st.lane];
+        if (!l.append_piece(st.ids, st.pos0, st.T)) return;
+        if (slot < 0) return;
+        bool all = true;
+        for (uint32_t k = 0; k < b_.n_stages(); ++k) all = all && b_.lad[k][lad_base(st.lane) + size_t(slot)].depth == st.pos0 + st.T;
+        if (all) { l.set(slot, st.pos0 + st.T); ++lad_copies_; }
+    }
+    void lad_init() {
+        const char* off = std::getenv("IE_Q4E_LANE_LADDER");
+        if (const char* v = std::getenv("IE_Q4E_DIVERGE_LOG"); v && *v == '0') diverge_text_ = false;
+        if (off && *off == '0') return;
+        const char* sv = std::getenv("IE_Q4E_LANE_LADDER_STEP");
+        const uint32_t want = sv && std::atoi(sv) > 0 ? uint32_t(std::atoi(sv)) : 8192u;
+        const uint32_t n = uint32_t(snap_.size());
+        lad_.resize(n); lad_pt_.assign(n, 0u); lad_admit_.assign(n, 0u); lad_pend_.assign(n, {});
+        for (uint32_t l = 0; l < n; ++l) lad_[l].init(dn_ladder_step(b_.A.lane_ctx(l), kLadRegular, want), kLadRegular, kLadTurns);
+        lad_step_ = lad_[0].step;
+        b_.lad_resize(size_t(n) * (kLadRegular + kLadTurns));
+        std::fprintf(stderr, "[qwen4exp] lane restart points ON: every lane keeps copies of its recurrent state while a prompt is read "
+                             "(every %u tokens on lane 0, up to %u a lane) and at its last %u turn boundaries, in pinned system RAM "
+                             "(tens of MiB a copy, on first use) -- a prompt that changes its history is read from the copy below the "
+                             "change, not from 0 (IE_Q4E_LANE_LADDER=0 = off)\n", lad_step_, kLadRegular, kLadTurns);
+    }
+    void lad_reset(uint32_t lane) {
+        std::lock_guard<std::mutex> g(lad_mu_);
+        if (lane < lad_.size()) { lad_[lane].reset(); lad_admit_[lane] = 0; lad_pend_[lane].clear(); }
+    }
+    void lad_keep(uint32_t lane, uint32_t depth) {
+        std::lock_guard<std::mutex> g(lad_mu_);
+        if (lane < lad_.size()) { lad_[lane].keep(depth); lad_admit_[lane] = uint32_t(lad_[lane].rec.size()); lad_pend_[lane].clear(); }
+    }
+    bool lad_whole_to(uint32_t lane, uint32_t pos) const { std::lock_guard<std::mutex> g(lad_mu_); return lane < lad_.size() && lad_[lane].whole_to(pos); }
+    uint32_t lad_own(uint32_t lane, std::span<const int32_t> ids) const {
+        std::lock_guard<std::mutex> g(lad_mu_);
+        return lane < lad_.size() ? lad_[lane].own(ids) : 0u;
+    }
+    uint32_t lad_best(uint32_t lane, std::span<const int32_t> ids, int* slot = nullptr) const {
+        std::lock_guard<std::mutex> g(lad_mu_);
+        return lane < lad_.size() ? lad_[lane].best(ids, slot) : 0u;
+    }
+    // run_chunks' end: the chunks that finished every stage join the record, and their copies count once every stage holds one
+    void lad_commit(uint32_t lane, const int32_t* ids, std::span<const LanesChunk> ch, size_t done, const std::vector<int>& lsl) {
+        std::lock_guard<std::mutex> g(lad_mu_);
+        Q4eLaneLadder& l = lad_[lane];
+        const uint32_t base = lad_base(lane);
+        for (size_t k = 0; k < done && k < ch.size(); ++k) {
+            const uint32_t p0 = ch[k].first, n = ch[k].second;
+            if (!l.append(ids, p0, n)) break;    // (not contiguous: stop here, the slots so far stand)
+            if (lsl[k] < 0) continue;
+            bool all = true;
+            for (uint32_t st = 0; st < b_.n_stages(); ++st) all = all && b_.lad[st][base + size_t(lsl[k])].depth == p0 + n;
+            if (all) { l.set(lsl[k], p0 + n); ++lad_copies_; }
+        }
+        lad_admit_[lane] = uint32_t(l.rec.size());   // (the pipe may read the rest of this prompt)
+    }
+    void lad_turn(uint32_t lane, uint32_t Tp) {   // the lane is at the prompt boundary Tp (prompt_end, after its snapshot)
+        if (!lad_step_ || lane >= lad_.size()) return;
+        int slot;
+        { std::lock_guard<std::mutex> g(lad_mu_); slot = lad_[lane].turn_slot(Tp); }
+        if (slot < 0) return;
+        if (b_.lad_take(lad_base(lane) + uint32_t(slot), Tp).empty()) {
+            std::lock_guard<std::mutex> g(lad_mu_);
+            lad_[lane].set(slot, Tp); ++lad_copies_;
+        }
+    }
+    // A long conversation on the lane that the prompt does not extend: where it leaves, and the text on both sides, so the
+    // log names the cause of a re-read (a changed early block, a rewritten tool result, another conversation).
+    void diverge_note(uint32_t lane, const std::vector<int32_t>& ids) {
+        std::vector<int32_t> rec;
+        { std::lock_guard<std::mutex> g(lad_mu_); if (lane < lad_.size() && lad_[lane].rec.size() > snap_[lane].size()) rec = lad_[lane].rec; }
+        const std::vector<int32_t>& had = rec.empty() ? snap_[lane] : rec;
+        if (had.size() < 2048) return;
+        const uint32_t L = dn_ladder_lcp(had, ids);
+        auto text = [&](const std::vector<int32_t>& v, uint32_t at) {
+            if (!diverge_text_) return std::string("(text off)");
+            if (at >= v.size()) return std::string("(the end)");
+            std::string t = tok_.decode(std::span<const int32_t>(v.data() + at, std::min<size_t>(24, v.size() - at)));
+            for (char& c : t) if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+            if (t.size() > 110) t.resize(110);
+            return t;
+        };
+        const uint32_t b0 = L > 12 ? L - 12 : 0;
+        std::string before = diverge_text_ ? tok_.decode(std::span<const int32_t>(ids.data() + b0, L - b0)) : std::string();
+        for (char& c : before) if (c == '\n' || c == '\r' || c == '\t') c = ' ';
+        std::fprintf(stderr, "[q4e lanes] lane %u: the prompt (%zu tokens) leaves the lane's conversation (%zu tokens) at token %u (%.1f %% in)%s, "
+                             "after \"%s\": the conversation went on \"%s\", the prompt goes on \"%s\" (IE_Q4E_DIVERGE_LOG=0 = no text)\n",
+                     lane, ids.size(), had.size(), L, had.empty() ? 0.0 : 100.0 * L / double(had.size()),
+                     uint64_t(L) * 20 < had.size() ? " -- another conversation took the lane, or this one's start changed" : "",
+                     before.c_str(), text(had, L).c_str(), text(ids, L).c_str());
     }
 
     Q4eBundle& b_;
@@ -2458,6 +2670,8 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         // multi-GPU path. Per-card weights + KV/DeltaNet; host-logits bounce like the
         // 27B split. The single-GPU crown (model_) is untouched → PPL gate safe.
         QwenConfig cfg;
+        if (auto m = read_qwen35moe_config(e->gguf_, cfg); !m.empty()) { err = "config: " + m; return nullptr; }
+        if (auto m = qwen35moe_shape_check(cfg); !m.empty()) { err = m; return nullptr; }
         const uint32_t q35m_cards = std::max<uint32_t>(opts.n_gpus, 1u);
         if (auto m = e->fleet_.init(q35m_cards, "B70", false, /*shared_ctx=*/false); !m.empty()) { err = "fleet: " + m; return nullptr; }
         if (q35m_cards > 1 && e->fleet_.size() < 2) { err = "layer-split needs >=2 GPUs (have " +
@@ -3129,6 +3343,8 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         vocab = b->cfg.vocab;
     } else {
         QwenConfig cfg;
+        if (auto m = read_qwen35moe_config(e->gguf_, cfg); !m.empty()) { err = "config: " + m; return nullptr; }
+        if (auto m = qwen35moe_shape_check(cfg); !m.empty()) { err = m; return nullptr; }
         if (auto m = e->model_.load(e->alloc_, e->gguf_, cfg); !m.empty()) { err = "model: " + m; return nullptr; }
         cfg = e->model_.config();
 
@@ -6922,6 +7138,25 @@ GenerateResult Engine::generate(const std::string& prompt,
                 std::fprintf(stderr, "  (%.2f '%s')", v[j].first, dbg_tok(v[j].second).c_str());
             std::fprintf(stderr, "\n");
         }
+        // IE_LOGITS_DUMP=<prefix> (2026-11-08, the generic mini-model oracle, scripts/mini_oracle): the prompt's ids
+        // (<prefix>.prompt.i32), every step's logits as fp16 rows (<prefix>.logits.f16: step 0 = the prompt's last row) and
+        // the picks (<prefix>.picks.i32) of this request, rewritten at its step 0. Zero cost when unset; copied before the
+        // sampler, which tombstones d_logits_.
+        static const char* logits_dump = std::getenv("IE_LOGITS_DUMP");
+        if (logits_dump && *logits_dump) {
+            const std::string pre(logits_dump);
+            if (step == 0)
+                if (FILE* f = std::fopen((pre + ".prompt.i32").c_str(), "wb")) {
+                    std::fwrite(ids.data(), sizeof(int32_t), ids.size(), f);
+                    std::fclose(f);
+                }
+            std::vector<sycl::half> hl(vocab());
+            q.memcpy(hl.data(), d_logits_, vocab() * sizeof(sycl::half)).wait();
+            if (FILE* f = std::fopen((pre + ".logits.f16").c_str(), step == 0 ? "wb" : "ab")) {
+                std::fwrite(hl.data(), sizeof(sycl::half), hl.size(), f);
+                std::fclose(f);
+            }
+        }
         // In-order queue: the sampler is ordered after the forward that wrote
         // d_logits_, so the 4-byte pick readback below is the ONE host sync per
         // token (was four: sampler wait, pick D2H, pick H2D, forward wait).
@@ -6930,6 +7165,11 @@ GenerateResult Engine::generate(const std::string& prompt,
                                  rng + step);
         int32_t pick = 0;
         alloc_.d2h(&pick, d_pick_, sizeof(pick));
+        if (logits_dump && *logits_dump)
+            if (FILE* f = std::fopen((std::string(logits_dump) + ".picks.i32").c_str(), step == 0 ? "wb" : "ab")) {
+                std::fwrite(&pick, sizeof(pick), 1, f);
+                std::fclose(f);
+            }
         {   // IE_DEBUG_PICKS=1 (P4 B49): every picked token id and its text, one line a step (stderr).
             static const bool dbg_picks = std::getenv("IE_DEBUG_PICKS") != nullptr;
             if (dbg_picks) {

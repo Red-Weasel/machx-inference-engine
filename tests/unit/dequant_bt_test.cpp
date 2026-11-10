@@ -8,6 +8,7 @@
 #include <sycl/sycl.hpp>
 
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -107,7 +108,30 @@ int main() {
                        ie::dequant_q8_0_to_Bt, ie::dequant_q8_0);
     }
 
+    // 2026-11-08 (known_bugs 50): ANY N, odd included -- a width that is not a multiple of the 64-item work-group used to
+    // abort the process ("Non-uniform work-groups are not supported", e.g. an unpadded vocab 248077); the launches now
+    // round the grid up to whole work-groups and the padding items return. N = 77 (a partial group) and N = 1.
+    for (uint32_t No : {77u, 1u}) {
+        const auto W8 = rand_blocks<false>(size_t(No) * (K / 32), sizeof(ie::block_q8_0), rng);
+        fails += check(q, W8, sizeof(ie::block_q8_0), K, No, "Q8_0", ie::dequant_q8_0_to_Bt, ie::dequant_q8_0);
+        const auto W4 = rand_blocks<true>(size_t(No) * (K / 256), sizeof(ie::block_q4_K), rng);
+        fails += check(q, W4, sizeof(ie::block_q4_K), K, No, "Q4_K", ie::dequant_q4_K_to_Bt, ie::dequant_q4_K);
+        const auto W5 = rand_blocks<true>(size_t(No) * (K / 256), sizeof(ie::block_q5_K), rng);
+        fails += check(q, W5, sizeof(ie::block_q5_K), K, No, "Q5_K", ie::dequant_q5_K_to_Bt, ie::dequant_q5_K);
+        // Q6_K: d sits at the END of the 210-byte block (offset 208), not where rand_blocks writes it
+        auto W6 = rand_blocks<false>(size_t(No) * (K / 256), sizeof(ie::block_q6_K), rng);
+        for (size_t i = 0; i < W6.size() / sizeof(ie::block_q6_K); ++i) {
+            const uint16_t d = ie::fp32_to_fp16(0.01f + 0.001f * float(i % 97));
+            std::memcpy(W6.data() + i * sizeof(ie::block_q6_K) + offsetof(ie::block_q6_K, d), &d, 2);
+        }
+        fails += check(q, W6, sizeof(ie::block_q6_K), K, No, "Q6_K", ie::dequant_q6_K_to_Bt, ie::dequant_q6_K);
+        // MXFP4: byte 0 is an E8M0 exponent -- keep it near 2^0 (a random byte reaches inf / NaN)
+        auto Wm = rand_blocks<false>(size_t(No) * (K / 32), sizeof(ie::block_mxfp4), rng);
+        for (size_t i = 0; i < Wm.size() / sizeof(ie::block_mxfp4); ++i) Wm[i * sizeof(ie::block_mxfp4)] = uint8_t(120 + i % 12);
+        fails += check(q, Wm, sizeof(ie::block_mxfp4), K, No, "MXFP4", ie::dequant_mxfp4_to_Bt, ie::dequant_mxfp4);
+    }
+
     if (fails) { std::fprintf(stderr, "dequant_bt_test: %d mismatch\n", fails); return 1; }
-    std::printf("dequant_bt_test: all OK (Q4_K + Q5_K + Q8_0 _to_Bt match flat dequant)\n");
+    std::printf("dequant_bt_test: all OK (Q4_K + Q5_K + Q8_0 + Q6_K + MXFP4 _to_Bt match flat dequant, odd N included)\n");
     return 0;
 }

@@ -674,7 +674,11 @@ std::string Qwen35MoeSplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
     }
 
     // Per-card int-dot activation scratch + prefill dequant scratch.
-    const uint32_t Kmax = std::max(std::max(cfg_.hidden, cfg_.expert_ffn),
+    // 2026-11-10 (known_bugs 51): the SHARED expert has its own width (qwen35moe.expert_shared_feed_forward_length; its tensors'
+    // N). Every site ran it at the routed experts' width -- equal on the 35B (512 / 512), wrong on any model where they differ.
+    uint32_t sh_ffn = 0;
+    for (const auto& l : layers_) sh_ffn = std::max(sh_ffn, l.sh_gate.N);
+    const uint32_t Kmax = std::max(std::max(cfg_.hidden, std::max(cfg_.expert_ffn, sh_ffn)),
                                    std::max(cfg_.ssm_inner, cfg_.n_q_heads * cfg_.head_dim));
     act_q8_.assign(n_dev_, nullptr);
     prefill_bt_.assign(n_dev_, nullptr);
@@ -774,7 +778,9 @@ std::string Qwen35MoeSplitModel::ensure_ws(uint32_t dev, uint32_t max_T) {
     w.dn_alpha_h = ah(T*Nv); w.dn_beta_h = ah(T*Nv);
     w.dn_alpha64 = ah(T*Nvp); w.dn_beta64 = ah(T*Nvp);
     w.topk_idx = static_cast<int32_t*>(alloc.malloc(TK * sizeof(int32_t)));
-    w.topk_w = ah(TK); w.gate_o = ah(T*EFF); w.up_o = ah(T*EFF); w.ffn_h = ah(T*EFF);
+    uint32_t EFW = EFF;   // (2026-11-10: wide enough for the shared expert too)
+    for (const auto& l : layers_) EFW = std::max(EFW, l.sh_gate.N);
+    w.topk_w = ah(TK); w.gate_o = ah(T*EFW); w.up_o = ah(T*EFW); w.ffn_h = ah(T*EFW);
     w.moe_y = ah(T*H); w.eo = ah(T*H);
     w.moe_hp = ah(TK*EFF); w.moe_yp = ah(TK*H);
     w.x_q8 = alloc.malloc(uint64_t(T) * (H / 32) * sizeof(block_q8_1x));
@@ -1438,18 +1444,19 @@ void Qwen35MoeSplitModel::run_layers(uint32_t dev, uint32_t T, uint32_t start_po
         }
         // shared expert (always-on, sigmoid-gated).
         if (w_l.ffn_gate_inp_shexp) {
+            const uint32_t SFF = w_l.sh_gate.N ? w_l.sh_gate.N : EFF;   // 2026-11-10: the shared expert's OWN width (known_bugs 51)
             {   // P4 B70: the MoE route's quantization of x_normed (x_q8) serves the shared expert's gate and up
                 const void* xq8 = (T == 1 && xq8_ok) ? w.x_q8 : nullptr;
-                sgemv(dev, w.x_normed, w_l.sh_gate, w.gate_o, H, EFF, T, xq8);
-                sgemv(dev, w.x_normed, w_l.sh_up,   w.up_o,   H, EFF, T, xq8);
+                sgemv(dev, w.x_normed, w_l.sh_gate, w.gate_o, H, SFF, T, xq8);
+                sgemv(dev, w.x_normed, w_l.sh_up,   w.up_o,   H, SFF, T, xq8);
             }
-            if (T == 1 && EFF % 32 == 0 && (w_l.sh_down.int_dot() || w_l.sh_down.kq.lo)) {
+            if (T == 1 && SFF % 32 == 0 && (w_l.sh_down.int_dot() || w_l.sh_down.kq.lo)) {
                 // P4 B70: the SiLU product and sh_down's activation quantize in one launch (the same bits)
-                DPE(dev, kElem, swiglu_quant_q8_1(q, w.gate_o, w.up_o, w.ffn_h, act_q8_[dev], EFF));
-                sgemv(dev, w.ffn_h, w_l.sh_down, w.eo, EFF, H, T, act_q8_[dev]);
+                DPE(dev, kElem, swiglu_quant_q8_1(q, w.gate_o, w.up_o, w.ffn_h, act_q8_[dev], SFF));
+                sgemv(dev, w.ffn_h, w_l.sh_down, w.eo, SFF, H, T, act_q8_[dev]);
             } else {
-            DPE(dev, kElem, swiglu(q, w.gate_o, w.up_o, w.ffn_h, uint64_t(T) * EFF));
-            sgemv(dev, w.ffn_h, w_l.sh_down, w.eo, EFF, H, T);
+            DPE(dev, kElem, swiglu(q, w.gate_o, w.up_o, w.ffn_h, uint64_t(T) * SFF));
+            sgemv(dev, w.ffn_h, w_l.sh_down, w.eo, SFF, H, T);
             }
             // shared-expert gate g[t]=sigmoid(ffn_gate_inp_shexp · x_normed[t]);
             // moe_y += eo*g. [VERIFY gate semantics vs qwen36.cpp:1775-1829.]
@@ -1735,7 +1742,9 @@ std::string Qwen35MoeSplitModel::init_lanes(uint32_t n_lanes, uint32_t lane_ctx,
     if (!lane_logits_) return "request lanes: logits buffer alloc failed";
     owned_[plan_.head_dev].push_back(lane_logits_);
     // P4 B14 rows: the G-row int-dot activation per card and the G rows' logits (~80 KiB + ~7.9 MB; inside the reserve)
-    const uint32_t Kmax = std::max(std::max(cfg_.hidden, cfg_.expert_ffn), std::max(cfg_.ssm_inner, cfg_.n_q_heads * cfg_.head_dim));
+    uint32_t sh_ffn = 0;   // (2026-11-10: the shared expert's own width)
+    for (const auto& l : layers_) sh_ffn = std::max(sh_ffn, l.sh_gate.N);
+    const uint32_t Kmax = std::max(std::max(cfg_.hidden, std::max(cfg_.expert_ffn, sh_ffn)), std::max(cfg_.ssm_inner, cfg_.n_q_heads * cfg_.head_dim));
     act_rows_.assign(n_dev_, nullptr);
     for (uint32_t dev = 0; dev < n_dev_; ++dev) {
         void* p = fleet_->dev(dev).malloc(uint64_t(kMaxRows) * (Kmax / 32) * sizeof(block_q8_1x));
@@ -2078,11 +2087,12 @@ void Qwen35MoeSplitModel::run_layers_rows(uint32_t dev, std::span<const uint32_t
         }
         moe_reduce_q8(q, w.moe_yp, w.moe_y, G, Kt, H);
         if (w_l.ffn_gate_inp_shexp) {
-            srows(dev, w.x_normed, w_l.sh_gate, w.gate_o, H, EFF, G, w.x_q8);   // P4 B70: the MoE route's x_q8 (G rows)
-            srows(dev, w.x_normed, w_l.sh_up,   w.up_o,   H, EFF, G, w.x_q8);
+            const uint32_t SFF = w_l.sh_gate.N ? w_l.sh_gate.N : EFF;   // 2026-11-10: the shared expert's OWN width (known_bugs 51)
+            srows(dev, w.x_normed, w_l.sh_gate, w.gate_o, H, SFF, G, w.x_q8);   // P4 B70: the MoE route's x_q8 (G rows)
+            srows(dev, w.x_normed, w_l.sh_up,   w.up_o,   H, SFF, G, w.x_q8);
             // P4 B70: the SiLU product and sh_down's activation quantize (G rows) in one launch (the same bits)
-            swiglu_quant_q8_1(q, w.gate_o, w.up_o, w.ffn_h, act_rows_[dev], G * EFF);
-            srows(dev, w.ffn_h, w_l.sh_down, w.eo, EFF, H, G, act_rows_[dev]);
+            swiglu_quant_q8_1(q, w.gate_o, w.up_o, w.ffn_h, act_rows_[dev], G * SFF);
+            srows(dev, w.ffn_h, w_l.sh_down, w.eo, SFF, H, G, act_rows_[dev]);
             {   // run_layers' shared-expert gate, verbatim (row-wise)
                 float* dng = w.dn_g; const float* gw = w_l.ffn_gate_inp_shexp;
                 const sycl::half* xn = w.x_normed; const sycl::half* eo = w.eo;

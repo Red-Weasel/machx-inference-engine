@@ -148,6 +148,23 @@ std::string DeviceAllocator::init(std::string_view name_filter, uint32_t ordinal
         }
     }
     if (!found) return "no SYCL GPU device available at ordinal " + std::to_string(ordinal);
+    // 2026-11-10: a GPU with no matrix hardware (XMX / DPAS): an integrated Xe-LPG, for one. The dense path (qwen3 / qwen2 /
+    // llama-family) has SIMD forms of every kernel behind two switches; set them here, before any kernel reads them, so such
+    // a card serves those models without anyone knowing the switches. Measured on this box's Arrow Lake integrated GPU: a
+    // 2-layer qwen3 mini matches the reference (cos 0.999998, argmax 16/16) and decodes at 35 tok/s; without the switches
+    // the first attention kernel throws "no matrix hardware on the target device". The B70s report the aspect: unchanged.
+    // Other architectures still need XMX kernels and say so at the first one.
+    if (!picked.has(sycl::aspect::ext_intel_matrix)) {
+        ::setenv("IE_NO_XMX", "1", 0);
+        ::setenv("IE_FA2_DECODE_XMX", "0", 0);
+        static bool said = false;
+        if (!said) {
+            said = true;
+            std::fprintf(stderr, "[gpu] %s has no matrix hardware (XMX): the dense path runs its SIMD kernels (IE_NO_XMX=1, "
+                                 "IE_FA2_DECODE_XMX=0 set); architectures whose kernels need XMX stop at the first one\n",
+                         picked.get_info<sycl::info::device::name>().c_str());
+        }
+    }
 
     try {
         const auto pci = picked.get_info<sycl::ext::intel::info::device::pci_address>();

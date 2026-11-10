@@ -50,6 +50,14 @@ struct QwenConfig {
     float    rms_eps            = 1.0e-6f;
 };
 
+// (2026-11-08) The qwen35moe shape from the file: QwenConfig's defaults ARE Qwen3.6-35B-A3B, and the qwen35moe load paths
+// used them for every file. Overwrites each field whose qwen35moe.* key the file carries (a missing key keeps the default);
+// n_layers = block_count - nextn_predict_layers (the MTP block). Every owner file measured reads back the defaults exactly.
+std::string read_qwen35moe_config(const GgufReader& g, QwenConfig& out);
+// "" when `c` is Qwen3.6-35B-A3B's shape (QwenConfig's defaults), the only shape the qwen35moe kernels are verified on;
+// otherwise the refusal naming the file's shape. The generic mini oracle measured other shapes WRONG (known_bugs 51).
+std::string qwen35moe_shape_check(const QwenConfig& c);
+
 struct QuantPtr {
     void* p = nullptr; DType dt = DType::kCount;
     // Natural-order SoA-Q4_K streams (repack_q4_K_to_soa) for the coalesced-load

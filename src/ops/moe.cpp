@@ -7,6 +7,7 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <unordered_map>
 #include "ie/kernel_profiler.hpp"
 
@@ -28,8 +29,64 @@ sycl::event moe_router(sycl::queue& q,
                        const std::vector<sycl::event>& deps,
                        const float* sh_gate_w, float* sh_gate_out) {
     if (n_experts != 256 || k != 8) {
-        // Phase 6 v1: only the Qwen3.6 router shape.
-        return ie::ps(q, "moe_router", [&](sycl::handler& h) { h.depends_on(deps); h.single_task([](){}); });
+        // 2026-11-10 (known_bugs 51): every other router shape. Until now this branch submitted an EMPTY task ("Phase 6 v1: only
+        // the Qwen3.6 router shape"), so a qwen35moe model with another expert count ran its experts on whatever topk_idx /
+        // topk_w held -- the generic mini oracle measured cos 0.07..0.37 on every such shape. One work-group a token: the lanes
+        // share the experts' dots (fp32, the fused kernel's four partial sums), lane 0 does the softmax over all experts, the
+        // top-k (an exact tie goes to the higher expert id, as below), the renormalisation and the ascending-id order.
+        if (k == 0 || k > 32 || n_experts < k || n_experts > 16384)
+            throw std::runtime_error("moe_router: unsupported shape (" + std::to_string(k) + " of " + std::to_string(n_experts) + " experts)");
+        return ie::ps(q, "moe_router_any", [&](sycl::handler& h) {
+            h.depends_on(deps);
+            constexpr uint32_t LWG = 64;
+            const uint32_t E = n_experts, K = k, H = hidden;
+            sycl::local_accessor<float, 1> lg(E, h);
+            h.parallel_for(sycl::nd_range<1>(uint64_t(n_tokens) * LWG, LWG), [=](sycl::nd_item<1> it) {
+                const uint32_t lid = uint32_t(it.get_local_id(0));
+                const uint32_t token = uint32_t(it.get_group(0));
+                const sycl::half* xt = x + uint64_t(token) * H;
+                for (uint32_t e = lid; e < E; e += LWG) {
+                    const float* wr = W_gate + uint64_t(e) * H;
+                    float l0 = 0.f, l1 = 0.f, l2 = 0.f, l3 = 0.f;
+                    uint32_t hh = 0;
+                    for (; hh + 4 <= H; hh += 4) {
+                        l0 += wr[hh] * float(xt[hh]);
+                        l1 += wr[hh + 1] * float(xt[hh + 1]);
+                        l2 += wr[hh + 2] * float(xt[hh + 2]);
+                        l3 += wr[hh + 3] * float(xt[hh + 3]);
+                    }
+                    for (; hh < H; ++hh) l0 += wr[hh] * float(xt[hh]);
+                    lg[e] = (l0 + l1) + (l2 + l3);
+                }
+                sycl::group_barrier(it.get_group());
+                if (lid != 0) return;
+                float m = lg[0];
+                for (uint32_t e = 1; e < E; ++e) m = lg[e] > m ? lg[e] : m;
+                float sum = 0.f;
+                for (uint32_t e = 0; e < E; ++e) { const float v = sycl::exp(lg[e] - m); lg[e] = v; sum += v; }
+                int32_t idx[32]; float w[32];
+                for (uint32_t kk = 0; kk < K; ++kk) {
+                    int32_t best = -1; float bp = -1.f;
+                    for (uint32_t e = 0; e < E; ++e) if (lg[e] >= bp) { bp = lg[e]; best = int32_t(e); }
+                    idx[kk] = best; w[kk] = bp / sum;
+                    lg[uint32_t(best)] = -2.f;   // taken (a probability is never negative)
+                }
+                float ren = 0.f;
+                for (uint32_t kk = 0; kk < K; ++kk) ren += w[kk];
+                const float inv = 1.0f / ren;
+                for (uint32_t kk = 0; kk < K; ++kk) w[kk] *= inv;
+                for (uint32_t i = 0; i + 1 < K; ++i)
+                    for (uint32_t j = 0; j + 1 + i < K; ++j)
+                        if (idx[j] > idx[j + 1]) {
+                            const int32_t ti = idx[j]; idx[j] = idx[j + 1]; idx[j + 1] = ti;
+                            const float tw = w[j]; w[j] = w[j + 1]; w[j + 1] = tw;
+                        }
+                for (uint32_t kk = 0; kk < K; ++kk) {
+                    topk_idx[uint64_t(token) * K + kk] = idx[kk];
+                    topk_w[uint64_t(token) * K + kk]   = sycl::half(w[kk]);
+                }
+            });
+        });
     }
     constexpr uint32_t WG = 256;
 

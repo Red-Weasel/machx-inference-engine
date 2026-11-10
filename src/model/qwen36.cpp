@@ -630,6 +630,71 @@ inline size_t bytes_per_block_for(DType dt) {
 
 }  // namespace
 
+// (2026-11-08) Found by the generic mini oracle (scripts/mini_oracle): the qwen35moe paths read none of these keys, so a file
+// of any other shape loaded as 40 layers / 256 experts top-8 / rope base 1e7 / vocab 248320 -- the hidden-1024, 4-layer,
+// 16-expert mini failed at "layer 4 attn_norm.weight: tensor not found", a 48-layer file would have loaded 40 of them.
+// The owner's 35B-A3B files (Q8_0 / Q6_K: block_count 41 with nextn_predict_layers 1; APEX: block_count 40) read back
+// exactly the defaults, so their loads are unchanged.
+std::string read_qwen35moe_config(const GgufReader& g, QwenConfig& c) {
+    auto u = [&](const char* k, uint32_t& dst) {
+        if (const auto* kv = g.find_kv(std::string("qwen35moe.") + k)) dst = uint32_t(kv->as_uint());
+    };
+    uint32_t blocks = c.n_layers, nextn = 0;
+    u("block_count", blocks);
+    u("nextn_predict_layers", nextn);
+    if (nextn >= blocks) return "qwen35moe: nextn_predict_layers >= block_count";
+    c.n_layers = blocks - nextn;
+    u("embedding_length", c.hidden);
+    u("attention.head_count", c.n_q_heads);
+    u("attention.head_count_kv", c.n_kv_heads);
+    u("attention.key_length", c.head_dim);
+    u("rope.dimension_count", c.rope_dim);
+    if (const auto* kv = g.find_kv("qwen35moe.rope.freq_base")) c.rope_theta = float(kv->as_float());
+    if (const auto* kv = g.find_kv("qwen35moe.attention.layer_norm_rms_epsilon")) c.rms_eps = float(kv->as_float());
+    u("expert_count", c.n_experts);
+    u("expert_used_count", c.experts_topk);
+    u("expert_feed_forward_length", c.expert_ffn);
+    u("full_attention_interval", c.full_attn_interval);
+    u("ssm.inner_size", c.ssm_inner);
+    u("ssm.time_step_rank", c.ssm_n_v_heads);
+    u("ssm.group_count", c.ssm_n_k_heads);
+    u("ssm.state_size", c.ssm_head_dim);
+    u("ssm.conv_kernel", c.ssm_conv_kernel);
+    if (const auto* t = g.find_tensor("token_embd.weight"); t && t->n_dims == 2) c.vocab = uint32_t(t->shape[1]);
+    if (!c.n_layers || !c.hidden || !c.n_q_heads || !c.n_kv_heads || c.n_q_heads % c.n_kv_heads || !c.head_dim ||
+        !c.n_experts || !c.experts_topk || c.experts_topk > c.n_experts || !c.full_attn_interval ||
+        !c.ssm_n_k_heads || c.ssm_n_v_heads % c.ssm_n_k_heads || c.ssm_inner != c.ssm_n_v_heads * c.ssm_head_dim ||
+        c.rope_dim > c.head_dim || !c.vocab)
+        return "qwen35moe: inconsistent shape keys (layers " + std::to_string(c.n_layers) + ", hidden " +
+               std::to_string(c.hidden) + ", heads " + std::to_string(c.n_q_heads) + "/" + std::to_string(c.n_kv_heads) +
+               ", experts " + std::to_string(c.experts_topk) + " of " + std::to_string(c.n_experts) + ")";
+    return {};
+}
+
+std::string qwen35moe_shape_check(const QwenConfig& c) {
+    const QwenConfig d{};
+    if (c.n_layers == d.n_layers && c.hidden == d.hidden && c.n_q_heads == d.n_q_heads && c.n_kv_heads == d.n_kv_heads &&
+        c.head_dim == d.head_dim && c.vocab == d.vocab && c.rope_dim == d.rope_dim && c.rope_theta == d.rope_theta &&
+        c.n_experts == d.n_experts && c.experts_topk == d.experts_topk && c.expert_ffn == d.expert_ffn &&
+        c.full_attn_interval == d.full_attn_interval && c.ssm_inner == d.ssm_inner && c.ssm_n_v_heads == d.ssm_n_v_heads &&
+        c.ssm_n_k_heads == d.ssm_n_k_heads && c.ssm_head_dim == d.ssm_head_dim && c.ssm_conv_kernel == d.ssm_conv_kernel &&
+        c.rms_eps == d.rms_eps)
+        return {};
+    if (const char* v = std::getenv("IE_Q35MOE_ANY_SHAPE"); v && *v == '1') {   // diagnosis only (known_bugs 51)
+        std::fprintf(stderr, "[qwen35moe] IE_Q35MOE_ANY_SHAPE=1: loading an UNVERIFIED shape (layers %u, hidden %u, "
+                     "experts %u of %u) -- the generic mini oracle measured such shapes wrong\n",
+                     c.n_layers, c.hidden, c.experts_topk, c.n_experts);
+        return {};
+    }
+    char b[400];
+    std::snprintf(b, sizeof(b), "qwen35moe: this file's shape (layers %u, hidden %u, heads %u/%u x %u, experts %u of %u x %u, "
+                  "rope base %.0f, vocab %u) is not Qwen3.6-35B-A3B's (layers 40, hidden 2048, heads 16/2 x 256, experts 8 "
+                  "of 256 x 512, rope base 10000000, vocab 248320) -- the only shape this path is verified on; not loaded "
+                  "rather than computed wrong (known_bugs 51)", c.n_layers, c.hidden, c.n_q_heads, c.n_kv_heads, c.head_dim,
+                  c.experts_topk, c.n_experts, c.expert_ffn, double(c.rope_theta), c.vocab);
+    return b;
+}
+
 QwenModel::~QwenModel() {
     if (alloc_) for (void* p : owned_) alloc_->free(p);
 }

@@ -142,7 +142,7 @@ std::string dequant_tensor_fp32(const GgufTensorInfo* t, std::vector<float>& out
 
 }  // namespace
 
-Qwen4ExpModel::~Qwen4ExpModel() { free_all(); }
+Qwen4ExpModel::~Qwen4ExpModel() { if (pick_trace_) std::fclose(pick_trace_); free_all(); }
 
 // IE_Q4E_EXPERT_PINS: read an IE_Q4E_EXPERT_HIST file ("L total share share counts[E]" a line, '#' comments) and pin the
 // IE_Q4E_PIN_FRAC x slots most-used experts of each layer (at most slots - 8, so the LRU and the prefetch ring keep room).
@@ -1970,6 +1970,7 @@ std::string Qwen4ExpModel::init_ecache(uint32_t vram_share) {
             ec.slot_of.assign(cfg_.n_experts, -1);
             ec.expert_in.assign(ecache_slots_, -1);
             ec.last_use.assign(ecache_slots_, 0);
+            ec.prot.assign(ecache_slots_, 0); ec.n_prot = 0;
         }
         if (const char* hp = std::getenv("IE_Q4E_EXPERT_HIST"); hp && *hp && expert_hist_.empty())
             expert_hist_.assign(uint64_t(cfg_.n_layers) * cfg_.n_experts, 0);
@@ -1977,6 +1978,17 @@ std::string Qwen4ExpModel::init_ecache(uint32_t vram_share) {
         std::fprintf(stderr, "[qwen4exp] expert cache: %u slots/layer, %.2f GiB\n",
                      ecache_slots_,
                      double(ecache_slots_) * sum_slot / 1073741824.0);
+        if (const char* sv = std::getenv("IE_Q4E_ECACHE_SLRU"); sv && *sv == '1' && !ecache_slru_) {
+            ecache_slru_ = true;
+            std::fprintf(stderr, "[qwen4exp] IE_Q4E_ECACHE_SLRU=1: the expert cache evicts by segmented LRU (an experiment; host routing "
+                                 "only)\n");
+        }
+        if (const char* tp = std::getenv("IE_Q4E_PICK_TRACE"); tp && *tp && !pick_trace_) {
+            const std::string f = std::string(tp) + ".layers" + std::to_string(layer_lo_) + "-" + std::to_string(layer_hi_) + ".u32";
+            pick_trace_ = std::fopen(f.c_str(), "wb");
+            std::fprintf(stderr, "[qwen4exp] IE_Q4E_PICK_TRACE: expert accesses of layers [%u, %u) -> %s%s\n", layer_lo_, layer_hi_,
+                         f.c_str(), pick_trace_ ? "" : " (could not be opened)");
+        }
         {   // 2026-11-02: the pinned upload ring (the header note by up_ring_)
             // Measured 2026-11-02 at the owner's launch: the tokens identical, but decode 28.5 / 27.0 / 26.0 -> 24.4 / 21.7 /
             // 20.0 tok/s over three turns (-14..-23 %), the first token 13.6 -> 19.9 s (+47 %), concurrent requests 29-74 %
@@ -1984,7 +1996,15 @@ std::string Qwen4ExpModel::init_ecache(uint32_t vram_share) {
             // misses blocks on the 32-entry ring. OPT-IN (IE_Q4E_PINNED_UPLOADS=1) for a box whose copy engine faults on the
             // mapping.
             const char* pv = std::getenv("IE_Q4E_PINNED_UPLOADS");
-            const bool on = pv && *pv == '1';
+            // 2026-11-10: the copy engine only ever reads pinned memory. With the banks pinned (the default) the direct copies
+            // already do; with IE_Q4E_NO_PIN_BANKS=1 (a low-RAM box) they read the pageable file mapping, the case a copy-engine
+            // fault (-ENOENT, DEVICE_LOST: GitHub issue 3, known_bugs 46's signature) is reported on -- so that mode stages
+            // through the ring unless IE_Q4E_PINNED_UPLOADS=0 says otherwise.
+            const bool unpinned_banks = std::getenv("IE_Q4E_NO_PIN_BANKS") != nullptr;
+            const bool on = pv ? *pv == '1' : unpinned_banks;
+            if (on && !pv)
+                std::fprintf(stderr, "[qwen4exp] IE_Q4E_NO_PIN_BANKS: the banks are not pinned, so expert uploads go through the pinned "
+                                     "ring (IE_Q4E_PINNED_UPLOADS=0 = straight from the file mapping, as before)\n");
             uint64_t entry = 0;
             for (uint32_t L = layer_lo_; L < layer_hi_; ++L) entry = std::max(entry, ecache_[L].slot_bytes);
             const int rn = [] { const char* v = std::getenv("IE_Q4E_UPLOAD_RING"); const int n = v ? std::atoi(v) : 32;
@@ -2343,6 +2363,7 @@ std::string Qwen4ExpModel::ecache_shrink(uint32_t d) {
         std::fill(ec.slot_of.begin(), ec.slot_of.end(), int16_t(-1));
         ec.expert_in.assign(N, -1);
         ec.last_use.assign(N, 0);
+        ec.prot.assign(N, 0); ec.n_prot = 0;
     }
     ecache_slots_ = N;
     ecache_usable_ = N;
@@ -3489,13 +3510,14 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
     // The upload queue is a parameter so the prefill wave loop can land
     // refills on copyq_ (overlapped with compute); decode/verify stay on q.
     ECache& ec = ecache_[L];
+    const uint64_t ec_since = ecache_clock_;   // (IE_Q4E_ECACHE_SLRU: the slots stamped after this are this forward's)
+    trace_mark(L, T);
     auto ensure_slot_on = [&](sycl::queue& uq, uint32_t e) -> uint8_t* {
         int32_t sl = ec.slot_of[e];
-        if (sl >= 0) ++ecache_hits; else ++ecache_misses;
+        trace_pick(L, e);
+        if (sl >= 0) { ++ecache_hits; ecache_use(ec, uint32_t(sl)); } else ++ecache_misses;
         if (sl < 0) {
-            uint32_t v = 0; uint64_t best = UINT64_MAX;
-            for (uint32_t c2 = 0; c2 < ecache_slots_; ++c2)
-                if (ec.last_use[c2] < best) { best = ec.last_use[c2]; v = c2; }
+            const uint32_t v = ecache_victim(ec, ec_since);
             if (ec.expert_in[v] >= 0) ec.slot_of[ec.expert_in[v]] = -1;
             ec.expert_in[v] = int32_t(e);
             ec.slot_of[e]   = int16_t(v);
@@ -5184,7 +5206,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
 // ============== device routing (option 2 phase 3): the header's DevRoute note ==============
 
 std::string Qwen4ExpModel::dr_init() {
-    if (!q4e_dev_route() || ecache_.empty() || ecache_slots_ == 0) return {};
+    if (!q4e_dev_route() || ecache_slru_ || ecache_.empty() || ecache_slots_ == 0) return {};   // (SLRU: host routing only)
     sycl::queue& q = alloc_->queue();
     const sycl::context ctx = q.get_context();
     const uint32_t E = cfg_.n_experts, NU = cfg_.n_experts_used, S = ecache_slots_;
@@ -5896,13 +5918,14 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
     {
         const uint32_t NU = cfg_.n_experts_used;
         ECache& ec = ecache_[L];
+        const uint64_t ec_since = ecache_clock_;   // (IE_Q4E_ECACHE_SLRU: the slots stamped after this are this forward's)
+        trace_mark(L, G);
         auto ensure_slot_on = [&](sycl::queue& uq, uint32_t e) -> uint8_t* {
             int32_t sl = ec.slot_of[e];
-            if (sl >= 0) ++ecache_hits; else ++ecache_misses;
+            trace_pick(L, e);
+            if (sl >= 0) { ++ecache_hits; ecache_use(ec, uint32_t(sl)); } else ++ecache_misses;
             if (sl < 0) {
-                uint32_t v = 0; uint64_t best = UINT64_MAX;
-                for (uint32_t c2 = 0; c2 < ecache_slots_; ++c2)
-                    if (ec.last_use[c2] < best) { best = ec.last_use[c2]; v = c2; }
+                const uint32_t v = ecache_victim(ec, ec_since);
                 if (ec.expert_in[v] >= 0) ec.slot_of[ec.expert_in[v]] = -1;
                 ec.expert_in[v] = int32_t(e);
                 ec.slot_of[e]   = int16_t(v);
