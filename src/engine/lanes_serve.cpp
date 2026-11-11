@@ -114,6 +114,7 @@ std::string CardPipe::stop() {
 // ---- LanesServe --------------------------------------------------------------------------------------------------------------
 
 LanesServe::LanesServe(LanesModel& m, Options o) : m_(m), o_(o), lanes_(m.n_lanes()) {
+    if (const char* v = std::getenv("IE_LANES_ROUND_STATS")) rs_on_ = *v == '1';
     for (uint32_t i = 0; i < lanes_.size(); ++i) lanes_[i].cap = m.lane_cap(i);
     if (const char* v = std::getenv("IE_LANES_PREFILL_FIFO")) o_.prefill_fifo = *v != '0';
     if (const char* v = std::getenv("IE_LANES_HANDOVER_MS")) o_.handover_ms = uint32_t(std::max(0, std::atoi(v)));
@@ -121,6 +122,16 @@ LanesServe::LanesServe(LanesModel& m, Options o) : m_(m), o_(o), lanes_(m.n_lane
 }
 
 LanesServe::~LanesServe() { shutdown(); }
+
+static void rs_print(const char* tag, const char* what, uint32_t rows, const auto& r) {
+    if (!r.n) return;
+    const double n = double(r.n);
+    std::fprintf(stderr, "[%s ROUNDS] %s%s: %llu, %.2f tokens each; ms each: cycle %.2f = pipe %.2f + draft %.2f + sampling %.2f + keep %.2f "
+                         "+ rest %.2f -> %.2f ms a token\n",
+                 tag, what, rows ? (" of " + std::to_string(rows) + " rows").c_str() : "", (unsigned long long)r.n, double(r.tok) / n,
+                 r.cycle_ms / n, r.pipe_ms / n, r.draft_ms / n, r.samp_ms / n, r.keep_ms / n,
+                 (r.cycle_ms - r.pipe_ms - r.draft_ms - r.samp_ms - r.keep_ms) / n, r.tok ? r.cycle_ms / double(r.tok) : 0.0);
+}
 
 void LanesServe::shutdown() {
     // the callbacks stop resubmitting (stopping + pause); the idle serial worker ends; the pipe drains and joins its stages
@@ -130,6 +141,11 @@ void LanesServe::shutdown() {
     wcv_.notify_all();
     if (worker_.joinable()) worker_.join();
     if (auto e = m_.pipe_stop(); !e.empty()) std::fprintf(stderr, "[%s] teardown pipe_stop: %s\n", m_.tag(), e.c_str());
+    if (rs_on_) {   // IE_LANES_ROUND_STATS
+        rs_print(m_.tag(), "plain steps", 0, rs_plain_);
+        for (uint32_t r = 2; r < 9; ++r) rs_print(m_.tag(), "MTP rounds", r, rs_round_[r]);
+        rs_on_ = false;
+    }
 }
 
 // P4 B33 (see the header). The serial turn's prefill sees stopping_ through its `stop` (run_chunks asks it before each chunk);
@@ -360,6 +376,7 @@ bool LanesServe::commit(Lane& l, int32_t id) {
 // submit ends the request (the pipe refuses every step after a stage error).
 void LanesServe::submit(Lane& l, uint32_t li) {
     l.parked = false; l.held = false; l.bypass = 0; l.t_sub = Clock::now();
+    l.rs_draft_ms = 0;
     l.qheld = l.qfree = false;   // (P4 B36 (C): its quota wait, if any, ends here)
     std::string e;
     const bool prefill = l.phase == Lane::Phase::kPrefill;
@@ -539,6 +556,14 @@ bool LanesServe::step_landed(Lane& l, uint32_t li) {
     }
     if (l.look_n) { look_landed(l, li); return false; }   // P4 B55: a lookup round
     if (l.draft_n) { draft_landed(l, li); return false; }  // 2026-10-21: an MTP round
+    if (rs_on_) {
+        const auto now = Clock::now();
+        ++rs_plain_.n; ++rs_plain_.tok; rs_plain_.pipe_ms += step - l.rs_draft_ms; rs_plain_.draft_ms += l.rs_draft_ms;   // (a draft that gave no round)
+        // (a request's first step has no landing before it: its pipe time stands in)
+        const void* rq = static_cast<const void*>(&*l.rq);
+        if (l.rs_rq == rq) rs_plain_.cycle_ms += std::chrono::duration<double, std::milli>(now - l.rs_t_cycle).count(); else rs_plain_.cycle_ms += step;
+        l.rs_t_cycle = now; l.rs_rq = rq;
+    }
     ++steps_; ++l.steps; ++l.dsteps;
     step_ms_ = steps_ == 1 ? step : 0.9 * step_ms_ + 0.1 * step;
     l.pos += 1;
@@ -651,8 +676,10 @@ bool LanesServe::draft_try(Lane& l, uint32_t li) {
     if (room < V) return false;
     std::vector<int32_t> d;
     std::string e;
+    const auto rs_t0 = Clock::now();
     try { e = m_.draft(li, l.next, l.pos, l.rq->sp, l.rq->rng + l.n_new, d); }
     catch (const std::exception& x) { e = std::string("threw: ") + x.what(); }
+    l.rs_draft_ms = ms_since(rs_t0);
     if (!e.empty()) {   // the lane takes plain steps; the reply is the same
         if (!draft_said_) std::fprintf(stderr, "[%s] lane %u MTP draft: %s -- plain steps\n", m_.tag(), li, e.c_str());
         draft_said_ = true;
@@ -670,6 +697,10 @@ bool LanesServe::draft_try(Lane& l, uint32_t li) {
 
 void LanesServe::draft_landed(Lane& l, uint32_t li) {
     const uint32_t R = l.draft_n;
+    const double rs_pipe = ms_since(l.t_sub);
+    const auto rs_t1 = Clock::now();
+    const void* rs_rq_now = static_cast<const void*>(&*l.rq);
+    const bool rs_first = l.rs_rq != rs_rq_now;
     l.draft_n = 0;
     ++steps_; ++l.steps;
     const LanesSampling& sp = l.rq->sp;
@@ -681,6 +712,7 @@ void LanesServe::draft_landed(Lane& l, uint32_t li) {
     std::string err;
     try { err = m_.sample_draft(li, R, sp, wins, seeds, picks); }
     catch (const std::exception& x) { err = std::string("threw: ") + x.what(); }
+    const double rs_samp = ms_since(rs_t1);
     if (!err.empty()) { end_lane(l, std::string("error: ") + m_.tag() + " lane " + std::to_string(li) + " MTP sample: " + err, true); return; }
     uint32_t acc = 0;      // rows followed: the lane's state must end at draft_base + acc
     bool ended = false;
@@ -691,8 +723,18 @@ void LanesServe::draft_landed(Lane& l, uint32_t li) {
         if (r + 1 < R && picks[r] != l.draft_ids[r + 1]) break;
     }
     draft_hits_ += acc - 1;
+    const auto rs_t2 = Clock::now();
     try { err = m_.draft_keep(li, R, acc, l.draft_base); }
     catch (const std::exception& x) { err = std::string("threw: ") + x.what(); }
+    if (rs_on_ && R < 9) {
+        RoundStat& r = rs_round_[R];
+        const auto now = Clock::now();
+        ++r.n; r.tok += acc; r.pipe_ms += rs_pipe; r.draft_ms += l.rs_draft_ms; r.samp_ms += rs_samp; r.keep_ms += ms_since(rs_t2);
+        // (t_sub is taken before the draft: the pipe time measured holds it)
+        r.pipe_ms -= l.rs_draft_ms;
+        r.cycle_ms += rs_first ? rs_pipe : std::chrono::duration<double, std::milli>(now - l.rs_t_cycle).count();
+        l.rs_t_cycle = now; l.rs_rq = rs_rq_now;
+    }
     if (!err.empty()) { end_lane(l, std::string("error: ") + m_.tag() + " lane " + std::to_string(li) + " MTP keep: " + err, true); return; }
     if (o_.trace) std::fprintf(stderr, "[%s step] lane %u MTP %u row(s) at %u: %u followed\n", m_.tag(), li, R, l.draft_base, acc);
     if (ended) { end_lane(l, l.finish, false); return; }

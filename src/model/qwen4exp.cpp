@@ -180,6 +180,24 @@ void Qwen4ExpModel::load_expert_pins(const char* path) {
 }
 
 void Qwen4ExpModel::free_all() {
+    if (n_mtp_steps)
+        std::fprintf(stderr, "[qwen4exp FWD] MTP head draft steps: %llu, ms each: fusion %.2f + the head's layer %.2f + mixer / lm_head / pick %.2f\n",
+                     (unsigned long long)n_mtp_steps, t_mtp_pre * 1e3 / double(n_mtp_steps), t_mtp_layer * 1e3 / double(n_mtp_steps),
+                     t_mtp_head * 1e3 / double(n_mtp_steps));
+    if (fwd_stats_on_) {   // IE_Q4E_FWD_STATS
+        static const char* kn[3] = {"plain", "spec-verify", "lane rows"};
+        for (uint32_t k = 0; k < 3; ++k)
+            for (uint32_t r = 0; r < 10; ++r) {
+                const FwdStat& f = fwd_stat_[k][r];
+                if (!f.n) continue;
+                std::fprintf(stderr, "[qwen4exp FWD] layers %u-%u %s %s%u row(s): %llu forwards, %.2f ms each, %.1f expert accesses and "
+                                     "%.2f misses each (%.1f %% missed), %.2f of them evicting a resident; the host inside the fills' submissions %.2f ms each\n",
+                             layer_lo_, layer_hi_, kn[k], r == 9 ? "> " : "", r == 9 ? 8u : r, (unsigned long long)f.n, f.ms / double(f.n),
+                             double(f.picks) / double(f.n), double(f.miss) / double(f.n), f.picks ? 100.0 * double(f.miss) / double(f.picks) : 0.0,
+                             double(f.evict) / double(f.n), f.fill_ms / double(f.n));
+            }
+        fwd_stats_on_ = false;
+    }
     if (!droute_.empty() && dr_fwd_dev_ + dr_fwd_host_)
         std::fprintf(stderr, "[qwen4exp] device routing: %llu of %llu decode / verify forwards on the device, %llu picks read "
                              "from the pinned bank, decode miss-rate EMA %.4f (IE_Q4E_DEV_ROUTE_MISS)\n",
@@ -223,6 +241,9 @@ void Qwen4ExpModel::free_all() {
     up_ring_.clear(); up_ev_.clear(); up_entry_bytes_ = 0;
     for (void* p : owned_) if (p) alloc_->free(p);
     owned_.clear();
+    token_embd_host_.clear(); token_embd_host_.shrink_to_fit();   // (IE_Q4E_HOST_EMBED)
+    if (emb_stage_) { alloc_->free_host(emb_stage_); emb_stage_ = nullptr; }
+    emb_ev_ = sycl::event{};
     ag_ = AttnGemmScratch{};   // (P4 B49: its buffers were in owned_)
     layers_.clear();
     alloc_ = nullptr;
@@ -742,6 +763,35 @@ static bool q4e_hc_cnorm() {
 // The routing-independent work of a MoE layer (the shared expert, its scalar gate, the MoE activation quantization) queued
 // behind the router D2H copy BEFORE the host waits for it (2026-11-08, the decode host gap): the GPU runs it during the
 // host's routing bubble. A submission reorder only, no numeric change. DEFAULT ON; IE_Q4E_HOIST_SHEXP=0 waits first.
+// IE_Q4E_HITS_FIRST (2026-11-10): the routed jobs of cached experts launch before the barrier behind the miss fills (the
+// decode / verify MoE body's note). A submission reorder only, no numeric change. DEFAULT ON; =0: every job behind the fills.
+static bool q4e_hits_first() {
+    static const bool on = [] { const char* v = std::getenv("IE_Q4E_HITS_FIRST"); return !(v && *v == '0'); }();
+    return on;
+}
+// IE_Q4E_KCOPY (2026-11-10): the MoE body's two small copies a layer -- the router logits to the host and the job table to
+// the device -- as kernels on the compute queue reading / writing the pinned host buffers, not queue memcpys. A memcpy
+// between pinned host memory and the device runs on the card's COPY engine, and the step's kernels then wait for the
+// compute -> copy -> compute hand-offs, twice a layer (allocator.cpp's d2h note measured the same on the 27B lanes).
+// The bytes moved are the same; no numeric change. DEFAULT ON; IE_Q4E_KCOPY=0 = the queue memcpys.
+static int q4e_kcopy() {   // bit 0 = the router logits to the host, bit 1 = the job table to the device
+    static const int on = [] { const char* v = std::getenv("IE_Q4E_KCOPY"); return v ? std::atoi(v) : 0; }();
+    return on;
+}
+class ie_q4e_kcopy_u16;
+class ie_q4e_kcopy_u32;
+static sycl::event q4e_copy_u16(sycl::queue& q, void* dst, const void* src, uint64_t n) {   // n 16-bit words
+    if (!(q4e_kcopy() & 1)) return q.memcpy(dst, src, n * 2);
+    auto* d = static_cast<uint16_t*>(dst);
+    const auto* s = static_cast<const uint16_t*>(src);
+    return q.parallel_for<ie_q4e_kcopy_u16>(sycl::range<1>(n), [=](sycl::id<1> i) { d[i] = s[i]; });
+}
+static sycl::event q4e_copy_u32(sycl::queue& q, void* dst, const void* src, uint64_t n) {   // n 32-bit words
+    if (!(q4e_kcopy() & 2)) return q.memcpy(dst, src, n * 4);
+    auto* d = static_cast<uint32_t*>(dst);
+    const auto* s = static_cast<const uint32_t*>(src);
+    return q.parallel_for<ie_q4e_kcopy_u32>(sycl::range<1>(n), [=](sycl::id<1> i) { d[i] = s[i]; });
+}
 static bool q4e_hoist_shexp() {
     static const bool v = [] { const char* e = std::getenv("IE_Q4E_HOIST_SHEXP"); return !(e && e[0] == '0'); }();
     return v;
@@ -1557,11 +1607,68 @@ std::string Qwen4ExpModel::prepare_bank_views() {
     return {};
 }
 
+// IE_Q4E_HOST_EMBED (the header's note). The device table is read back, so the host rows are the bytes the card held.
+std::string Qwen4ExpModel::embed_to_host() {
+    static const bool off = [] { const char* v = std::getenv("IE_Q4E_HOST_EMBED"); return v && *v == '0'; }();
+    if (off || !token_embd || !token_embd_host_.empty()) return {};
+    const uint64_t n = uint64_t(cfg_.vocab) * cfg_.hidden;
+    try {
+        token_embd_host_.resize(n);
+        alloc_->queue().wait();
+        alloc_->d2h(token_embd_host_.data(), token_embd, n * sizeof(sycl::half));
+    } catch (const std::exception& x) {
+        token_embd_host_.clear(); token_embd_host_.shrink_to_fit();
+        std::fprintf(stderr, "[qwen4exp] the token embedding stays on the card (%s)\n", x.what());
+        return {};
+    }
+    if (auto it = std::find(owned_.begin(), owned_.end(), static_cast<void*>(token_embd)); it != owned_.end()) owned_.erase(it);
+    alloc_->free(token_embd);
+    token_embd = nullptr;
+    dev_bytes_ = dev_bytes_ > n * sizeof(sycl::half) ? dev_bytes_ - n * sizeof(sycl::half) : 0;
+    std::fprintf(stderr, "[qwen4exp] token embedding: %.2f GiB moved from the card to system RAM, rows uploaded as they are read "
+                         "(IE_Q4E_HOST_EMBED=0 keeps it on the card)\n", double(n * sizeof(sycl::half)) / 1073741824.0);
+    return {};
+}
+
+// emb_[t, :] = the embedding row of ids[t]: gathered on the card from token_embd, or on the host and uploaded.
+sycl::event Qwen4ExpModel::embed_rows(const int32_t* ids_host, uint32_t T) {
+    sycl::queue& q = alloc_->queue();
+    const uint32_t H = cfg_.hidden;
+    if (token_embd) return gather_embed_rows(q, token_embd, d_tokens_, emb_, T, H);   // (d_tokens_ holds the ids)
+    emb_ev_.wait();   // the upload that last read the stage (long done: every forward ends in a wait)
+    if (!emb_stage_) {
+        emb_stage_ = static_cast<sycl::half*>(alloc_->malloc_host(uint64_t(std::max<uint32_t>(max_chunk_, 16u)) * H * sizeof(sycl::half)));
+        if (!emb_stage_) throw std::runtime_error("qwen4exp: the embedding stage could not be allocated");
+    }
+    std::vector<int32_t> back;
+    if (!ids_host) {   // the ids are on the card only
+        back.resize(T);
+        q.memcpy(back.data(), d_tokens_, T * sizeof(int32_t)).wait();
+        ids_host = back.data();
+    }
+    const sycl::half* tab = token_embd_host_.data();
+    for (uint32_t t = 0; t < T; ++t) {
+        const uint32_t id = uint32_t(ids_host[t]) < cfg_.vocab ? uint32_t(ids_host[t]) : 0u;
+        std::memcpy(emb_stage_ + uint64_t(t) * H, tab + uint64_t(id) * H, H * sizeof(sycl::half));
+    }
+    emb_ev_ = q.memcpy(emb_, emb_stage_, uint64_t(T) * H * sizeof(sycl::half));
+    return emb_ev_;
+}
+
 std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
                                         uint32_t lanes, uint32_t lane_ctx,
                                          uint32_t vram_share, bool defer_cache) {
     if (!alloc_) return "qwen4exp runtime: load() first";
-    max_ctx_ = max_ctx; max_chunk_ = max_chunk;
+    // Elastic context (the header's note): `max_ctx` stays the admitted context below (the lanes' cap, the attention
+    // GEMM's limit); lane 0's context-strided buffers are made for `cap0` tokens and ctx_reserve grows them.
+    ctx_limit_ = 0;
+    uint32_t cap0 = max_ctx;
+    {
+        static const bool off = [] { const char* v = std::getenv("IE_Q4E_ELASTIC_CTX"); return v && *v == '0'; }();
+        if (ctx_elastic_ && !off && max_ctx > kElasticInit + kElasticStep) { ctx_limit_ = max_ctx; cap0 = kElasticInit; }
+    }
+    max_ctx_ = cap0; max_chunk_ = max_chunk;
+    if (auto e = embed_to_host(); !e.empty()) return e;   // (before any buffer and the cache's sizing)
     const uint32_t H = cfg_.hidden, MT = max_chunk;
     const uint32_t D = cfg_.hc_count * H;                     // 10240
     const uint32_t SI = cfg_.ssm_inner;                       // 6144
@@ -1577,7 +1684,8 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
     if (nf == 0) nf = 1;   // KvCache/DeltaNetState reject zero layers
     if (nl == 0) nl = 1;
 
-    KvCacheConfig kc{uint32_t(nf), cfg_.n_kv_heads, max_ctx, cfg_.head_dim, false};
+    ctx_nf_ = uint32_t(nf);
+    KvCacheConfig kc{uint32_t(nf), cfg_.n_kv_heads, cap0, cfg_.head_dim, false};
     if (auto e = kv_.init(*alloc_, kc); !e.empty()) return e;
     DeltaNetStateConfig dc{uint32_t(nl), cfg_.ssm_v_heads, cfg_.ssm_state,
                            cfg_.ssm_state, CC, cfg_.ssm_conv_kernel};
@@ -1746,7 +1854,7 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
     // that shares this card has its context and the tail its draft head (IE_Q4E_LOGICAL_CARDS, the run2 gate)
     ecache_lanes_total_ = lanes_total;
     ecache_deferred_ = defer_cache;
-    if (!defer_cache) if (auto e = init_ecache(vram_share); !e.empty()) return e;
+    // (2026-11-10 evening: the cache is sized at the END of this function -- see there)
     if (cfg_.has_ple() && own_ple) {
         e16_ = ah(uint64_t(MT) * kPleD);   // E (16 x 160 wide), whatever the hidden
         ple_key_out_ = ah(uint64_t(MT) * D);
@@ -1757,14 +1865,16 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
     if (cfg_.indexer_top_k) {
         const uint32_t nf2 = uint32_t(nf);
         qsa_sel_cap_ = cfg_.indexer_top_k + 4;   // 512 blocks x4 + tail(3) + self
-        idx_kcache_ = ah(uint64_t(nf2) * max_ctx * cfg_.indexer_head_dim);
-        blk_keys_   = af(uint64_t(nf2) * (max_ctx / 4) * cfg_.indexer_head_dim);
+        // (elastic context: lane 0's caches at its capacity; the score workspaces at the widest lane's context)
+        ws_ctx_ = std::max(cap0, lanes > 1 ? (lane_ctx ? std::min(lane_ctx, max_ctx) : max_ctx) : cap0);
+        idx_kcache_ = ah(uint64_t(nf2) * cap0 * cfg_.indexer_head_dim);
+        blk_keys_   = af(uint64_t(nf2) * (cap0 / 4) * cfg_.indexer_head_dim);
         idx_q_      = ah(uint64_t(MT) * cfg_.indexer_n_heads * cfg_.indexer_head_dim);
         idx_kraw_   = ah(uint64_t(MT) * cfg_.indexer_head_dim);
-        qsa_scores_ = af(max_ctx / 4);
+        qsa_scores_ = af(ws_ctx_ / 4);
         qsa_sel_    = ai(qsa_sel_cap_);
         qsa_blk_sel_ = ai(cfg_.indexer_top_k / 4);
-        qsa_scoresT_  = af(uint64_t(MT) * (max_ctx / 4));
+        qsa_scoresT_  = af(uint64_t(MT) * (ws_ctx_ / 4));
         qsa_blk_selT_ = ai(uint64_t(MT) * (cfg_.indexer_top_k / 4));
         qsa_selT_     = ai(uint64_t(MT) * qsa_sel_cap_);
         qsa_nselT_    = ai(MT);
@@ -1849,6 +1959,12 @@ std::string Qwen4ExpModel::init_runtime(uint32_t max_ctx, uint32_t max_chunk,
         reset_state();
     }
     if (auto e = select_lane(0); !e.empty()) return e;
+    // 2026-11-10 (evening): the cache is sized HERE, after every buffer above. It used to be sized before the PLE, indexer,
+    // logits, head and MoE workspaces, against an estimate of them (1.5 GiB) plus a 4 GiB reserve; at ctx 262000 those
+    // buffers really took ~3.3 GiB, so the cards ran with ~2.2 GiB free. With the elastic context the indexer caches and the
+    // score workspace are small at the load and the same arithmetic left ~3.8 GiB idle on each card (the owner's question).
+    // Now the device's free memory is read with everything allocated and the reserve is the real margin.
+    if (!defer_cache) if (auto e = init_ecache(vram_share); !e.empty()) return e;
     return {};
 }
 
@@ -1877,7 +1993,18 @@ std::string Qwen4ExpModel::init_ecache(uint32_t vram_share) {
         // 4 GiB reserve: 2.5 proved too thin — the driver near-OOM-migrates
         // and L0 spin-stalls when a tool's real workspaces exceed the 1 GiB
         // estimate (2026-08-27, run2 reference section at ~30/32 GiB).
-        const uint64_t reserve = 4096ull << 20;
+        // 2026-11-10 (evening): 1 GiB (IE_Q4E_RESERVE_GIB=N.N sets it) plus what the loader says the card takes later
+        // (set_late_reserve: the vision tower's encode scratch). While this read 4 GiB the cards really ran with ~2.2 GiB
+        // free: the workspaces allocated after the cache was sized took the difference. The cache is sized last now
+        // (init_runtime's end), so the reserve is the free memory left on the card. Probed at the owner's launch with 2.5:
+        // free stayed 2.25-2.6 GiB through the load, a 33K read, an image, a second lane's wake and a context growth --
+        // nothing after the load took more than 0.25 GiB. The cliff (the driver migrating device memory once the card is
+        // over-committed: 0.2 tok/s on 2026-10-02) is guarded at every request's start by ecache_ensure_free.
+        const uint64_t reserve = [] {
+            const char* v = std::getenv("IE_Q4E_RESERVE_GIB");
+            const double g = v ? std::atof(v) : 1.0;
+            return uint64_t(std::clamp(g, 0.25, 16.0) * 1073741824.0);
+        }() + late_reserve_;
         const uint64_t ws_est  = 1536ull << 20;
         const uint64_t used = dev_bytes_ + ws_est;            // weights + ws estimate
         uint64_t budget = gmem > used + reserve ? gmem - used - reserve
@@ -1897,7 +2024,7 @@ std::string Qwen4ExpModel::init_ecache(uint32_t vram_share) {
         if (dv.has(sycl::aspect::ext_intel_free_memory)) {
             const uint64_t free_now = dv.get_info<sycl::ext::intel::info::device::free_memory>();
             // (deferred: init_runtime's workspaces are allocated already, so free_now excludes them -- no ws_est twice)
-            const uint64_t ws_left = ecache_deferred_ ? 0 : ws_est;
+            const uint64_t ws_left = 0;   // (the workspaces are allocated before the cache in every path now)
             // stages sharing a card keep the reserve once between them: this stage leaves 1/share of it, the last the whole
             const uint64_t reserve_here = vram_share > 1 ? reserve / vram_share : reserve;
             uint64_t from_free = free_now > reserve_here + ws_left ? free_now - reserve_here - ws_left : 0;
@@ -1931,12 +2058,20 @@ std::string Qwen4ExpModel::init_ecache(uint32_t vram_share) {
             if (!refusal.empty()) return refusal;
             budget = left;
         }
+        sum_slot_ = sum_slot;
+        // (elastic context: what lane 0's growth to its limit will take is not the lanes' to count on)
+        const uint64_t grow_bytes = ctx_limit_ ? ctx_bytes(ctx_limit_, true) - ctx_bytes(max_ctx_, true) : 0;
         if (lanes_lazy_ && lanes_.size() > 1) {   // 2026-10-23: the lanes that will wake must still leave kQ4eLaneMinSlots
             uint64_t left = 0;
-            const std::string refusal = q4e_lanes_cache_fit(budget, lane_bytes_ + mtp_lane_bytes_, uint32_t(lanes_.size() - 1),
-                                                            lanes_[1].max_ctx, sum_slot, left);
+            const std::string refusal = q4e_lanes_cache_fit(budget > grow_bytes ? budget - grow_bytes : 0, lane_bytes_ + mtp_lane_bytes_,
+                                                            uint32_t(lanes_.size() - 1), lanes_[1].max_ctx, sum_slot, left);
             if (!refusal.empty()) return refusal;
         }
+        if (ctx_limit_)
+            std::fprintf(stderr, "[qwen4exp] elastic context: lane 0 holds %u of %u tokens now and grows in the serial turn before a "
+                                 "longer prompt is read; %.2f GiB (%u expert slots a layer) stay with the cache until then "
+                                 "(IE_Q4E_ELASTIC_CTX=0 = allocated whole)\n", max_ctx_, ctx_limit_, grow_bytes / 1073741824.0,
+                         uint32_t(grow_bytes / sum_slot));
         if (const char* e = std::getenv("IE_Q4E_ECACHE_GB"))
             if (int v = std::atoi(e); v > 0) {
                 // CLAMP to the adaptive fit: an override above what the card
@@ -1956,6 +2091,14 @@ std::string Qwen4ExpModel::init_ecache(uint32_t vram_share) {
             }
         ecache_slots_ = uint32_t(std::min<uint64_t>(
             cfg_.n_experts, std::max<uint64_t>(4, budget / sum_slot)));
+        // IE_Q4E_ECACHE_SLOTS=N (a TEST switch, 2026-11-10): at most N slots a layer, so a mini model whose experts would all
+        // be resident takes the miss paths (the fills, the cached-experts-first order) under the reference check.
+        if (const char* e = std::getenv("IE_Q4E_ECACHE_SLOTS"))
+            if (const int v = std::atoi(e); v >= 4 && uint32_t(v) < ecache_slots_) {
+                std::fprintf(stderr, "[qwen4exp] IE_Q4E_ECACHE_SLOTS=%d: the expert cache capped at %d slots a layer (%u fit) -- a test switch\n",
+                             v, v, ecache_slots_);
+                ecache_slots_ = uint32_t(v);
+            }
         ecache_.resize(cfg_.n_layers);
         for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
             const Qwen4ExpLayer& w = layers_[L];
@@ -1983,6 +2126,7 @@ std::string Qwen4ExpModel::init_ecache(uint32_t vram_share) {
             std::fprintf(stderr, "[qwen4exp] IE_Q4E_ECACHE_SLRU=1: the expert cache evicts by segmented LRU (an experiment; host routing "
                                  "only)\n");
         }
+        if (const char* fs = std::getenv("IE_Q4E_FWD_STATS"); fs && *fs == '1') fwd_stats_on_ = true;
         if (const char* tp = std::getenv("IE_Q4E_PICK_TRACE"); tp && *tp && !pick_trace_) {
             const std::string f = std::string(tp) + ".layers" + std::to_string(layer_lo_) + "-" + std::to_string(layer_hi_) + ".u32";
             pick_trace_ = std::fopen(f.c_str(), "wb");
@@ -2213,6 +2357,7 @@ std::string Qwen4ExpModel::select_lane(uint32_t lane) {
 }
 
 uint32_t Qwen4ExpModel::lane_ctx(uint32_t lane) const noexcept {
+    if (lane == 0 && ctx_limit_) return ctx_limit_;   // (elastic: what lane 0 may grow to, not what it holds now)
     if (lane == lane_) return max_ctx_;
     return lane < lanes_.size() ? lanes_[lane].max_ctx : 0;
 }
@@ -2300,6 +2445,7 @@ uint32_t Qwen4ExpModel::ecache_slots_floor() const noexcept {
         if (mtp_.loaded && !(lane_ == 0 ? mtp_.kv.ready() : lanes_[0].mtp_kv.ready()))
             s = s > mtp_lane0_slots_ ? s - mtp_lane0_slots_ : 0;
     }
+    if (const uint32_t g = ctx_grow_slots()) s = s > g ? s - g : 0;   // (elastic context: lane 0 grown to its limit)
     return std::max(1u, s);
 }
 
@@ -2307,6 +2453,192 @@ uint32_t Qwen4ExpModel::rows_max_floor() const noexcept {
     const uint32_t lost = ecache_slots_ - ecache_usable_;   // (the quarantined worst case, as of now)
     const uint32_t f = ecache_slots_floor();
     return q4e_rows_max_group(f > lost ? f - lost : 1u, cfg_.n_experts_used);
+}
+
+// ---- 2026-11-10 (evening): the cache's guard against an over-committed card ------------------------------------------------
+
+uint64_t Qwen4ExpModel::vram_free() const {
+    if (!alloc_) return 0;
+    const sycl::device& dv = alloc_->device();
+    if (!dv.has(sycl::aspect::ext_intel_free_memory)) return 0;
+    try { return dv.get_info<sycl::ext::intel::info::device::free_memory>(); } catch (const sycl::exception&) { return 0; }
+}
+
+std::string Qwen4ExpModel::ecache_ensure_free(uint64_t need) {
+    static const bool off = [] { const char* v = std::getenv("IE_Q4E_VRAM_GUARD"); return v && *v == '0'; }();
+    if (off || !ecache_slots_ || !sum_slot_ || spec_verify_) return {};
+    const uint64_t kLow = 384ull << 20, kBack = 512ull << 20;   // act below 384 MiB free (beyond `need`), restore 512
+    const uint64_t free_now = vram_free();
+    if (!free_now || free_now >= need + kLow) return {};
+    const uint64_t want = need + kBack - free_now;
+    uint32_t d = uint32_t((want + sum_slot_ - 1) / sum_slot_);
+    const uint32_t floor_slots = uint32_t(kQ4eLaneMinSlots / 2) + 1;
+    if (ecache_slots_ <= floor_slots) {
+        std::fprintf(stderr, "[qwen4exp] VRAM guard: %.0f MiB free on this card and the expert cache is at its floor (%u slots a layer) -- "
+                             "nothing left to give\n", free_now / 1048576.0, ecache_slots_);
+        return {};
+    }
+    d = std::min(d, ecache_slots_ - floor_slots);
+    const uint32_t before = ecache_slots_;
+    if (auto e = ecache_shrink(d); !e.empty()) { std::fprintf(stderr, "[qwen4exp] VRAM guard: %s\n", e.c_str()); return {}; }
+    std::fprintf(stderr, "[qwen4exp] VRAM guard: %.0f MiB free on this card%s -- the expert cache gave %u slots a layer (%u -> %u); "
+                         "%.0f MiB free now (IE_Q4E_VRAM_GUARD=0 = off)\n", free_now / 1048576.0,
+                 need ? (" with " + std::to_string(need >> 20) + " MiB about to be allocated").c_str() : "", d, before, ecache_slots_,
+                 vram_free() / 1048576.0);
+    return {};
+}
+
+// ---- 2026-11-10: elastic context on lane 0 (the header's note) ---------------------------------------------------------------
+
+// Bytes of lane 0's context-strided buffers at `ctx` tokens: the KV, the indexer caches, the score workspaces beyond what the
+// other lanes need anyway, and (with_head) the draft head's KV and indexer caches.
+uint64_t Qwen4ExpModel::ctx_bytes(uint32_t ctx, bool with_head) const noexcept {
+    const uint64_t nf = ctx_nf_, kvh = cfg_.n_kv_heads, hd = cfg_.head_dim, ihd = cfg_.indexer_top_k ? cfg_.indexer_head_dim : 0;
+    uint64_t b = 2 * nf * kvh * uint64_t(ctx) * hd * sizeof(sycl::half);
+    b += nf * uint64_t(ctx) * ihd * sizeof(sycl::half) + nf * uint64_t(ctx / 4) * ihd * sizeof(float);
+    if (ihd && ctx > ws_ctx_) b += (uint64_t(max_chunk_) + 1) * uint64_t(ctx / 4 - ws_ctx_ / 4) * sizeof(float);
+    if (with_head && mtp_.loaded) b += mtp_lane_bytes(ctx);
+    return b;
+}
+
+uint32_t Qwen4ExpModel::ctx_grow_slots() const noexcept {
+    if (!ctx_limit_ || !sum_slot_) return 0;
+    const uint32_t cap = lane_ == 0 ? max_ctx_ : (lanes_.empty() ? max_ctx_ : lanes_[0].max_ctx);
+    if (cap >= ctx_limit_) return 0;
+    return uint32_t((ctx_bytes(ctx_limit_, true) - ctx_bytes(cap, true) + sum_slot_ - 1) / sum_slot_) + 1;
+}
+
+std::string Qwen4ExpModel::ctx_reserve(uint32_t need) {
+    if (!ctx_limit_) return {};
+    const std::string who = "qwen4exp ctx_reserve: ";
+    if (lane_ != 0) return who + "lane 0 is not live";
+    if (spec_verify_) return who + "refused in spec-verify mode";
+    need = std::min(need, ctx_limit_);
+    if (need <= max_ctx_) return {};
+    const uint32_t old = max_ctx_;
+    const uint32_t cap = uint32_t(std::min<uint64_t>(ctx_limit_, (uint64_t(need) + kElasticStep - 1) / kElasticStep * kElasticStep));
+    const auto t0 = std::chrono::steady_clock::now();
+    sycl::queue& q = alloc_->queue();
+    try { q.wait(); if (copyq_) copyq_->wait(); } catch (const sycl::exception& x) { return who + x.what(); }
+    const uint32_t nf = ctx_nf_, KVH = cfg_.n_kv_heads, HD = cfg_.head_dim;
+    const uint32_t IHD = cfg_.indexer_top_k ? cfg_.indexer_head_dim : 0;
+    const bool head = mtp_.loaded && mtp_.kv.ready();
+    if (kv_.is_int8() || (head && mtp_.kv.is_int8())) return who + "an int8 KV is not grown";
+    {   // refuse BEFORE anything is freed when the cache cannot give the slots (the admission counted them: not expected)
+        const uint64_t take0 = ctx_bytes(cap, head) - ctx_bytes(old, head);
+        const uint32_t d0 = uint32_t((take0 + sum_slot_ - 1) / std::max<uint64_t>(1, sum_slot_)) + 1;
+        if (!sum_slot_ || ecache_slots_ < d0 + kQ4eLaneMinSlots / 2)
+            return who + "growing lane 0 from " + std::to_string(old) + " to " + std::to_string(cap) + " tokens needs " + std::to_string(d0) +
+                   " expert slots a layer and the cache has " + std::to_string(ecache_slots_);
+    }
+    auto drop = [&](void* p) {
+        if (!p) return;
+        if (auto it = std::find(owned_.begin(), owned_.end(), p); it != owned_.end()) owned_.erase(it);
+        alloc_->free(p);
+    };
+    auto af = [&](uint64_t n) { void* p = alloc_->malloc(n * 4); if (p) owned_.push_back(p); return static_cast<float*>(p); };
+    auto ah = [&](uint64_t n) { void* p = alloc_->malloc(n * 2); if (p) owned_.push_back(p); return static_cast<sycl::half*>(p); };
+    // 1. what the lane holds, packed, to system RAM: rows [0, length) of every (layer, kv head), the indexer's key rows of
+    //    the same positions, the block keys made so far -- the main model's and the draft head's
+    struct Saved { std::vector<sycl::half> k, v, idx; std::vector<float> blk; std::vector<uint32_t> len, blocks; };
+    uint64_t moved = 0;
+    auto save = [&](KvCache& kv, uint32_t layers, const sycl::half* idx, const float* blk, const std::vector<uint32_t>& blocks, Saved& sv) {
+        sv.len.resize(layers); sv.blocks = blocks;
+        uint64_t rows = 0, nblk = 0;
+        for (uint32_t l = 0; l < layers; ++l) { sv.len[l] = std::min(kv.length(l), old); rows += sv.len[l]; }
+        for (uint32_t l = 0; l < layers && l < blocks.size(); ++l) nblk += std::min(blocks[l], old / 4);
+        sv.k.resize(rows * KVH * HD); sv.v.resize(rows * KVH * HD);
+        if (IHD && idx) sv.idx.resize(rows * IHD);
+        if (IHD && blk) sv.blk.resize(nblk * IHD);
+        uint64_t ko = 0, io = 0, bo = 0;
+        for (uint32_t l = 0; l < layers; ++l) {
+            const uint64_t n = uint64_t(sv.len[l]) * HD;
+            for (uint32_t h = 0; h < KVH && n; ++h, ko += n) {
+                const uint64_t src = (uint64_t(l) * KVH + h) * old * HD;
+                alloc_->d2h(sv.k.data() + ko, kv.k_ptr() + src, n * sizeof(sycl::half));
+                alloc_->d2h(sv.v.data() + ko, kv.v_ptr() + src, n * sizeof(sycl::half));
+                moved += 2 * n * sizeof(sycl::half);
+            }
+            if (!sv.idx.empty() && sv.len[l]) {
+                alloc_->d2h(sv.idx.data() + io, idx + uint64_t(l) * old * IHD, uint64_t(sv.len[l]) * IHD * sizeof(sycl::half));
+                io += uint64_t(sv.len[l]) * IHD;
+            }
+            if (!sv.blk.empty() && l < blocks.size()) {
+                const uint64_t nb = std::min(blocks[l], old / 4);
+                if (nb) alloc_->d2h(sv.blk.data() + bo, blk + uint64_t(l) * (old / 4) * IHD, nb * IHD * sizeof(float));
+                bo += nb * IHD;
+            }
+        }
+    };
+    auto load = [&](KvCache& kv, uint32_t layers, sycl::half* idx, float* blk, const Saved& sv) {
+        uint64_t ko = 0, io = 0, bo = 0;
+        for (uint32_t l = 0; l < layers; ++l) {
+            const uint64_t n = uint64_t(sv.len[l]) * HD;
+            for (uint32_t h = 0; h < KVH && n; ++h, ko += n) {
+                const uint64_t dst = (uint64_t(l) * KVH + h) * cap * HD;
+                alloc_->h2d(kv.k_ptr() + dst, sv.k.data() + ko, n * sizeof(sycl::half));
+                alloc_->h2d(kv.v_ptr() + dst, sv.v.data() + ko, n * sizeof(sycl::half));
+            }
+            kv.set_length(l, sv.len[l]);
+            if (!sv.idx.empty() && sv.len[l]) {
+                alloc_->h2d(idx + uint64_t(l) * cap * IHD, sv.idx.data() + io, uint64_t(sv.len[l]) * IHD * sizeof(sycl::half));
+                io += uint64_t(sv.len[l]) * IHD;
+            }
+            if (!sv.blk.empty() && l < sv.blocks.size()) {
+                const uint64_t nb = std::min(sv.blocks[l], old / 4);
+                if (nb) alloc_->h2d(blk + uint64_t(l) * (cap / 4) * IHD, sv.blk.data() + bo, nb * IHD * sizeof(float));
+                bo += nb * IHD;
+            }
+        }
+    };
+    Saved m, hsv;
+    try {
+        save(kv_, nf, idx_kcache_, blk_keys_, blk_done_, m);
+        if (head) save(mtp_.kv, 1, mtp_.idx_kcache, mtp_.blk_keys, std::vector<uint32_t>{mtp_.blk_done}, hsv);
+    } catch (const std::exception& x) { return who + "saving the lane: " + x.what(); }
+    // 2. the old buffers back to the device, the difference out of the expert cache, the new ones in their place
+    const uint64_t take = ctx_bytes(cap, head) - ctx_bytes(old, head);
+    const uint32_t d = uint32_t((take + sum_slot_ - 1) / std::max<uint64_t>(1, sum_slot_)) + 1;
+    kv_.free_storage();
+    drop(idx_kcache_); idx_kcache_ = nullptr;
+    drop(blk_keys_); blk_keys_ = nullptr;
+    if (head) { mtp_.kv.free_storage(); drop(mtp_.idx_kcache); mtp_.idx_kcache = nullptr; drop(mtp_.blk_keys); mtp_.blk_keys = nullptr; }
+    const bool ws = IHD && cap > ws_ctx_;
+    if (ws) { drop(qsa_scores_); qsa_scores_ = nullptr; drop(qsa_scoresT_); qsa_scoresT_ = nullptr; }
+    if (d_blkpos3_) { drop(d_blkpos3_); d_blkpos3_ = nullptr; blkpos3_cap_ = 0; }   // (made again at the new context on its next use)
+    const uint32_t slots_before = ecache_slots_;
+    if (auto e = ecache_shrink(d); !e.empty()) return who + e + " (the lane's state is lost)";
+    max_ctx_ = cap;
+    KvCacheConfig kc{nf, KVH, cap, HD, false};
+    if (auto e = kv_.init(*alloc_, kc); !e.empty()) return who + "kv: " + e;
+    if (IHD) {
+        idx_kcache_ = ah(uint64_t(nf) * cap * IHD);
+        blk_keys_   = af(uint64_t(nf) * (cap / 4) * IHD);
+        if (!idx_kcache_ || !blk_keys_) return who + "the indexer caches could not be allocated";
+    }
+    if (ws) {
+        ws_ctx_ = cap;
+        qsa_scores_  = af(ws_ctx_ / 4);
+        qsa_scoresT_ = af(uint64_t(max_chunk_) * (ws_ctx_ / 4));
+        if (!qsa_scores_ || !qsa_scoresT_) return who + "the score workspaces could not be allocated";
+    }
+    if (head) {
+        KvCacheConfig mkc{1u, KVH, cap, HD, false};
+        if (auto e = mtp_.kv.init(*alloc_, mkc); !e.empty()) return who + "the head's kv: " + e;
+        mtp_.idx_kcache = ah(uint64_t(cap) * cfg_.indexer_head_dim);
+        mtp_.blk_keys   = af(uint64_t(cap / 4) * cfg_.indexer_head_dim);
+        if (!mtp_.idx_kcache || !mtp_.blk_keys) return who + "the head's indexer caches could not be allocated";
+    }
+    try {
+        load(kv_, nf, idx_kcache_, blk_keys_, m);
+        if (head) load(mtp_.kv, 1, mtp_.idx_kcache, mtp_.blk_keys, hsv);
+        q.wait();
+    } catch (const std::exception& x) { return who + "restoring the lane: " + x.what(); }
+    if (mtp_.loaded && lanes_lazy_) mtp_lane0_slots_ = uint32_t((mtp_lane_bytes(max_ctx_) + sum_slot_ - 1) / std::max<uint64_t>(1, sum_slot_)) + 1;
+    std::fprintf(stderr, "[qwen4exp] elastic context: lane 0 grown %u -> %u tokens (of %u) for a need of %u; %.2f GiB of its rows moved, "
+                         "the expert cache gave %u slots a layer (%u -> %u), %.0f ms\n", old, cap, ctx_limit_, need, moved / 1073741824.0,
+                 d, slots_before, ecache_slots_, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    return {};
 }
 
 std::string Qwen4ExpModel::lane_ensure(uint32_t lane) {
@@ -2411,7 +2743,7 @@ std::string Qwen4ExpModel::mtp_ingest_row(int32_t token, uint32_t pos, uint32_t 
     gemm_fp16(q, mtp_x16_, mtp_.fc_hidden, gemm_c_, hc, H, H);
     cast_fp32_to_fp16(q, gemm_c_, mtp_x16_, uint64_t(hc) * H);
     q.memcpy(d_tokens_, &token, sizeof(int32_t)).wait();
-    gather_embed_rows(q, token_embd, d_tokens_, emb_, 1, H);
+    embed_rows(&token, 1);
     rms_norm_f32w(q, emb_, mtp_.pre_fc_norm_embed, emb_, 1, H, eps);
     gemm_fp16(q, emb_, mtp_.fc_embed, gemm_c_, 1, H, H);
     cast_fp32_to_fp16(q, gemm_c_, mtp_e16_, uint64_t(H));
@@ -2432,7 +2764,7 @@ std::string Qwen4ExpModel::load_mtp(const GgufReader& mg,
     if (cfg_.is_dense_ffn())
         return "qwen4exp MTP: the draft head binds a MoE block; a dense-FFN model's head is not wired yet (plain decode runs)";
     sycl::queue& q = alloc_->queue();
-    if (!token_embd && main_g) {
+    if (!has_embed() && main_g) {
         // Tail-of-pipeline stage: pull token_embd for the MTP embed path.
         // Dequant->F16 upload (UD files quantize the embedding table); the
         // head stage's loader does the same normalization.
@@ -2894,7 +3226,7 @@ std::string Qwen4ExpModel::mtp_ingest(const int32_t* tokens_host, uint32_t T,
         std::vector<int32_t> et(nr);
         for (uint32_t i = 0; i < nr; ++i) et[i] = tokens_host[i + (nc ? 0 : 1)];
         q.memcpy(d_tokens_, et.data(), nr * sizeof(int32_t)).wait();
-        gather_embed_rows(q, token_embd, d_tokens_, emb_, nr, H);
+        embed_rows(et.data(), nr);
         rms_norm_f32w(q, emb_, mtp_.pre_fc_norm_embed, emb_, nr, H, eps);
         gemm_fp16(q, emb_, mtp_.fc_embed, gemm_c_, nr, H, H);
         cast_fp32_to_fp16(q, gemm_c_, mtp_e16_, uint64_t(nr) * H);
@@ -2922,7 +3254,18 @@ std::string Qwen4ExpModel::mtp_draft(int32_t t_next, uint32_t pos, uint32_t K,
     uint32_t drafted = 0;
     if (n_drafted) *n_drafted = 0;
     // Draft step k runs the MTP layer at row position (carry_pos + k).
+    auto mt_now = [] { return std::chrono::steady_clock::now(); };
+    static const bool mtp_stats = [] { const char* v = std::getenv("IE_Q4E_MTP_STATS"); return v && *v == '1'; }();   // (drains the queue 3x a step)
+    auto mt_mark = [&](double& acc, std::chrono::steady_clock::time_point& t) {
+        if (!mtp_stats) return;
+        q.wait();
+        const auto n = mt_now(); acc += std::chrono::duration<double>(n - t).count(); t = n;
+    };
     for (uint32_t k = 0; k < K; ++k) {
+        auto mt_t = mt_now();
+        struct StepEnd { Qwen4ExpModel* m; std::chrono::steady_clock::time_point* t; bool on; ~StepEnd() {
+            if (!on) return;
+            m->t_mtp_head += std::chrono::duration<double>(std::chrono::steady_clock::now() - *t).count(); ++m->n_mtp_steps; } } step_end{this, &mt_t, mtp_stats};
         if (k == 0)
             q.memcpy(mtp_wide_, mtp_carry_, uint64_t(hc) * H * 4).wait();
         // else: mtp_wide_ already holds the previous step's layer OUTPUT wide.
@@ -2930,11 +3273,13 @@ std::string Qwen4ExpModel::mtp_draft(int32_t t_next, uint32_t pos, uint32_t K,
         gemm_fp16(q, mtp_x16_, mtp_.fc_hidden, gemm_c_, hc, H, H);
         cast_fp32_to_fp16(q, gemm_c_, mtp_x16_, uint64_t(hc) * H);
         q.memcpy(d_tokens_, &tok, sizeof(int32_t)).wait();
-        gather_embed_rows(q, token_embd, d_tokens_, emb_, 1, H);
+        embed_rows(&tok, 1);
         rms_norm_f32w(q, emb_, mtp_.pre_fc_norm_embed, emb_, 1, H, eps);
         gemv_fp16(q, emb_, mtp_.fc_embed, mtp_e16_, H, H);
         mtp_fuse_add(q, mtp_x16_, mtp_e16_, mtp_wide_, 1, H, hc);
+        mt_mark(t_mtp_pre, mt_t);
         if (auto e = mtp_layer_fwd(1, mtp_carry_pos_ + k); !e.empty()) return e;
+        mt_mark(t_mtp_layer, mt_t);
         // Prediction head: GR-read mixer -> shared lm_head -> greedy token.
         qwen4_hc_mix_v2(q, mtp_wide_, mtp_.out_hc_norm, mtp_.out_hc_down,
                         mtp_.out_hc_up, nullptr, xn_ws_, lo_ws_, mixed_, nullptr,
@@ -3512,22 +3857,20 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
     ECache& ec = ecache_[L];
     const uint64_t ec_since = ecache_clock_;   // (IE_Q4E_ECACHE_SLRU: the slots stamped after this are this forward's)
     trace_mark(L, T);
-    auto ensure_slot_on = [&](sycl::queue& uq, uint32_t e) -> uint8_t* {
-        int32_t sl = ec.slot_of[e];
-        trace_pick(L, e);
-        if (sl >= 0) { ++ecache_hits; ecache_use(ec, uint32_t(sl)); } else ++ecache_misses;
-        if (sl < 0) {
-            const uint32_t v = ecache_victim(ec, ec_since);
-            if (ec.expert_in[v] >= 0) ec.slot_of[ec.expert_in[v]] = -1;
-            ec.expert_in[v] = int32_t(e);
-            ec.slot_of[e]   = int16_t(v);
-            sl = int32_t(v);
+    // (IE_Q4E_HITS_FIRST: with `defer_fills` set, a miss's copies are not submitted at its resolve but listed, and the caller
+    // submits them through fill_slot once the job table and the cached experts' kernels are in the queue)
+    std::vector<std::pair<uint32_t, uint32_t>>* defer_fills = nullptr;   // (expert, slot)
+    auto fill_slot = [&](sycl::queue& uq, uint32_t e, uint32_t v) {
             uint8_t* dst = static_cast<uint8_t*>(ec.base) + uint64_t(v) * ec.slot_bytes;
             auto srcp = [&](const Qwen4ExpLayer::BankView& bv) {
                 return bv.raw ? bv.raw + uint64_t(e) * bv.slice_bytes
                               : reinterpret_cast<const uint8_t*>(bv.f16) +
                                     uint64_t(e) * bv.slice_bytes;
             };
+            struct FillT {   // IE_Q4E_FWD_STATS: the host's time inside this fill's submissions
+                double* acc; std::chrono::steady_clock::time_point t0;
+                ~FillT() { if (acc) *acc += std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count(); }
+            } fill_t{fwd_stats_on_ ? &t_fill_host : nullptr, std::chrono::steady_clock::now()};
             if (up_entry_bytes_) {   // 2026-11-02: through the pinned ring (the header note), one DMA a slot
                 uint8_t* st = up_ring_[up_next_];
                 sycl::event& ev = up_ev_[up_next_];
@@ -3542,6 +3885,18 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 uq.memcpy(dst + ec.up_off,   srcp(w.up_bv),   w.up_bv.slice_bytes);
                 uq.memcpy(dst + ec.down_off, srcp(w.down_bv), w.down_bv.slice_bytes);
             }
+    };
+    auto ensure_slot_on = [&](sycl::queue& uq, uint32_t e) -> uint8_t* {
+        int32_t sl = ec.slot_of[e];
+        trace_pick(L, e);
+        if (sl >= 0) { ++ecache_hits; ecache_use(ec, uint32_t(sl)); } else ++ecache_misses;
+        if (sl < 0) {
+            const uint32_t v = ecache_victim(ec, ec_since);
+            if (ec.expert_in[v] >= 0) { ec.slot_of[ec.expert_in[v]] = -1; ++ecache_evictions; }
+            ec.expert_in[v] = int32_t(e);
+            ec.slot_of[e]   = int16_t(v);
+            sl = int32_t(v);
+            if (defer_fills) defer_fills->emplace_back(e, v); else fill_slot(uq, e, v);
         }
         ec.last_use[uint32_t(sl)] = ++ecache_clock_;
         if (uint32_t(sl) < pf_pin_mask_.size() && pf_pin_mask_[uint32_t(sl)]) ec.last_use[uint32_t(sl)] = UINT64_MAX - 1;
@@ -4394,7 +4749,7 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 q.memcpy(drt->h_ids, drt->ids, uint64_t(T) * NU * sizeof(int32_t));
                 drt->pend_T = T;
             } else {
-                route_ev = q.memcpy(r16, router_all_, uint64_t(T) * cfg_.n_experts * 2);
+                route_ev = q4e_copy_u16(q, r16, router_all_, uint64_t(T) * cfg_.n_experts);
             }
             const uint8_t* const* stab  = drt ? drt->tab : nullptr;       // gate / up rows
             const uint8_t* const* stabd = drt ? drt->tab + 2 : nullptr;   // the down entries
@@ -4528,6 +4883,18 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                 if (tp_sync_ && tp_cell_owner_.size() < uint64_t(T) * NU)
                     tp_cell_owner_.assign(uint64_t(T) * NU, 0);
                 uint32_t P = drt ? T * NU : 0;   // (device routing: every pick a job, the table written on the device)
+                // 2026-11-10 (IE_Q4E_HITS_FIRST, default on): the jobs whose expert was in the cache go to the front of
+                // the table and their kernels are launched BEFORE the barrier that holds the compute queue behind the miss
+                // fills; the jobs of the experts being filled run after it. The fills (copyq_) then stream while the
+                // cached experts compute, instead of the card idling through them (~0.14 ms a miss; a 4-row verify
+                // misses ~3 experts a layer). Every job is one (row, expert) pair writing its own cells, so the order of
+                // the jobs and the number of launches change no bit. Not with device routing (no host-known misses) nor
+                // the expert-parallel exchange.
+                std::vector<int32_t> miss_jobs;      // (vt, slot, cell) of the jobs waiting on a fill
+                std::vector<char> miss_e;
+                const bool hits_first = q4e_hits_first() && !drt && !tp_sync_ && copyq_;
+                std::vector<std::pair<uint32_t, uint32_t>> fills;   // the misses' copies, submitted after the hits' kernels
+                if (hits_first) { miss_e.assign(cfg_.n_experts, 0); defer_fills = &fills; }
                 // One H2D copy a layer (2026-11-08): the pick weights ride behind the pick table and the per-row counts,
                 // at int offset W0 of the same pinned buffer; the reduce reads them from moe_tok_idx_ + W0.
                 const uint32_t W0 = 3u * 16 * NU + 16;
@@ -4542,115 +4909,151 @@ void Qwen4ExpModel::run_block(uint32_t L, uint32_t T, uint32_t start_pos,
                         // Verify expert-parallel: only owned experts get a
                         // job; peer cells arrive via tp_sync_ below.
                         if (!own) continue;
-                        if (slot_of[e] < 0)
+                        if (slot_of[e] < 0) {
+                            const uint64_t m0 = ecache_misses;
                             slot_of[e] = int16_t(
                                 (ensure_slot_on(copyq_ ? *copyq_ : q, e) -
                                  static_cast<uint8_t*>(ec.base)) /
                                 ec.slot_bytes);
+                            if (hits_first && ecache_misses != m0) miss_e[e] = 1;
+                        }
+                        if (hits_first && miss_e[e]) {
+                            miss_jobs.insert(miss_jobs.end(), {int32_t(vt), int32_t(slot_of[e]), int32_t(vt * NU + k)});
+                            continue;
+                        }
                         h_tok_idx_[3u * P + 0] = int32_t(vt);
                         h_tok_idx_[3u * P + 1] = int32_t(slot_of[e]);
                         h_tok_idx_[3u * P + 2] = int32_t(vt * NU + k);
                         ++P;
                     }
                 }
-                if (misses_before != ecache_misses && copyq_) {
+                const uint32_t P_hit = P;   // the jobs [0, P_hit) read no slot being filled
+                for (size_t i = 0; i < miss_jobs.size(); i += 3, ++P) {
+                    h_tok_idx_[3u * P + 0] = miss_jobs[i];
+                    h_tok_idx_[3u * P + 1] = miss_jobs[i + 1];
+                    h_tok_idx_[3u * P + 2] = miss_jobs[i + 2];
+                }
+                defer_fills = nullptr;
+                const bool split = hits_first && P_hit != 0 && P_hit != P;
+                // (not split: the fills go out here, before the barrier, as they did at each resolve)
+                if (!split) { for (auto& f : fills) fill_slot(*copyq_, f.first, f.second); fills.clear(); }
+                auto fills_barrier = [&] {
                     // Order every subsequent q submission behind the copyq_
                     // fills (cross-queue; q drained at the router wait, so
                     // this is the only ordering the fills need).
-                    q.ext_oneapi_submit_barrier(
-                        {copyq_->ext_oneapi_submit_barrier()});
-                }
-                if (!drt) q.memcpy(moe_tok_idx_, h_tok_idx_, (W0 + uint64_t(T) * NU) * sizeof(int32_t));
+                    if (misses_before != ecache_misses && copyq_)
+                        q.ext_oneapi_submit_barrier(
+                            {copyq_->ext_oneapi_submit_barrier()});
+                };
+                if (!split) fills_barrier();
+                if (!drt) q4e_copy_u32(q, moe_tok_idx_, h_tok_idx_, W0 + uint64_t(T) * NU);
                 static const bool no_g1  = std::getenv("IE_Q4E_SV_NO_G1") != nullptr;
                 static const bool no_g2  = std::getenv("IE_Q4E_SV_NO_G2") != nullptr;
                 static const bool no_red = std::getenv("IE_Q4E_SV_NO_RED") != nullptr;
-                bool sw_done = false;   // the fused-epilogue kernels write moe_hT_ themselves (IE_Q4E_FUSED_SWIGLU)
-                if (gate_kq8 && q4e_fused_swiglu()) {
-                    qwen4_bank_gemv_grouped_dual_q8s_swiglu(q, w.gate_bv.kind, act_q8sT_,
-                        static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                        ec.gate_off, ec.up_off, moe_tok_idx_, moe_hT_, H, EF, P, {}, stab);
-                    sw_done = true;
-                } else if (gate_kq8) {
-                    qwen4_bank_gemv_grouped_dual_q8s(q, w.gate_bv.kind, act_q8sT_,
-                        static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                        ec.gate_off, ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P, {}, stab);
-                } else if (gate_kq && q4e_fused_swiglu()) {
-                    qwen4_bank_gemv_grouped_dual_swiglu(q, w.gate_bv.kind, mixed_,
-                        static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                        ec.gate_off, ec.up_off, moe_tok_idx_, moe_hT_, H, EF, P, {}, stab);
-                    sw_done = true;
-                } else if (gate_kq) {
-                    qwen4_bank_gemv_grouped_dual(q, w.gate_bv.kind, mixed_,
-                        static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                        ec.gate_off, ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P, {}, stab);
-                } else if (!gate_q8) {
-                    // F16 gate/up banks (pre-dequantized at load): per-pick
-                    // decode leaves on the slot's F16 slices.
-                    for (uint32_t pk = 0; pk < P; ++pk) {
-                        const uint32_t vt = uint32_t(h_tok_idx_[3u * pk + 0]);
-                        const uint8_t* slot = static_cast<uint8_t*>(ec.base) +
-                            uint64_t(h_tok_idx_[3u * pk + 1]) * ec.slot_bytes;
-                        const sycl::half* x = mixed_ + uint64_t(vt) * H;
-                        gemv_fp16(q, x,
-                                  reinterpret_cast<const sycl::half*>(slot + ec.gate_off),
-                                  moe_gT_ + uint64_t(pk) * EF, H, EF);
-                        gemv_fp16(q, x,
-                                  reinterpret_cast<const sycl::half*>(slot + ec.up_off),
-                                  moe_uT_ + uint64_t(pk) * EF, H, EF);
+                // the routed experts' kernels over the jobs [j0, j0 + jn) of the table
+                auto run_jobs = [&](uint32_t j0, uint32_t jn) {
+                    const int32_t* jt = moe_tok_idx_ + 3u * j0;
+                    sycl::half* jh = moe_hT_ + uint64_t(j0) * EF;
+                    sycl::half* jg = moe_gT_ + uint64_t(j0) * EF;
+                    sycl::half* ju = moe_uT_ + uint64_t(j0) * EF;
+                    bool sw_done = false;   // the fused-epilogue kernels write jh themselves (IE_Q4E_FUSED_SWIGLU)
+                    if (gate_kq8 && q4e_fused_swiglu()) {
+                        qwen4_bank_gemv_grouped_dual_q8s_swiglu(q, w.gate_bv.kind, act_q8sT_,
+                            static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                            ec.gate_off, ec.up_off, jt, jh, H, EF, jn, {}, stab);
+                        sw_done = true;
+                    } else if (gate_kq8) {
+                        qwen4_bank_gemv_grouped_dual_q8s(q, w.gate_bv.kind, act_q8sT_,
+                            static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                            ec.gate_off, ec.up_off, jt, jg, ju, H, EF, jn, {}, stab);
+                    } else if (gate_kq && q4e_fused_swiglu()) {
+                        qwen4_bank_gemv_grouped_dual_swiglu(q, w.gate_bv.kind, mixed_,
+                            static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                            ec.gate_off, ec.up_off, jt, jh, H, EF, jn, {}, stab);
+                        sw_done = true;
+                    } else if (gate_kq) {
+                        qwen4_bank_gemv_grouped_dual(q, w.gate_bv.kind, mixed_,
+                            static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                            ec.gate_off, ec.up_off, jt, jg, ju, H, EF, jn, {}, stab);
+                    } else if (!gate_q8) {
+                        // F16 gate/up banks (pre-dequantized at load): per-pick
+                        // decode leaves on the slot's F16 slices.
+                        for (uint32_t pk = 0; pk < jn; ++pk) {
+                            const uint32_t vt = uint32_t(h_tok_idx_[3u * (j0 + pk) + 0]);
+                            const uint8_t* slot = static_cast<uint8_t*>(ec.base) +
+                                uint64_t(h_tok_idx_[3u * (j0 + pk) + 1]) * ec.slot_bytes;
+                            const sycl::half* x = mixed_ + uint64_t(vt) * H;
+                            gemv_fp16(q, x,
+                                      reinterpret_cast<const sycl::half*>(slot + ec.gate_off),
+                                      jg + uint64_t(pk) * EF, H, EF);
+                            gemv_fp16(q, x,
+                                      reinterpret_cast<const sycl::half*>(slot + ec.up_off),
+                                      ju + uint64_t(pk) * EF, H, EF);
+                        }
+                    } else if (no_g1) {
+                        // Bisect alt: per-pick solo gate/up (decode kernels).
+                        for (uint32_t pk = 0; pk < jn; ++pk) {
+                            const uint32_t vt = uint32_t(h_tok_idx_[3u * (j0 + pk) + 0]);
+                            const uint8_t* slot = static_cast<uint8_t*>(ec.base) +
+                                uint64_t(h_tok_idx_[3u * (j0 + pk) + 1]) * ec.slot_bytes;
+                            const uint8_t* xq = static_cast<const uint8_t*>(act_q8sT_) +
+                                uint64_t(vt) * (H / 32) * sizeof(block_q8_1s);
+                            gemv_q4_K_q8s(q, xq, slot + ec.gate_off,
+                                          jg + uint64_t(pk) * EF, H, EF);
+                            gemv_q4_K_q8s(q, xq, slot + ec.up_off,
+                                          ju + uint64_t(pk) * EF, H, EF);
+                        }
+                    } else if (q4e_fused_swiglu()) {
+                        gemv_q4_K_q8s_grouped_dual_swiglu(q, act_q8sT_,
+                            static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                            ec.gate_off, ec.up_off, jt,
+                            jh, H, EF, jn, {}, stab);
+                        sw_done = true;
+                    } else {
+                        gemv_q4_K_q8s_grouped_dual(q, act_q8sT_,
+                            static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                            ec.gate_off, ec.up_off, jt,
+                            jg, ju, H, EF, jn, {}, stab);
                     }
-                } else if (no_g1) {
-                    // Bisect alt: per-pick solo gate/up (decode kernels).
-                    for (uint32_t pk = 0; pk < P; ++pk) {
-                        const uint32_t vt = uint32_t(h_tok_idx_[3u * pk + 0]);
-                        const uint8_t* slot = static_cast<uint8_t*>(ec.base) +
-                            uint64_t(h_tok_idx_[3u * pk + 1]) * ec.slot_bytes;
-                        const uint8_t* xq = static_cast<const uint8_t*>(act_q8sT_) +
-                            uint64_t(vt) * (H / 32) * sizeof(block_q8_1s);
-                        gemv_q4_K_q8s(q, xq, slot + ec.gate_off,
-                                      moe_gT_ + uint64_t(pk) * EF, H, EF);
-                        gemv_q4_K_q8s(q, xq, slot + ec.up_off,
-                                      moe_uT_ + uint64_t(pk) * EF, H, EF);
+                    if (!sw_done) swiglu(q, jg, ju, jh, uint64_t(jn) * EF);
+                    if (down_kq) {
+                        qwen4_bank_gemv_grouped(q, w.down_bv.kind, jh,
+                            static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                            ec.down_off, jt, moe_yT_, H, EF, H, jn, {}, stabd);
+                    } else if (!down_q51) {
+                        for (uint32_t pk = 0; pk < jn; ++pk) {
+                            const uint8_t* slot = static_cast<uint8_t*>(ec.base) +
+                                uint64_t(h_tok_idx_[3u * (j0 + pk) + 1]) * ec.slot_bytes;
+                            gemv_fp16(q, jh + uint64_t(pk) * EF,
+                                      reinterpret_cast<const sycl::half*>(slot + ec.down_off),
+                                      moe_yT_ + uint64_t(h_tok_idx_[3u * (j0 + pk) + 2]) * H,
+                                      EF, H);
+                        }
+                    } else if (no_g2) {
+                        for (uint32_t pk = 0; pk < jn; ++pk) {
+                            const uint8_t* slot = static_cast<uint8_t*>(ec.base) +
+                                uint64_t(h_tok_idx_[3u * (j0 + pk) + 1]) * ec.slot_bytes;
+                            gemv_q5_1(q, jh + uint64_t(pk) * EF,
+                                      slot + ec.down_off,
+                                      moe_yT_ + uint64_t(h_tok_idx_[3u * (j0 + pk) + 2]) * H,
+                                      EF, H);
+                        }
+                    } else {
+                        gemv_q5_1_grouped(q, jh,
+                            static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                            ec.down_off, jt, moe_yT_, H, EF, H, jn, {}, stabd);
                     }
-                } else if (q4e_fused_swiglu()) {
-                    gemv_q4_K_q8s_grouped_dual_swiglu(q, act_q8sT_,
-                        static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                        ec.gate_off, ec.up_off, moe_tok_idx_,
-                        moe_hT_, H, EF, P, {}, stab);
-                    sw_done = true;
-                } else {
-                    gemv_q4_K_q8s_grouped_dual(q, act_q8sT_,
-                        static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                        ec.gate_off, ec.up_off, moe_tok_idx_,
-                        moe_gT_, moe_uT_, H, EF, P, {}, stab);
-                }
-                if (!sw_done) swiglu(q, moe_gT_, moe_uT_, moe_hT_, uint64_t(P) * EF);
-                if (down_kq) {
-                    qwen4_bank_gemv_grouped(q, w.down_bv.kind, moe_hT_,
-                        static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                        ec.down_off, moe_tok_idx_, moe_yT_, H, EF, H, P, {}, stabd);
-                } else if (!down_q51) {
-                    for (uint32_t pk = 0; pk < P; ++pk) {
-                        const uint8_t* slot = static_cast<uint8_t*>(ec.base) +
-                            uint64_t(h_tok_idx_[3u * pk + 1]) * ec.slot_bytes;
-                        gemv_fp16(q, moe_hT_ + uint64_t(pk) * EF,
-                                  reinterpret_cast<const sycl::half*>(slot + ec.down_off),
-                                  moe_yT_ + uint64_t(h_tok_idx_[3u * pk + 2]) * H,
-                                  EF, H);
-                    }
-                } else if (no_g2) {
-                    for (uint32_t pk = 0; pk < P; ++pk) {
-                        const uint8_t* slot = static_cast<uint8_t*>(ec.base) +
-                            uint64_t(h_tok_idx_[3u * pk + 1]) * ec.slot_bytes;
-                        gemv_q5_1(q, moe_hT_ + uint64_t(pk) * EF,
-                                  slot + ec.down_off,
-                                  moe_yT_ + uint64_t(h_tok_idx_[3u * pk + 2]) * H,
-                                  EF, H);
-                    }
-                } else {
-                    gemv_q5_1_grouped(q, moe_hT_,
-                        static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                        ec.down_off, moe_tok_idx_, moe_yT_, H, EF, H, P, {}, stabd);
-                }
+                };
+                if (split) {
+                    // The table's upload and the cached experts' kernels are queued BEFORE the fills: the table is a
+                    // copy too, and behind the fills on the copy engine it held the kernels back (the first version of
+                    // this order measured no gain for that reason; tests/unit/fill_overlap_bench shows the overlap).
+                    // (fills before or after the hits' launches: measured the same, 40.22 / 40.20 tok/s)
+                    run_jobs(0, P_hit);        // the cached experts compute while the fills stream
+                    for (auto& f : fills) fill_slot(*copyq_, f.first, f.second);
+                    fills_barrier();
+                    run_jobs(P_hit, P - P_hit);
+                } else run_jobs(0, P);
                 if (tp_sync_) tp_sync_(L);
                 // Ordered reduce: each row's top-k axpy sequence in k order —
                 // the decode body's exact fp32 add chain, one launch.
@@ -5470,6 +5873,16 @@ std::string Qwen4ExpModel::forward_range(const int32_t* tokens_host, uint32_t T,
     if (start_pos + T > max_ctx_)
         return "qwen4exp forward_range: ctx " + std::to_string(start_pos + T) +
                " > max_ctx " + std::to_string(max_ctx_);
+    struct FwdNote {   // IE_Q4E_FWD_STATS
+        Qwen4ExpModel* m; uint32_t kind, rows; uint64_t h0, m0; std::chrono::steady_clock::time_point t0; double f0; uint64_t e0;
+        ~FwdNote() {
+            if (!m) return;
+            m->fwd_stat_add(kind, rows, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                            m->ecache_hits + m->ecache_misses - h0 - m0, m->ecache_misses - m0, (m->t_fill_host - f0) * 1e3,
+                            m->ecache_evictions - e0);
+        }
+    } fwd_note{fwd_stats_on_ ? this : nullptr, spec_verify_ ? 1u : 0u, T, ecache_hits, ecache_misses, std::chrono::steady_clock::now(), t_fill_host,
+               ecache_evictions};
     sycl::queue& q = alloc_->queue();
     const uint32_t H = cfg_.hidden;
     const float eps = cfg_.rms_eps;
@@ -5503,8 +5916,8 @@ std::string Qwen4ExpModel::forward_range(const int32_t* tokens_host, uint32_t T,
         q.memcpy(wide_, wide_in_host,
                  uint64_t(T) * cfg_.hc_count * H * sizeof(float)).wait();
     } else {
-        if (layer_lo_ != 0 || !token_embd) return "qwen4exp: head stage needs layer 0";
-        gather_embed_rows(q, token_embd, d_tokens_, emb_, T, H);
+        if (layer_lo_ != 0 || !has_embed()) return "qwen4exp: head stage needs layer 0";
+        embed_rows(tokens_host, T);
         for (const VisSpan& vs : vis_spans_) {
             // Vision splice: staged ViT rows overwrite the gathered embed rows
             // where this chunk overlaps [t0, t0+n). In-order queue ⇒ ordered
@@ -5676,6 +6089,14 @@ std::string Qwen4ExpModel::forward_rows(const uint32_t* lanes, const int32_t* id
     if (G < 2 || G > kMaxRows || G > rows_max() || G > max_chunk_)
         return who + std::to_string(G) + " rows (2.." + std::to_string(std::min<uint32_t>(rows_max(), kMaxRows)) + " here)";
     if (spec_verify_) return who + "refused in spec-verify mode";
+    struct RowsNote {   // IE_Q4E_FWD_STATS
+        Qwen4ExpModel* m; uint32_t rows; uint64_t h0, m0; std::chrono::steady_clock::time_point t0;
+        ~RowsNote() {
+            if (!m) return;
+            m->fwd_stat_add(2, rows, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(),
+                            m->ecache_hits + m->ecache_misses - h0 - m0, m->ecache_misses - m0);
+        }
+    } rows_note{fwd_stats_on_ ? this : nullptr, G, ecache_hits, ecache_misses, std::chrono::steady_clock::now()};
     if (!droute_.empty()) {   // the lanes body routes on the device like the decode body (lanes == decode either way)
         dr_fwd_ = dr_choose(!q4e_dr_host_only() && !tp_sync_);
         if (!dr_fwd_) dr_host_path();
@@ -5719,8 +6140,8 @@ std::string Qwen4ExpModel::forward_rows(const uint32_t* lanes, const int32_t* id
     if (wide_in_host) {
         q.memcpy(wide_, wide_in_host, uint64_t(G) * D * sizeof(float)).wait();
     } else {
-        if (!token_embd) return who + "head stage needs layer 0";
-        gather_embed_rows(q, token_embd, d_tokens_, emb_, G, H);
+        if (!has_embed()) return who + "head stage needs layer 0";
+        embed_rows(ids, G);
         qwen4_hc_expand_streams(q, emb_, wide_, G, H, cfg_.hc_count);
     }
     for (uint32_t L = layer_lo_; L < layer_hi_; ++L) {
@@ -5920,16 +6341,9 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
         ECache& ec = ecache_[L];
         const uint64_t ec_since = ecache_clock_;   // (IE_Q4E_ECACHE_SLRU: the slots stamped after this are this forward's)
         trace_mark(L, G);
-        auto ensure_slot_on = [&](sycl::queue& uq, uint32_t e) -> uint8_t* {
-            int32_t sl = ec.slot_of[e];
-            trace_pick(L, e);
-            if (sl >= 0) { ++ecache_hits; ecache_use(ec, uint32_t(sl)); } else ++ecache_misses;
-            if (sl < 0) {
-                const uint32_t v = ecache_victim(ec, ec_since);
-                if (ec.expert_in[v] >= 0) ec.slot_of[ec.expert_in[v]] = -1;
-                ec.expert_in[v] = int32_t(e);
-                ec.slot_of[e]   = int16_t(v);
-                sl = int32_t(v);
+        // (IE_Q4E_HITS_FIRST, as run_block: a miss's copies listed, submitted after the cached experts' launches)
+        std::vector<std::pair<uint32_t, uint32_t>>* defer_fills = nullptr;   // (expert, slot)
+        auto fill_slot = [&](sycl::queue& uq, uint32_t e, uint32_t v) {
                 uint8_t* dst = static_cast<uint8_t*>(ec.base) + uint64_t(v) * ec.slot_bytes;
                 auto srcp = [&](const Qwen4ExpLayer::BankView& bv) {
                     return bv.raw ? bv.raw + uint64_t(e) * bv.slice_bytes
@@ -5949,6 +6363,18 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
                     uq.memcpy(dst + ec.up_off,   srcp(w.up_bv),   w.up_bv.slice_bytes);
                     uq.memcpy(dst + ec.down_off, srcp(w.down_bv), w.down_bv.slice_bytes);
                 }
+        };
+        auto ensure_slot_on = [&](sycl::queue& uq, uint32_t e) -> uint8_t* {
+            int32_t sl = ec.slot_of[e];
+            trace_pick(L, e);
+            if (sl >= 0) { ++ecache_hits; ecache_use(ec, uint32_t(sl)); } else ++ecache_misses;
+            if (sl < 0) {
+                const uint32_t v = ecache_victim(ec, ec_since);
+                if (ec.expert_in[v] >= 0) { ec.slot_of[ec.expert_in[v]] = -1; ++ecache_evictions; }
+                ec.expert_in[v] = int32_t(e);
+                ec.slot_of[e]   = int16_t(v);
+                sl = int32_t(v);
+                if (defer_fills) defer_fills->emplace_back(e, v); else fill_slot(uq, e, v);
             }
             ec.last_use[uint32_t(sl)] = ++ecache_clock_;
             if (!expert_pin_.empty() && expert_pin_[uint64_t(L) * cfg_.n_experts + e]) ec.last_use[uint32_t(sl)] = UINT64_MAX - 2;   // the pin set
@@ -5969,7 +6395,7 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
             q.memcpy(drt->h_ids, drt->ids, uint64_t(G) * NU * sizeof(int32_t));
             drt->pend_T = G;
         } else {
-            route_ev = q.memcpy(r16, router_all_, uint64_t(G) * cfg_.n_experts * 2);
+            route_ev = q4e_copy_u16(q, r16, router_all_, uint64_t(G) * cfg_.n_experts);
         }
         const uint8_t* const* stab  = drt ? drt->tab : nullptr;
         const uint8_t* const* stabd = drt ? drt->tab + 2 : nullptr;
@@ -6040,69 +6466,106 @@ void Qwen4ExpModel::run_block_rows(uint32_t L, uint32_t G, const LaneRef* lr, co
         uint32_t P = drt ? G * NU : 0;
         const uint32_t W0 = 3u * 16 * NU + 16;   // the pick weights behind the pick table: one H2D copy a layer
         float* hw = reinterpret_cast<float*>(h_tok_idx_ + W0);
+        // IE_Q4E_HITS_FIRST (run_block's note): the cached experts' jobs first in the table and launched before the barrier
+        // behind the miss fills; the filled experts' jobs after it.
+        std::vector<int32_t> miss_jobs;
+        std::vector<char> miss_e;
+        std::vector<std::pair<uint32_t, uint32_t>> fills;
+        const bool hits_first = q4e_hits_first() && !drt && copyq_;
+        if (hits_first) { miss_e.assign(cfg_.n_experts, 0); defer_fills = &fills; }
         for (uint32_t vt = 0; vt < G && !drt; ++vt) {
             h_tok_idx_[3u * 16 * NU + vt] = int32_t(tk[vt].size());
             for (uint32_t k = 0; k < uint32_t(tk[vt].size()); ++k) {
                 const uint32_t e = tk[vt][k].first;
                 hw[vt * NU + k] = tk[vt][k].second;
-                if (slot_of[e] < 0)
+                if (slot_of[e] < 0) {
+                    const uint64_t m0 = ecache_misses;
                     slot_of[e] = int16_t((ensure_slot_on(copyq_ ? *copyq_ : q, e) - static_cast<uint8_t*>(ec.base)) /
                                          ec.slot_bytes);
+                    if (hits_first && ecache_misses != m0) miss_e[e] = 1;
+                }
+                if (hits_first && miss_e[e]) {
+                    miss_jobs.insert(miss_jobs.end(), {int32_t(vt), int32_t(slot_of[e]), int32_t(vt * NU + k)});
+                    continue;
+                }
                 h_tok_idx_[3u * P + 0] = int32_t(vt);
                 h_tok_idx_[3u * P + 1] = int32_t(slot_of[e]);
                 h_tok_idx_[3u * P + 2] = int32_t(vt * NU + k);
                 ++P;
             }
         }
-        if (misses_before != ecache_misses && copyq_)   // q waits for the copyq_ fills (q drained at the router wait)
-            q.ext_oneapi_submit_barrier({copyq_->ext_oneapi_submit_barrier()});
-        if (!drt) q.memcpy(moe_tok_idx_, h_tok_idx_, (W0 + uint64_t(G) * NU) * sizeof(int32_t));
-        bool sw_done = false;   // the fused-epilogue kernels write moe_hT_ themselves (IE_Q4E_FUSED_SWIGLU)
-        if (gate_kq8 && q4e_fused_swiglu()) {   // raw Q5_K / Q6_K gate/up banks: the int-dot A8 kernel, swiglu fused
-            qwen4_bank_gemv_grouped_dual_q8s_swiglu(q, w.gate_bv.kind, act_q8sT_, static_cast<const uint8_t*>(ec.base),
-                                                    ec.slot_bytes, ec.gate_off, ec.up_off, moe_tok_idx_, moe_hT_, H, EF, P,
-                                                    {}, stab);
-            sw_done = true;
-        } else if (gate_kq8) {   // raw Q5_K / Q6_K gate/up banks through the int-dot A8 kernel (IE_Q4E_KQ_INTDOT=1)
-            qwen4_bank_gemv_grouped_dual_q8s(q, w.gate_bv.kind, act_q8sT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                                             ec.gate_off, ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P, {}, stab);
-        } else if (w.gate_bv.kq && q4e_fused_swiglu()) {   // raw Q8_0 / Q5_K / Q6_K gate/up banks: A16 dual, swiglu fused
-            qwen4_bank_gemv_grouped_dual_swiglu(q, w.gate_bv.kind, mixed_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                                                ec.gate_off, ec.up_off, moe_tok_idx_, moe_hT_, H, EF, P, {}, stab);
-            sw_done = true;
-        } else if (w.gate_bv.kq) {   // raw Q8_0 / Q5_K / Q6_K gate/up banks: the A16 grouped dual kernel
-            qwen4_bank_gemv_grouped_dual(q, w.gate_bv.kind, mixed_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                                         ec.gate_off, ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P, {}, stab);
-        } else if (!gate_q8) {   // F16 gate/up banks (dequantized at load): the per-pick decode leaves
-            for (uint32_t pk = 0; pk < P; ++pk) {
-                const uint32_t vt = uint32_t(h_tok_idx_[3u * pk + 0]);
-                const uint8_t* slot = static_cast<uint8_t*>(ec.base) + uint64_t(h_tok_idx_[3u * pk + 1]) * ec.slot_bytes;
-                const sycl::half* x = mixed_ + uint64_t(vt) * H;
-                gemv_fp16(q, x, reinterpret_cast<const sycl::half*>(slot + ec.gate_off), moe_gT_ + uint64_t(pk) * EF, H, EF);
-                gemv_fp16(q, x, reinterpret_cast<const sycl::half*>(slot + ec.up_off), moe_uT_ + uint64_t(pk) * EF, H, EF);
-            }
-        } else if (q4e_fused_swiglu()) {
-            gemv_q4_K_q8s_grouped_dual_swiglu(q, act_q8sT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes, ec.gate_off,
-                                              ec.up_off, moe_tok_idx_, moe_hT_, H, EF, P, {}, stab);
-            sw_done = true;
-        } else {
-            gemv_q4_K_q8s_grouped_dual(q, act_q8sT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes, ec.gate_off,
-                                       ec.up_off, moe_tok_idx_, moe_gT_, moe_uT_, H, EF, P, {}, stab);
+        defer_fills = nullptr;
+        const uint32_t P_hit = P;
+        for (size_t i = 0; i < miss_jobs.size(); i += 3, ++P) {
+            h_tok_idx_[3u * P + 0] = miss_jobs[i];
+            h_tok_idx_[3u * P + 1] = miss_jobs[i + 1];
+            h_tok_idx_[3u * P + 2] = miss_jobs[i + 2];
         }
-        if (!sw_done) swiglu(q, moe_gT_, moe_uT_, moe_hT_, uint64_t(P) * EF);
-        if (w.down_bv.kq) {   // raw Q8_0 / Q5_0 / Q4_0 down bank: the A16 grouped kernel
-            qwen4_bank_gemv_grouped(q, w.down_bv.kind, moe_hT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
-                                    ec.down_off, moe_tok_idx_, moe_yT_, H, EF, H, P, {}, stabd);
-        } else if (!down_q51) {
-            for (uint32_t pk = 0; pk < P; ++pk) {
-                const uint8_t* slot = static_cast<uint8_t*>(ec.base) + uint64_t(h_tok_idx_[3u * pk + 1]) * ec.slot_bytes;
-                gemv_fp16(q, moe_hT_ + uint64_t(pk) * EF, reinterpret_cast<const sycl::half*>(slot + ec.down_off),
-                          moe_yT_ + uint64_t(h_tok_idx_[3u * pk + 2]) * H, EF, H);
+        const bool split = hits_first && P_hit != 0 && P_hit != P;
+        if (!split) { for (auto& f : fills) fill_slot(*copyq_, f.first, f.second); fills.clear(); }
+        auto fills_barrier = [&] {   // q waits for the copyq_ fills (q drained at the router wait)
+            if (misses_before != ecache_misses && copyq_) q.ext_oneapi_submit_barrier({copyq_->ext_oneapi_submit_barrier()});
+        };
+        if (!split) fills_barrier();
+        if (!drt) q4e_copy_u32(q, moe_tok_idx_, h_tok_idx_, W0 + uint64_t(G) * NU);
+        auto run_jobs = [&](uint32_t j0, uint32_t jn) {   // the routed experts' kernels over the jobs [j0, j0 + jn)
+            const int32_t* jt = moe_tok_idx_ + 3u * j0;
+            sycl::half* jh = moe_hT_ + uint64_t(j0) * EF;
+            sycl::half* jg = moe_gT_ + uint64_t(j0) * EF;
+            sycl::half* ju = moe_uT_ + uint64_t(j0) * EF;
+            bool sw_done = false;   // the fused-epilogue kernels write jh themselves (IE_Q4E_FUSED_SWIGLU)
+            if (gate_kq8 && q4e_fused_swiglu()) {   // raw Q5_K / Q6_K gate/up banks: the int-dot A8 kernel, swiglu fused
+                qwen4_bank_gemv_grouped_dual_q8s_swiglu(q, w.gate_bv.kind, act_q8sT_, static_cast<const uint8_t*>(ec.base),
+                                                        ec.slot_bytes, ec.gate_off, ec.up_off, jt, jh, H, EF, jn,
+                                                        {}, stab);
+                sw_done = true;
+            } else if (gate_kq8) {   // raw Q5_K / Q6_K gate/up banks through the int-dot A8 kernel (IE_Q4E_KQ_INTDOT=1)
+                qwen4_bank_gemv_grouped_dual_q8s(q, w.gate_bv.kind, act_q8sT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                                                 ec.gate_off, ec.up_off, jt, jg, ju, H, EF, jn, {}, stab);
+            } else if (w.gate_bv.kq && q4e_fused_swiglu()) {   // raw Q8_0 / Q5_K / Q6_K gate/up banks: A16 dual, swiglu fused
+                qwen4_bank_gemv_grouped_dual_swiglu(q, w.gate_bv.kind, mixed_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                                                    ec.gate_off, ec.up_off, jt, jh, H, EF, jn, {}, stab);
+                sw_done = true;
+            } else if (w.gate_bv.kq) {   // raw Q8_0 / Q5_K / Q6_K gate/up banks: the A16 grouped dual kernel
+                qwen4_bank_gemv_grouped_dual(q, w.gate_bv.kind, mixed_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                                             ec.gate_off, ec.up_off, jt, jg, ju, H, EF, jn, {}, stab);
+            } else if (!gate_q8) {   // F16 gate/up banks (dequantized at load): the per-pick decode leaves
+                for (uint32_t pk = 0; pk < jn; ++pk) {
+                    const uint32_t vt = uint32_t(h_tok_idx_[3u * (j0 + pk) + 0]);
+                    const uint8_t* slot = static_cast<uint8_t*>(ec.base) + uint64_t(h_tok_idx_[3u * (j0 + pk) + 1]) * ec.slot_bytes;
+                    const sycl::half* x = mixed_ + uint64_t(vt) * H;
+                    gemv_fp16(q, x, reinterpret_cast<const sycl::half*>(slot + ec.gate_off), jg + uint64_t(pk) * EF, H, EF);
+                    gemv_fp16(q, x, reinterpret_cast<const sycl::half*>(slot + ec.up_off), ju + uint64_t(pk) * EF, H, EF);
+                }
+            } else if (q4e_fused_swiglu()) {
+                gemv_q4_K_q8s_grouped_dual_swiglu(q, act_q8sT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes, ec.gate_off,
+                                                  ec.up_off, jt, jh, H, EF, jn, {}, stab);
+                sw_done = true;
+            } else {
+                gemv_q4_K_q8s_grouped_dual(q, act_q8sT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes, ec.gate_off,
+                                           ec.up_off, jt, jg, ju, H, EF, jn, {}, stab);
             }
-        } else {
-            gemv_q5_1_grouped(q, moe_hT_, static_cast<const uint8_t*>(ec.base), ec.slot_bytes, ec.down_off, moe_tok_idx_,
-                              moe_yT_, H, EF, H, P, {}, stabd);
-        }
+            if (!sw_done) swiglu(q, jg, ju, jh, uint64_t(jn) * EF);
+            if (w.down_bv.kq) {   // raw Q8_0 / Q5_0 / Q4_0 down bank: the A16 grouped kernel
+                qwen4_bank_gemv_grouped(q, w.down_bv.kind, jh, static_cast<const uint8_t*>(ec.base), ec.slot_bytes,
+                                        ec.down_off, jt, moe_yT_, H, EF, H, jn, {}, stabd);
+            } else if (!down_q51) {
+                for (uint32_t pk = 0; pk < jn; ++pk) {
+                    const uint8_t* slot = static_cast<uint8_t*>(ec.base) + uint64_t(h_tok_idx_[3u * (j0 + pk) + 1]) * ec.slot_bytes;
+                    gemv_fp16(q, jh + uint64_t(pk) * EF, reinterpret_cast<const sycl::half*>(slot + ec.down_off),
+                              moe_yT_ + uint64_t(h_tok_idx_[3u * (j0 + pk) + 2]) * H, EF, H);
+                }
+            } else {
+                gemv_q5_1_grouped(q, jh, static_cast<const uint8_t*>(ec.base), ec.slot_bytes, ec.down_off, jt,
+                                  moe_yT_, H, EF, H, jn, {}, stabd);
+            }
+        };
+        if (split) {
+            run_jobs(0, P_hit);
+            for (auto& f : fills) fill_slot(*copyq_, f.first, f.second);
+            fills_barrier();
+            run_jobs(P_hit, P - P_hit);
+        } else run_jobs(0, P);
         if (q4e_fused_reduce()) {   // the ordered reduce + the shared expert's gated add + the f16 cast, one launch (see the
                                     // verify body); each row's picks in k order (the decode body's fp32 add chain)
             const float* wtab = reinterpret_cast<const float*>(moe_tok_idx_ + W0);

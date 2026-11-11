@@ -39,6 +39,7 @@
 
 **Latest**
 
+- **v0.2.40, November 10 — Flash-Next decodes 24 % faster with the same tokens, uses the whole card, and always reads images:** at `--gpus 2 --ctx 262000 --parallel 4 --spec` one conversation at 33–39K tokens decodes at **37.3 → 46.2 tok/s** (**36.6 → 44.9 tok/s** at temperature 1.0) and its 33.4K-token prompt reads in 33.1 s instead of 37.0, every greedy reply byte-identical to v0.2.39. Found with a [profile](#new-in-v0240): the card no longer idles while a missed expert uploads, the speculation guard re-tries rounds after 6 steps instead of 48, and three changes give the expert cache memory that sat unused — the token embedding moved to system RAM, the context buffers grow with the conversation, and the cards are filled to a real 1 GiB margin instead of leaving ~4 GiB free (**304 / 280 expert slots a layer, were 203 / 165**). The image encoder is now part of every Flash-Next load. One lane (`--parallel 1`): 38.2 → 45.9 tok/s.
 - **v0.2.39, November 10 — long conversations stop re-reading themselves:** on the request lanes (`--parallel N`) one changed token anywhere in a conversation's history used to re-read the whole prompt — 53 times and 7,711 seconds in one 37-hour session. Every lane now keeps [restart points](#new-in-v0239): a prompt with one word changed 85 % in reads in **14.6 s instead of 38.3 s**, a rewritten last turn reads 30 tokens instead of 33,609, replies byte-identical. Also: a reference check for [any architecture and any quant](#new-in-v0239) that found and fixed five engine defects, dense models on Intel GPUs without a matrix engine, and a 40-minute soak gate.
 - **v0.2.38, November 8 — Flash-Next on four cards reads prompts up to 60 % faster:** on three or more cards every stage of the [layer split](#new-in-v0238) now reads its part of the prompt on its own thread; before, stages 1 … N − 1 read one after another. A 12,069-token prompt on four stages (two per card here) reads **572 → 910 tok/s**, and **610 → 975** with the request lanes, with byte-identical replies. The scheduling is a small header with its own race test, and two cards are unchanged. [Details](#new-in-v0238)
 - **v0.2.37, November 8 — Qwen 4's possible shapes tested before the weights exist, and Flash-Next decodes 12 % faster:** a new [mini end-to-end check](#new-in-v0237) builds small random models from the Hugging Face reference code in 15 shapes a Qwen 4 tier may take (dense, hidden 5120, 4 KV heads, no sparse-attention indexer, fused expert banks, …), writes them in llama.cpp's layout and compares the engine's output with the reference. It found that hidden 5120 lost the GPU and that dense and indexer-less files were refused; all fixed. Fused gate/up expert banks load. Flash-Next's hyper-connection mixing reads 8-bit and its expert routing runs on the GPU when that pays: two cards **44.4 → 49.7 tok/s**, the tokens unchanged. [Details](#new-in-v0237)
@@ -217,6 +218,70 @@ class ([New in v0.2.6](#new-in-v026)).
 
 ![DeepSeek-V4.1-Flash running locally in the Dream Agent Harness, served by Mach X on two Arc Pro B70 cards](docs/images/dream-deepseek-v41.png)
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
+
+---
+
+<a id="new-in-v0240"></a>
+## 🆕 New in v0.2.40
+
+### Flash-Next decodes 24 % faster, with identical output
+
+Measured on 2 × Arc Pro B70, UD-Q4_K_XL, `--gpus 2 --ctx 262000 --parallel 4 --slot-ctx 75000 --spec --spec-k 3`, one conversation at 33–39K tokens (6 turns of 300 tokens, each after a ~1K-token tool result). Greedy replies are byte-identical to v0.2.39 in every comparison below.
+
+| | v0.2.39 | v0.2.40 |
+|---|---|---|
+| decode, greedy | 37.3 tok/s | **46.2 tok/s** |
+| decode, temperature 1.0 | 36.6 tok/s | **44.9 tok/s** |
+| a plain step | 29.1 ms | 26.9 ms |
+| a 4-row speculative round | 73.2 ms | 59.6 ms |
+| the 33.4K-token prompt, read cold | 37.0 s | 33.1 s |
+| ~1K new tokens a turn | 333 tok/s | 396 tok/s |
+| expert slots a layer at the load (card 0 / card 1) | 221 / 185 | 304 / 280 |
+| free memory on the cards while serving | ~2.2 GiB (of a nominal 4) | ~1.0–1.6 GiB |
+| one lane (`--parallel 1`), decode | 38.2 tok/s | 45.9 tok/s |
+
+A profile came first. Flash-Next has 512 experts a layer and two 32 GB cards hold about 40 % of them, so a decode step missed ~36 experts and a 4-row speculative round ~141, each a 3 MiB upload at the PCIe rate; a quarter of a round was the card waiting for those uploads. Attention does not matter here: its cost is the same at 3K and at 39K tokens.
+
+- **Cached experts compute while missed ones upload.** The kernels of the experts already in the cache are launched first; the uploads stream beside them and only the missed experts' jobs wait. A first version that merely reordered the launches gained nothing — the small job table's upload sat behind the expert uploads on the copy engine and held everything back. `IE_Q4E_HITS_FIRST=0` = the old order. **+8 %.**
+- **The speculation guard re-tries after 6 plain steps, not 48** (`IE_Q4E_MTP_OFF_STEPS=N`). With rounds cheaper, the text passes the break-even again long before 48 steps are over. **+6 %**, on the request lanes and on one lane.
+- **The token embedding lives in system RAM.** The 1.2 GiB table sat on both cards (the second only embeds the draft head's 1–3 tokens a round). Rows are now gathered on the host and uploaded, 5 KiB each: 17 more expert slots a layer on each card. Costs 1.2 GiB of RAM for each stage that embeds. `IE_Q4E_HOST_EMBED=0` keeps it on the cards. **+2.7 %.**
+- **Lane 0's context grows with its conversation.** The lane that holds the whole `--ctx` (lane 0 with `--parallel N`, the only lane at `--parallel 1`) took 4.3 GiB on card 0 and 4.8 GiB on card 1 from the first token. They now start at 16,384 tokens and grow in 32,768-token steps before a longer prompt is read (rows saved to RAM, slots taken from the expert cache, buffers remade, rows restored: about a second a step at 100K tokens). The cache keeps what the conversation does not use yet. Gated on a conversation from 83K to 123K tokens with a history edit and a second conversation beside it, and the same on one lane: identical replies. `IE_Q4E_ELASTIC_CTX=0` = allocated whole. **+3.8 %** at 33–39K, less as a conversation nears the full context.
+
+- **The cards are filled to a real margin.** The expert cache used to be sized before several workspaces existed, against an estimate plus a 4 GiB reserve; in practice ~2.2 GiB stayed free, and with the elastic context ~3.8 GiB. The cache is now sized last, against the memory really left, with a 1 GiB reserve (`IE_Q4E_RESERVE_GIB=N.N`) plus the image encoder's scratch on its card. Probed through a load, a 33K read, a 1024 × 1024 image, a second lane's wake and a context growth: nothing after the load took more than 0.25 GiB. **A guard** checks free memory at every request's start and has the cache give slots back below 384 MiB (another process, the driver's own growth), so an over-committed card — where the driver starts moving device memory and decode falls to a fraction of a token a second — is not reached silently. `IE_Q4E_VRAM_GUARD=0` = off.
+
+### Several agents at once
+
+The same launch with C conversations decoding at once (short 4K-token conversations, 300 tokens each, greedy; `--parallel 4` for up to 4, `--parallel 8 --slot-ctx 32768` for 8, `--parallel 16 --slot-ctx 16384` for 16). Tokens a second of all conversations together:
+
+| conversations at once | v0.2.39 | v0.2.40 | each, v0.2.40 |
+|---|---|---|---|
+| 1 | 35.3 | 44.8 | 44.8 tok/s |
+| 2 | 55.7 | 66.7 | 33.3 |
+| 4 | 59.8 | **90.0** | 22.5 |
+| 8 | 65.0 | **110.8** | 13.8 |
+| 16 | 47.6 | **109.2** | 6.8 |
+
+v0.2.39 lost ground past 8 conversations (every awake lane took expert slots from a cache that was already short); v0.2.40 holds its ceiling of about 110 tok/s from 8 on.
+
+### Flash-Next always reads images
+
+The image encoder is part of the load at every lane count: its weights go up before the expert cache of its card is sized and its scratch is reserved, so the first picture allocates nothing. A Flash-Next load without an mmproj file beside the model (or `--mmproj`) now **fails**, naming the files to add — there is no load that cannot see.
+
+### Measuring it
+
+- `ie-qwen4exp-profile <gguf> [gpu] [ctx] [depth]`: a plain step against 2- and 4-row verify forwards, kernel by kernel, at any depth, with miss counts; with `IE_QUEUE_PROFILING=1` or without (true wall time).
+- Counters, all off by default: `IE_Q4E_FWD_STATS=1` (forwards by kind: wall, expert accesses, misses, evictions), `IE_LANES_ROUND_STATS=1` (plain steps and rounds: tokens, pipe / draft / sampling ms), `IE_Q4E_MTP_STATS=1` (the draft head's step), `IE_ALLOC_LOG_MIB=N` (every device allocation of N MiB or more).
+- `tests/unit/fill_overlap_bench`: does a cache fill run beside a compute kernel on this card, alone and in a 24-layer stage in miniature.
+
+### Tried and left off
+
+- The per-layer router copy and job table as compute-queue kernels (`IE_Q4E_KCOPY`): 3.7 % slower / no change.
+- The existing segmented-LRU eviction (`IE_Q4E_ECACHE_SLRU=1`): more misses than the default on real traffic.
+
+### What is still slow, and not checked
+
+- The draft head costs 9 ms of a 60 ms round, and its expert bank holds 2.4 GiB of card 1.
+- A ~1K-token tool result still reads at ~370 tok/s: each chunk streams most of the expert bank across PCIe.
 
 ---
 

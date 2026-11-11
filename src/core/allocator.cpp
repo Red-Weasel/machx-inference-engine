@@ -424,6 +424,15 @@ void* malloc_device_checked(sycl::queue& q, size_t nbytes) {
 void* DeviceAllocator::malloc(size_t nbytes) {
     if (!queue_) return nullptr;
     void* p = malloc_device_checked(*queue_, nbytes);
+    // IE_ALLOC_LOG_MIB=N (2026-11-10): every device allocation of N MiB or more to stderr, with this allocator's running
+    // total -- a VRAM map of a load, read beside the model's own log lines (smaller ones count in the total only).
+    static const long log_mib = [] { const char* v = std::getenv("IE_ALLOC_LOG_MIB"); return v ? std::atol(v) : -1L; }();
+    if (log_mib >= 0 && p) {
+        log_total_ += nbytes;
+        if (nbytes >= uint64_t(log_mib) << 20)
+            std::fprintf(stderr, "[alloc %p] +%.1f MiB (total %.2f GiB)\n", static_cast<void*>(this), nbytes / 1048576.0,
+                         log_total_ / 1073741824.0);
+    }
     if (p && dev_alloc_auditing()) dev_alloc_record(this, p, nbytes);
     return p;
 }

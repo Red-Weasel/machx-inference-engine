@@ -494,6 +494,9 @@ public:
         std::chrono::steady_clock::time_point t_sub{}, t_ahead{}, t_land{};   // (t_land: its last piece landed, or its pipe part began)
         uint32_t steps = 0, chunks = 0;
         double   cb_ms = 0;
+        double   rs_draft_ms = 0;                 // IE_LANES_ROUND_STATS: the round in flight's draft time
+        std::chrono::steady_clock::time_point rs_t_cycle{};   // IE_LANES_ROUND_STATS: the lane's last decode landing
+        const void* rs_rq = nullptr;                // IE_LANES_ROUND_STATS: the request that landing belonged to
         // P4 B55 lookup rounds
         Ds41NgramIndex idx; bool idx_on = false;    // the history's n-gram index (prompt ++ committed ids)
         std::vector<int32_t> look_ids;              // the round's inputs
@@ -585,6 +588,12 @@ private:
     Clock::time_point look_gap_t0_{};
     uint64_t look_rounds_ = 0, look_drafted_ = 0, look_hits_ = 0, look_redos_ = 0;
     uint64_t draft_rounds_ = 0, draft_drafted_ = 0, draft_hits_ = 0;   // 2026-10-21 MTP rounds
+    // IE_LANES_ROUND_STATS=1 (2026-11-10): where a decoding lane's time goes, by step kind -- plain steps and MTP rounds of
+    // R rows: how many, the tokens they gave, the pipe time (submit -> landed), the head's draft, the round's sampling, the
+    // keep, and the whole cycle (landing to landing: everything between two steps included). Printed at shutdown.
+    struct RoundStat { uint64_t n = 0, tok = 0; double pipe_ms = 0, draft_ms = 0, samp_ms = 0, keep_ms = 0, cycle_ms = 0; };
+    RoundStat rs_plain_, rs_round_[9];
+    bool      rs_on_ = false;
     bool     draft_said_ = false;              //   a draft() error is logged once
     uint32_t turn_waiters_ = 0;
     uint64_t tick_ = 0;

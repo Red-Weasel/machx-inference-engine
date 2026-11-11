@@ -123,6 +123,8 @@ target_link_libraries(dequant_q6k_c32_bench PRIVATE ie_core ie_sycl_flags)
 # A bench, not a CTest: host <-> device copy latency, pageable vs the pinned stage vs pinned memory (issue #2), at decode sizes.
 add_executable(copy_path_bench unit/copy_path_bench.cpp)
 target_link_libraries(copy_path_bench PRIVATE ie_core ie_sycl_flags)
+add_executable(fill_overlap_bench unit/fill_overlap_bench.cpp)
+target_link_libraries(fill_overlap_bench PRIVATE ie_core ie_sycl_flags)
 
 # A bench, not a CTest: gemm_fp16_splitk vs gemm_fp16 at GLM-5.3 expert row counts (time + error vs fp64), on GPU1.
 add_executable(gemm_splitk_bench unit/gemm_splitk_bench.cpp)

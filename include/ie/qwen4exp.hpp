@@ -253,7 +253,17 @@ public:
     const Qwen4HcQ8* hc8_site(const sycl::half* down) const { return hc8_for(down); }
 
     // Globals (device, F16/F32 as noted).
-    sycl::half* token_embd = nullptr;   // [vocab, 2560] row-gather source
+    sycl::half* token_embd = nullptr;   // [vocab, 2560] row-gather source (null once embed_to_host moved it)
+    // 2026-11-10 (IE_Q4E_HOST_EMBED, default on; =0 keeps the table on the card): the token embedding in system RAM. The
+    // F16 table is 1.2 GiB on the head stage's card AND on the tail's (the draft head embeds 1-3 rows a round from it) --
+    // 17 expert slots a layer on each. init_runtime reads the uploaded table back (the same bytes), frees it, and the
+    // forwards gather their rows on the host and upload them (5 KiB a row) before the cache is sized.
+    std::vector<sycl::half> token_embd_host_;
+    sycl::half* emb_stage_ = nullptr;   // pinned [max_chunk, H]: the rows on their way to emb_
+    sycl::event emb_ev_;                // the last upload from emb_stage_
+    bool has_embed() const noexcept { return token_embd != nullptr || !token_embd_host_.empty(); }
+    std::string embed_to_host();
+    sycl::event embed_rows(const int32_t* ids_host, uint32_t T);
     sycl::half* lm_head    = nullptr;   // [2560 -> vocab] (F16 fallback)
     Qwen4ExpLayer::Q8W lmh_q8;          //   ... or Q8_0-SoA
     sycl::half* out_hc_up   = nullptr;  // [320 -> 10240] final HC merge (spec 11 §5)
@@ -852,6 +862,19 @@ private:
     std::unique_ptr<sycl::queue> copyq_;
 public:
     uint64_t ecache_hits = 0, ecache_misses = 0;   // perf counters (host)
+    // IE_Q4E_FWD_STATS=1 (2026-11-10): per stage, the forwards by kind and row count -- how many, their wall time, their
+    // expert accesses and misses -- printed when the model is freed. The serving-side measurement of what a --spec verify
+    // row costs against a plain step (the kernel profiler runs one card only). kind 0 = a plain forward, 1 = spec-verify,
+    // 2 = lane rows; row counts above 8 (prompt reading) share the last column.
+    struct FwdStat { uint64_t n = 0, picks = 0, miss = 0, evict = 0; double ms = 0, fill_ms = 0; };
+    uint64_t ecache_evictions = 0;   // misses that threw a resident out (the others filled a free slot)
+    double t_fill_host = 0;   // host seconds inside the miss fills' submissions (IE_Q4E_FWD_STATS)
+    FwdStat fwd_stat_[3][10];
+    bool    fwd_stats_on_ = false;
+    void fwd_stat_add(uint32_t kind, uint32_t rows, double ms, uint64_t picks, uint64_t miss, double fill_ms = 0, uint64_t evict = 0) noexcept {
+        FwdStat& f = fwd_stat_[kind < 3 ? kind : 0][rows <= 8 ? rows : 9];
+        ++f.n; f.ms += ms; f.picks += picks; f.miss += miss; f.fill_ms += fill_ms; f.evict += evict;
+    }
     // IE_Q4E_PICK_TRACE=<prefix> (2026-11-10): every host-routed expert access as a uint32 ((layer << 16) | expert) appended
     // to <prefix>.layers<lo>-<hi>.u32, in order, each layer's forward opened by a marker (bit 31 | layer << 16 | rows) -- the input of scripts/q4e_cache_sim.py (what another eviction policy or
     // slot count would miss on real traffic). Run with IE_Q4E_DEV_ROUTE=0 so every forward routes on the host.
@@ -870,6 +893,8 @@ public:
     // Decode router-sync breakdown (grouped T=1 path): time blocked in the
     // per-layer logits D2H .wait() vs host routing + job build + H2D submit.
     double t_route_wait = 0, t_route_host = 0, t_moe_submit = 0;
+    // IE_Q4E_MTP_STATS=1: a draft step of the MTP head in three parts (the queue is drained at each boundary, only when on)
+    double t_mtp_pre = 0, t_mtp_layer = 0, t_mtp_head = 0; uint64_t n_mtp_steps = 0;
 private:
     sycl::half* e16_ = nullptr;           // [MT, H] PLE embedding f16
     sycl::half *ple_key_out_ = nullptr, *ple_v_out_ = nullptr;  // [MT,10240]/[MT,H]
@@ -964,6 +989,36 @@ private:
     std::vector<uint8_t> lane_ready_;        // [lane] its state is allocated (lane 0 always)
     bool     lanes_lazy_ = false;
     uint32_t lane_slots_ = 0, mtp_lane0_slots_ = 0;   // slots a layer a wake gives back: an extra lane / lane 0's head state
+    // 2026-11-10 (evening): ELASTIC CONTEXT on lane 0 (set_ctx_elastic before init_runtime; IE_Q4E_ELASTIC_CTX=0 = off).
+    // Lane 0 is the whole --ctx lane: at ctx 262000 its KV, indexer caches and score workspace are ~3 GiB a card (plus the
+    // draft head's on the tail), allocated whole while the owner's median prompt is 119K tokens and half of his decoded
+    // tokens sit below 75K. With this on, lane 0's buffers hold `max_ctx_` tokens (kElasticInit at the load) and
+    // ctx_reserve grows them -- content saved to system RAM, the slots taken from the expert cache (ecache_shrink),
+    // reallocated at the new stride, content restored -- in the lanes' serial turn before a request's read. The cache
+    // gets what the conversation does not use yet. ctx_limit_ = the admitted context (what lane_ctx(0) reports).
+    static constexpr uint32_t kElasticInit = 16384, kElasticStep = 32768;
+    uint64_t late_reserve_ = 0;
+    bool     ctx_elastic_ = false;
+    uint32_t ctx_limit_ = 0;      // 0 = not elastic
+    uint32_t ctx_nf_ = 0;         // full-attention layers of this stage (the KV's layer count)
+    uint32_t ws_ctx_ = 0;         // the context the score workspaces (qsa_scores_ / qsa_scoresT_) hold
+    uint64_t sum_slot_ = 0;       // bytes of one expert slot over this stage's layers
+    uint64_t ctx_bytes(uint32_t ctx, bool with_head) const noexcept;
+    uint32_t ctx_grow_slots() const noexcept;   // slots a layer lane 0's growth to the limit will still take
+public:
+    // 2026-11-10 (evening): memory this stage's card will take AFTER the cache is sized and that the loader knows of (the
+    // vision tower's encode scratch): added to the cache's reserve. Call before init_runtime / init_ecache.
+    void set_late_reserve(uint64_t bytes) noexcept { late_reserve_ = bytes; }
+    // The card's free memory now (0 = the device does not report it).
+    uint64_t vram_free() const;
+    // A request's start (nothing in flight): the card has `need` bytes free beyond the low-water mark, or the expert cache
+    // gives slots until it does (ecache_shrink). Never fails a request: what it could not free it reports on stderr.
+    std::string ecache_ensure_free(uint64_t need);
+    void set_ctx_elastic(bool on) noexcept { ctx_elastic_ = on; }
+    uint32_t ctx_limit() const noexcept { return ctx_limit_; }
+    // Lane 0 live, no step in flight: its buffers hold at least `need` tokens (up to the limit) on return.
+    std::string ctx_reserve(uint32_t need);
+private:
     uint64_t mtp_lane_bytes_ = 0;            // an extra lane's head state (0 without the head)
     uint32_t lane_lctx_ = 0, lane_nf_ = 0, lane_nl_ = 0, lane_cc_ = 0;
     uint64_t lane_ple_floats_ = 0;

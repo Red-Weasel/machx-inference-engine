@@ -463,7 +463,11 @@ struct Q4eBundle {
         // ~2.6 steps served; at the owner's sampler prose gave 2.25-2.6 tokens a round, maths 3.4). So each request
         // starts with kProbe plain steps (their time is the yardstick), then rounds; after kWin rounds, when their
         // tokens x step time < their time, rounds stop for kOff plain steps and are probed again.
-        static constexpr uint32_t kProbe = 4, kWin = 6, kOff = 48;
+        static constexpr uint32_t kProbe = 4, kWin = 6;
+        // The off period: 6 plain steps, was 48 (IE_Q4E_MTP_OFF_STEPS=N), as the lanes' guard below. Measured on this path
+        // 2026-11-10 (--parallel 1, ctx 262000, --spec --spec-k 3, one conversation at 33-39K): 41.85 (48) -> 44.18 tok/s (6),
+        // the greedy replies identical; with the day's other changes 38.80 -> 44.18.
+        static inline const uint32_t kOff = [] { const char* v = std::getenv("IE_Q4E_MTP_OFF_STEPS"); return v && std::atoi(v) > 0 ? uint32_t(std::atoi(v)) : 6u; }();
         double win_ms[kWin] = {}; uint32_t win_tok[kWin] = {}; uint32_t win_n = 0, win_i = 0;
         double step_ms = 0; uint32_t step_n = 0;
         double last_ms = 0;
@@ -1035,6 +1039,14 @@ public:
         // 2026-10-23: a lazy lane's state (and lane 0's head state) on its first request -- out of the expert cache
         if (auto e = b_.each_stage([lane](Qwen4ExpModel& M) { return M.lane_ensure(lane); }); !e.empty()) return e;
         if (auto e = select(lane); !e.empty()) return e;
+        // 2026-11-10: the cards keep a low-water mark of free memory (another process, the driver's own growth): the caches give
+        // slots here, with nothing in flight, before an over-committed card makes the driver migrate device memory
+        b_.each_stage([](Qwen4ExpModel& M) { return M.ecache_ensure_free(0); });
+        if (lane == 0) {   // 2026-11-10 elastic context: lane 0's buffers hold this prompt and its reply before anything is read
+            const uint32_t T = uint32_t(rq.ids->size()), lim = b_.A.lane_ctx(0);
+            const uint32_t need = T + lanes_reply_budget(T, rq.sp.max_tokens, lim > 8 ? lim - 8 : 0) + 64;
+            if (auto e = b_.each_stage([need](Qwen4ExpModel& M) { return M.ctx_reserve(need); }); !e.empty()) return e;
+        }
         if (draft_V_ && lane < guard_.size()) { guard_[lane].reset(); qd_[lane].clear(); forget_round(lane); }
         if (lane < vis_.size()) vis_[lane] = rq.vision;   // (the request's images, for the pipe's pos-0 reset; null = text)
         if (rq.vision) {   // 2026-10-23: the request's images on its lane (qvis_apply's staging, per lane): a new sequence, no
@@ -1314,7 +1326,13 @@ private:
     // Q4eBundle::Spec's adaptive guard, per lane (IE_Q4E_MTP_ADAPT=0 = off): kProbe plain steps give the yardstick, then
     // rounds; after kWin rounds whose tokens x step time < their time, rounds stop for kOff plain steps and are probed again
     struct Guard {
-        static constexpr uint32_t kProbe = 4, kWin = 6, kOff = 48;
+        static constexpr uint32_t kProbe = 4, kWin = 6;
+        // The plain steps a losing window turns the rounds off for. 2026-11-10: 6, was 48 (IE_Q4E_MTP_OFF_STEPS=N sets it).
+        // With the cached experts computing beside the miss fills a round costs ~65 ms against ~27.8 ms a plain step, so
+        // the text passes the break-even (2.36 tokens a round) again long before 48 steps are over. Measured at the owner's
+        // launch, one conversation at 33-39K: greedy 40.2 (48) / 41.9 (12) / 42.6 (6) / 43.1 tok/s (the guard off), the
+        // replies identical; temperature 1.0: 39.8 (48) / 41.5 (12) / 42.1 (6).
+        static inline const uint32_t kOff = [] { const char* v = std::getenv("IE_Q4E_MTP_OFF_STEPS"); return v && std::atoi(v) > 0 ? uint32_t(std::atoi(v)) : 6u; }();
         double win_ms[kWin] = {}; uint32_t win_tok[kWin] = {}; uint32_t win_n = 0, win_i = 0;
         double step_ms = 0; uint32_t step_n = 0;
         uint32_t probe = kProbe, off_steps = 0; bool off = false;
@@ -3057,11 +3075,22 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         // 2026-10-23: the request lanes take images, so the vision tower is placed NOW, before the expert caches are sized (a
         // late 1.6 GB allocation beside a full card is what the 27B's lanes refuse): on card 0 when the head's bank will sit
         // on card 1, else on card 1 (the tail stage's card, as at one lane). No mmproj found = images refused on the lanes.
-        if (n_lanes > 1 && b->split && !e->qvis_resolve_mmproj().empty()) {
-            b->vis_card0 = q4e_mtp;
-            if (b->vis_card0)
-                if (auto m = e->qvis_upload_tower(); !m.empty()) { err = "vision: " + m; e->q4e_.reset(); return nullptr; }
+        // 2026-11-10 (owner: "I do not even want it possible to load the model without image on"): the image encoder is part
+        // of the load at every lane count -- its weights on a card before that card's expert cache is sized, its encode
+        // scratch in that card's reserve -- and a load without an mmproj file fails here, naming what to put beside the model.
+        // No first-image upload, no load that answers "I cannot see images".
+        if (e->qvis_resolve_mmproj().empty()) {
+            err = "qwen4exp: this model is loaded with its image encoder and no mmproj file was found -- put the model's "
+                  "mmproj-F16.gguf / mmproj-BF16.gguf (any mmproj*.gguf) beside the model or one directory up, or pass --mmproj <file>";
+            e->q4e_.reset(); return nullptr;
         }
+        b->vis_card0 = !b->split || q4e_mtp;   // (card 0: the only card, or the head stage's card when the head's bank sits on the tail's)
+        if (b->vis_card0) {
+            if (auto m = e->qvis_upload_tower(); !m.empty()) { err = "vision: " + m; e->q4e_.reset(); return nullptr; }
+            // (the tower's encode scratch comes on the first image: counted in this card's reserve)
+            b->A.set_late_reserve(e->qvis_tower_->gpu_scratch_bytes(kVisMaxPatches));
+        }
+        b->A.set_ctx_elastic(true);   // (2026-11-10: the context buffers of lane 0 -- the only lane at --parallel 1 -- grow with its conversation)
         if (auto m = b->A.init_runtime(opts.max_ctx, chunk, n_lanes, lane_ctx, b->split ? q4e_share(0) : 1u, b->split && q4e_logical > 1); !m.empty()) {
             err = "qwen4exp A runtime: " + m; e->q4e_.reset(); return nullptr;
         }
@@ -3079,6 +3108,7 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                     err = "qwen4exp stage " + std::to_string(st) + ": " + m; e->q4e_.reset(); return nullptr;
                 }
                 if (q4e_mtp && n_lanes > 1) M->set_verify_rows(8);   // (the lanes' rounds verify on every stage)
+                M->set_ctx_elastic(true);
                 if (auto m = M->init_runtime(opts.max_ctx, chunk, n_lanes, lane_ctx, q4e_share(st), q4e_logical > 1); !m.empty()) {
                     err = "qwen4exp stage " + std::to_string(st) + " runtime: " + m; e->q4e_.reset(); return nullptr;
                 }
@@ -3103,8 +3133,11 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                 if (auto m = b->mtp_load(gguf_path, q4e_head, e->gguf_, q4e_k); !m.empty())
                     std::fprintf(stderr, "[qwen4exp] %s -- lookup drafts only\n", m.c_str());
             if (q4e_mtp && n_lanes > 1) b->B.set_verify_rows(8);   // (2026-10-23)
-            if (n_lanes > 1 && !b->vis_card0 && !e->qvis_resolve_mmproj().empty())   // (2026-10-23: the tower on card 1, before its cache)
+            if (!b->vis_card0) {   // (2026-10-23: the tower on the tail's card, before its cache; 2026-11-10: at every lane count)
                 if (auto m = e->qvis_upload_tower(); !m.empty()) { err = "vision: " + m; e->q4e_.reset(); return nullptr; }
+                b->B.set_late_reserve(e->qvis_tower_->gpu_scratch_bytes(kVisMaxPatches));   // (2026-11-10: its encode scratch, in the reserve)
+            }
+            b->B.set_ctx_elastic(true);
             if (auto m = b->B.init_runtime(opts.max_ctx, chunk, n_lanes, lane_ctx, q4e_share(b->nst - 1), q4e_logical > 1); !m.empty()) {
                 err = "qwen4exp B runtime: " + m; e->q4e_.reset(); return nullptr;
             }
@@ -5767,6 +5800,26 @@ GenerateResult Engine::generate(const std::string& prompt,
     // running one's latched error between its forward and its check.
     ds4_err_.clear();   // deepseek4 latch (inert on every other arch)
     q4e_err_.clear();   // qwen4exp latch, same contract
+    // 2026-11-10 elastic context (one lane): the context buffers hold this prompt, its reply budget and a round's rows before
+    // anything is restored or read (Qwen4ExpModel::ctx_reserve; under the gate, nothing in flight). A no-op unless the load
+    // made the context elastic.
+    if (q4e_ && !(q4e_->serve)) {
+        {   // the VRAM guard (Qwen4ExpModel::ecache_ensure_free): the low-water mark on every card, and on the vision card
+            // what this request's images are about to allocate (the tower's weights when it is not up yet, its scratch)
+            uint64_t vneed = 0;
+            if (!qvis_pending_.empty())
+                vneed = qvis_tower_ ? (qvis_tower_->gpu_resident() ? 0 : qvis_tower_->gpu_weight_bytes()) + qvis_tower_->gpu_scratch_bytes(kVisMaxPatches)
+                                    : (uint64_t(1700) << 20);
+            Qwen4ExpModel& vis_stage = q4e_->split && !q4e_->vis_card0 ? q4e_->B : q4e_->A;
+            q4e_->each_stage([&](Qwen4ExpModel& M) { return M.ecache_ensure_free(&M == &vis_stage ? vneed : 0); });
+        }
+        const uint32_t T = uint32_t(ids.size());
+        const uint32_t need = T + lanes_reply_budget(T, sp.max_tokens, budget) + 256;
+        if (auto m = q4e_->each_stage([need](Qwen4ExpModel& M) { return M.ctx_reserve(need); }); !m.empty()) {
+            res.finish_reason = "error: " + m;
+            return res;
+        }
+    }
 
     // Vision staging (qwen4exp; P4 B45: the 27B split too): encode the images chat()
     // left pending against this prompt's pad runs. GPU work — runs under the gate

@@ -136,6 +136,7 @@ private:
     void     copy_direct(void* dst, const void* src, size_t nbytes);   // kStageBytes pieces, one wait
     std::optional<sycl::queue> queue_;
     std::unique_ptr<Stage>     stage_;
+    uint64_t                   log_total_ = 0;   // IE_ALLOC_LOG_MIB: bytes this allocator handed out (frees not subtracted)
     // init / init_with: on every return, a queue has a stage (also when the call fails and the old queue stays)
     struct StageGuard {
         DeviceAllocator& a;
