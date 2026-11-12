@@ -8,6 +8,7 @@
 #include "ie/laguna_engine.hpp"
 #include "ie/inkling_engine.hpp"
 #include "ie/mimo26_host_rules.hpp"  // mimo26_vision_refusal (vision_status_json)
+#include "ie/vision_required.hpp"   // vision_required_error: the image encoder is part of the load
 #include "ie/ds41_vision.hpp"        // kDs41VisMaxTok (vision_status_json)
 #include "ie/prompt_cache_slots.hpp" // prompt_cache_slots_rule (/props "prompt_cache_slots", P4 B45 (3))
 #include "ie/dense_fleet_rules.hpp"  // dense_fleet_loads: one-card dense on the fleet class (2026-10-28, serving campaign P1)
@@ -3075,17 +3076,21 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         // 2026-10-23: the request lanes take images, so the vision tower is placed NOW, before the expert caches are sized (a
         // late 1.6 GB allocation beside a full card is what the 27B's lanes refuse): on card 0 when the head's bank will sit
         // on card 1, else on card 1 (the tail stage's card, as at one lane). No mmproj found = images refused on the lanes.
-        // 2026-11-10 (owner: "I do not even want it possible to load the model without image on"): the image encoder is part
-        // of the load at every lane count -- its weights on a card before that card's expert cache is sized, its encode
-        // scratch in that card's reserve -- and a load without an mmproj file fails here, naming what to put beside the model.
-        // No first-image upload, no load that answers "I cannot see images".
-        if (e->qvis_resolve_mmproj().empty()) {
-            err = "qwen4exp: this model is loaded with its image encoder and no mmproj file was found -- put the model's "
-                  "mmproj-F16.gguf / mmproj-BF16.gguf (any mmproj*.gguf) beside the model or one directory up, or pass --mmproj <file>";
-            e->q4e_.reset(); return nullptr;
+        // 2026-11-10 / 11 (ie/vision_required.hpp): the image encoder is part of the load at every lane count -- its weights
+        // on a card before that card's expert cache is sized, its encode scratch in that card's reserve; no first-image
+        // upload. Without an mmproj file the load goes on TEXT-ONLY and says so (the public default: some run without
+        // images); IE_VISION_REQUIRED=1 makes that load fail instead, naming what to put beside the model.
+        const bool q4e_vis = !e->qvis_resolve_mmproj().empty();
+        {
+            std::string warn;
+            err = vision_required_error("qwen4exp", q4e_vis ? "" : "no mmproj file was found",
+                                        "put the model's mmproj-F16.gguf / mmproj-BF16.gguf (any mmproj*.gguf) beside the model or one "
+                                        "directory up, or pass --mmproj <file>", vision_required_env(), &warn);
+            if (!err.empty()) { e->q4e_.reset(); return nullptr; }
+            if (!warn.empty()) std::fprintf(stderr, "%s\n", warn.c_str());
         }
         b->vis_card0 = !b->split || q4e_mtp;   // (card 0: the only card, or the head stage's card when the head's bank sits on the tail's)
-        if (b->vis_card0) {
+        if (q4e_vis && b->vis_card0) {
             if (auto m = e->qvis_upload_tower(); !m.empty()) { err = "vision: " + m; e->q4e_.reset(); return nullptr; }
             // (the tower's encode scratch comes on the first image: counted in this card's reserve)
             b->A.set_late_reserve(e->qvis_tower_->gpu_scratch_bytes(kVisMaxPatches));
@@ -3133,7 +3138,7 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
                 if (auto m = b->mtp_load(gguf_path, q4e_head, e->gguf_, q4e_k); !m.empty())
                     std::fprintf(stderr, "[qwen4exp] %s -- lookup drafts only\n", m.c_str());
             if (q4e_mtp && n_lanes > 1) b->B.set_verify_rows(8);   // (2026-10-23)
-            if (!b->vis_card0) {   // (2026-10-23: the tower on the tail's card, before its cache; 2026-11-10: at every lane count)
+            if (q4e_vis && !b->vis_card0) {   // (2026-10-23: the tower on the tail's card, before its cache; 2026-11-10: at every lane count)
                 if (auto m = e->qvis_upload_tower(); !m.empty()) { err = "vision: " + m; e->q4e_.reset(); return nullptr; }
                 b->B.set_late_reserve(e->qvis_tower_->gpu_scratch_bytes(kVisMaxPatches));   // (2026-11-10: its encode scratch, in the reserve)
             }

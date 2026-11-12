@@ -28,6 +28,10 @@
 
 namespace ie {
 
+// IE_MIMO26_ADAPTIVE=1 (2026-11-11, Ds41ExpertTier::set_adaptive): no fixed VRAM tier -- every slot follows the traffic
+static bool mimo26_adaptive() { static const bool on = [] { const char* v = std::getenv("IE_MIMO26_ADAPTIVE"); return v && *v == '1'; }(); return on; }
+
+
 namespace {
 
 double ms_since(std::chrono::steady_clock::time_point t0) {
@@ -282,17 +286,27 @@ std::string Mimo26Forward::upload_card(Card& c) {
         }
         // the claim can overshoot what the driver hands out (allocator padding): an AUTO count gives back a slot per layer
         // at a time -- those experts fall to the pinned tier, a speed cost, not a correctness one
+        // IE_MIMO26_ADAPTIVE=1 (2026-11-11, Ds41ExpertTier::set_adaptive): no fixed tier -- every VRAM slot follows the traffic
+        const bool adaptive = adaptive_;
+        uint32_t stream = opt_.stream_slots;
+        if (adaptive) { stream += n_static; n_static = 0; }
         std::string te;
         for (uint32_t give = 0; ; ++give) {
             const uint32_t n_pinned = std::min(opt_.n_pinned, E - std::min(E, n_static));
-            try { te = c.tier.init(q, s, first, n_moe, ranking, n_static, n_pinned, opt_.stream_slots, T); }
+            try { te = c.tier.init(q, s, first, n_moe, ranking, n_static, n_pinned, stream, T); }
             catch (const sycl::exception& ex) { te = std::string("threw: ") + ex.what(); }
-            if (te.empty() || opt_.n_static != 0 || give == 8 || n_static <= 1 ||
+            if (te.empty() || opt_.n_static != 0 || give == 8 || (!adaptive && n_static <= 1) ||
                 (te.find("OUT_OF_DEVICE_MEMORY") == std::string::npos && te.find("malloc_device failed") == std::string::npos)) break;
             c.tier.free_storage(q);
-            --n_static;
+            if (adaptive) { if (stream <= opt_.stream_slots + 1) break; --stream; } else --n_static;
         }
         if (!te.empty()) return "tier: " + te;
+        if (adaptive) {
+            c.tier.set_adaptive(true, opt_.stream_slots);
+            if (auto e = c.tier.prewarm(ranking); !e.empty()) return e;
+            std::fprintf(stderr, "[mimo26 forward] card %zu: adaptive residency -- %u VRAM slots a layer follow the traffic (started from the ranking file), %u experts a layer pinned in RAM\n",
+                         ci, c.tier.n_stream(), c.tier.n_pinned());
+        }
         c.tier_on = true; c.tier_L0 = first; c.qstar_multi0 = c.tier.qstar_multi();
     }
     return {};
@@ -386,6 +400,14 @@ std::string Mimo26Forward::init(const std::vector<sycl::queue*>& qs, const Mimo2
         if (const char* v = std::getenv("IE_MIMO26_PIN_RESERVE_GIB"); v && *v) reserve_gib = std::max(0.0, std::atof(v));
         const double budget = double(avail_kb) * 1024.0 - reserve_gib * 1073741824.0;
         const uint32_t cap = budget <= 0 || !moe_layers ? 0u : uint32_t(budget / (double(lay.bytes) * moe_layers));
+        adaptive_ = mimo26_adaptive();
+        if (adaptive_ && cap < cfg.n_routed_experts) {   // every expert needs its RAM copy (a VRAM slot may be given to another): without the RAM, the fixed tier
+            std::fprintf(stderr, "[mimo26] adaptive residency OFF for this load: it pins every expert in RAM (%.1f GiB) and MemAvailable %.1f GiB - %.0f GiB reserve holds %u of %u a layer; "
+                                 "the fixed VRAM tier from the ranking file serves instead\n", double(lay.bytes) * moe_layers * cfg.n_routed_experts / 1073741824.0,
+                         double(avail_kb) / 1048576.0, reserve_gib, cap, cfg.n_routed_experts);
+            adaptive_ = false;
+        }
+        if (adaptive_) opt_.n_pinned = cfg.n_routed_experts;
         const uint32_t room = cfg.n_routed_experts > opt_.n_static ? cfg.n_routed_experts - opt_.n_static : 0u;
         const uint32_t want = std::min(opt_.n_pinned, room);
         if (cap < want) {

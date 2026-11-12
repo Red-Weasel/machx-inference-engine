@@ -220,6 +220,7 @@ public:
     const sycl::half* head_weights() const { return cards_.empty() ? nullptr : cards_.back()->head; }
     sycl::queue*      last_queue() const { return cards_.empty() ? nullptr : cards_.back()->q; }
     uint64_t vram_bytes(size_t card) const;
+    bool adaptive() const { return adaptive_; }   // IE_MIMO26_ADAPTIVE=1 and the RAM for it (Ds41ExpertTier::set_adaptive)
     uint32_t card_static(size_t card) const { return card < cards_.size() && cards_[card]->tier_on ? cards_[card]->tier.n_static() : 0; }
     uint32_t card_pinned(size_t card) const { return card < cards_.size() && cards_[card]->tier_on ? cards_[card]->tier.n_pinned() : 0; }
     uint64_t pinned_bytes() const;
@@ -287,6 +288,7 @@ private:
     uint32_t hi_end_ = 0;   // written_end()
     std::vector<uint32_t> feat_layers_; uint32_t feat_max_ = 0, feat_rows_ = 0;
     std::vector<float> h_feat_;   // [feat_layers_.size()][feat_rows_][dim] (compact per call)
+    bool adaptive_ = false;   // adaptive residency is on for this load
     uint32_t ring_ = 0;   // the SWA layers' K/V ring slots (window + max_tokens; 0 = linear, IE_MIMO26_SWA_LINEAR=1)
     uint32_t n_calls_ = 0;
     bool profiling_ = false; const uint8_t* profile_rows_ = nullptr;

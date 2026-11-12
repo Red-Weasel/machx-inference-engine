@@ -316,6 +316,8 @@ std::string ds41_slot_pack_pread(const Ds4SlotLayout& lay, const SafetensorsMode
 // returning on an error) destroyed the readers' condition variables while the threads still waited on them, and
 // pthread_cond_destroy blocked forever (2026-09-18, docs/deepseek41/97). Both stops are no-ops once free_storage ran.
 Ds41ExpertTier::~Ds41ExpertTier() {
+    if (pick_trace_) { std::fclose(pick_trace_); pick_trace_ = nullptr; }
+    if (promoted_) std::fprintf(stderr, "[ds41 tier] layers [%u, %u): %llu experts promoted from the NVMe tier into RAM homes (IE_DS41_PROMOTE=0 turns it off)\n", L0_, L0_ + nL_, (unsigned long long)promoted_);
     mm_reader_stop(); cpu_stop();
     // B13 gate finding: cpu_.x was a std::vector (freed with the tier); pinned now, so free it here when free_storage did not
     if (cpu_.x && cpu_.x_ctx) { try { sycl::free(cpu_.x, *cpu_.x_ctx); } catch (const std::exception& e) {
@@ -633,6 +635,7 @@ std::string Ds41ExpertTier::init(sycl::queue& q, const Ds41ExpertSource& s, uint
 void Ds41ExpertTier::cpu_start(sycl::queue& q) {
     const char* on = std::getenv("IE_DS41_CPU_MISS");
     cpu_.on = !(on && *on && std::string(on) == "0");   // ON since gate 20 (docs/52): -7.6 ms/token under EP; =0 the kill switch
+    { const char* pv = std::getenv("IE_DS41_PROMOTE"); promote_ = !(pv && *pv == '0') && !share_ && tp_n_ <= 1; }   // default ON (2026-11-11); =0 the fixed RAM tier
     if (!cpu_.on) return;
     if (share_) cpu_.qstar = 0.60f;                         // under expert parallel (a parity share): the sweep's optimum (docs/52); 0.30 for a whole tier
     if (const char* qs = std::getenv("IE_DS41_QSTAR")) cpu_.qstar = std::max(0.f, std::min(1.f, float(std::atof(qs))));
@@ -861,6 +864,22 @@ void Ds41ExpertTier::cpu_run() {
     }
 }
 
+std::string Ds41ExpertTier::prewarm(const std::vector<std::vector<uint32_t>>& ranking) {
+    if (!ready_ || empty_) return {};
+    const uint32_t S = cache_.stream_slots();
+    std::vector<int32_t> ids; std::vector<uint32_t> slots;
+    for (uint32_t l = 0; l < nL_; ++l) {
+        if (L0_ + l >= ranking.size()) return "tier prewarm: the ranking has no layer " + std::to_string(L0_ + l);
+        ids.clear();
+        for (uint32_t e : ranking[L0_ + l]) if (ids.size() < S && e < E_ && tier_[l][e] == 1 && arena_.slot(l, e)) ids.push_back(int32_t(e));
+        slots.assign(ids.size(), kDs4NoSlot);
+        if (!ids.empty()) cache_.acquire(l, ids.data(), uint32_t(ids.size()), slots.data()).wait();
+        cache_.acquire(l, nullptr, 0, nullptr);   // nothing reads these slots: drop the in-use marks (a pipelined acquire would keep them a generation)
+    }
+    cache_.transfer_queue().wait_and_throw();
+    return {};
+}
+
 void Ds41ExpertTier::stage_x(sycl::queue& q, const float* x, uint32_t T) {
     cpu_.x_staged = nullptr; cpu_.x_staged_rows = 0;
     if (!cpu_.on || !cpu_.x || T == 0 || T > CpuMiss::kMaxRows) return;   // a decode step's rows only
@@ -923,6 +942,29 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
         if (ep_export_) for (uint32_t rrow = off[e]; rrow < off[e + 1]; ++rrow) ep_rows_.push_back(int32_t(rrow));
         if (tier_[l][e] == 2) mm.push_back(e); else occ.push_back(e);
     }
+    if ((adaptive_ || promote_) && T <= CpuMiss::kMaxRows) {   // the experts' recent use (decode steps only: a prefill uses them all)
+        if (heat_.empty()) { heat_.assign(size_t(nL_) * E, 0.f); heat_inc_.assign(nL_, 1.f); }
+        float* ht = heat_.data() + size_t(l) * E; float& inc = heat_inc_[l];
+        inc *= 1.02f;
+        if (inc > 1e18f) { for (uint32_t e = 0; e < E; ++e) ht[e] /= inc; inc = 1.f; }
+        for (uint32_t e = 0; e < E; ++e) if (off[e + 1] > off[e]) ht[e] += inc;
+    }
+    if (T <= 16) {   // IE_DS41_PICK_TRACE: this step's experts, with where each one lives right now
+        if (!pick_trace_tried_) {
+            pick_trace_tried_ = true;
+            if (const char* tp = std::getenv("IE_DS41_PICK_TRACE"); tp && *tp) {
+                const std::string f = std::string(tp) + ".L" + std::to_string(L0_) + ".u32";
+                pick_trace_ = std::fopen(f.c_str(), "wb");
+                std::fprintf(stderr, "[ds41 tier] IE_DS41_PICK_TRACE: the experts of decode steps, layers [%u, %u) -> %s%s\n", L0_, L0_ + nL_, f.c_str(), pick_trace_ ? "" : " (could not be opened)");
+            }
+        }
+        if (pick_trace_) {
+            std::vector<uint32_t> rec; rec.reserve(occ.size() + mm.size() + 1); rec.push_back(0xFFFF0000u | T);
+            for (uint32_t e = 0; e < E; ++e) if (off[e + 1] > off[e] && tier_[l][e] != 3)
+                rec.push_back((L << 16) | (cache_.is_resident(l, e) ? 1u << 14 : 0u) | (uint32_t(tier_[l][e]) << 12) | e);
+            std::fwrite(rec.data(), 4, rec.size(), pick_trace_);
+        }
+    }
     if (alien && !ep_import_) { std::copy_n(bws_.pk.weights_packed.data(), TK, h_w_pk2_); q.memcpy(bws_.w_pk, h_w_pk2_, TK * 4); }
     // ---- the decode miss path: a share of the pinned MISSES goes to the CPU worker, concurrently
     bool cpu_leg = false; std::chrono::steady_clock::time_point tc{};
@@ -931,6 +973,10 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
         for (uint32_t e : occ) if (tier_[l][e] == 1 && !cache_.is_resident(l, e)) miss.push_back(e);
         // Phase 59 (docs/98): a multi-row step sends the experts with the MOST rows over PCIe (a transfer costs the same
         // per expert, the CPU per row) and keeps the rest; one row keeps the Phase 20 order and share exactly
+        if (adaptive_ && T <= CpuMiss::kMaxRows) {   // the uploads go to the experts used most lately (they stay resident): the order below keeps ties
+            const float* ht = heat_.data() + size_t(l) * E;
+            std::stable_sort(miss.begin(), miss.end(), [&](uint32_t a, uint32_t b) { return ht[a] > ht[b]; });
+        }
         if (T > 1) std::stable_sort(miss.begin(), miss.end(), [&](uint32_t a, uint32_t b) { return off[a + 1] - off[a] > off[b + 1] - off[b]; });
         uint32_t n_pcie = uint32_t(std::lround((T > 1 ? cpu_.qstar_multi : cpu_.qstar) * double(miss.size())));
         if (T > CpuMiss::kMaxRows) {   // a continuation chunk: the fewest transfers whose time covers the CPU's remaining rows
@@ -964,6 +1010,22 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
     const auto t1 = std::chrono::steady_clock::now();
     st_.ms_prep = ms_since(t0);
     uint8_t* mm_dev = nullptr; std::string mm_err;
+    // IE_DS41_PROMOTE: this step's NVMe experts that have been used more lately than the layer's coldest RAM experts take
+    // those homes. The reader copies the bytes (it holds them staged); the tiers and the arena's map change when this
+    // call is over (ApplyPromos, destroyed after the reader has been joined), so the call itself runs on the old ones.
+    std::vector<Promo> promos;
+    struct ApplyPromos { Ds41ExpertTier& t; uint32_t l; std::vector<Promo>& p;
+        ~ApplyPromos() { for (auto& m : p) if (m.done && t.arena_.move_home(l, m.y, m.x)) { t.tier_[l][m.x] = 1; t.tier_[l][m.y] = 2; ++t.promoted_; } } } apply_promos{*this, l, promos};
+    if (promote_ && T <= CpuMiss::kMaxRows && !mm.empty() && !heat_.empty()) {
+        const float* ht = heat_.data() + size_t(l) * E;
+        std::vector<uint32_t> cold;
+        for (uint32_t e = 0; e < E; ++e)
+            if (tier_[l][e] == 1 && off[e + 1] == off[e] && !cache_.is_resident(l, e) && arena_.slot(l, e)) cold.push_back(e);
+        const size_t k = std::min(cold.size(), mm.size());
+        std::partial_sort(cold.begin(), cold.begin() + k, cold.end(), [&](uint32_t a, uint32_t b) { return ht[a] < ht[b]; });
+        std::vector<uint32_t> hot(mm); std::sort(hot.begin(), hot.end(), [&](uint32_t a, uint32_t b) { return ht[a] > ht[b]; });
+        for (size_t i = 0; i < k && ht[hot[i]] > ht[cold[i]]; ++i) promos.push_back({hot[i], cold[i], arena_.slot(l, cold[i]), false});
+    }
     int reader = -1;                                      // the persistent reader running this call's fill, or none
     struct WaitAtExit { Ds41ExpertTier& t; int& w; ~WaitAtExit() { if (w >= 0) t.mm_reader_wait(w); } } join_guard{*this, reader};   // gate 8b finding 4
     if (!mm.empty()) {
@@ -1026,6 +1088,8 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
                         const size_t sl = (b0 + i) % mm_stage_slots_;
                         inflight[sl] = dq.memcpy(mm_dev + (b0 + i) * lay_.bytes, mm_stage_[sl], lay_.bytes);
                     }
+                    for (size_t i = 0; i < bn; ++i)   // promotions: the staged bytes into their RAM homes, beside the DMAs
+                        for (auto& pm : promos) if (pm.x == mm[b0 + i]) { std::memcpy(pm.home, mm_stage_[(b0 + i) % mm_stage_slots_], lay_.bytes); pm.done = true; }
                 }
                 for (auto& ev : inflight) ev.wait();
                 dq.wait_and_throw();
@@ -1051,12 +1115,16 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
     // double-buffer, fall back to the serial shape and the full partition.
     const auto t2 = std::chrono::steady_clock::now();
     st_.ms_spawn = ms_since(t1);                          // the transient bank's alloc + the reader's start
+    // adaptive residency: a prefill's misses stay inside the layer's coldest `adapt_pool_` slots (Ds4ExpertCache scope)
+    const bool scoped = adaptive_ && T > CpuMiss::kMaxRows;
+    struct ScopeGuard { Ds4ExpertCache& c; bool on; ~ScopeGuard() { if (on) c.scope_off(); } } scope_guard{cache_, scoped};
+    if (scoped) { cache_.acquire(l, nullptr, 0, nullptr); cache_.scope_coldest(l, adapt_pool_); }   // (the last call's compute is drained: its marks protect nothing)
     const bool pipe = cache_.pipelined_group_cap() != 0;
-    const uint32_t cap = pipe ? cache_.pipelined_group_cap() : cache_.stream_slots();
+    const uint32_t cap = scoped ? adapt_pool_ / 2 : pipe ? cache_.pipelined_group_cap() : cache_.stream_slots();
     std::vector<uint32_t> gb{0};
     { uint32_t need = 0;
       for (uint32_t i = 0; i < occ.size(); ++i) {
-          const bool takes_slot = tier_[l][occ[i]] == 1;
+          const bool takes_slot = tier_[l][occ[i]] == 1 && !(scoped && cache_.resident_outside_scope(l, occ[i]));
           if (takes_slot && need == cap) { gb.push_back(i); need = 0; }
           if (takes_slot) ++need;
       }

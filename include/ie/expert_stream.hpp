@@ -850,6 +850,14 @@ public:
         return L < slot_bytes_.size() && e < n_experts_ &&
                pin_index_[size_t(L) * n_experts_ + e] >= 0;
     }
+    // Hands expert `from`'s host home (layer L) to expert `to`, which must have none: `from` has no host copy after it.
+    // The caller has put `to`'s bytes there (the NVMe -> RAM promotion of the tiered experts). False: nothing changed.
+    bool move_home(uint32_t L, uint32_t from, uint32_t to) noexcept {
+        if (L >= slot_bytes_.size() || from >= n_experts_ || to >= n_experts_) return false;
+        int32_t& a = pin_index_[size_t(L) * n_experts_ + from]; int32_t& b = pin_index_[size_t(L) * n_experts_ + to];
+        if (a < 0 || b >= 0) return false;
+        b = a; a = -1; return true;
+    }
     uint64_t total_bytes() const noexcept { return total_bytes_; }
     size_t   n_segments() const noexcept { return segs_.size(); }
     uint64_t segment_bytes(size_t i) const noexcept { return segs_[i].bytes; }
@@ -1068,6 +1076,18 @@ public:
     // are to be resident at once.  Returns 0 when the streaming partition is too
     // small to double-buffer at all (fewer than 2 evictable slots), which the
     // caller must read as "run the serial shape" rather than as a cap of zero.
+    // SCOPE (2026-11-11, adaptive residency: every slot evictable, the working set kept by recency). A prefill sweeps
+    // every expert of a layer and would evict the whole decode working set; under a scope the misses of layer `L` may
+    // only replace its `P` least recently used streaming slots, and a hit outside the scope keeps its stamp. scope_off
+    // marks those P slots coldest again, so decode replaces the prefill's leftovers first. LRU eviction only.
+    void scope_coldest(uint32_t L, uint32_t P);
+    void scope_off() noexcept;
+    // resident in a slot the live scope cannot replace (with no scope: resident)
+    bool resident_outside_scope(uint32_t L, uint32_t e) const noexcept {
+        if (!arena_ || L >= n_layers_ || e >= n_experts_) return false;
+        const int32_t w = slot_of_[uint64_t(L) * n_experts_ + e];
+        return w >= 0 && !(scope_L_ == int64_t(L) && scope_[uint64_t(L) * slots_ + uint32_t(w)]);
+    }
     uint32_t pipelined_group_cap() const noexcept {
         return stream_slots() < 2 ? 0u : stream_slots() / 2;
     }
@@ -1203,6 +1223,8 @@ private:
     std::vector<uint64_t>      stamp_;      // [n_layers * slots]
     std::vector<uint64_t>      tick_;       // [n_layers]
     void touch(uint32_t L, uint32_t s) noexcept { stamp_[uint64_t(L) * slots_ + s] = ++tick_[L]; }
+    std::vector<uint8_t>       scope_;      // [n_layers * slots] 1 = a slot of the layer's live scope (scope_coldest)
+    int64_t                    scope_L_ = -1;   // the layer whose scope is live, or -1
     std::vector<uint8_t>       inuse_;      // [n_layers * slots] 1 if last acquire used it
     std::vector<uint8_t>       inuse_prev_; // [n_layers * slots] 1 if the acquire BEFORE it did
     std::vector<uint8_t>       from_spec_;  // [n_layers * slots] 1 if filled speculatively

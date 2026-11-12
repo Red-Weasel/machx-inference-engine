@@ -14,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <malloc.h>
 #include <string>
@@ -106,10 +107,40 @@ std::string find_ie_pull(const char* argv0) {
     return "ie-pull";   // hope it's on PATH
 }
 
+// 2026-11-11: machine-local defaults. A file `ie.env` beside this executable holds IE_NAME=value lines ('#' starts a
+// comment); each becomes an environment variable unless the environment already sets it. For a preference of one machine
+// that every launch should have whoever starts the binary -- here IE_VISION_REQUIRED=1 on a box where a model that cannot
+// read images must not load (ie/vision_required.hpp) while the public default stays text-only with a warning. No file =
+// nothing happens. Only names beginning with IE_ are taken.
+void apply_local_env() {
+    std::error_code ec;
+    const std::string self = std::filesystem::read_symlink("/proc/self/exe", ec).string();
+    const size_t slash = self.rfind('/');
+    if (self.empty() || slash == std::string::npos) return;
+    const std::string path = self.substr(0, slash + 1) + "ie.env";
+    std::ifstream f(path);
+    if (!f) return;
+    std::string line, applied;
+    while (std::getline(f, line)) {
+        if (const size_t h = line.find('#'); h != std::string::npos) line.erase(h);
+        const size_t a0 = line.find_first_not_of(" \t\r"), eq = line.find('=');
+        if (a0 == std::string::npos || eq == std::string::npos || eq <= a0) continue;
+        std::string key = line.substr(a0, eq - a0), val = line.substr(eq + 1);
+        while (!key.empty() && (key.back() == ' ' || key.back() == '\t')) key.pop_back();
+        const size_t v0 = val.find_first_not_of(" \t"), v1 = val.find_last_not_of(" \t\r");
+        val = v0 == std::string::npos ? std::string() : val.substr(v0, v1 - v0 + 1);
+        if (key.rfind("IE_", 0) != 0 || std::getenv(key.c_str())) continue;
+        ::setenv(key.c_str(), val.c_str(), 0);
+        applied += (applied.empty() ? "" : ", ") + key + "=" + val;
+    }
+    if (!applied.empty()) std::fprintf(stderr, "[ie] local defaults from %s: %s\n", path.c_str(), applied.c_str());
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     if (argc < 2) { std::fputs(USAGE, stderr); return 2; }
+    apply_local_env();
     const std::string cmd = argv[1];
 
     // ie serve: pin glibc's mmap threshold at 256 KiB. Left dynamic it climbs to the largest

@@ -39,7 +39,8 @@
 
 **Latest**
 
-- **v0.2.40, November 10 — Flash-Next decodes 24 % faster with the same tokens, uses the whole card, and always reads images:** at `--gpus 2 --ctx 262000 --parallel 4 --spec` one conversation at 33–39K tokens decodes at **37.3 → 46.2 tok/s** (**36.6 → 44.9 tok/s** at temperature 1.0) and its 33.4K-token prompt reads in 33.1 s instead of 37.0, every greedy reply byte-identical to v0.2.39. Found with a [profile](#new-in-v0240): the card no longer idles while a missed expert uploads, the speculation guard re-tries rounds after 6 steps instead of 48, and three changes give the expert cache memory that sat unused — the token embedding moved to system RAM, the context buffers grow with the conversation, and the cards are filled to a real 1 GiB margin instead of leaving ~4 GiB free (**304 / 280 expert slots a layer, were 203 / 165**). The image encoder is now part of every Flash-Next load. One lane (`--parallel 1`): 38.2 → 45.9 tok/s.
+- **v0.2.41, November 12 — DeepSeek-V4.1 and MiMo-V2.6 keep the experts the conversation is using in fast memory:** both models held a fixed set of experts in VRAM and RAM, chosen by a ranking file. On real traffic expert use is strongly recent, so the sets now follow it. **DeepSeek-V4.1** (default on): an expert read from the NVMe tier takes the RAM place of the layer's coldest RAM expert, with no extra memory: one conversation of prose / code / prose turns decodes at **12.4 / 6.9 / 10.6 → 14.1 / 13.1 / 14.6 tok/s**, and greedy replies are identical with it on and off. **MiMo-V2.6** (opt-in, `IE_MIMO26_ADAPTIVE=1`, 34 GiB more RAM): every VRAM slot follows recent use: **19.0 → 23.9 tok/s**. [Details](#new-in-v0241). Also in v0.2.41: a Flash-Next load without its image encoder file is text-only again, not an error: v0.2.40 refused to load Flash-Next when no mmproj file was beside the model. The encoder is still loaded at the start whenever the file is there; without it the model now loads text-only with a warning that says what to add. `IE_VISION_REQUIRED=1` keeps v0.2.40's behaviour for a deployment where a model that cannot see must not load, and a file `ie.env` beside the `ie` binary can hold such `IE_NAME=value` defaults for one machine.
+- **v0.2.40, November 10 — Flash-Next decodes 24 % faster with the same tokens, uses the whole card, and always reads images:** at `--gpus 2 --ctx 262000 --parallel 4 --spec` one conversation at 33–39K tokens decodes at **37.3 → 46.2 tok/s** (**36.6 → 44.9 tok/s** at temperature 1.0) and its 33.4K-token prompt reads in 33.1 s instead of 37.0, every greedy reply byte-identical to v0.2.39. Found with a [profile](#new-in-v0240): the card no longer idles while a missed expert uploads, the speculation guard re-tries rounds after 6 steps instead of 48, and three changes give the expert cache memory that sat unused — the token embedding moved to system RAM, the context buffers grow with the conversation, and the cards are filled to a real 1 GiB margin instead of leaving ~4 GiB free (**304 / 280 expert slots a layer, were 203 / 165**). The image encoder loads with every Flash-Next load that has its file. One lane (`--parallel 1`): 38.2 → 45.9 tok/s.
 - **v0.2.39, November 10 — long conversations stop re-reading themselves:** on the request lanes (`--parallel N`) one changed token anywhere in a conversation's history used to re-read the whole prompt — 53 times and 7,711 seconds in one 37-hour session. Every lane now keeps [restart points](#new-in-v0239): a prompt with one word changed 85 % in reads in **14.6 s instead of 38.3 s**, a rewritten last turn reads 30 tokens instead of 33,609, replies byte-identical. Also: a reference check for [any architecture and any quant](#new-in-v0239) that found and fixed five engine defects, dense models on Intel GPUs without a matrix engine, and a 40-minute soak gate.
 - **v0.2.38, November 8 — Flash-Next on four cards reads prompts up to 60 % faster:** on three or more cards every stage of the [layer split](#new-in-v0238) now reads its part of the prompt on its own thread; before, stages 1 … N − 1 read one after another. A 12,069-token prompt on four stages (two per card here) reads **572 → 910 tok/s**, and **610 → 975** with the request lanes, with byte-identical replies. The scheduling is a small header with its own race test, and two cards are unchanged. [Details](#new-in-v0238)
 - **v0.2.37, November 8 — Qwen 4's possible shapes tested before the weights exist, and Flash-Next decodes 12 % faster:** a new [mini end-to-end check](#new-in-v0237) builds small random models from the Hugging Face reference code in 15 shapes a Qwen 4 tier may take (dense, hidden 5120, 4 KV heads, no sparse-attention indexer, fused expert banks, …), writes them in llama.cpp's layout and compares the engine's output with the reference. It found that hidden 5120 lost the GPU and that dense and indexer-less files were refused; all fixed. Fused gate/up expert banks load. Flash-Next's hyper-connection mixing reads 8-bit and its expert routing runs on the GPU when that pays: two cards **44.4 → 49.7 tok/s**, the tokens unchanged. [Details](#new-in-v0237)
@@ -221,6 +222,47 @@ class ([New in v0.2.6](#new-in-v026)).
 
 ---
 
+<a id="new-in-v0241"></a>
+## 🆕 New in v0.2.41
+
+### DeepSeek-V4.1 and MiMo-V2.6: the expert sets follow the conversation
+
+Both models are larger than the two cards, so each layer's experts live in three places: VRAM, pinned system RAM (computed on the CPU or uploaded when needed) and, for DeepSeek-V4.1, the NVMe drive. Until now a ranking file fixed which expert lives where, on the reasoning that training equalises expert use and no replacement policy can beat a fixed set. A recorded trace of real decode traffic says otherwise: expert use is strongly recent, and a change of subject (prose to code) moves it.
+
+`IE_DS41_PICK_TRACE=<prefix>` records every expert a decode step uses and where it lived; `scripts/ds41_cache_sim.py` replays the record through other policies without a GPU. The replay predicted the MiMo result below within 1.5 points before any engine code was written.
+
+**DeepSeek-V4.1, default on** (`IE_DS41_PROMOTE=0` turns it off). A decode step that reads an expert from the NVMe tier already holds its bytes; when that expert has been used more lately than the layer's coldest RAM expert, the bytes are copied into that expert's place in RAM and the two trade tiers. No extra RAM, no extra read.
+
+Measured on 2 × Arc Pro B70 + 256 GB RAM, `--gpus 2 --ctx 265000 --parallel 4 --slot-ctx 75000 --prefill-chunk 2048 --thinking on --reasoning-effort high`, temperature 1.0, one conversation: a 7.7K-token document, then three turns of 450 tokens (prose, C++ code, prose). Single runs.
+
+| | v0.2.40 | v0.2.41 |
+|---|---|---|
+| Decode, prose / code / prose turn | 12.4 / 6.9 / 10.6 tok/s | **14.1 / 13.1 / 14.6 tok/s** |
+| Decode, all three turns | 9.4 tok/s | **13.9 tok/s** |
+| Expert uses served from NVMe, card 0 / card 1 | 7.2 / 5.6 % | 1.3 / 0.6 % |
+| Prompt reading (7.7K tokens) | 238 tok/s | 244 tok/s |
+
+The code turn's first 100 tokens ran at 8.6 tok/s and the rest at 15.5: the set adapts within about a hundred tokens of a change of subject. With the CPU leg off (`IE_DS41_CPU_MISS=0`, the bit-exact mode) and greedy sampling, the three replies are identical with promotion on and off (3,581 promotions in that run).
+
+**MiMo-V2.6, opt-in** (`IE_MIMO26_ADAPTIVE=1`). No fixed VRAM set: every slot starts from the ranking file and is then replaced by recency; the uploads a decode step already made go to the experts used most lately; a prompt read may only replace the 8 coldest slots of a layer, so reading does not flush the set. The cost is system RAM: every expert keeps a pinned copy (149.8 GiB, about 34 GiB more than before), which is why it is not the default. When RAM is short at load the engine says so and serves on the fixed set.
+
+| `--gpus 2 --parallel 1`, same conversation | fixed set | `IE_MIMO26_ADAPTIVE=1` |
+|---|---|---|
+| Experts not in VRAM when a step needs them, card 0 / card 1 | 52.0 / 42.6 % | 36.4 / 24.9 % |
+| Decode, greedy, ctx 200000 | 21.0 tok/s | **27.6 tok/s** |
+| Decode, temperature 1.0, thinking on, ctx 250000 | 19.0 tok/s | **23.9 tok/s** |
+| Prompt reading (8.2K tokens) | 646 tok/s | 653 tok/s |
+
+Single runs on one conversation; MiMo's output is not deterministic run to run (its CPU expert leg), so the texts of the two arms differ. Raising the share of misses that is uploaded did not help with it on (0.4: 24.4 tok/s, 0.6: 18.9).
+
+Not built yet: the same exchange between VRAM and RAM for DeepSeek-V4.1, where RAM is too full for MiMo's "every expert has a RAM copy" (the replay: experts not in VRAM 44 → 33 % and 34 → 26 %).
+
+### A Flash-Next load without its image encoder file is text-only again
+
+v0.2.40 refused to load Flash-Next when no mmproj file was beside the model. The encoder is still loaded at the start whenever the file is there; without it the model loads text-only with a warning that says what to add, and image requests are refused by name. `IE_VISION_REQUIRED=1` keeps v0.2.40's behaviour, and a file `ie.env` beside the `ie` binary can hold `IE_NAME=value` defaults for one machine (the environment wins).
+
+---
+
 <a id="new-in-v0240"></a>
 ## 🆕 New in v0.2.40
 
@@ -265,7 +307,7 @@ v0.2.39 lost ground past 8 conversations (every awake lane took expert slots fro
 
 ### Flash-Next always reads images
 
-The image encoder is part of the load at every lane count: its weights go up before the expert cache of its card is sized and its scratch is reserved, so the first picture allocates nothing. A Flash-Next load without an mmproj file beside the model (or `--mmproj`) now **fails**, naming the files to add — there is no load that cannot see.
+The image encoder is part of the load at every lane count: its weights go up before the expert cache of its card is sized and its scratch is reserved, so the first picture allocates nothing. Without an mmproj file beside the model (or `--mmproj`) the model loads text-only and says so; `IE_VISION_REQUIRED=1` makes that load fail instead, naming the files to add (v0.2.40 failed it always; v0.2.41 made that a choice).
 
 ### Measuring it
 

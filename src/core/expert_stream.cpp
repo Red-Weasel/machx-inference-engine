@@ -1588,8 +1588,9 @@ uint32_t Ds4ExpertCache::pick_victim(uint32_t L, const uint8_t* iu,
         const uint64_t* st = stamp_.data() + uint64_t(L) * slots_;
         uint32_t best = kDs4NoSlot;
         uint64_t best_stamp = ~uint64_t(0);
+        const uint8_t* sc = scope_L_ == int64_t(L) ? scope_.data() + uint64_t(L) * slots_ : nullptr;
         for (uint32_t s = static_; s < avail_slots_(); ++s) {
-            if (iu[s] || (iu_prev && iu_prev[s])) continue;
+            if (iu[s] || (iu_prev && iu_prev[s]) || (sc && !sc[s])) continue;
             if (st[s] < best_stamp) { best_stamp = st[s]; best = s; }
         }
         return best;
@@ -1628,6 +1629,24 @@ const void* Ds4ExpertCache::slot_ptr(uint32_t L, uint32_t slot) const noexcept {
     if (n_elastic_ && slot >= elastic_base_)   // elastic slot: backed by the separate block, not dev_[L]
         return elastic_blk_ + elastic_off_[L] + uint64_t(slot - elastic_base_) * arena_->slot_bytes(L);
     return dev_[L] + uint64_t(slot) * arena_->slot_bytes(L);
+}
+
+void Ds4ExpertCache::scope_coldest(uint32_t L, uint32_t P) {
+    scope_off();
+    if (!arena_ || L >= n_layers_ || !lru_ || P == 0) return;
+    if (scope_.size() != uint64_t(n_layers_) * slots_) scope_.assign(uint64_t(n_layers_) * slots_, 0);
+    std::vector<std::pair<uint64_t, uint32_t>> order;
+    for (uint32_t s = static_; s < avail_slots_(); ++s) order.push_back({stamp_[uint64_t(L) * slots_ + s], s});
+    std::sort(order.begin(), order.end());
+    for (size_t i = 0; i < order.size() && i < P; ++i) scope_[uint64_t(L) * slots_ + order[i].second] = 1;
+    scope_L_ = int64_t(L);
+}
+
+void Ds4ExpertCache::scope_off() noexcept {
+    if (scope_L_ < 0) return;
+    const uint64_t b = uint64_t(scope_L_) * slots_;
+    for (uint32_t s = 0; s < slots_; ++s) if (scope_[b + s]) { scope_[b + s] = 0; stamp_[b + s] = 0; }   // the sweep's leftovers: the first to go
+    scope_L_ = -1;
 }
 
 void* Ds4ExpertCache::lend_elastic(sycl::queue& q) noexcept {
@@ -1795,7 +1814,7 @@ sycl::event Ds4ExpertCache::acquire_impl(uint32_t L, const int32_t* ids, uint32_
             if (fs) { ++st_.spec_hits; fs = 0; }
             out_slots[k] = uint32_t(where);
             iu[where] = 1;
-            touch(L, uint32_t(where));
+            if (!(scope_L_ == int64_t(L) && !scope_[uint64_t(L) * slots_ + uint32_t(where)])) touch(L, uint32_t(where));   // (a hit outside a live scope keeps its recency)
             observe(uint32_t(where));
             continue;
         }

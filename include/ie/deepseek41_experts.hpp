@@ -15,6 +15,7 @@
 #include "ie/expert_stream.hpp"
 #include "ie/safetensors.hpp"
 
+#include <cstdio>
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
@@ -227,6 +228,15 @@ public:
     sycl::half* packed_yp() const { return static_cast<sycl::half*>(bws_.yp); }
     uint64_t vram_bytes() const { return cache_.device_bytes(); }
     uint64_t pinned_bytes() const { return arena_.total_bytes() + cpu_.x_bytes; }   // (+ the CPU leg's pinned activations, B13)
+    // ADAPTIVE RESIDENCY (2026-11-11). The caller inits the tier with n_static = 0 and ALL the card's slots as stream
+    // slots (every expert then has a pinned host copy), calls set_adaptive and prewarm: the VRAM set starts as the ranking
+    // file's top experts and from there follows the traffic -- a decode step's uploads (the same share of its misses as
+    // before) go to the experts used most lately and replace the least recently used ones; a prefill may only replace
+    // `prefill_pool` slots a layer (the fixed tier's stream slots), so reading a prompt does not flush the set.
+    // Measured first on a trace (scripts/ds41_cache_sim.py): MiMo-V2.6 misses 52 -> 37 % / 43 -> 26 % at the same uploads.
+    void set_adaptive(bool on, uint32_t prefill_pool) { adaptive_ = on; adapt_pool_ = std::max(2u, prefill_pool); }
+    bool adaptive() const { return adaptive_; }
+    std::string prewarm(const std::vector<std::vector<uint32_t>>& ranking);
     uint32_t n_static() const { return cache_.static_slots(); }
     uint32_t n_stream() const { return cache_.stream_slots(); }
     uint32_t n_pinned() const { return np_; }
@@ -282,6 +292,21 @@ private:
     std::vector<int32_t> ep_rows_;             // the last call's packed rows that are this tier's experts'
     Ds41TierStats   st_;
     bool ready_ = false;
+    bool adaptive_ = false; uint32_t adapt_pool_ = 8;
+    // PROMOTION (default ON, IE_DS41_PROMOTE=0 off; 2026-11-11): the RAM tier follows the traffic too. A decode step that reads an expert
+    // from the NVMe tier already holds its bytes in a staging slot; when that expert has been used more lately than the
+    // coldest RAM expert of the layer (one this step does not use and no VRAM slot holds), the bytes are copied into that
+    // expert's RAM home and the two trade tiers. No extra RAM, no extra read. Not under expert / tensor parallel.
+    // DeepSeek-V4.1 at docs/MODEL_SETTINGS.md's launch, one conversation (prose / code / prose): 12.4 / 6.9 / 10.6 -> 14.1 / 13.1 / 14.6 tok/s,
+    // NVMe uses 7.2 / 5.6 % -> ~1 %; greedy with the CPU leg off: the replies identical with it on and off (3,581 promotions).
+    bool promote_ = false; uint64_t promoted_ = 0;
+    struct Promo { uint32_t x = 0, y = 0; void* home = nullptr; bool done = false; };
+    std::vector<float> heat_;        // [layer * E]: an expert's decode uses, the older ones decayed (heat_inc_ grows 2 % a step)
+    std::vector<float> heat_inc_;    // [layer]
+    // IE_DS41_PICK_TRACE=<prefix> (2026-11-11): every expert a decode / verify step (<= 16 rows) uses, appended to
+    // <prefix>.L<first layer>.u32 as uint32 = (layer << 16) | (resident now << 14) | (tier << 12) | expert, a step's layer opened by
+    // 0xFFFF0000 | rows. What scripts/ds41_cache_sim.py replays through other residency policies. Off: no file, no cost.
+    std::FILE* pick_trace_ = nullptr; bool pick_trace_tried_ = false;
     bool empty_ = false;                       // the empty subset (part == n_parts): no storage at all, moe() returns at once
     bool share_ = false;                       // a parity share of every layer (expert parallel): the CPU split's q* default is 0.60 then (docs/52)
     // ---- the decode miss path (docs/deepseek41/34): at T = 1, a share of the pinned MISSES is

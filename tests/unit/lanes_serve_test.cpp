@@ -8,6 +8,7 @@
 // prefill through the pipe beside decoding lanes, the prompt cache and cancels must all leave each request == solo.
 // Does NOT link ie_core.
 #undef NDEBUG
+#include "ie/vision_required.hpp"
 #include "ie/lanes_serve.hpp"
 #include "ie/q4e_lanes.hpp"
 
@@ -416,6 +417,20 @@ void test_q4e_rules() {
         ie::Q4eRowsRoute y = r;
         y.slots_per_layer = 20;
         check(ie::q4e_rows_route_refusal(y).empty(), "q4e_rows_route_refusal: 20 slots/layer = groups of 2");
+    }
+    {   // 2026-11-11 ie/vision_required.hpp: the encoder at the load -- text-only with a warning by default, a failed load on request
+        std::string w = "x";
+        check(ie::vision_required_error("qwen4exp", "", "put the mmproj beside the model", false, &w).empty() && w.empty() &&
+              ie::vision_required_error("qwen4exp", "", "put the mmproj beside the model", true, &w).empty() && w.empty(),
+              "vision_required_error: the encoder is there: the load goes on, nothing printed (required or not)");
+        check(ie::vision_required_error("qwen4exp", "no mmproj file was found", "put the mmproj beside the model", false, &w).empty() &&
+              w.find("TEXT-ONLY") != std::string::npos && w.find("no mmproj file was found") != std::string::npos &&
+              w.find("put the mmproj beside the model") != std::string::npos && w.find("IE_VISION_REQUIRED=1") != std::string::npos,
+              "vision_required_error: no encoder, the default: the load goes on text-only and says what to add");
+        const std::string e = ie::vision_required_error("qwen4exp", "no mmproj file was found", "put the mmproj beside the model", true, &w);
+        check(e.find("qwen4exp") != std::string::npos && e.find("no mmproj file was found") != std::string::npos &&
+              e.find("put the mmproj beside the model") != std::string::npos && w.empty(),
+              "vision_required_error: no encoder, IE_VISION_REQUIRED=1: the load fails, naming the family, the problem and the fix");
     }
     check(ie::q4e_vision_refusal(1).empty() && ie::q4e_vision_refusal(0).empty() &&
           ie::q4e_vision_refusal(2).find("--parallel 1") != std::string::npos,
