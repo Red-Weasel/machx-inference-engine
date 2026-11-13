@@ -1076,6 +1076,15 @@ public:
     // are to be resident at once.  Returns 0 when the streaming partition is too
     // small to double-buffer at all (fewer than 2 evictable slots), which the
     // caller must read as "run the serial shape" rather than as a cap of zero.
+    // EXCHANGE (2026-11-12): expert `in` -- resident in a streaming slot, its host copy at `home` -- takes the STATIC slot of
+    // expert `out`, whose bytes are first read back into `home` (a static expert has no host copy; after this `out` has one
+    // and `in` has none: the caller hands the home over in its arena). The streaming slot is left empty and coldest. Two
+    // copies on the in-order transfer queue (VRAM -> host, VRAM -> VRAM); `ev` is the last one. A later hit on the static
+    // slot is covered by its fill event like any slot's. The caller waits `ev` before the host reads `home`. False: nothing
+    // was done (not resident where required, the slot lent, or its compute could still be reading it: call it only with
+    // the compute queue drained).
+    bool exchange_static(uint32_t L, uint32_t in, uint32_t out, void* home, sycl::event* ev);
+    uint64_t exchanges() const noexcept { return exchanges_; }
     // SCOPE (2026-11-11, adaptive residency: every slot evictable, the working set kept by recency). A prefill sweeps
     // every expert of a layer and would evict the whole decode working set; under a scope the misses of layer `L` may
     // only replace its `P` least recently used streaming slots, and a hit outside the scope keeps its stamp. scope_off
@@ -1225,6 +1234,7 @@ private:
     void touch(uint32_t L, uint32_t s) noexcept { stamp_[uint64_t(L) * slots_ + s] = ++tick_[L]; }
     std::vector<uint8_t>       scope_;      // [n_layers * slots] 1 = a slot of the layer's live scope (scope_coldest)
     int64_t                    scope_L_ = -1;   // the layer whose scope is live, or -1
+    uint64_t                   exchanges_ = 0;
     std::vector<uint8_t>       inuse_;      // [n_layers * slots] 1 if last acquire used it
     std::vector<uint8_t>       inuse_prev_; // [n_layers * slots] 1 if the acquire BEFORE it did
     std::vector<uint8_t>       from_spec_;  // [n_layers * slots] 1 if filled speculatively

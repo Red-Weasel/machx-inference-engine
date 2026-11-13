@@ -317,6 +317,8 @@ std::string ds41_slot_pack_pread(const Ds4SlotLayout& lay, const SafetensorsMode
 // pthread_cond_destroy blocked forever (2026-09-18, docs/deepseek41/97). Both stops are no-ops once free_storage ran.
 Ds41ExpertTier::~Ds41ExpertTier() {
     if (pick_trace_) { std::fclose(pick_trace_); pick_trace_ = nullptr; }
+    xchg_drain();
+    if (exchanged_) std::fprintf(stderr, "[ds41 tier] layers [%u, %u): %llu exchanges between the fixed VRAM set and RAM (IE_DS41_EXCHANGE=0 turns it off)\n", L0_, L0_ + nL_, (unsigned long long)exchanged_);
     if (promoted_) std::fprintf(stderr, "[ds41 tier] layers [%u, %u): %llu experts promoted from the NVMe tier into RAM homes (IE_DS41_PROMOTE=0 turns it off)\n", L0_, L0_ + nL_, (unsigned long long)promoted_);
     mm_reader_stop(); cpu_stop();
     // B13 gate finding: cpu_.x was a std::vector (freed with the tier); pinned now, so free it here when free_storage did not
@@ -326,6 +328,7 @@ Ds41ExpertTier::~Ds41ExpertTier() {
 }
 
 void Ds41ExpertTier::free_storage(sycl::queue& q) {
+    xchg_drain();
     mm_reader_stop();
     // #54: the DMA queue drained before anything its copies touch is freed -- the staging slots (their source) and the
     // bank (their destination) below. The reader waits its own DMAs, so this is idle unless the reader threw mid-fill.
@@ -636,6 +639,8 @@ void Ds41ExpertTier::cpu_start(sycl::queue& q) {
     const char* on = std::getenv("IE_DS41_CPU_MISS");
     cpu_.on = !(on && *on && std::string(on) == "0");   // ON since gate 20 (docs/52): -7.6 ms/token under EP; =0 the kill switch
     { const char* pv = std::getenv("IE_DS41_PROMOTE"); promote_ = !(pv && *pv == '0') && !share_ && tp_n_ <= 1; }   // default ON (2026-11-11); =0 the fixed RAM tier
+    { const char* xv = std::getenv("IE_DS41_EXCHANGE"); exchange_ = (xv && *xv ? *xv == '1' : exchange_default_) && !share_ && tp_n_ <= 1 && !adaptive_; }
+    if (exchange_) heat_growth_ = 1.003f;   // (the replay: a longer memory holds the set as well and exchanges far less)
     if (!cpu_.on) return;
     if (share_) cpu_.qstar = 0.60f;                         // under expert parallel (a parity share): the sweep's optimum (docs/52); 0.30 for a whole tier
     if (const char* qs = std::getenv("IE_DS41_QSTAR")) cpu_.qstar = std::max(0.f, std::min(1.f, float(std::atof(qs))));
@@ -895,6 +900,7 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
     if (L < L0_ || L >= L0_ + nL_) return "tier: layer " + std::to_string(L) + " is not in this tier";
     if (empty_) { st_ = Ds41TierStats{}; ep_rows_.clear(); if (pre_groups_) pre_groups_(); if (!ep_export_ && y) q.memset(y, 0, size_t(T) * H_ * 4).wait(); return {}; }   // nothing to serve (the caller's pre-groups work still runs: gate 18 finding 3)
     if (T > bws_.max_tokens) return "tier: T exceeds the batch workspace";
+    if (L - L0_ < xchg_pending_.size() && xchg_pending_[L - L0_]) { xchg_ev_[L - L0_].wait(); xchg_pending_[L - L0_] = 0; }   // this layer's last exchange has landed (issued a token ago)
     const auto t0 = std::chrono::steady_clock::now();
     const uint64_t fetched0 = cache_.stats().bytes_fetched;   // the pinned tier's H2D bytes, counted at the cache's misses
     const uint64_t shits0 = cache_.stats().stream_hits;       // ... and the pinned experts a stream slot already held
@@ -942,10 +948,10 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
         if (ep_export_) for (uint32_t rrow = off[e]; rrow < off[e + 1]; ++rrow) ep_rows_.push_back(int32_t(rrow));
         if (tier_[l][e] == 2) mm.push_back(e); else occ.push_back(e);
     }
-    if ((adaptive_ || promote_) && T <= CpuMiss::kMaxRows) {   // the experts' recent use (decode steps only: a prefill uses them all)
+    if ((adaptive_ || promote_ || exchange_) && T <= CpuMiss::kMaxRows) {   // the experts' recent use (decode steps only: a prefill uses them all)
         if (heat_.empty()) { heat_.assign(size_t(nL_) * E, 0.f); heat_inc_.assign(nL_, 1.f); }
         float* ht = heat_.data() + size_t(l) * E; float& inc = heat_inc_[l];
-        inc *= 1.02f;
+        inc *= heat_growth_;
         if (inc > 1e18f) { for (uint32_t e = 0; e < E; ++e) ht[e] /= inc; inc = 1.f; }
         for (uint32_t e = 0; e < E; ++e) if (off[e + 1] > off[e]) ht[e] += inc;
     }
@@ -973,7 +979,7 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
         for (uint32_t e : occ) if (tier_[l][e] == 1 && !cache_.is_resident(l, e)) miss.push_back(e);
         // Phase 59 (docs/98): a multi-row step sends the experts with the MOST rows over PCIe (a transfer costs the same
         // per expert, the CPU per row) and keeps the rest; one row keeps the Phase 20 order and share exactly
-        if (adaptive_ && T <= CpuMiss::kMaxRows) {   // the uploads go to the experts used most lately (they stay resident): the order below keeps ties
+        if ((adaptive_ || exchange_) && T <= CpuMiss::kMaxRows && !heat_.empty()) {   // the uploads go to the experts used most lately (they stay resident): the order below keeps ties
             const float* ht = heat_.data() + size_t(l) * E;
             std::stable_sort(miss.begin(), miss.end(), [&](uint32_t a, uint32_t b) { return ht[a] > ht[b]; });
         }
@@ -1314,6 +1320,24 @@ std::string Ds41ExpertTier::moe(sycl::queue& q, uint32_t L, const float* x, cons
         if (rescale) ds4_scale_pow2_rows(q, bws_.w_pk, row_shift_, TK);   // #74: a rescaled row's weight x 2^k
         if (f32_rows) ds4_expert_scatter_accum_f32(q, bws_.y_f32, bws_.tk2p, bws_.w_pk, y, T, K, H).wait();
         else ds4_expert_scatter_accum(q, bws_.yp, bws_.tk2p, bws_.w_pk, y, T, K, H).wait();
+    }
+    if (exchange_ && xchg_cool_.size() != nL_) xchg_cool_.assign(nL_, 0);
+    if (exchange_ && T <= CpuMiss::kMaxRows && xchg_cool_[l] > 0) --xchg_cool_[l];
+    else if (exchange_ && T <= CpuMiss::kMaxRows && !ep_export_ && !heat_.empty()) {   // (the compute queue is drained: the scatter's wait)
+        const float* ht = heat_.data() + size_t(l) * E; const float inc = heat_inc_[l];
+        int32_t P = -1, S = -1;
+        for (uint32_t e = 0; e < E; ++e) {
+            const bool used = off[e + 1] > off[e];
+            if (used && tier_[l][e] == 1 && cache_.is_resident(l, e) && !cache_.is_static(l, e) && arena_.slot(l, e)) { if (P < 0 || ht[e] > ht[P]) P = int32_t(e); }
+            else if (!used && tier_[l][e] == 0 && cache_.is_static(l, e)) { if (S < 0 || ht[e] < ht[S]) S = int32_t(e); }
+        }
+        if (P >= 0 && S >= 0 && ht[P] > 4.0f * ht[S] + inc) {
+            sycl::event xe;
+            if (cache_.exchange_static(l, uint32_t(P), uint32_t(S), arena_.slot(l, uint32_t(P)), &xe) && arena_.move_home(l, uint32_t(P), uint32_t(S))) {
+                if (xchg_ev_.size() != nL_) { xchg_ev_.assign(nL_, sycl::event{}); xchg_pending_.assign(nL_, 0); }
+                tier_[l][P] = 0; tier_[l][S] = 1; xchg_ev_[l] = xe; xchg_pending_[l] = 1; ++exchanged_; xchg_cool_[l] = 8;
+            }
+        }
     }
     st_.ms_tail = ms_since(t4);
     st_.bytes_pinned_to_vram = cache_.stats().bytes_fetched - fetched0;      // actual: a hit in a stream slot moves nothing

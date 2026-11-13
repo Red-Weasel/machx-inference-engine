@@ -362,6 +362,7 @@ std::string Ds41Forward::init_resident(const std::vector<sycl::queue*>& qs, cons
         }
         if (split_cores) card.tier.set_cpu_cores(ds41_cpu_cores_part(leg_cores, uint32_t(ci), n_cards));
         card.tier.set_link_gbs(link_gbs[ci]);
+        card.tier.set_exchange_default(true);   // 2026-11-12: the fixed VRAM set follows the traffic (IE_DS41_EXCHANGE=0 off)
         if (tp_) card.tier.set_tp(uint32_t(ci), tp_);
         // The static claim is derived from the free VRAM this card reports, and that estimate can
         // overshoot what the driver will actually hand out -- by the allocator's own padding, or because

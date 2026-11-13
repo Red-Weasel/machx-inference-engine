@@ -39,6 +39,7 @@
 
 **Latest**
 
+- **v0.2.42, November 13 — DeepSeek-V4.1's VRAM expert set follows the conversation too:** a hot RAM expert trades places with the coldest expert of the fixed VRAM set, about once a token and card, with no extra memory: **16.4 → 17.7 tok/s** on one conversation, **13.8 → 17.2 tok/s** with three requests at once, greedy replies identical on and off. Also: Flash-Next honours `--no-prompt-cache` at one request lane and says when it does not take `--prefill-chunk`, a contributed container build (`Containerfile.b70`), and the first four-card numbers measured by a user. [Details](#new-in-v0242).
 - **v0.2.41, November 12 — DeepSeek-V4.1 and MiMo-V2.6 keep the experts the conversation is using in fast memory:** both models held a fixed set of experts in VRAM and RAM, chosen by a ranking file. On real traffic expert use is strongly recent, so the sets now follow it. **DeepSeek-V4.1** (default on): an expert read from the NVMe tier takes the RAM place of the layer's coldest RAM expert, with no extra memory: one conversation of prose / code / prose turns decodes at **12.4 / 6.9 / 10.6 → 14.1 / 13.1 / 14.6 tok/s**, and greedy replies are identical with it on and off. **MiMo-V2.6** (opt-in, `IE_MIMO26_ADAPTIVE=1`, 34 GiB more RAM): every VRAM slot follows recent use: **19.0 → 23.9 tok/s**. [Details](#new-in-v0241). Also in v0.2.41: a Flash-Next load without its image encoder file is text-only again, not an error: v0.2.40 refused to load Flash-Next when no mmproj file was beside the model. The encoder is still loaded at the start whenever the file is there; without it the model now loads text-only with a warning that says what to add. `IE_VISION_REQUIRED=1` keeps v0.2.40's behaviour for a deployment where a model that cannot see must not load, and a file `ie.env` beside the `ie` binary can hold such `IE_NAME=value` defaults for one machine.
 - **v0.2.40, November 10 — Flash-Next decodes 24 % faster with the same tokens, uses the whole card, and always reads images:** at `--gpus 2 --ctx 262000 --parallel 4 --spec` one conversation at 33–39K tokens decodes at **37.3 → 46.2 tok/s** (**36.6 → 44.9 tok/s** at temperature 1.0) and its 33.4K-token prompt reads in 33.1 s instead of 37.0, every greedy reply byte-identical to v0.2.39. Found with a [profile](#new-in-v0240): the card no longer idles while a missed expert uploads, the speculation guard re-tries rounds after 6 steps instead of 48, and three changes give the expert cache memory that sat unused — the token embedding moved to system RAM, the context buffers grow with the conversation, and the cards are filled to a real 1 GiB margin instead of leaving ~4 GiB free (**304 / 280 expert slots a layer, were 203 / 165**). The image encoder loads with every Flash-Next load that has its file. One lane (`--parallel 1`): 38.2 → 45.9 tok/s.
 - **v0.2.39, November 10 — long conversations stop re-reading themselves:** on the request lanes (`--parallel N`) one changed token anywhere in a conversation's history used to re-read the whole prompt — 53 times and 7,711 seconds in one 37-hour session. Every lane now keeps [restart points](#new-in-v0239): a prompt with one word changed 85 % in reads in **14.6 s instead of 38.3 s**, a rewritten last turn reads 30 tokens instead of 33,609, replies byte-identical. Also: a reference check for [any architecture and any quant](#new-in-v0239) that found and fixed five engine defects, dense models on Intel GPUs without a matrix engine, and a 40-minute soak gate.
@@ -219,6 +220,51 @@ class ([New in v0.2.6](#new-in-v026)).
 
 ![DeepSeek-V4.1-Flash running locally in the Dream Agent Harness, served by Mach X on two Arc Pro B70 cards](docs/images/dream-deepseek-v41.png)
 <sub>DeepSeek-V4.1-Flash on two Arc Pro B70 cards, served by `ie serve` and driven from Dream — reasoning shown, 11.7 tok/s.</sub>
+
+---
+
+<a id="new-in-v0242"></a>
+## 🆕 New in v0.2.42
+
+### DeepSeek-V4.1: the fixed VRAM expert set follows the conversation
+
+v0.2.41 let the RAM set follow the traffic (an expert read from NVMe takes the coldest RAM expert's place). The VRAM set was still fixed by the ranking file: its experts have no copy in RAM, and RAM is full, so they cannot simply be made replaceable. Now, at the end of a decode step, the hottest RAM expert the step found in a replaceable slot trades places with the coldest fixed-set expert the step did not use: the old one is read back into the newcomer's place in RAM, the newcomer is copied into the fixed slot. A step's uploads also go to the experts used most lately. No extra RAM or VRAM. Default on; `IE_DS41_EXCHANGE=0` turns it off.
+
+Measured on 2 × Arc Pro B70 + 256 GB RAM, `--gpus 2 --ctx 265000 --parallel 4 --slot-ctx 75000 --prefill-chunk 2048 --thinking on --reasoning-effort high`, temperature 1.0, the v0.2.41 conversation (a 7.7K-token document, then prose / code / prose turns of 450 tokens). Single runs; both columns were measured the same day (the v0.2.41 section's 13.9 tok/s was a slower day for the whole machine).
+
+| | v0.2.41 | v0.2.42 |
+|---|---|---|
+| Decode, all three turns | 16.4 tok/s | **17.7 tok/s** |
+| Experts computed on the CPU per token | 58 | 45 |
+| Three requests at once (different tasks, two turns each), together | 13.8 tok/s | **17.2 tok/s** |
+
+With the CPU leg off (`IE_DS41_CPU_MISS=0`, the bit-exact mode) and greedy sampling, the replies are identical with the exchange on and off (2,458 exchanges in that run).
+
+What did not work, for the record: the first version exchanged whenever a candidate had twice the recent use, about six times a token. Each exchange costs about 0.8 ms of the card, so it took back five of the six milliseconds the better set saved (16.4 → 16.6 tok/s). The replay of the recorded trace found the settings that keep the set nearly as good with a fifth of the exchanges (four times the recent use, a longer memory, eight steps of rest for a layer after one) and predicted the 0.9 exchanges a token that the real run then showed.
+
+MiMo-V2.6 can use the same exchange (`IE_DS41_EXCHANGE=1`) when the RAM for `IE_MIMO26_ADAPTIVE=1` is not there: 19.5 → 21.0 tok/s, against 25.7 for adaptive residency.
+
+### Flash-Next: two flags that were dropped without a word
+
+Both were found by a user on a four-card box ([issue #3](https://github.com/Red-Weasel/machx-inference-engine/issues/3#issuecomment-6805091553)).
+
+- `--no-prompt-cache` at one request lane now reads every prompt from its first token. It was ignored: a prompt that continued the previous one still reused it. With `--parallel` above 1 a lane still continues its own conversation, and the load says so; the per-request log line states the cached tokens either way.
+- `--prefill-chunk N` is not used by Flash-Next, which reads in chunks of 4096 (the fastest measured). The load now says so and names `IE_Q4E_PREFILL_CHUNK=N`, the switch that does change it.
+
+### A container build, and the first four-card numbers
+
+`Containerfile.b70` at the top of the tree is a contributed, pinned container build (oneAPI 2026.0.0, compute-runtime 26.35.39758.10, IGC 2.41.5) with a slim runtime image: `podman build -f Containerfile.b70 -t machx-b70 .`. It is shipped as its author built and ran it on four Arc Pro B70 cards with v0.2.39; we have not built it in our own CI yet.
+
+The same user measured v0.2.39 on four physical B70 cards (Flash-Next Q8_0, one stage a card, one request lane, no draft head, ctx 262144), from the server's own log lines with 0 cached tokens. Their caveats apply: single observations per arm, warm caches, not a general speedup estimate.
+
+| Prompt | Deep pipeline (default) | `IE_Q4E_NO_DEEP_PIPE=1` |
+|---|---|---|
+| Prose, 33,804 tokens | 564 / 549 tok/s | 414 / 432 tok/s |
+| Code, 8,768 tokens | 599 / 564 tok/s | 416 / 427 tok/s |
+| Code, 34,370 tokens | 836 / 824 tok/s | 494 / 503 tok/s |
+| Filler with a hidden code, 195,432 tokens | 1,171 tok/s | 499 tok/s |
+
+Replies were byte-identical across the arms, decode ran at about 31 tok/s, and the hidden code was returned at every length up to 195K tokens. The device loss they reported on v0.2.38 happened with `IE_Q4E_NO_PIN_BANKS=1`, the case v0.2.39 moved onto pinned staging by itself; their v0.2.39 runs showed no fault.
 
 ---
 

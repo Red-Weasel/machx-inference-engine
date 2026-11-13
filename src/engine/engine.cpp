@@ -2970,6 +2970,10 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             const int v = std::atoi(c);
             if (v >= 64 && uint32_t(v) <= opts.max_ctx) chunk = uint32_t(v);
         }
+        // 2026-11-13 (issue 3): a --prefill-chunk that Flash-Next does not take was dropped without a word
+        if (opts.prefill_chunk_set && opts.prefill_chunk != chunk)
+            std::fprintf(stderr, "[qwen4exp] --prefill-chunk %u is not used: Flash-Next reads a prompt in chunks of %u (its own default, the "
+                                 "fastest measured); IE_Q4E_PREFILL_CHUNK=N sets another\n", opts.prefill_chunk, chunk);
         e->opts_.prefill_chunk = chunk;
         b->split = opts.n_gpus >= 2;
         const uint32_t q4e_logical = [] { const char* v = std::getenv("IE_Q4E_LOGICAL_CARDS"); const int k = v ? std::atoi(v) : 1;
@@ -3156,7 +3160,13 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         }
         e->q4e_vocab_ = b->cfg.vocab;
         vocab = b->cfg.vocab;
-        e->prompt_cache_on_ = true;   // snapshot/restore via the generic flow
+        // snapshot/restore via the generic flow. 2026-11-13 (issue 3): --no-prompt-cache is honoured at one request lane --
+        // every prompt is read from its first token (it was ignored: the live sequence's prefix was still reused)
+        e->prompt_cache_on_ = opts.prompt_cache || opts.parallel > 1;   // (the lanes: exactly as before)
+        if (!opts.prompt_cache)
+            std::fprintf(stderr, "[qwen4exp] --no-prompt-cache: %s\n", opts.parallel > 1
+                ? "it does not apply to the request lanes (--parallel > 1): a lane continues its own conversation; the per-request log line states the cached tokens"
+                : "every prompt is read from its first token");
     } else if (e->arch_ == ModelArch::kDeepSeek4) {
         // DeepSeek-V4-Flash (deepseek4): MLA with q/kv/o LoRA, a lightning
         // indexer that picks the top-k KV entries, per-layer KV compressors,

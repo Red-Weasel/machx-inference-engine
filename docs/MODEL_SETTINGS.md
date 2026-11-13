@@ -88,6 +88,7 @@ Rules that hold for every model here:
 | Vision | native, at `--parallel 1` |
 | Switches | `IE_DS41_TP=1` tensor parallel; `IE_DS41_ELASTIC_GIB=0` the elastic region off; `IE_DS41_CONT` continuation chunks (default on); `IE_DS41_CPU_MISS=0` for an A/B at the token level (the default mode's CPU leg drifts) |
 | NVMe -> RAM promotion | default on since 2026-11-11 (`IE_DS41_PROMOTE=0` off): an expert read from NVMe takes the RAM home of the layer's coldest RAM expert, no extra RAM; one conversation at this launch 12.4 / 6.9 (code) / 10.6 -> 14.1 / 13.1 / 14.6 tok/s |
+| VRAM exchange | default on since 2026-11-12 (`IE_DS41_EXCHANGE=0` off): the fixed VRAM set follows the traffic (a hot RAM expert trades places with the coldest fixed one, about once a token and card), no extra memory; 16.4 -> 17.7 tok/s on the same conversation, three requests at once 13.8 -> 17.2 together; greedy replies identical with the CPU leg off |
 | Residency ranking | since 2026-11-04 the served-traffic profile: Dream launches the engine with `IE_DS41_PROFILE_OUT=~/.cache/machx-ie/ds41-dream-profile.txt`, and that profile (870K generated tokens of real traffic) covers 57 % of the expert selections with 64 resident experts a layer where the September chat ranking covered 38 %, leaving 1.6 % of selections to the NVMe tier instead of 9 % (code-writing replies had fallen to 6-7 tok/s on disk reads). Installed as the model dir's `ie_ranking_decode_chat.txt` (the September file kept as `.2026-09-16.bak`) and the NVMe tail file re-cut from it (`ie-ds41-expert-file`; the old one kept as `ie_experts_tail.chat-2026-10-21.ieslot`). The engine rule (next build): `IE_DS41_RANKING` > the served profile once it holds 100K generated tokens > the chat ranking > the held-out profile; the init line names the choice. Re-cut the tail file when the init coverage line drops. Measured 2026-11-05 on one code-writing prompt (second 600-token reply, thinking off, temperature 0): the September ranking 7.8 tok/s with 22 experts a step from the NVMe tier, the served profile 12.8 tok/s with 5.5 |
 | Known | never raise `IE_DS41_MAX_FWD` under tensor parallel at long context (it took the desktop down once); the reserve stays 0 |
 
@@ -102,6 +103,7 @@ Rules that hold for every model here:
 | Decode | 27.8–28.3 tok/s with the drafter on agent-style prompts, 16.9–18.9 without (v0.2.23); four requests at once 25.6 together |
 | Prefill | 596–630 tok/s at 5–6K, 708–716 at 38K (`ie serve`) |
 | Vision | native, with the tower |
+| VRAM exchange | `IE_DS41_EXCHANGE=1` (opt-in, 2026-11-12): the no-extra-RAM alternative to adaptive residency: 19.5 -> 21.0 tok/s at this launch (adaptive: 25.7) |
 | Adaptive residency | `IE_MIMO26_ADAPTIVE=1` (opt-in, 2026-11-11): the VRAM expert set follows the traffic instead of the ranking file: 19.0 -> 23.9 tok/s at this launch, 21.0 -> 27.6 greedy; pins every expert in RAM (149.8 GiB, +34 GiB); falls back by itself when RAM is short |
 | Known | greedy output is not deterministic run to run (the CPU expert-miss leg); very sensitive to small numeric changes on agent transcripts; the reserve stays small |
 

@@ -1631,6 +1631,24 @@ const void* Ds4ExpertCache::slot_ptr(uint32_t L, uint32_t slot) const noexcept {
     return dev_[L] + uint64_t(slot) * arena_->slot_bytes(L);
 }
 
+bool Ds4ExpertCache::exchange_static(uint32_t L, uint32_t in, uint32_t out, void* home, sycl::event* ev) {
+    if (!arena_ || !xq_ || !home || L >= n_layers_ || in >= n_experts_ || out >= n_experts_ || in == out) return false;
+    const int32_t v = slot_of(L, in), s = slot_of(L, out);
+    if (v < int32_t(static_) || uint32_t(v) >= avail_slots_() || s < 0 || uint32_t(s) >= static_) return false;
+    const uint64_t sb = arena_->slot_bytes(L);
+    uint8_t* ps = static_cast<uint8_t*>(slot_ptr(L, uint32_t(s))); uint8_t* pv = static_cast<uint8_t*>(slot_ptr(L, uint32_t(v)));
+    if (!ps || !pv) return false;
+    xq_->memcpy(home, ps, size_t(sb));                         // `out` back to the host (in order: after `in`'s own fill)
+    const sycl::event fe = xq_->memcpy(ps, pv, size_t(sb));    // `in` into the static slot
+    const uint64_t is = uint64_t(L) * slots_ + uint32_t(s), iv = uint64_t(L) * slots_ + uint32_t(v);
+    tag_of_[is] = int32_t(in);  slot_of(L, in) = s;  slot_ev_[is] = fe; slot_seq_[is] = ++seq_; from_spec_[is] = 0;
+    tag_of_[iv] = -1;           slot_of(L, out) = -1; stamp_[iv] = 0;   from_spec_[iv] = 0;   // (its fill event stays: the next fill is queued behind the copy)
+    note_fill(fe);
+    ++exchanges_;
+    if (ev) *ev = fe;
+    return true;
+}
+
 void Ds4ExpertCache::scope_coldest(uint32_t L, uint32_t P) {
     scope_off();
     if (!arena_ || L >= n_layers_ || !lru_ || P == 0) return;

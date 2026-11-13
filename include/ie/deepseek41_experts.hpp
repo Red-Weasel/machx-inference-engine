@@ -234,7 +234,10 @@ public:
     // before) go to the experts used most lately and replace the least recently used ones; a prefill may only replace
     // `prefill_pool` slots a layer (the fixed tier's stream slots), so reading a prompt does not flush the set.
     // Measured first on a trace (scripts/ds41_cache_sim.py): MiMo-V2.6 misses 52 -> 37 % / 43 -> 26 % at the same uploads.
-    void set_adaptive(bool on, uint32_t prefill_pool) { adaptive_ = on; adapt_pool_ = std::max(2u, prefill_pool); }
+    void set_adaptive(bool on, uint32_t prefill_pool) { adaptive_ = on; adapt_pool_ = std::max(2u, prefill_pool); if (on) { exchange_ = false; heat_growth_ = 1.02f; } }
+    // EXCHANGE's default for this tier's model, before init (IE_DS41_EXCHANGE=1 / =0 names it either way). DeepSeek-V4.1: on.
+    void set_exchange_default(bool on) { exchange_default_ = on; }
+    bool exchange() const { return exchange_; }
     bool adaptive() const { return adaptive_; }
     std::string prewarm(const std::vector<std::vector<uint32_t>>& ranking);
     uint32_t n_static() const { return cache_.static_slots(); }
@@ -300,6 +303,22 @@ private:
     // DeepSeek-V4.1 at docs/MODEL_SETTINGS.md's launch, one conversation (prose / code / prose): 12.4 / 6.9 / 10.6 -> 14.1 / 13.1 / 14.6 tok/s,
     // NVMe uses 7.2 / 5.6 % -> ~1 %; greedy with the CPU leg off: the replies identical with it on and off (3,581 promotions).
     bool promote_ = false; uint64_t promoted_ = 0;
+    // EXCHANGE (2026-11-12; DeepSeek-V4.1 default ON, IE_DS41_EXCHANGE=0 off; elsewhere IE_DS41_EXCHANGE=1): the fixed VRAM set follows the traffic. At the end of a decode step the
+    // hottest RAM expert the step found in a stream slot trades places with the coldest fixed-set expert the step did not
+    // use (Ds4ExpertCache::exchange_static: one read-back into the RAM home, one VRAM copy), and a step's uploads go to the
+    // experts used most lately. No extra RAM or VRAM. Not under expert / tensor parallel.
+    // An exchange costs ~0.8 ms of the card (measured: 6 a token took back 5 of the 6 ms the better set saved), so they
+    // are kept rare: the candidate must carry 4x the heat of the one it replaces, the heat has a long memory (0.3 % a
+    // step) and a layer waits 8 steps after one. The replay (the 2026-11-11 trace): 0.8 a token and card instead of 2.9
+    // for 1 point less of the experts in VRAM.
+    // DeepSeek-V4.1 at docs/MODEL_SETTINGS.md's launch, the 2026-11-11 conversation: 16.4 -> 17.7 tok/s (the CPU leg's experts a
+    // token 58 -> 44), three requests at once 13.8 -> 17.2 together; greedy with the CPU leg off: replies identical on / off.
+    bool exchange_ = false, exchange_default_ = false; uint64_t exchanged_ = 0; float heat_growth_ = 1.02f;
+    // a layer's last exchange: its copies are waited before that layer's next call (only that layer's calls read the RAM home
+    // or the two slots; the next call is a token later, so the wait finds them done) and before the storage is freed
+    std::vector<sycl::event> xchg_ev_; std::vector<uint8_t> xchg_pending_;
+    std::vector<uint32_t> xchg_cool_;   // [layer] decode steps until the layer may exchange again (8 after an exchange)
+    void xchg_drain() noexcept { for (size_t i = 0; i < xchg_pending_.size(); ++i) if (xchg_pending_[i]) { try { xchg_ev_[i].wait(); } catch (...) {} xchg_pending_[i] = 0; } }
     struct Promo { uint32_t x = 0, y = 0; void* home = nullptr; bool done = false; };
     std::vector<float> heat_;        // [layer * E]: an expert's decode uses, the older ones decayed (heat_inc_ grows 2 % a step)
     std::vector<float> heat_inc_;    // [layer]

@@ -1,0 +1,138 @@
+# syntax=docker/dockerfile:1
+# Mach X on Intel Arc B-series (tested on B70): container build and slim runtime.
+#
+# Contributed by @wormley (GitHub issue #3), who built and ran it on four Arc Pro B70 cards with v0.2.39. Shipped as
+# received; the Mach X maintainers have not built it in their own CI yet.
+#
+# Place this file at the root of a Mach X source checkout as Containerfile.b70.
+# The issue #3 retest used upstream commit 08aeebb02fc8c237367a9a39ba76b1ae42e07b14.
+# Build from that checkout (Docker may be used instead of Podman):
+#
+#   podman build -f Containerfile.b70 -t machx-b70 .
+#
+# Example: MODEL_DIR is an existing host directory containing all GGUF shards;
+# MODEL_FILE is the first shard's filename. No model download is performed.
+#
+#   podman run --device /dev/dri --group-add keep-groups --shm-size=2g \
+#     --ulimit memlock=-1:-1 -p 127.0.0.1:11435:11435 \
+#     -e UR_ADAPTERS_FORCE_LOAD=/opt/ie/lib/libur_adapter_level_zero.so.0 \
+#     -v "$MODEL_DIR:/models:ro" machx-b70 \
+#     serve "/models/$MODEL_FILE" --gpus 1 --ctx 8192 --parallel 1 \
+#     --host 0.0.0.0 --port 11435
+#
+# The port is bound to host loopback; adjust networking and access controls as needed. GPU
+# access and group handling depend on the host and Podman configuration. The
+# multi-GPU retest used additional settings documented in the accompanying report.
+#
+# Requires an amd64 host, an Intel Arc B-series GPU with the appropriate host
+# kernel driver, /dev/dri render nodes and network access during the build.
+# The binary contains SPIR-V; the bundled Level Zero runtime and IGC JIT-compile
+# for the GPU. The host provides the kernel driver, not the container.
+#
+# The main compiler, compute-runtime and IGC versions are pinned below, but
+# base-image digests, some packages and downloaded artifact checksums are not.
+# Future rebuilds are therefore not guaranteed bit-identical. Package availability
+# and signatures should be independently verified before production use.
+
+ARG ONEAPI_KEY=https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB
+
+# ============================ build stage ============================
+FROM ubuntu:24.04 AS build
+ARG ONEAPI_KEY
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates gnupg wget cmake ninja-build git software-properties-common \
+ && add-apt-repository -y ppa:kobuk-team/intel-graphics \
+ && apt-get update && apt-get install -y --no-install-recommends libze1 libze-dev \
+ && rm -rf /var/lib/apt/lists/*
+# Intel oneAPI apt repo → oneAPI 2026.x (DPC++ compiler + oneDNN headers).
+RUN wget -qO- "$ONEAPI_KEY" | gpg --dearmor -o /usr/share/keyrings/oneapi.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/oneapi.gpg] https://apt.repos.intel.com/oneapi all main" \
+      > /etc/apt/sources.list.d/oneAPI.list \
+ && apt-get update && apt-get install -y --no-install-recommends \
+      intel-oneapi-compiler-dpcpp-cpp=2026.0.0-947 intel-oneapi-dnnl-devel=2026.0.2-40 \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+# Build. Source oneAPI setvars DIRECTLY + unconditionally (--force) so the full
+# DPC++ toolchain — incl. llvm-foreach — is on PATH. Compile to SPIR-V (spir64 JIT)
+# with NO device hint, so the build needs no ocloc/GPU; the Level-Zero runtime
+# JIT-compiles for the actual Arc device on first model load (a one-time cost).
+RUN bash -c 'source /opt/intel/oneapi/setvars.sh --force >/dev/null 2>&1 || true ; \
+      set -e ; \
+      cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DIE_SYCL_TARGET=spir64 -DIE_SYCL_DEVICE_HINT= ; \
+      cmake --build build -j4 --target ie ie-perplexity ie-qwen4-ple-test ie-qwen4exp-fwd-test ie-qwen4exp-run2 deep_pipe_test'
+
+# ===================== oneAPI runtime-lib extract =====================
+# Installs the oneAPI runtime packages ONLY so the final stage can copy the few
+# libs it needs out of the flat redist/lib layout. This whole stage is discarded.
+FROM ubuntu:24.04 AS oneapi
+ARG ONEAPI_KEY
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates gnupg wget \
+ && wget -qO- "$ONEAPI_KEY" | gpg --dearmor -o /usr/share/keyrings/oneapi.gpg \
+ && echo "deb [signed-by=/usr/share/keyrings/oneapi.gpg] https://apt.repos.intel.com/oneapi all main" \
+      > /etc/apt/sources.list.d/oneAPI.list \
+ && apt-get update && apt-get install -y --no-install-recommends \
+      intel-oneapi-runtime-dpcpp-cpp=2026.0.0-947 intel-oneapi-runtime-dnnl=2026.0.2-40 \
+      intel-oneapi-runtime-tbb=2023.2.0-492 intel-oneapi-umf \
+ && rm -rf /var/lib/apt/lists/*
+
+# ============================ runtime stage ============================
+FROM ubuntu:24.04 AS runtime
+ENV DEBIAN_FRONTEND=noninteractive
+# Minimal tools: curl + python3 for `ie pull`; gnupg + software-properties-common
+# only to add the Arc graphics PPA, then purged.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      ca-certificates curl python3 gnupg software-properties-common \
+ && add-apt-repository -y ppa:kobuk-team/intel-graphics \
+ && apt-get update && apt-get install -y --no-install-recommends libze1 ocl-icd-libopencl1 \
+ && mkdir -p /tmp/exact && cd /tmp/exact \
+ && curl -fsSLO https://github.com/intel/compute-runtime/releases/download/26.35.39758.10/intel-opencl-icd_26.35.39758.10-0_amd64.deb \
+ && curl -fsSLO https://github.com/intel/compute-runtime/releases/download/26.35.39758.10/libze-intel-gpu1_26.35.39758.10-0_amd64.deb \
+ && curl -fsSLO https://github.com/intel/compute-runtime/releases/download/26.35.39758.10/intel-ocloc_26.35.39758.10-0_amd64.deb \
+ && curl -fsSLO https://github.com/intel/compute-runtime/releases/download/26.35.39758.10/libigdgmm12_22.10.0_amd64.deb \
+ && curl -fsSLO https://github.com/intel/intel-graphics-compiler/releases/download/v2.41.5/intel-igc-core-2_2.41.5%2B22716_amd64.deb \
+ && curl -fsSLO https://github.com/intel/intel-graphics-compiler/releases/download/v2.41.5/intel-igc-opencl-2_2.41.5%2B22716_amd64.deb \
+ && dpkg --purge --force-depends libigc2 libigdfcl2 intel-opencl-icd libze-intel-gpu1 intel-ocloc libigdgmm12 >/dev/null 2>&1 || true \
+ && dpkg -i ./*.deb \
+ && cd / && rm -rf /tmp/exact \
+ && apt-get purge -y --auto-remove software-properties-common gnupg \
+ && rm -rf /var/lib/apt/lists/*
+# The exact oneAPI libs the binary + the Level-Zero UR adapter need (see ldd
+# closure) — ~250 MB instead of the 1.2 GB full runtime. libur_adapter_level_zero
+# is the GPU backend; libumf is its hard dependency.
+COPY --from=oneapi /opt/intel/oneapi/redist/lib/libdnnl.so*                    /opt/ie/lib/
+COPY --from=oneapi /opt/intel/oneapi/redist/lib/libsycl.so*                    /opt/ie/lib/
+COPY --from=oneapi /opt/intel/oneapi/redist/lib/libur_loader.so*              /opt/ie/lib/
+COPY --from=oneapi /opt/intel/oneapi/redist/lib/libur_adapter_level_zero*.so* /opt/ie/lib/
+COPY --from=oneapi /opt/intel/oneapi/redist/lib/libtbb.so*                    /opt/ie/lib/
+COPY --from=oneapi /opt/intel/oneapi/redist/lib/libsvml.so*                   /opt/ie/lib/
+COPY --from=oneapi /opt/intel/oneapi/redist/lib/libimf.so*                    /opt/ie/lib/
+COPY --from=oneapi /opt/intel/oneapi/redist/lib/libintlc.so*                  /opt/ie/lib/
+COPY --from=oneapi /opt/intel/oneapi/redist/lib/libirng.so*                   /opt/ie/lib/
+COPY --from=oneapi /opt/intel/oneapi/redist/lib/libhwloc.so*                  /opt/ie/lib/
+COPY --from=oneapi /opt/intel/oneapi/umf/*/lib/libumf.so*                     /opt/ie/lib/
+COPY --from=oneapi /opt/intel/oneapi/redist/lib/libiomp5.so*                  /opt/ie/lib/
+RUN echo /opt/ie/lib > /etc/ld.so.conf.d/ie.conf && ldconfig
+# ie-pull download deps: curl (public GGUFs) + python3 (repo listing) already present.
+COPY --from=build /src/build/src/ie               /opt/ie/bin/ie
+COPY --from=build /src/build/tools/ie-perplexity  /opt/ie/bin/ie-perplexity
+# B70 gate binaries (issue #3 gate suite; deep_pipe_test is host-only).
+COPY --from=build /src/build/tools/ie-qwen4-ple-test    /opt/ie/bin/
+COPY --from=build /src/build/tools/ie-qwen4exp-fwd-test /opt/ie/bin/
+COPY --from=build /src/build/tools/ie-qwen4exp-run2     /opt/ie/bin/
+COPY --from=build /src/build/tests/deep_pipe_test       /opt/ie/bin/
+COPY --from=build /src/scripts/ie-pull            /opt/ie/bin/ie-pull
+COPY Containerfile.b70 /usr/share/machx/Containerfile.b70
+RUN chmod +x /opt/ie/bin/*
+# LD_LIBRARY_PATH is REQUIRED: the Unified Runtime loader discovers its GPU adapter
+# (libur_adapter_level_zero) via LD_LIBRARY_PATH, not ldconfig.
+ENV PATH=/opt/ie/bin:$PATH \
+    IE_MODELS=/models \
+    LD_LIBRARY_PATH=/opt/ie/lib
+VOLUME /models
+EXPOSE 11435
+ENTRYPOINT ["ie"]
+CMD ["--help"]
