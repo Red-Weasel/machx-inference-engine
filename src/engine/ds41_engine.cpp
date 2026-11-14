@@ -848,18 +848,23 @@ int32_t ds41_image_id(uint64_t image_hash, uint32_t slot) {
     return -1 - int32_t(x >> 33);
 }
 
-// The turn's text with one placeholder per image: where the parser's markers sit, else in front (as the V4 path does).
+// What stands for an image in a message's content until the renderer puts the template's placeholder there (known_bugs 56:
+// since the 2026-11-05 control-token guard a placeholder INSIDE the request's text stayed text, so every image request
+// failed with "fewer image placeholders than images"). Control bytes: no client text carries it once ds41_chat removed it.
+constexpr std::string_view kDs41ImageSentinel = "\x01\x7fie-image\x7f\x01";
+
+// The turn's text with one sentinel per image: where the parser's markers sit, else in front (as the V4 path does).
 std::string ds41_place_images(std::string text, size_t n_images) {
     size_t markers = 0;
     for (size_t p = text.find(kChatImageMarker); p != std::string::npos; p = text.find(kChatImageMarker, p + kChatImageMarker.size())) ++markers;
     if (markers == n_images) {
-        for (size_t p = text.find(kChatImageMarker); p != std::string::npos; p = text.find(kChatImageMarker, p + kDs41ImagePlaceholder.size()))
-            text.replace(p, kChatImageMarker.size(), kDs41ImagePlaceholder);
+        for (size_t p = text.find(kChatImageMarker); p != std::string::npos; p = text.find(kChatImageMarker, p + kDs41ImageSentinel.size()))
+            text.replace(p, kChatImageMarker.size(), kDs41ImageSentinel);
         return text;
     }
     for (size_t p = text.find(kChatImageMarker); p != std::string::npos; p = text.find(kChatImageMarker)) text.erase(p, kChatImageMarker.size());
     std::string front;
-    for (size_t i = 0; i < n_images; ++i) front += kDs41ImagePlaceholder;
+    for (size_t i = 0; i < n_images; ++i) front += kDs41ImageSentinel;
     return front + text;
 }
 }  // namespace
@@ -871,6 +876,7 @@ GenerateResult Engine::ds41_chat(std::span<const ChatTurn> turns, const Sampling
     std::vector<Ds41RequestImage> images;
     for (const auto& t : turns) {
         std::string content = t.content_without_tool_calls.value_or(t.content);
+        for (size_t p = content.find(kDs41ImageSentinel); p != std::string::npos; p = content.find(kDs41ImageSentinel, p)) content.erase(p, kDs41ImageSentinel.size());   // (never the client's)
         if (!t.images.empty()) {
             if (!ds41_->vis_ready) { r.finish_reason = "error: deepseek41 image input: " + ds41_->vis_error; return r; }
             if (ds41_->drafter.ready()) { r.finish_reason = "error: deepseek41 image input is not supported with speculation (IE_DS41_SPEC=1)"; return r; }
@@ -890,6 +896,7 @@ GenerateResult Engine::ds41_chat(std::span<const ChatTurn> turns, const Sampling
     }
     Ds41PromptOptions po; po.thinking = enable_thinking; po.has_tools = !tools_json.empty(); po.tools_json = std::string(tools_json); std::string err;
     if (!reasoning_effort.empty()) { po.reasoning_effort = ds41_reasoning_effort_of(std::string(reasoning_effort), err); if (!err.empty()) { r.finish_reason = "error: " + err; return r; } }
+    if (!images.empty()) { po.image_sentinel = std::string(kDs41ImageSentinel); po.image_placeholder = std::string(kDs41ImagePlaceholder); }
     std::vector<std::pair<size_t, size_t>> content;                   // known_bugs 45: the request's own text never carries a control token
     const std::string prompt = ds41_encode_messages(msgs, po, err, &content);
     if (!err.empty()) { r.finish_reason = "error: " + err; return r; }

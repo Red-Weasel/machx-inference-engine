@@ -87,6 +87,17 @@ struct Piece {
     void add_content(std::string_view s) { if (!s.empty()) content.emplace_back(text.size(), text.size() + s.size()); text += s; }
     void add(const Piece& p) { for (const auto& [b, e] : p.content) content.emplace_back(text.size() + b, text.size() + e); text += p.text; }
 };
+// A message's content as request text, except the engine's image sentinels: there the template's placeholder (known_bugs 56)
+void add_request(Piece& p, std::string_view c, const Ds41PromptOptions& o) {
+    if (o.image_sentinel.empty() || o.image_placeholder.empty()) { p.add_content(c); return; }
+    size_t at = 0;
+    for (size_t q = c.find(o.image_sentinel); q != std::string_view::npos; q = c.find(o.image_sentinel, at)) {
+        p.add_content(c.substr(at, q - at));
+        p.add_text(o.image_placeholder);
+        at = q + o.image_sentinel.size();
+    }
+    p.add_content(c.substr(at));
+}
 Piece render_tools(const std::string& raw) {
     auto tools=array_json(raw); Piece out; if(tools.empty()) return out;
     std::string schemas;
@@ -214,14 +225,14 @@ Piece render(size_t idx, const std::vector<Ds41ChatMessage>& m, const Ds41Prompt
     p.add_text(effort);
     if (msg.role == "system") {
         if (idx > 0) p.add_text(kSystem);                // mid-conversation system message
-        p.add_content(msg.content);
+        add_request(p, msg.content, o);
         auto tools = render_tools(msg.tools_json);
         if (!tools.text.empty()) { p.add_text("\n\n"); p.add(tools); }
     } else if (msg.role == "user") {
-        p.add_text(kUser); p.add_content(msg.content);
+        p.add_text(kUser); add_request(p, msg.content, o);
     } else {                                              // assistant: {reasoning}{content}{tool_calls}eos
         if (o.thinking && (!o.drop_thinking || int(idx) > last_user)) { p.add_content(msg.reasoning_content); p.add_text(kThinkEnd); }
-        p.add_content(msg.content); p.add(render_calls(msg.tool_calls_json)); p.add_text(kEos);
+        add_request(p, msg.content, o); p.add(render_calls(msg.tool_calls_json)); p.add_text(kEos);
     }
     // the transition tokens, only when what follows is an assistant turn (or nothing)
     if (idx + 1 < m.size() && m[idx + 1].role != "assistant") return p;

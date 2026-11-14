@@ -22,6 +22,8 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdio>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
@@ -765,6 +767,42 @@ bool ds41_decode_multi_env() { static const bool v = [] { const char* e = std::g
 bool ds41_cont_env() { static const bool v = [] { const char* e = std::getenv("IE_DS41_CONT"); return !(e && *e && std::string(e) == "0"); }(); return v; }             // Phase 24 step 2, ON since 2026-09-16
 }  // namespace
 
+// ---- IE_DS41_ACT_DUMP=<dir> (2026-11-13): the recorder of internal activations, for work on the weights themselves ----
+// While the file <dir>/RECORD exists (checked once a forward; create and remove it with the server running), every card
+// appends to <dir>/acts.card<N>.pid<P>.bin, for each of its layers, the residual stream ENTERING the layer -- the mean over
+// the hc copies, fp32 -- of a decode step's rows (all of them) or of a prompt chunk's LAST row (IE_DS41_ACT_ROWS=all: every
+// row). A record: uint32 magic 'ACT1', lane, layer, position of the first row, rows, dim; then rows x int32 token ids (the
+// token fed at that position; -1 unknown, negative: an image row); then rows x dim float32. scripts/ds41_acts.py reads them.
+// A position recorded twice (a rollback, a re-read) is superseded by the later record. Cost while recording: one small
+// read-back a layer (40 a token). Off (no env): nothing, not even the check.
+struct Ds41ActDump {
+    std::string dir; bool all_rows = false; std::array<std::FILE*, 16> f{};
+    Ds41ActDump() {
+        if (const char* v = std::getenv("IE_DS41_ACT_DUMP"); v && *v) dir = v;
+        if (const char* v = std::getenv("IE_DS41_ACT_ROWS"); v && std::string(v) == "all") all_rows = true;
+        if (!dir.empty()) std::fprintf(stderr, "[ds41 forward] IE_DS41_ACT_DUMP: activations are recorded to %s while %s/RECORD exists\n", dir.c_str(), dir.c_str());
+    }
+    bool active() const { return !dir.empty() && ::access((dir + "/RECORD").c_str(), F_OK) == 0; }
+    void write(size_t ci, uint32_t lane, uint32_t L, uint32_t pos, uint32_t rows, uint32_t H, uint32_t HC, const float* hh, const int32_t* ids) {
+        if (ci >= f.size()) return;
+        if (!f[ci]) {
+            const std::string path = dir + "/acts.card" + std::to_string(ci) + ".pid" + std::to_string(::getpid()) + ".bin";
+            f[ci] = std::fopen(path.c_str(), "ab");
+            if (!f[ci]) { std::fprintf(stderr, "[ds41 forward] IE_DS41_ACT_DUMP: %s could not be opened\n", path.c_str()); return; }
+        }
+        const uint32_t hdr[6] = {0x31544341u, lane, L, pos, rows, H};
+        std::fwrite(hdr, 4, 6, f[ci]);
+        for (uint32_t r = 0; r < rows; ++r) { const int32_t id = ids ? ids[r] : -1; std::fwrite(&id, 4, 1, f[ci]); }
+        std::vector<float> row(H);
+        for (uint32_t r = 0; r < rows; ++r) {
+            for (uint32_t d = 0; d < H; ++d) { float acc = 0.f; for (uint32_t cp = 0; cp < HC; ++cp) acc += hh[(size_t(r) * HC + cp) * H + d]; row[d] = acc / float(HC); }
+            std::fwrite(row.data(), 4, H, f[ci]);
+        }
+    }
+    void flush(size_t ci) { if (ci < f.size() && f[ci]) std::fflush(f[ci]); }
+};
+static Ds41ActDump& ds41_act_dump() { static Ds41ActDump d; return d; }
+
 std::string Ds41Forward::forward(const int32_t* ids, uint32_t T, uint32_t pos0, std::vector<float>& logits_out,
                                  const Probe& probe, const std::vector<std::vector<int32_t>>* expected,
                                  const std::vector<std::vector<float>>* expected_w, bool force_routing,
@@ -1209,8 +1247,16 @@ std::string Ds41Forward::forward_impl(const int32_t* ids, uint32_t T, uint32_t p
     if (!resident_) if (auto e = ds4_expert_ws_alloc(q, H, EF, ws); !e.empty()) return e;
 
     // =========================================================================================
+    const bool act_rec = ds41_act_dump().active();   // IE_DS41_ACT_DUMP + its RECORD file
+    struct ActFlush { bool on; size_t ci; ~ActFlush() { if (on) ds41_act_dump().flush(ci); } } act_flush{act_rec, ci};
     for (uint32_t L = card.L0; L < card.L1; ++L) {
         const auto t0 = std::chrono::steady_clock::now();
+        if (act_rec && Tl) {   // the stream entering this layer: a decode step's rows, a prompt chunk's last row
+            const uint32_t nr = (Tl <= kDs41MaxDecodeRows || ds41_act_dump().all_rows) ? Tl : 1u, r0 = Tl - nr;
+            std::vector<float> hh(size_t(nr) * FLAT); q.memcpy(hh.data(), h + size_t(r0) * FLAT, hh.size() * 4).wait();
+            const uint32_t i0 = seg_off + r0;
+            ds41_act_dump().write(ci, lane, L, pos0 + i0, nr, H, HC, hh.data(), ids && i0 + nr <= T ? ids + i0 : nullptr);
+        }
         // DSpark P1: the drafter reads the mean over hc of the stream entering the target layers (model.py:1264-1266)
         if (const auto& tl = c.dspark_target_layer_ids; capture_main_hidden_ && !tl.empty() && c.dspark_block_size) {
             const auto it = std::find(tl.begin(), tl.end(), L);

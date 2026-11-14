@@ -145,6 +145,27 @@ int main(int argc, char** argv) {
         check(guarded.size() > plain.size(), "the spellings cost more tokens as text than as control tokens", std::to_string(guarded.size()) + " vs " + std::to_string(plain.size()));
     }
 
+    // known_bugs 56 (2026-11-13): the engine's own image placeholder is the TEMPLATE's text. Since the content ranges it sat
+    // inside the request's text and stayed text: every image request failed ("fewer image placeholders than images").
+    std::printf("\n=== the engine's image placeholder ===\n");
+    {
+        const std::string ph = "<｜deepseek_image｜>", sent = "\x01\x7fie-image\x7f\x01";
+        const int32_t img = tok.find_token(ph.c_str());
+        const auto count = [&](const std::vector<int32_t>& v) { return size_t(std::count(v.begin(), v.end(), img)); };
+        std::string err; std::vector<std::pair<size_t, size_t>> content; ie::Ds41PromptOptions o; o.image_sentinel = sent; o.image_placeholder = ph;
+        const std::vector<ie::Ds41ChatMessage> msgs = {
+            {"user", sent + "what is in this picture? I typed " + ph + " myself", ""},
+            {"assistant", "a cat", ""}, {"tool", "shot " + sent, "", false, false, "", "c1", ""}, {"user", sent + sent + "and these two?", ""}};
+        const std::string got = ie::ds41_encode_messages(msgs, o, err, &content);
+        check(err.empty() && img >= 0, "the render with image sentinels succeeds and the tokenizer knows the placeholder", err);
+        check(got.find(sent) == std::string::npos, "no sentinel is left in the prompt");
+        check(count(tok.encode(got, true, content)) == 4, "the engine's 4 placeholders are image tokens; the one the user typed is text", std::to_string(count(tok.encode(got, true, content))));
+        check(count(tok.encode(got, true)) == 5, "(specials on everywhere would read the typed one too: 5)", std::to_string(count(tok.encode(got, true))));
+        ie::Ds41PromptOptions o0; std::vector<std::pair<size_t, size_t>> c0;
+        const std::string plain = ie::ds41_encode_messages({{"user", "I typed " + ph, ""}}, o0, err, &c0);
+        check(count(tok.encode(plain, true, c0)) == 0, "without the options nothing changes: a typed placeholder is text");
+    }
+
     std::printf("\n%s\n", g_fail ? "PROMPT TEST: FAILURE(S)" : "PROMPT TEST: PASS");
     return g_fail ? 1 : 0;
 }

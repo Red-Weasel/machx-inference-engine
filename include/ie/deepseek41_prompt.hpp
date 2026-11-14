@@ -26,6 +26,11 @@ struct Ds41PromptOptions {
     bool add_bos = true;              // the leading <｜begin▁of▁sentence｜>
     bool has_tools = false;           // requires tools_json when true
     std::string tools_json;           // OpenAI tools array, attached to initial system turn
+    // The engine's image placeholders (2026-11-13). A caller that put `image_sentinel` into a message's content where an
+    // image goes gets `image_placeholder` there as the TEMPLATE's text (outside the content ranges, so it tokenises to the
+    // image token); the same spelling typed by a client stays request text. Both empty: no image handling. The caller
+    // removes any occurrence of the sentinel from the request's own text first.
+    std::string image_sentinel, image_placeholder;
 };
 
 // "low" / "high" / "max" or a decimal 1..100; -1 with `err` set otherwise.
