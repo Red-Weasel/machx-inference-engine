@@ -6,6 +6,7 @@
 #include "ie/ds41_engine.hpp"
 #include "ie/mimo26_engine.hpp"
 #include "ie/laguna_engine.hpp"
+#include "ie/hy4flash_engine.hpp"
 #include "ie/inkling_engine.hpp"
 #include "ie/mimo26_host_rules.hpp"  // mimo26_vision_refusal (vision_status_json)
 #include "ie/vision_required.hpp"   // vision_required_error: the image encoder is part of the load
@@ -2070,6 +2071,10 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
     }
     if (mimo26_dir(gguf_path)) {                     // MiMo-V2.6: a safetensors directory, its own runtime
         if (auto m = e->mimo26_load(gguf_path); !m.empty()) { err = m; return nullptr; }
+        return e;
+    }
+    if (hy4flash_dir(gguf_path)) {                   // Hy4-flash: the engine's directory (8-bit pack), its own runtime
+        if (auto m = e->hy4flash_load(gguf_path); !m.empty()) { err = m; return nullptr; }
         return e;
     }
     if (auto m = e->gguf_.open(gguf_path); !m.empty())   { err = "gguf: " + m;  return nullptr; }
@@ -5761,6 +5766,7 @@ GenerateResult Engine::generate(const std::string& prompt,
                                 bool anchor) {
     if (arch_ == ModelArch::kDeepSeek41) return ds41_generate(prompt, sp, on_token);
     if (arch_ == ModelArch::kMimo26) return mimo26_generate(prompt, sp, on_token);
+    if (arch_ == ModelArch::kHy4Flash) return hy4flash_generate(prompt, sp, on_token);
     if (arch_ == ModelArch::kLaguna) return laguna_generate(prompt, sp, on_token);
     if (arch_ == ModelArch::kInkling) return inkling_generate(prompt, sp, on_token);
     if (q4e_ && q4e_->serve) return q4e_generate_lanes(prompt, sp, on_token, cache_prefix_len, shared_prefix_len);
@@ -7719,6 +7725,10 @@ std::string Engine::vision_status_json() const {
                                          q35m_ && q35m_->serve, qvis_tower_ && qvis_tower_->gpu_resident());
             ready = reason.empty();
             break;
+        case ModelArch::kHy4Flash:
+            if (hy4f_) { ready = hy4f_->vis_ready; reason = ready ? "" : hy4f_->vis_error; tokens = long(hy4f_->image_tokens); }
+            else reason = "model not loaded";
+            break;
         default:
             reason = "this architecture has no vision input";
     }
@@ -7728,14 +7738,14 @@ std::string Engine::vision_status_json() const {
 }
 
 std::string Engine::reasoning_effort_error(std::string_view effort) const {
-    if (arch_ == ModelArch::kDeepSeek41 || arch_ == ModelArch::kMimo26) return ie::reasoning_effort_error(reasoning_capabilities(arch_), effort);   // no GGUF template
+    if (arch_ == ModelArch::kDeepSeek41 || arch_ == ModelArch::kMimo26 || arch_ == ModelArch::kHy4Flash) return ie::reasoning_effort_error(reasoning_capabilities(arch_), effort);   // no GGUF template
     const auto* ct=gguf_.find_kv("tokenizer.chat_template");
     return ie::reasoning_effort_error(reasoning_capabilities(arch_,
         ct && ct->type==GgufValueType::kString?ct->as_string():std::string_view{}),effort);
 }
 
 std::string Engine::gguf_string(std::string_view key) const {
-    if (arch_ == ModelArch::kDeepSeek41 || arch_ == ModelArch::kMimo26) return {};   // no GGUF
+    if (arch_ == ModelArch::kDeepSeek41 || arch_ == ModelArch::kMimo26 || arch_ == ModelArch::kHy4Flash) return {};   // no GGUF
     const auto* ct = gguf_.find_kv(key);
     return ct && ct->type == GgufValueType::kString ? std::string(ct->as_string()) : std::string();
 }
@@ -7751,6 +7761,7 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
     }
     if (arch_ == ModelArch::kDeepSeek41) return ds41_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
     if (arch_ == ModelArch::kMimo26) return mimo26_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
+    if (arch_ == ModelArch::kHy4Flash) return hy4flash_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
     if (arch_ == ModelArch::kLaguna) return laguna_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
     if (arch_ == ModelArch::kInkling) return inkling_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
     // known_bugs 45 (2026-11-05): the request's own text never carries a control token. Every renderer below records the

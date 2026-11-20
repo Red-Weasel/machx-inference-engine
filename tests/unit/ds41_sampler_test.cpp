@@ -59,7 +59,7 @@ int main() {
     const std::vector<int32_t> recent;
     for (const Case& c : cases) {
         ie::Ds41SampleParams sp; sp.temperature = c.temp; sp.top_p = c.top_p; sp.min_p = c.min_p; sp.top_k = c.top_k;
-        int same = 0;
+        int same = 0; const double t_case0 = t_new;
         for (size_t r = 0; r < rows.size(); ++r) {
             uint64_t s1 = 0x5eed0000ull + r * 7919, s2 = s1;
             std::vector<float> a = rows[r];
@@ -72,7 +72,7 @@ int main() {
             t_old += std::chrono::duration<double, std::milli>(t2 - t1).count();
             same += x == y && s1 == s2;
         }
-        std::printf("  %-38s %3d / %zu identical picks\n", c.name, same, rows.size());
+        std::printf("  %-38s %3d / %zu identical picks, %.2f ms/row\n", c.name, same, rows.size(), (t_new - t_case0) / double(rows.size()));
         fails += same != int(rows.size());
     }
     const double n = double(rows.size() * std::size(cases));

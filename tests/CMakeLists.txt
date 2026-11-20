@@ -683,6 +683,14 @@ add_executable(mimo26_chat_test unit/mimo26_chat_test.cpp)
 target_link_libraries(mimo26_chat_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME mimo26_chat_test COMMAND mimo26_chat_test)
 # known_bugs 45: the Laguna chat renderer's own request-text ranges (host-only).
+add_executable(hy4flash_template_test unit/hy4flash_template_test.cpp)
+target_link_libraries(hy4flash_template_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME hy4flash_template_test COMMAND hy4flash_template_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# speculative sampling's accept / resample step: the returned token follows the model's distribution (host-only, Monte Carlo).
+add_executable(spec_accept_test unit/spec_accept_test.cpp)
+target_link_libraries(spec_accept_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME spec_accept_test COMMAND spec_accept_test)
+
 add_executable(laguna_chat_test unit/laguna_chat_test.cpp)
 target_link_libraries(laguna_chat_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME laguna_chat_test COMMAND laguna_chat_test)

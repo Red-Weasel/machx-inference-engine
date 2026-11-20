@@ -17,6 +17,7 @@ std::string server_reasoning_error(const std::string& path,std::string_view effo
     if(effort.empty())return {};
     if(Engine::ds41_dir(path))return reasoning_effort_error(reasoning_capabilities(ModelArch::kDeepSeek41),effort);
     if(Engine::mimo26_dir(path))return reasoning_effort_error(reasoning_capabilities(ModelArch::kMimo26),effort);
+    if(Engine::hy4flash_dir(path))return reasoning_effort_error(reasoning_capabilities(ModelArch::kHy4Flash),effort);
     GgufReader g;
     if(auto e=g.open(path);!e.empty())return "gguf: "+e;
     const auto* ct=g.find_kv("tokenizer.chat_template");
@@ -31,14 +32,14 @@ bool server_supports_arch(ModelArch arch) noexcept {
         case ModelArch::kGemma4: case ModelArch::kGptOss:
         case ModelArch::kDeepSeek4: case ModelArch::kQwen4Exp:
         case ModelArch::kGlm5Next: case ModelArch::kDeepSeek41: case ModelArch::kMimo26:
-        case ModelArch::kLaguna: case ModelArch::kInkling: return true;
+        case ModelArch::kLaguna: case ModelArch::kInkling: case ModelArch::kHy4Flash: return true;
         default: return false;
     }
 }
 bool server_streams_experts(ModelArch arch) noexcept {
     return arch == ModelArch::kDeepSeek4 || arch == ModelArch::kQwen4Exp ||
            arch == ModelArch::kGlm5Next || arch == ModelArch::kDeepSeek41 || arch == ModelArch::kMimo26 ||
-           arch == ModelArch::kLaguna || arch == ModelArch::kInkling;
+           arch == ModelArch::kLaguna || arch == ModelArch::kInkling || arch == ModelArch::kHy4Flash;
 }
 std::string server_capabilities_json(const std::string& model_path) {
     using nlohmann::json;
@@ -48,6 +49,7 @@ std::string server_capabilities_json(const std::string& model_path) {
     bool dense_fleet_file = true;   // a dense GGUF the fleet class loads (the prompt cache's path); see below
     if (!model_path.empty() && Engine::ds41_dir(model_path)) { arch = ModelArch::kDeepSeek41; name = "deepseek_v41"; }
     else if (!model_path.empty() && Engine::mimo26_dir(model_path)) { arch = ModelArch::kMimo26; name = "mimo_v2"; }
+    else if (!model_path.empty() && Engine::hy4flash_dir(model_path)) { arch = ModelArch::kHy4Flash; name = "hy_v4_flash"; }
     else if (!model_path.empty()) {
         GgufReader g;
         if (auto e = g.open(model_path); !e.empty()) throw std::runtime_error("gguf: " + e);
@@ -89,7 +91,7 @@ std::string server_capabilities_json(const std::string& model_path) {
         arch == ModelArch::kQwen35Dense || arch == ModelArch::kQwen3Next ||
         arch == ModelArch::kGemma4 || arch == ModelArch::kQwen4Exp ||
         arch == ModelArch::kDeepSeek4 || arch == ModelArch::kDeepSeek41 || arch == ModelArch::kMimo26 ||
-        arch == ModelArch::kLaguna || arch == ModelArch::kInkling || arch == ModelArch::kGlm5Next;
+        arch == ModelArch::kLaguna || arch == ModelArch::kInkling || arch == ModelArch::kGlm5Next || arch == ModelArch::kHy4Flash;
     // v0.2.21: the 35B-A3B class (lookup drafts on the request lanes, P4 B55) and Flash-Next (lookup drafts at one lane, B56; its
     // MTP head only with a --spec-head path, B63) take --spec too, so a client's load screen can offer it.
     // 2026-10-28 (serving campaign P2): the dense fleet class takes --spec too (prompt-lookup drafts at one lane).
@@ -121,7 +123,7 @@ std::string server_capabilities_json(const std::string& model_path) {
                      // (P4 B45: the Qwen3.8 splits -- the 27B takes images on its two-card split with an mmproj at --parallel 1,
                      // the 35B-A3B is the next step; the load's /props "vision" says whether THIS load is ready)
                      {"vision",arch==ModelArch::kDeepSeek4 || arch==ModelArch::kQwen4Exp || arch==ModelArch::kDeepSeek41 || arch==ModelArch::kMimo26 ||
-                               arch==ModelArch::kQwen35Dense || arch==ModelArch::kQwen35Moe}}},
+                               arch==ModelArch::kQwen35Dense || arch==ModelArch::kQwen35Moe || arch==ModelArch::kHy4Flash}}},
         {"defaults",{{"temperature",r6(sp.temperature)},{"top_k",sp.top_k},{"top_p",r6(sp.top_p)},{"min_p",r6(sp.min_p)},
                      {"repeat_penalty",r6(sp.repeat_penalty)},{"repeat_last_n",sp.repeat_window},{"presence_penalty",r6(sp.presence_penalty)},
                      {"frequency_penalty",r6(sp.frequency_penalty)},{"seed",sp.seed},

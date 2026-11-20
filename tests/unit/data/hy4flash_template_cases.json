@@ -1,0 +1,1247 @@
+[
+ {
+  "name": "one user turn [no_think]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Say hello in French."
+   }
+  ],
+  "tools": [],
+  "reasoning_effort": "no_think",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Say hello in French.<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>"
+ },
+ {
+  "name": "one user turn [high]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Say hello in French."
+   }
+  ],
+  "tools": [],
+  "reasoning_effort": "high",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Say hello in French.<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "one user turn [max]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Say hello in French."
+   }
+  ],
+  "tools": [],
+  "reasoning_effort": "max",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:max<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Say hello in French.<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "system, history without reasoning [no_think]",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "2+2?"
+   },
+   {
+    "role": "assistant",
+    "content": "4"
+   },
+   {
+    "role": "user",
+    "content": "And times 3?"
+   }
+  ],
+  "tools": [],
+  "reasoning_effort": "no_think",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>You are terse.<｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>2+2?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>4<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>And times 3?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>"
+ },
+ {
+  "name": "system, history without reasoning [high]",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "2+2?"
+   },
+   {
+    "role": "assistant",
+    "content": "4"
+   },
+   {
+    "role": "user",
+    "content": "And times 3?"
+   }
+  ],
+  "tools": [],
+  "reasoning_effort": "high",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>You are terse.<｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>2+2?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>4<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>And times 3?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "system, history without reasoning [max]",
+  "messages": [
+   {
+    "role": "system",
+    "content": "You are terse."
+   },
+   {
+    "role": "user",
+    "content": "2+2?"
+   },
+   {
+    "role": "assistant",
+    "content": "4"
+   },
+   {
+    "role": "user",
+    "content": "And times 3?"
+   }
+  ],
+  "tools": [],
+  "reasoning_effort": "max",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜>You are terse.<｜reasoning_mode:opensource｜>reasoning_effort:max<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>2+2?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>4<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>And times 3?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "history reasoning before the last user turn is dropped without tools [no_think]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Pick a colour."
+   },
+   {
+    "role": "assistant",
+    "content": "Blue.",
+    "reasoning_content": "Any colour will do; blue is common."
+   },
+   {
+    "role": "user",
+    "content": "Why?"
+   }
+  ],
+  "tools": [],
+  "reasoning_effort": "no_think",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Pick a colour.<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>Blue.<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Why?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>"
+ },
+ {
+  "name": "history reasoning before the last user turn is dropped without tools [high]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Pick a colour."
+   },
+   {
+    "role": "assistant",
+    "content": "Blue.",
+    "reasoning_content": "Any colour will do; blue is common."
+   },
+   {
+    "role": "user",
+    "content": "Why?"
+   }
+  ],
+  "tools": [],
+  "reasoning_effort": "high",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Pick a colour.<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>Blue.<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Why?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "history reasoning before the last user turn is dropped without tools [max]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Pick a colour."
+   },
+   {
+    "role": "assistant",
+    "content": "Blue.",
+    "reasoning_content": "Any colour will do; blue is common."
+   },
+   {
+    "role": "user",
+    "content": "Why?"
+   }
+  ],
+  "tools": [],
+  "reasoning_effort": "max",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:max<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Pick a colour.<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>Blue.<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Why?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "tools, no system [no_think]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Oslo?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city — metric units.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search_files",
+     "description": "Find files whose text matches a pattern.",
+     "strict": true,
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "paths": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       "opts": {
+        "type": "object"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "no_think",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city — metric units.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n{\"name\": \"search_files\", \"description\": \"Find files whose text matches a pattern.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\"}, \"paths\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"opts\": {\"type\": \"object\"}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Oslo?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>"
+ },
+ {
+  "name": "tools, no system [high]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Oslo?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city — metric units.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search_files",
+     "description": "Find files whose text matches a pattern.",
+     "strict": true,
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "paths": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       "opts": {
+        "type": "object"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "high",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city — metric units.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n{\"name\": \"search_files\", \"description\": \"Find files whose text matches a pattern.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\"}, \"paths\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"opts\": {\"type\": \"object\"}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Oslo?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "tools, no system [max]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Weather in Oslo?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city — metric units.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search_files",
+     "description": "Find files whose text matches a pattern.",
+     "strict": true,
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "paths": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       "opts": {
+        "type": "object"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "max",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city — metric units.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n{\"name\": \"search_files\", \"description\": \"Find files whose text matches a pattern.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\"}, \"paths\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"opts\": {\"type\": \"object\"}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:max<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Oslo?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "tools with a system turn, a deferred tool left out [no_think]",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Use tools when they help."
+   },
+   {
+    "role": "user",
+    "content": "Weather in Oslo for 3 days?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city — metric units.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "rarely_used",
+     "description": "Loaded on demand.",
+     "defer_loading": true,
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "no_think",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city — metric units.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource>\n\nUse tools when they help.<｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Oslo for 3 days?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>"
+ },
+ {
+  "name": "tools with a system turn, a deferred tool left out [high]",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Use tools when they help."
+   },
+   {
+    "role": "user",
+    "content": "Weather in Oslo for 3 days?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city — metric units.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "rarely_used",
+     "description": "Loaded on demand.",
+     "defer_loading": true,
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "high",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city — metric units.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource>\n\nUse tools when they help.<｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Oslo for 3 days?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "tools with a system turn, a deferred tool left out [max]",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Use tools when they help."
+   },
+   {
+    "role": "user",
+    "content": "Weather in Oslo for 3 days?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city — metric units.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "rarely_used",
+     "description": "Loaded on demand.",
+     "defer_loading": true,
+     "parameters": {
+      "type": "object",
+      "properties": {}
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "max",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city — metric units.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource>\n\nUse tools when they help.<｜reasoning_mode:opensource｜>reasoning_effort:max<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Oslo for 3 days?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "tools with an empty system turn [no_think]",
+  "messages": [
+   {
+    "role": "system",
+    "content": ""
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city — metric units.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "no_think",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city — metric units.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Hi<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>"
+ },
+ {
+  "name": "tools with an empty system turn [high]",
+  "messages": [
+   {
+    "role": "system",
+    "content": ""
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city — metric units.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "high",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city — metric units.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Hi<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "tools with an empty system turn [max]",
+  "messages": [
+   {
+    "role": "system",
+    "content": ""
+   },
+   {
+    "role": "user",
+    "content": "Hi"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city — metric units.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "max",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city — metric units.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:max<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Hi<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "two calls, results given in the other order, reasoning kept with tools [no_think]",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Use tools."
+   },
+   {
+    "role": "user",
+    "content": "Weather in Oslo, and find TODOs in src."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Two independent lookups.",
+    "tool_calls": [
+     {
+      "id": "call_a",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Oslo\", \"days\": 2}"
+      }
+     },
+     {
+      "id": "call_b",
+      "type": "function",
+      "function": {
+       "name": "search_files",
+       "arguments": "{\"pattern\": \"TODO\", \"paths\": [\"src\", \"tests\"], \"opts\": {\"case\": false, \"max\": 20}}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_b",
+    "content": "src/a.cpp:10: TODO tidy"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_a",
+    "content": "{\"temp_c\": -3, \"sky\": \"snow ❄\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city — metric units.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search_files",
+     "description": "Find files whose text matches a pattern.",
+     "strict": true,
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "paths": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       "opts": {
+        "type": "object"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "no_think",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city — metric units.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n{\"name\": \"search_files\", \"description\": \"Find files whose text matches a pattern.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\"}, \"paths\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"opts\": {\"type\": \"object\"}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource>\n\nUse tools.<｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Oslo, and find TODOs in src.<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource><tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Oslo</arg_value:opensource><arg_key:opensource>days</arg_key:opensource><arg_value:opensource>2</arg_value:opensource></tool_call:opensource><tool_call:opensource>search_files<arg_key:opensource>pattern</arg_key:opensource><arg_value:opensource>TODO</arg_value:opensource><arg_key:opensource>paths</arg_key:opensource><arg_value:opensource>[\"src\", \"tests\"]</arg_value:opensource><arg_key:opensource>opts</arg_key:opensource><arg_value:opensource>{\"case\": false, \"max\": 20}</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>{\"temp_c\": -3, \"sky\": \"snow ❄\"}</tool_response:opensource><tool_response:opensource>src/a.cpp:10: TODO tidy</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>"
+ },
+ {
+  "name": "two calls, results given in the other order, reasoning kept with tools [high]",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Use tools."
+   },
+   {
+    "role": "user",
+    "content": "Weather in Oslo, and find TODOs in src."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Two independent lookups.",
+    "tool_calls": [
+     {
+      "id": "call_a",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Oslo\", \"days\": 2}"
+      }
+     },
+     {
+      "id": "call_b",
+      "type": "function",
+      "function": {
+       "name": "search_files",
+       "arguments": "{\"pattern\": \"TODO\", \"paths\": [\"src\", \"tests\"], \"opts\": {\"case\": false, \"max\": 20}}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_b",
+    "content": "src/a.cpp:10: TODO tidy"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_a",
+    "content": "{\"temp_c\": -3, \"sky\": \"snow ❄\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city — metric units.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search_files",
+     "description": "Find files whose text matches a pattern.",
+     "strict": true,
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "paths": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       "opts": {
+        "type": "object"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "high",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city — metric units.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n{\"name\": \"search_files\", \"description\": \"Find files whose text matches a pattern.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\"}, \"paths\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"opts\": {\"type\": \"object\"}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource>\n\nUse tools.<｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Oslo, and find TODOs in src.<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>Two independent lookups.</think:opensource><tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Oslo</arg_value:opensource><arg_key:opensource>days</arg_key:opensource><arg_value:opensource>2</arg_value:opensource></tool_call:opensource><tool_call:opensource>search_files<arg_key:opensource>pattern</arg_key:opensource><arg_value:opensource>TODO</arg_value:opensource><arg_key:opensource>paths</arg_key:opensource><arg_value:opensource>[\"src\", \"tests\"]</arg_value:opensource><arg_key:opensource>opts</arg_key:opensource><arg_value:opensource>{\"case\": false, \"max\": 20}</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>{\"temp_c\": -3, \"sky\": \"snow ❄\"}</tool_response:opensource><tool_response:opensource>src/a.cpp:10: TODO tidy</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "two calls, results given in the other order, reasoning kept with tools [max]",
+  "messages": [
+   {
+    "role": "system",
+    "content": "Use tools."
+   },
+   {
+    "role": "user",
+    "content": "Weather in Oslo, and find TODOs in src."
+   },
+   {
+    "role": "assistant",
+    "content": "",
+    "reasoning_content": "Two independent lookups.",
+    "tool_calls": [
+     {
+      "id": "call_a",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Oslo\", \"days\": 2}"
+      }
+     },
+     {
+      "id": "call_b",
+      "type": "function",
+      "function": {
+       "name": "search_files",
+       "arguments": "{\"pattern\": \"TODO\", \"paths\": [\"src\", \"tests\"], \"opts\": {\"case\": false, \"max\": 20}}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_b",
+    "content": "src/a.cpp:10: TODO tidy"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "call_a",
+    "content": "{\"temp_c\": -3, \"sky\": \"snow ❄\"}"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city — metric units.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   },
+   {
+    "type": "function",
+    "function": {
+     "name": "search_files",
+     "description": "Find files whose text matches a pattern.",
+     "strict": true,
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "pattern": {
+        "type": "string"
+       },
+       "paths": {
+        "type": "array",
+        "items": {
+         "type": "string"
+        }
+       },
+       "opts": {
+        "type": "object"
+       }
+      }
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "max",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city — metric units.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n{\"name\": \"search_files\", \"description\": \"Find files whose text matches a pattern.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"pattern\": {\"type\": \"string\"}, \"paths\": {\"type\": \"array\", \"items\": {\"type\": \"string\"}}, \"opts\": {\"type\": \"object\"}}}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource>\n\nUse tools.<｜reasoning_mode:opensource｜>reasoning_effort:max<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Weather in Oslo, and find TODOs in src.<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>Two independent lookups.</think:opensource><tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Oslo</arg_value:opensource><arg_key:opensource>days</arg_key:opensource><arg_value:opensource>2</arg_value:opensource></tool_call:opensource><tool_call:opensource>search_files<arg_key:opensource>pattern</arg_key:opensource><arg_value:opensource>TODO</arg_value:opensource><arg_key:opensource>paths</arg_key:opensource><arg_value:opensource>[\"src\", \"tests\"]</arg_value:opensource><arg_key:opensource>opts</arg_key:opensource><arg_value:opensource>{\"case\": false, \"max\": 20}</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>{\"temp_c\": -3, \"sky\": \"snow ❄\"}</tool_response:opensource><tool_response:opensource>src/a.cpp:10: TODO tidy</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "a call without ids keeps the given order [no_think]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Oslo and Bergen?"
+   },
+   {
+    "role": "assistant",
+    "content": "Checking both.",
+    "tool_calls": [
+     {
+      "id": "",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Oslo\"}"
+      }
+     },
+     {
+      "id": "",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Bergen\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "",
+    "content": "-3"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "",
+    "content": "4"
+   },
+   {
+    "role": "assistant",
+    "content": "Oslo -3, Bergen 4."
+   },
+   {
+    "role": "user",
+    "content": "Thanks. And Tromsø?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city — metric units.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "no_think",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city — metric units.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Oslo and Bergen?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>Checking both.<tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Oslo</arg_value:opensource></tool_call:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Bergen</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>-3</tool_response:opensource><tool_response:opensource>4</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>Oslo -3, Bergen 4.<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Thanks. And Tromsø?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>"
+ },
+ {
+  "name": "a call without ids keeps the given order [high]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Oslo and Bergen?"
+   },
+   {
+    "role": "assistant",
+    "content": "Checking both.",
+    "tool_calls": [
+     {
+      "id": "",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Oslo\"}"
+      }
+     },
+     {
+      "id": "",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Bergen\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "",
+    "content": "-3"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "",
+    "content": "4"
+   },
+   {
+    "role": "assistant",
+    "content": "Oslo -3, Bergen 4."
+   },
+   {
+    "role": "user",
+    "content": "Thanks. And Tromsø?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city — metric units.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "high",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city — metric units.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Oslo and Bergen?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>Checking both.<tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Oslo</arg_value:opensource></tool_call:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Bergen</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>-3</tool_response:opensource><tool_response:opensource>4</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>Oslo -3, Bergen 4.<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Thanks. And Tromsø?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "a call without ids keeps the given order [max]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Oslo and Bergen?"
+   },
+   {
+    "role": "assistant",
+    "content": "Checking both.",
+    "tool_calls": [
+     {
+      "id": "",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Oslo\"}"
+      }
+     },
+     {
+      "id": "",
+      "type": "function",
+      "function": {
+       "name": "get_weather",
+       "arguments": "{\"city\": \"Bergen\"}"
+      }
+     }
+    ]
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "",
+    "content": "-3"
+   },
+   {
+    "role": "tool",
+    "tool_call_id": "",
+    "content": "4"
+   },
+   {
+    "role": "assistant",
+    "content": "Oslo -3, Bergen 4."
+   },
+   {
+    "role": "user",
+    "content": "Thanks. And Tromsø?"
+   }
+  ],
+  "tools": [
+   {
+    "type": "function",
+    "function": {
+     "name": "get_weather",
+     "description": "Current weather for a city — metric units.",
+     "parameters": {
+      "type": "object",
+      "properties": {
+       "city": {
+        "type": "string"
+       },
+       "days": {
+        "type": "integer",
+        "minimum": 1
+       }
+      },
+      "required": [
+       "city"
+      ]
+     }
+    }
+   }
+  ],
+  "reasoning_effort": "max",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜># Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"name\": \"get_weather\", \"description\": \"Current weather for a city — metric units.\", \"parameters\": {\"type\": \"object\", \"properties\": {\"city\": {\"type\": \"string\"}, \"days\": {\"type\": \"integer\", \"minimum\": 1}}, \"required\": [\"city\"]}}\n</tools>\n\nFor function call returns, you should first print <tool_calls:opensource>\nFor each function call, you should return object like:\n<tool_call:opensource>{function-name}<arg_key:opensource>{arg-key-1}</arg_key:opensource><arg_value:opensource>{arg-value-1}</arg_value:opensource><arg_key:opensource>{arg-key-2}</arg_key:opensource><arg_value:opensource>{arg-value-2}</arg_value:opensource>...</tool_call:opensource>\nAt the end of function call returns, you should print </tool_calls:opensource><｜reasoning_mode:opensource｜>reasoning_effort:max<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Oslo and Bergen?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>Checking both.<tool_calls:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Oslo</arg_value:opensource></tool_call:opensource><tool_call:opensource>get_weather<arg_key:opensource>city</arg_key:opensource><arg_value:opensource>Bergen</arg_value:opensource></tool_call:opensource></tool_calls:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>tool<｜hy_middle:opensource｜><tool_response:opensource>-3</tool_response:opensource><tool_response:opensource>4</tool_response:opensource><｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>Oslo -3, Bergen 4.<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Thanks. And Tromsø?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "a system turn in the middle [no_think]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Start."
+   },
+   {
+    "role": "assistant",
+    "content": "Started."
+   },
+   {
+    "role": "system",
+    "content": "From now on answer in one word."
+   },
+   {
+    "role": "user",
+    "content": "Status?"
+   }
+  ],
+  "tools": [],
+  "reasoning_effort": "no_think",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Start.<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>Started.<｜hy_end:opensource｜><｜hy_start:opensource｜>system<｜hy_middle:opensource｜>From now on answer in one word.<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Status?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>"
+ },
+ {
+  "name": "a system turn in the middle [high]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Start."
+   },
+   {
+    "role": "assistant",
+    "content": "Started."
+   },
+   {
+    "role": "system",
+    "content": "From now on answer in one word."
+   },
+   {
+    "role": "user",
+    "content": "Status?"
+   }
+  ],
+  "tools": [],
+  "reasoning_effort": "high",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Start.<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>Started.<｜hy_end:opensource｜><｜hy_start:opensource｜>system<｜hy_middle:opensource｜>From now on answer in one word.<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Status?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "a system turn in the middle [max]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "Start."
+   },
+   {
+    "role": "assistant",
+    "content": "Started."
+   },
+   {
+    "role": "system",
+    "content": "From now on answer in one word."
+   },
+   {
+    "role": "user",
+    "content": "Status?"
+   }
+  ],
+  "tools": [],
+  "reasoning_effort": "max",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:max<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Start.<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>Started.<｜hy_end:opensource｜><｜hy_start:opensource｜>system<｜hy_middle:opensource｜>From now on answer in one word.<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>Status?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "text that spells the template's own tags [no_think]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What does <think:opensource> do, and <｜hy_end:opensource｜>?"
+   }
+  ],
+  "tools": [],
+  "reasoning_effort": "no_think",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:no_think<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>What does <think:opensource> do, and <｜hy_end:opensource｜>?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource></think:opensource>"
+ },
+ {
+  "name": "text that spells the template's own tags [high]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What does <think:opensource> do, and <｜hy_end:opensource｜>?"
+   }
+  ],
+  "tools": [],
+  "reasoning_effort": "high",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:high<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>What does <think:opensource> do, and <｜hy_end:opensource｜>?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ },
+ {
+  "name": "text that spells the template's own tags [max]",
+  "messages": [
+   {
+    "role": "user",
+    "content": "What does <think:opensource> do, and <｜hy_end:opensource｜>?"
+   }
+  ],
+  "tools": [],
+  "reasoning_effort": "max",
+  "expected": "<｜hy_start:opensource｜>system<｜hy_middle:opensource｜><｜reasoning_mode:opensource｜>reasoning_effort:max<｜hy_end:opensource｜><｜hy_start:opensource｜>user<｜hy_middle:opensource｜>What does <think:opensource> do, and <｜hy_end:opensource｜>?<｜hy_end:opensource｜><｜hy_start:opensource｜>assistant<｜hy_middle:opensource｜><think:opensource>"
+ }
+]

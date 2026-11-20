@@ -702,6 +702,16 @@ add_executable(ie_mimo26_vision_test mimo26_vision_test.cpp)
 target_link_libraries(ie_mimo26_vision_test PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_mimo26_vision_test PROPERTIES OUTPUT_NAME "ie-mimo26-vision-test")
 # MiMo-V2.6 P2 (docs/mimo26/00_PORT_PLAN.md): greedy generation and llama-perplexity-protocol NLL against the oracle
+# Hy4-flash (docs/hy4flash/00_PORT_AND_ABLITERATION_PLAN.md): the load check and the mini-model gate against the reference
+add_executable(ie_hy4flash_mini hy4flash_mini.cpp)
+target_link_libraries(ie_hy4flash_mini PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_hy4flash_mini PROPERTIES OUTPUT_NAME "ie-hy4flash-mini")
+add_executable(ie_hy4flash_run hy4flash_run.cpp)
+target_link_libraries(ie_hy4flash_run PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_hy4flash_run PROPERTIES OUTPUT_NAME "ie-hy4flash-run")
+add_executable(ie_hy4flash_vision hy4flash_vision.cpp)
+target_link_libraries(ie_hy4flash_vision PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_hy4flash_vision PROPERTIES OUTPUT_NAME "ie-hy4flash-vision")
 add_executable(ie_mimo26_run mimo26_run.cpp)
 target_link_libraries(ie_mimo26_run PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_mimo26_run PROPERTIES OUTPUT_NAME "ie-mimo26-run")
@@ -748,3 +758,11 @@ set_target_properties(ie_mimo26_dflash_check PROPERTIES OUTPUT_NAME "ie-mimo26-d
 add_executable(ie_mimo26_lanes_test mimo26_lanes_test.cpp)
 target_link_libraries(ie_mimo26_lanes_test PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_mimo26_lanes_test PROPERTIES OUTPUT_NAME "ie-mimo26-lanes-test")
+
+add_executable(ie_hy4flash_legbench hy4flash_legbench.cpp)
+target_link_libraries(ie_hy4flash_legbench PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_hy4flash_legbench PROPERTIES OUTPUT_NAME "ie-hy4flash-legbench")
+
+add_executable(ie_hy4flash_quant hy4flash_quant.cpp)
+target_link_libraries(ie_hy4flash_quant PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_hy4flash_quant PROPERTIES OUTPUT_NAME "ie-hy4flash-quant")

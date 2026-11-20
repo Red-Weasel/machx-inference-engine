@@ -24,6 +24,8 @@ inline ReasoningCapabilities reasoning_capabilities(ModelArch arch, std::string_
         return {true,{"low","high","max"},"high","on/off selects the DeepSeek-V4.1 thinking template; the effort is its numeric budget (low 50, high 75, max 100)"};
     if (arch == ModelArch::kMimo26)
         return {true,{}, {},"on/off selects MiMo-V2.6's thinking prompt (off renders <think></think>)"};
+    if (arch == ModelArch::kHy4Flash)
+        return {true,{"high","max"},"high","on/off selects Hy4-flash's reasoning mode (off = no_think); the effort is the template's high or max"};
     if (arch == ModelArch::kLaguna)
         return {true,{}, {},"on/off selects Laguna's thinking prompt (off renders </think>)"};
     if (arch == ModelArch::kInkling)

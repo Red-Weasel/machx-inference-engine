@@ -80,6 +80,13 @@ add_library(ie_core
   ops/deepseek41_candidate.cpp
   ops/deepseek41_attn_xmx.cpp
   ops/deepseek41_topk_split.cpp
+  ops/hy4flash_q8_moe.cpp
+  ops/hy4flash_q8_cpu.cpp
+  ops/hy4flash_small.cpp
+  ops/hy4flash_attn_xmx.cpp
+  ops/hy4flash_ix_gpu.cpp
+  ops/hy4flash_fuse.cpp
+  ops/hy4flash_moe_grp.cpp
   ops/mimo26_ops.cpp
   ops/inkling_ops.cpp
   ops/laguna_ops.cpp
@@ -141,6 +148,11 @@ add_library(ie_core
   model/deepseek41_residency.cpp
   model/deepseek41_weights.cpp
   model/deepseek41_experts.cpp
+  model/hy4flash.cpp
+  model/hy4flash_host.cpp
+  model/hy4flash_forward.cpp
+  model/hy4flash_q8.cpp
+  model/hy4flash_vision.cpp
   model/mimo26.cpp
   model/mimo26_dequant.cpp
   model/mimo26_forward.cpp
@@ -154,6 +166,7 @@ add_library(ie_core
   engine/ds41_engine.cpp
   engine/mimo26_engine.cpp
   engine/laguna_engine.cpp
+  engine/hy4flash_engine.cpp
   engine/inkling_engine.cpp
   engine/glm5_server.cpp
   engine/lanes_serve.cpp
@@ -195,6 +208,20 @@ set_source_files_properties(ops/gemv_kq_c32.cpp PROPERTIES
 # no contraction, IEEE division on both sides.
 set_source_files_properties(ops/qwen4_route.cpp PROPERTIES
   COMPILE_OPTIONS "-fp-model=precise")
+# Hy4-flash host arithmetic (rope tables, the FP8 round trip of the n-gram rows, the router's and the indexer's top-k):
+# no re-association, IEEE division, nearbyint as written (docs/hy4flash/00_PORT_AND_ABLITERATION_PLAN.md).
+set_source_files_properties(model/hy4flash_host.cpp PROPERTIES
+  COMPILE_OPTIONS "-fp-model=precise;-fopenmp")
+# Hy4-flash image loader: the resize plan's arithmetic is Python's (include/ie/hy4flash_vision.hpp)
+set_source_files_properties(model/hy4flash_vision.cpp PROPERTIES
+  COMPILE_OPTIONS "-fp-model=precise")
+# The Hy4-flash 8-bit expert store converts 148.6 B BF16 weights at load: an OpenMP team, F16C for the fp16 scales, and the
+# precise model so the rounding is the one written (include/ie/hy4flash_q8.hpp).
+# Hy4-flash decode misses on the CPU: AVX2 integer dot products over an OpenMP team (include/ie/hy4flash_q8.hpp)
+set_source_files_properties(ops/hy4flash_q8_cpu.cpp PROPERTIES
+  COMPILE_OPTIONS "-mavx2;-mfma;-mf16c;-fopenmp")
+set_source_files_properties(model/hy4flash_q8.cpp PROPERTIES
+  COMPILE_OPTIONS "-fopenmp;-mavx2;-mf16c;-fp-model=precise")
 set_source_files_properties(model/deepseek41_engram.cpp PROPERTIES
   COMPILE_OPTIONS "-fopenmp")
 target_link_options(ie_core PUBLIC -fopenmp)

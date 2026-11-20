@@ -79,6 +79,8 @@ std::string Ds41Forward::set_prefix_cache(bool on, const PrefixCacheOptions& o) 
     // sat at ~17-20 GiB, every 0.4-0.6 GiB slot was refused, and each resume or
     // post-compaction turn then re-prefilled tens of thousands of tokens: 178 s, 104 s,
     // 77 s). Tunable so that trade can be made without a rebuild.
+    // 2026-11-16: the switch alone fixed nothing -- the default stayed 24 and nobody set it, so the same thing cost the
+    // test machine 49 minutes of re-reads in one day at 20-24 GiB available. The default is 12 GiB now (PrefixCacheOptions::keep_free).
     if (const char* v = std::getenv("IE_DS41_CACHE_KEEP_FREE_GIB"))
         if (const double g = std::atof(v); g >= 0.0)
             pc_opt_.keep_free = uint64_t(g * 1073741824.0);

@@ -70,6 +70,9 @@ struct Mimo26Bundle;
 // Laguna-S-2.1 (kLaguna): the GGUF, the one-card runtime (LagunaModel), the GGUF's tokenizer and chat template.
 // src/engine/laguna_engine.cpp (docs/laguna/00_PORT_PLAN.md P5).
 struct LagunaBundle;
+// Tencent Hy4-flash (kHy4Flash): a model DIRECTORY (hy4flash_ie.json), the two-card forward with 8-bit experts, the
+// tokenizer.json tokenizer and the checkpoint's chat template. src/engine/hy4flash_engine.cpp.
+struct Hy4FlashBundle;
 // Inkling-Small (kInkling): the GGUF, the one-card runtime (InklingModel), the GGUF's tokenizer and its chat format.
 // src/engine/inkling_engine.cpp (docs/inkling/00_PORT_PLAN.md P5).
 struct InklingBundle;
@@ -272,6 +275,8 @@ public:
     static bool ds41_dir(const std::string& path);
     // A MiMo-V2.6 model directory (config.json model_type mimo_v2)?
     static bool mimo26_dir(const std::string& path);
+    // A Hy4-flash engine directory (it holds hy4flash_ie.json)?
+    static bool hy4flash_dir(const std::string& path);
     uint32_t  max_ctx() const noexcept { return opts_.max_ctx; }
     uint32_t  parallel() const noexcept { return opts_.parallel; }
     // P4 B38: the positions each of the request lanes 1..N-1 holds (lane 0 holds max_ctx); 0 with one lane. /props reports
@@ -625,6 +630,11 @@ private:
     GenerateResult mimo26_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
                               bool enable_thinking, std::string_view tools_json, std::string_view reasoning_effort);
     GenerateResult mimo26_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token);
+    // hy4-flash (src/engine/hy4flash_engine.cpp): the directory load and the chat/generate routes
+    std::string    hy4flash_load(const std::string& dir);
+    GenerateResult hy4flash_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
+                                 bool enable_thinking, std::string_view tools_json, std::string_view reasoning_effort);
+    GenerateResult hy4flash_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token);
     // laguna (src/engine/laguna_engine.cpp): the load (gguf_ already open) and the chat/generate routes
     std::string    laguna_load();
     GenerateResult laguna_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
@@ -720,6 +730,8 @@ private:
     std::unique_ptr<Ds4Bundle> ds4_;
     std::unique_ptr<Ds41Bundle> ds41_;   // deepseek41 only; frees its runtime in its own destructor
     std::unique_ptr<Mimo26Bundle> mimo26_;   // mimo_v2 only; frees its runtime in its own destructor
+    std::unique_ptr<Hy4FlashBundle> hy4f_;   // hy4-flash only; frees its runtime in its own destructor
+    std::mutex hy4f_mu_;                     // one request at a time on the one runtime
     std::unique_ptr<LagunaBundle> laguna_;   // laguna only; reads gguf_'s mapping, so it is declared after gguf_
     std::mutex laguna_mu_;                   // one request at a time on the one runtime
     std::unique_ptr<InklingBundle> inkling_; // inkling only; reads gguf_'s mapping, so it is declared after gguf_

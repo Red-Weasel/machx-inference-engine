@@ -291,7 +291,11 @@ public:
     struct PrefixCacheOptions {
         uint32_t checkpoints = 24;                 // ring checkpoints kept for the live state (pinned, ~5 MB per card each)
         uint64_t host_budget = 4ull << 30;         // bytes of host slots (other conversations), LRU-evicted
-        uint64_t keep_free = 24ull << 30;          // never grow the host slots below this much MemAvailable
+        // never grow the host slots below this much MemAvailable. 12 GiB since 2026-11-16 (it was 24): the expert tier
+        // pins RAM down to 20-24 GiB available on a 256 GB box, so a bar of 24 refused nearly every slot -- the test machine's
+        // 145K-token conversation was re-read in full 12 times in one day (49 minutes; 416 s the last time) whenever
+        // another conversation had used the lane. The slots are pageable and capped by host_budget (4 GiB).
+        uint64_t keep_free = 12ull << 30;
         uint32_t min_slot_tokens = 1024;           // a state shorter than this is not worth keeping in a host slot
         // Phase 47 (docs/deepseek41/87): DISK entries -- a prompt prefix's state (typically a system prompt + tools) written
         // once and loaded by later processes. Empty dir = off. Keyed by the token ids, the model's shape and (#48,

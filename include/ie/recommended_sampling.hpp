@@ -136,6 +136,16 @@ inline std::optional<Recommendation> recommended_sampling(ModelArch arch, std::s
         r.note = "card: top_p 0.95 or 1.0; 0.95 is what every card evaluation used (owner decision 2026-09-28)";
         return r;
     }
+    if (arch == ModelArch::kHy4Flash) {
+        Recommendation r;
+        r.model = "Hy4-flash";
+        r.source = "the checkpoint's generation_config.json";
+        r.thinking = {0.9, 1.0, 0, 0.0, 0.0, 1.0, "the default (the template reasons at effort high unless told no_think)"};
+        r.instruct = RecommendedMode{0.9, 1.0, 0, 0.0, 0.0, 1.0, "quick replies (the checkpoint gives one sampling set for both modes)"};
+        r.max_output_note = "not specified by the checkpoint";
+        r.note = "generation_config: temperature 0.9, top_p 1, top_k off";
+        return r;
+    }
     if (arch == ModelArch::kLaguna) {
         Recommendation r;
         r.model = "Laguna-S-2.1";
@@ -159,11 +169,11 @@ inline const RecommendedMode& recommended_mode(const Recommendation& r, bool thi
 // DeepSeek-V4.1 and MiMo-V2.6 sample on the host (deepseek41_generate.cpp), which has no presence or frequency penalty:
 // such a setting is served WITHOUT it (owner decision 2026-09-28: warn, do not refuse). "" = nothing is dropped.
 inline std::string dropped_penalty_warning(ModelArch arch, const SamplingParams& sp) {
-    if (arch != ModelArch::kDeepSeek41 && arch != ModelArch::kMimo26 && arch != ModelArch::kLaguna && arch != ModelArch::kInkling) return {};
+    if (arch != ModelArch::kDeepSeek41 && arch != ModelArch::kMimo26 && arch != ModelArch::kLaguna && arch != ModelArch::kInkling && arch != ModelArch::kHy4Flash) return {};
     if (sp.presence_penalty == 0.f && sp.frequency_penalty == 0.f) return {};
     return std::string("presence_penalty ") + std::to_string(sp.presence_penalty) + " / frequency_penalty " +
            std::to_string(sp.frequency_penalty) + " IGNORED: the " +
-           (arch == ModelArch::kMimo26 ? "MiMo-V2.6" : arch == ModelArch::kLaguna ? "Laguna" :
+           (arch == ModelArch::kMimo26 ? "MiMo-V2.6" : arch == ModelArch::kHy4Flash ? "Hy4-flash" : arch == ModelArch::kLaguna ? "Laguna" :
             arch == ModelArch::kInkling ? "Inkling" : "DeepSeek-V4.1") +
            " sampler has no presence/frequency penalty (repeat_penalty works)";
 }

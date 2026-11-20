@@ -39,6 +39,7 @@
 
 **Latest**
 
+- **v0.2.44, November 19 — Tencent Hy4-flash runs, with images, tool calls and long prompts:** the 220B model (512 experts a layer, 16 a token, four n-gram memories) is served from an 8-bit expert pack made from Tencent's full-precision release: a 25,000-token prompt reads at 462–470 tok/s and replies decode at 20–26 tok/s on two Arc Pro B70 cards, with the output closer to exact arithmetic than the reference is in bfloat16. Also: sampling with no top-p cut no longer sorts the whole vocabulary every token (DeepSeek-V4.1, MiMo-V2.6, Hy4-flash: 9.3 → 1.3 ms a token), and DeepSeek-V4.1 keeps a parked conversation in RAM down to 12 GiB free (it was 24, which a 256 GB machine never had). [Details](#-new-in-v0244)
 - **v0.2.43, November 13 — DeepSeek-V4.1 reads images again:** from v0.2.36 through v0.2.42 every image request to DeepSeek-V4.1 failed with `the prompt holds fewer image placeholders than images`. The guard that keeps control-token spellings in a request plain text also caught the engine's own image placeholder. Fixed, with a test; a placeholder typed by a client still stays text. Also new: `IE_DS41_ACT_DUMP=<dir>` records DeepSeek-V4.1's internal activations (the stream entering every layer) while a file `RECORD` exists in that folder, for work on the weights; `scripts/ds41_acts.py` reads them.
 - **v0.2.42, November 13 — DeepSeek-V4.1's VRAM expert set follows the conversation too:** a hot RAM expert trades places with the coldest expert of the fixed VRAM set, about once a token and card, with no extra memory: **16.4 → 17.7 tok/s** on one conversation, **13.8 → 17.2 tok/s** with three requests at once, greedy replies identical on and off. Also: Flash-Next honours `--no-prompt-cache` at one request lane and says when it does not take `--prefill-chunk`, a contributed container build (`Containerfile.b70`), and the first four-card numbers measured by a user. [Details](#new-in-v0242).
 - **v0.2.41, November 12 — DeepSeek-V4.1 and MiMo-V2.6 keep the experts the conversation is using in fast memory:** both models held a fixed set of experts in VRAM and RAM, chosen by a ranking file. On real traffic expert use is strongly recent, so the sets now follow it. **DeepSeek-V4.1** (default on): an expert read from the NVMe tier takes the RAM place of the layer's coldest RAM expert, with no extra memory: one conversation of prose / code / prose turns decodes at **12.4 / 6.9 / 10.6 → 14.1 / 13.1 / 14.6 tok/s**, and greedy replies are identical with it on and off. **MiMo-V2.6** (opt-in, `IE_MIMO26_ADAPTIVE=1`, 34 GiB more RAM): every VRAM slot follows recent use: **19.0 → 23.9 tok/s**. [Details](#new-in-v0241). Also in v0.2.41: a Flash-Next load without its image encoder file is text-only again, not an error: v0.2.40 refused to load Flash-Next when no mmproj file was beside the model. The encoder is still loaded at the start whenever the file is there; without it the model now loads text-only with a warning that says what to add. `IE_VISION_REQUIRED=1` keeps v0.2.40's behaviour for a deployment where a model that cannot see must not load, and a file `ie.env` beside the `ie` binary can hold such `IE_NAME=value` defaults for one machine.
@@ -141,6 +142,13 @@ experts that do not fit. Dates, workloads and methods are in [Benchmarks](#bench
 <td align="left" valign="middle" nowrap><b>27.8–28.3</b> <sub>with drafter</sub><br><b>16.9–18.9</b> <sub>plain</sub></td>
 </tr>
 <tr>
+<td width="48" align="center" valign="middle"></td>
+<td align="left" valign="middle" nowrap><b>Tencent Hy4-flash</b><br><sub>MoE + n-gram memories · measured Nov 19<br>native vision · tool calls · 262K context</sub></td>
+<td align="left" valign="middle" nowrap>8-bit expert pack<br><sub>225 GB, made from the BF16 release</sub></td>
+<td align="left" valign="middle" nowrap><b>487</b> <sub>at 4.9K</sub><br><b>462–470</b> <sub>at 25K</sub></td>
+<td align="left" valign="middle" nowrap><b>22.6–25.8</b> <sub>short prompt</sub><br><b>22.4–24.2</b> <sub>after 25K</sub></td>
+</tr>
+<tr>
 <td width="48" align="center" valign="middle"><img src="docs/images/logo-deepseek.png" width="36" height="36" alt="DeepSeek"></td>
 <td align="left" valign="middle" nowrap><b>DeepSeek-V4.1-Flash</b><br><sub>MoE · measured Sep 16–27<br>native vision · tool calls · 223K context</sub></td>
 <td align="left" valign="middle" nowrap>FP8 + MXFP4<br><sub>475 GB safetensors</sub></td>
@@ -225,6 +233,74 @@ class ([New in v0.2.6](#new-in-v026)).
 ---
 
 <a id="new-in-v0242"></a>
+## 🆕 New in v0.2.44
+
+### Tencent Hy4-flash
+
+Hy4-flash (released November 18: 220B parameters, about 12B active a token) is a 42-layer model with 512 small routed experts a layer of which a token uses 16, four n-gram memories, sliding-window and indexed attention, a SigLIP2 image tower and a draft head. `ie serve <directory>` now runs it: text and images, reasoning split from the reply, tool calls in the OpenAI shape, a prompt cache. One request at a time, two cards.
+
+Measured in `ie serve` on 2 × Arc Pro B70 + 256 GB RAM, `--ctx 262144`, thinking on, November 19. Single runs on a desktop with other work going on; decode moves by about ±2 tok/s between runs.
+
+| | |
+|---|---|
+| Prompt read, 4,882 tokens | **487 tok/s** |
+| Prompt read, 25,332 tokens | **462–470 tok/s** (54 s) |
+| Decode, short prompt, greedy | 23.8–25.8 tok/s |
+| Decode, short prompt, temperature 0.9 | 22.6–23.0 tok/s |
+| Decode after the 25,332-token prompt | 22.4–24.2 tok/s |
+| Decode after the 4,882-token prompt | 18.2–21.6 tok/s |
+| Load | 73–79 s |
+| An image (336 prompt rows) | read correctly; the tower matches the reference within 1.0e-3 to 2.2e-3 |
+
+**The format, and why 8 bits.** The release is bfloat16 and was not trained for a low-bit format, and the model is touchy: on most tokens the 16th and 17th expert candidates are nearly tied, so a small change in the weights changes which experts run. Measured against Tencent's reference code in exact arithmetic on a 554-token chat sample (KL divergence of the next-token distribution, lower is better):
+
+| Experts | KL, the reference's expert picks forced | KL, free-running | Same top token |
+|---|---|---|---|
+| The reference itself in bfloat16 | | 0.0195 | 525 of 554 |
+| 8-bit integers, one scale per 32 weights (what is served) | 0.0002 | 0.0124 | 529 of 554 |
+| 5-bit, error-fed rounding plus code flips, all three matrices | 0.0104 | 0.0379 | 512 of 554 |
+| 5-bit gate / up, 8-bit down | 0.0057 | 0.0336 | 521 of 554 |
+| MXFP4 (the format DeepSeek-V4.1 and MiMo ship in) | | 0.125 | 476 of 554 |
+
+So the experts are served at 8 bits, where the engine sits closer to exact arithmetic than the reference does in bfloat16. The large matrices outside the experts are 8-bit too (KL 0.0007 with the picks forced). The n-gram tables are stored as the exact FP8 values the reference rounds them to (61.5 GB instead of 127 GB, every row compared). 5 bits would put about 60 % more experts on the cards; it was measured and not adopted. `ie-hy4flash-quant` (experts at 4 / 5 / 8 bits on the card, the whole model in under five minutes on two cards) stays in the tree for anyone who wants to try another format against the same yardstick.
+
+**Where the time goes.** At 8 bits an expert is 7.5 MB and a layer's 512 are 3.6 GiB, so two 32 GB cards hold about 160 of each layer's 512. The engine keeps the ones the conversation is using on the cards and computes the rest on the CPU from RAM:
+
+- *Decode:* 130–200 of a token's 656 expert picks miss the cards. Reading them from RAM is 17–25 ms of a 40–47 ms token, at 58–65 GB/s on a machine whose plain read test tops out at 81. The cards' own work is about 30 ms of kernels a token, shared between two cards that take turns. With the CPU work skipped (a timing test with wrong output) decode is 34–35 tok/s: that is the bound for a machine with enough VRAM for every expert.
+- *Prompt reading:* a chunk of prompt rows touches nearly every expert, so the missed ones are streamed to the cards over PCIe (from a pinned copy of the pack, about 21 GB/s a card) while the CPU takes the least-used ones. Each expert on a card is read once per 32 of its picks, on the XMX units. For a long prompt the expert slots lend part of their VRAM to an 8,192-row workspace (a page remap, under a millisecond) and get it back, refilled, before the reply starts: 154–163 → 474–487 tok/s on the 4,882-token prompt. Decode right after is about 4 % slower than after the old path.
+- *Attention* runs on the XMX units in both phases (decode: 74 → 15 µs a layer-half); the sliding layers' attention runs on both cards at once; the indexed layers pick their keys on the card.
+
+**What did not pay, for the record.** The draft head is ported and matches a PyTorch forward, but it keeps about 1.4 of 5 drafts a round and a multi-token check touches more experts than the cards hold: 8–16 % slower in the server with thinking on, +36–48 % on plain code in the test tool. It is off by default (`IE_HY4F_DRAFT=1`). Merging the small kernels of a layer (2,349 → 2,026 launches a token) gave identical tokens and no speed. Moving experts onto the cards faster during a reply: +1–2 %.
+
+**Making the directory.** The engine reads its own directory, built once from `tencent/Hy4-flash` (the 440 GB bfloat16 release), with the reference environment the model card describes (PyTorch and the transformers build with Hy4-flash):
+
+```bash
+python scripts/hy4flash_oracle/pack.py     <download> <dir> --no-experts   # sidecar, config, tokenizer, template
+python scripts/hy4flash_oracle/pack_q8.py  <download> <dir>                # the 8-bit expert pack, 147 GiB
+python scripts/hy4flash_oracle/make_selfcontained.py <download> <dir> --link-tables
+ie-hy4flash-run <dir> --pack-tables                                        # the n-gram tables as exact FP8, 61.5 GB
+python scripts/hy4flash_oracle/make_selfcontained.py <download> <dir>      # drops the links to the download
+cp scripts/hy4flash_oracle/expert_ranking.u32 <dir>/                       # which experts start on the cards
+ie serve <dir> --ctx 262144
+```
+
+The directory is 225 GB and no longer needs the download. These are the steps the measured directory was built with over two days; the sequence as a whole has not been re-run from a fresh download.
+
+**Requirements and limits.**
+
+- The 8-bit pack is pinned in RAM (about 158 GB) so the cards can pull experts from it directly: this is a 256 GB machine's configuration. `IE_HY4F_PIN_PACK=0` maps the file instead (prompt reading is then slower).
+- One request at a time; no request lanes yet.
+- Two cards were measured. One card and three or more were not.
+- The Tencent Hy licence applies to the weights and to anything made from them.
+
+### Sampling without a top-p cut
+
+The host sampler shared by DeepSeek-V4.1, MiMo-V2.6 and Hy4-flash sorts only as far as the top-p nucleus reaches. With `top_p` 1 there is no nucleus to reach, and it grew its sorted prefix to the whole vocabulary: a full sort a token. It now stops as soon as the draw (or the `min_p` floor) is settled inside the prefix: 9.3 → 1.3 ms a row in its test, the same pick for the same seed in 720 of 720 cases, and Hy4-flash at temperature 0.9 goes 20.0 → 22.7 tok/s. Requests that set `top_p` below 1 were already fast.
+
+### DeepSeek-V4.1: a parked conversation stays in RAM
+
+The prompt cache keeps other conversations' state in host RAM only while a floor of memory stays available. The floor was 24 GiB, and the expert tier leaves 20–24 GiB on a 256 GB machine, so nearly every slot was refused: a 145K-token conversation was re-read in full twelve times in one day whenever another conversation had used the lane. The default is 12 GiB (`IE_DS41_CACHE_KEEP_FREE_GIB`); with it the same switch back takes a quarter of a second.
+
 ## 🆕 New in v0.2.42
 
 ### DeepSeek-V4.1: the fixed VRAM expert set follows the conversation
@@ -2195,6 +2271,7 @@ the benchmarked models. Prebuilt container images may lag these source updates.
 | **GLM-5.2** · `glm-dsa` | GLM-5.2 | Experimental `ie-glm52-run`; standalone MLA + MoE forward path |
 | **Laguna S 2.1** · `laguna` | Laguna-S-2.1 (118B-A8B MoE) | `ie serve` on one or two cards; sliding-window + full attention, GLM-style thinking and tool calls |
 | **Inkling-Small** · `inkling` | Inkling-Small (276B-A12B MoE) | `ie serve` on one or two cards; shortconv + relative-bias attention |
+| **Tencent Hy4-flash** · `hy_v4_flash` | Hy4-flash | `ie serve <directory>`: text, images (SigLIP2 tower), reasoning and tool calls, prompt cache; one request at a time; two cards; 8-bit expert pack made with `scripts/hy4flash_oracle/` (see v0.2.44) |
 | **Tencent Hy4-preview** · `hyv4` | Hy4-preview | Experimental `ie-hyv4-run`; standalone generation/PPL, two-GPU stage split and STQ1/IQ1 quantization support; no general server qualification claimed |
 
 Every model `ie serve` runs can also be one server of an `ie supervise` layout, on the cards the layout gives it

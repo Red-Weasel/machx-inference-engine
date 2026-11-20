@@ -162,6 +162,7 @@ int32_t Ds41Generator::sample_row(float* lg, size_t V, const std::vector<int32_t
     const double target = sp.top_p < 1.f ? double(sp.top_p) : 2.0;
     std::vector<double> p;
     size_t n = 0;
+    const double early_u = uniform01(rng);   // the draw's one uniform (taken here: the loop may settle the draw early)
     for (size_t K = std::min<size_t>(keep, 64);; K = std::min(keep, K * 4)) {
         if (K < keep) std::nth_element(idx.begin(), idx.begin() + std::ptrdiff_t(K), idx.begin() + std::ptrdiff_t(keep), by_logit);
         std::sort(idx.begin(), idx.begin() + std::ptrdiff_t(K), by_logit);
@@ -170,6 +171,14 @@ int32_t Ds41Generator::sample_row(float* lg, size_t V, const std::vector<int32_t
         double c = 0; bool fits = false;
         for (n = 0; n < K;) { c += p[n]; ++n; if (c >= target) { fits = true; break; } }
         if (fits || K == keep) break;
+        // No nucleus to reach (top_p 1): the sorted prefix is still enough once it settles the draw -- the min_p floor
+        // already falls inside it (the same n and p as the full sort gives), or, with no floor, the draw itself lands
+        // in it (the kept mass is 1). Without this the loop grew K to the whole vocabulary: a full sort a token,
+        // 11 ms of a 50 ms Hy4-flash token at temperature 0.9 (2026-11-19: 20.0 tok/s sampled against 25.8 greedy).
+        if (target > 1.0) {
+            if (sp.min_p > 0.f) { if (p[K - 1] < double(sp.min_p) * p[0]) { n = K; break; } }
+            else if (!stats && early_u < c) { double cc = 0; for (size_t i = 0; i < K; ++i) { cc += p[i]; if (early_u < cc) return idx[i]; } }
+        }
     }
     if (stats) {
         // ie_vitals: H = log z - (1/z) sum_i e_i a_i with a_i = l_i/T - mx, e_i = exp(a_i), over the same kept set as z. A
@@ -183,7 +192,7 @@ int32_t Ds41Generator::sample_row(float* lg, size_t V, const std::vector<int32_t
     }
     if (sp.min_p > 0.f) { const double floor = sp.min_p * p[0]; size_t m = 0; while (m < n && p[m] >= floor) ++m; n = std::max<size_t>(1, m); }
     double zz = 0; for (size_t i = 0; i < n; ++i) zz += p[i];
-    const double r = uniform01(rng) * zz; double c = 0;
+    const double r = early_u * zz; double c = 0;
     for (size_t i = 0; i < n; ++i) { c += p[i]; if (r < c) return idx[i]; }
     return idx[n - 1];
 }
@@ -221,6 +230,10 @@ void Ds41Generator::distribution(float* lg, size_t V, const std::vector<int32_t>
         double c = 0; bool fits = false;
         for (n = 0; n < K;) { c += p[n]; ++n; if (c >= target) { fits = true; break; } }
         if (fits || K == keep) break;
+        // (sample_row's min_p stop: the floor inside the sorted prefix gives the same n and p as the full sort)
+        if (target > 1.0) {
+            if (sp.min_p > 0.f) { if (p[K - 1] < double(sp.min_p) * p[0]) { n = K; break; } }
+        }
     }
     if (stats) {
         double s = 0;

@@ -334,7 +334,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
             // (P4 B35: and a Qwen thinking template's, whose text now shows the tag)
             const bool separate_thinking_ns =
                 (eng.arch() == ModelArch::kDeepSeek4 || eng.arch() == ModelArch::kGlm5Next || eng.arch() == ModelArch::kDeepSeek41 || eng.arch() == ModelArch::kMimo26 ||
-                 eng.arch() == ModelArch::kLaguna || eng.arch() == ModelArch::kInkling ||
+                 eng.arch() == ModelArch::kLaguna || eng.arch() == ModelArch::kInkling || eng.arch() == ModelArch::kHy4Flash ||
                  eng.chatml_thinking())
                 && cr.enable_thinking;
             std::string acc_ns;
@@ -494,7 +494,8 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 const bool mimo = (eng.arch() == ModelArch::kMimo26);   // the engine parses MiMo's XML tool calls (docs/mimo26 P3b)
                 const bool structured = ds4 || eng.arch() == ModelArch::kGlm5Next || eng.arch() == ModelArch::kDeepSeek41 || mimo ||
                                         eng.arch() == ModelArch::kLaguna ||   // GLM's tool-call format, parsed by the engine
-                                        eng.arch() == ModelArch::kInkling;    // its stream translated to </think> / <tool_call>
+                                        eng.arch() == ModelArch::kInkling ||  // its stream translated to </think> / <tool_call>
+                                        eng.arch() == ModelArch::kHy4Flash;   // its tags streamed in GLM's spelling, parsed by the engine
                 const std::string DSML_OPEN = (ds41 || ds4) ? "<｜DSML｜" : "<｜DSML｜tool_calls";   // bare token: see kDsmlOpen above
                 static const std::string THINK_CLOSE = "</think>";
                 // P4 B35: a Qwen thinking template with thinking on: the text before the model's first </think> (which
