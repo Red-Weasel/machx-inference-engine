@@ -23,6 +23,7 @@ struct Hy4FlashBundle {
     Hy4FlashModel model;
     Hy4fForward   fw;
     Hy4fVision    vis;                                     // the image tower, resident on the first card (allocated before the forward sizes its expert slots)
+    bool          vis_lazy = false;   // the tower is loaded at the first image (its VRAM holds expert slots until then)
     bool          vis_ready = false; std::string vis_error; uint32_t image_tokens = 0;   // image_tokens: the most rows one image takes
     Tokenizer     tok;
     std::vector<int32_t> live;                             // the tokens the caches hold (the next request reuses their common prefix)

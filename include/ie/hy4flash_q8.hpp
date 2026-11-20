@@ -47,13 +47,24 @@ public:
     // Builds the RAM slots of layers [first_layer, first_layer + n_layers) from the source (OpenMP), allocates
     // `vram_slots` VRAM slots a layer and fills them with the first experts of ranking[layer]. "" on success.
     std::string init(sycl::queue& q, const Hy4FlashModel& m, uint32_t first_layer, uint32_t n_layers, uint32_t vram_slots,
-                     const std::vector<std::vector<uint32_t>>& ranking, Hy4fQFmt fmt = {}, uint64_t lend_bytes = 0);
+                     const std::vector<std::vector<uint32_t>>& ranking, Hy4fQFmt fmt = {}, uint64_t lend_bytes = 0,
+                     const std::vector<uint64_t>& ctx_pieces = {});
+    // Context pieces (ctx_pieces at init, bytes a layer each; needs the lending layout): the end of every layer's slab is
+    // further pieces of physical VRAM that hold expert slots only while the conversation is short. release_ctx() drops the
+    // experts of the next piece in every layer and frees its VRAM (returns the bytes freed, 0 when none is left) -- the
+    // caller then backs more of its context cache (or an image tower) with it; restore_ctx() takes a released piece back and
+    // fills its slots with the best-scoring experts not resident. Any piece may be out: its slots are dead meanwhile. While
+    // the tails are lent the slots of the pieces keep their experts but are not served (they are not in the live range).
+    uint32_t ctx_pieces() const { return uint32_t(ctx_bytes_.size()); }
+    bool ctx_gone(uint32_t i) const { return i < ctx_gone_.size() && ctx_gone_[i]; }
+    uint64_t release_ctx(sycl::queue& q, uint32_t i);
+    std::string restore_ctx(sycl::queue& q, uint64_t token, uint32_t i);
     // Lending (lend_bytes > 0 at init): every layer's slab is two pieces of physical VRAM, the tail at least lend_bytes. lend()
     // maps every layer's tail into one contiguous range and returns it (the experts there become misses, the layers keep
     // the slots below); take_back() maps the tails home and fills those slots with the best-scoring experts not resident
     // (copies enqueued on q). The caller waits for every queue that may read either range first. A long prompt reads with a
     // big workspace in the lent range; decode gets every slot back.
-    uint64_t lendable() const { return lend_on_ ? uint64_t(nL_) * (res_bytes_ - tail_off_) : 0; }
+    uint64_t lendable() const { return lend_on_ ? uint64_t(nL_) * tail_bytes_ : 0; }
     uint8_t* lend(sycl::queue& q);
     void take_back(sycl::queue& q, uint64_t token);
     bool lent() const { return lent_; }
@@ -117,7 +128,7 @@ public:
         const uint64_t raw = 2 * uint64_t(MI) * Hy4fQFmt::row_bytes(fmt.gu, LAT) + uint64_t(LAT) * Hy4fQFmt::row_bytes(fmt.dn, MI) + 2 * uint64_t(MI) * (LAT / 32) * 2 + uint64_t(LAT) * (MI / 32) * 2;
         return (raw + 63) / 64 * 64;
     }
-    uint32_t vram_slots() const { return n_slots_; }
+    uint32_t vram_slots() const { return n_usable_; }       // the slots a layer that hold experts now
     struct Stats { uint64_t hits = 0, uploads = 0, promotions = 0; double build_s = 0; uint32_t mapped_layers = 0; };   // mapped_layers: read from the pack, not converted
     const Stats& stats() const { return st_; }
     void reset_stats() { st_.hits = st_.uploads = st_.promotions = 0; }
@@ -127,6 +138,13 @@ private:
     bool lend_on_ = false, lent_ = false;
     std::vector<sycl::ext::oneapi::experimental::physical_mem> ph_head_, ph_tail_;   // [layer] (lending)
     uint64_t res_bytes_ = 0, tail_off_ = 0; uintptr_t lend_va_ = 0;  // a layer's reserved range, where its tail starts; the lent range
+    // [head | tail (lent) | ctx piece K-1 .. ctx piece 0]: the tail is tail_bytes_ from tail_off_; piece i is ctx_bytes_[i] at ctx_off(i)
+    uint64_t tail_bytes_ = 0; std::vector<uint64_t> ctx_bytes_; std::vector<uint8_t> ctx_gone_; uint32_t n_usable_ = 0, tail_slot_end_ = 0;
+    static constexpr uint64_t kDead = ~0ull;   // the stamp of a slot whose VRAM is out (never a victim, never filled)
+    std::vector<std::vector<sycl::ext::oneapi::experimental::physical_mem>> ph_ctx_;   // [piece][layer]
+    uint64_t ctx_off(uint32_t i) const { uint64_t o = res_bytes_; for (uint32_t k = 0; k <= i; ++k) o -= ctx_bytes_[k]; return o; }
+    void set_slot_bounds();
+    void fill_empty(sycl::queue& q, uint64_t token, uint32_t s0);
     std::unique_ptr<sycl::context> vm_ctx_;
     Hy4fQFmt fmt_;
     std::thread warm_; std::atomic<bool> warm_stop_{false}, warm_done_{false}; std::atomic<uint64_t> warm_bytes_{0};

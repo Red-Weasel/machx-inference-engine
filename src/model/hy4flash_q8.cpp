@@ -175,14 +175,15 @@ void Hy4fQ8Store::free_all(sycl::queue& q) {
     stop_warm(); stop_uploader();
     namespace ex = sycl::ext::oneapi::experimental;
     if (lend_on_ && vm_ctx_) {
-        if (lent_) for (uint32_t l = 0; l < nL_; ++l) ex::unmap(reinterpret_cast<void*>(lend_va_ + l * (res_bytes_ - tail_off_)), res_bytes_ - tail_off_, *vm_ctx_);
+        if (lent_) for (uint32_t l = 0; l < nL_; ++l) ex::unmap(reinterpret_cast<void*>(lend_va_ + l * tail_bytes_), tail_bytes_, *vm_ctx_);
         for (size_t l = 0; l < dev_.size(); ++l) if (dev_[l]) {
             if (tail_off_) ex::unmap(dev_[l], tail_off_, *vm_ctx_);
-            if (!lent_) ex::unmap(dev_[l] + tail_off_, res_bytes_ - tail_off_, *vm_ctx_);
+            if (!lent_) ex::unmap(dev_[l] + tail_off_, tail_bytes_, *vm_ctx_);
+            for (uint32_t i = 0; i < ctx_bytes_.size(); ++i) if (!ctx_gone_[i] && l < ph_ctx_[i].size()) ex::unmap(dev_[l] + ctx_off(i), ctx_bytes_[i], *vm_ctx_);
             ex::free_virtual_mem(reinterpret_cast<uintptr_t>(dev_[l]), res_bytes_, *vm_ctx_);
         }
-        if (lend_va_) ex::free_virtual_mem(lend_va_, uint64_t(nL_) * (res_bytes_ - tail_off_), *vm_ctx_);
-        ph_head_.clear(); ph_tail_.clear(); lend_va_ = 0; lent_ = false; lend_on_ = false;
+        if (lend_va_) ex::free_virtual_mem(lend_va_, uint64_t(nL_) * tail_bytes_, *vm_ctx_);
+        ph_head_.clear(); ph_tail_.clear(); ph_ctx_.clear(); ctx_bytes_.clear(); ctx_gone_.clear(); lend_va_ = 0; lent_ = false; lend_on_ = false;
     } else for (uint8_t* p : dev_) if (p) sycl::free(p, q);
     dev_.clear();
     for (size_t l = 0; l < ram_.size(); ++l) {
@@ -193,7 +194,8 @@ void Hy4fQ8Store::free_all(sycl::queue& q) {
 }
 
 std::string Hy4fQ8Store::init(sycl::queue& q, const Hy4FlashModel& m, uint32_t first_layer, uint32_t n_layers, uint32_t vram_slots,
-                              const std::vector<std::vector<uint32_t>>& ranking, Hy4fQFmt fmt, uint64_t lend_bytes) {
+                              const std::vector<std::vector<uint32_t>>& ranking, Hy4fQFmt fmt, uint64_t lend_bytes,
+                              const std::vector<uint64_t>& ctx_pieces) {
     if (!Hy4fQFmt::known(fmt.gu) || !Hy4fQFmt::known(fmt.dn)) return "expert widths other than 8, 5 and 4 bits are not built";
     // IE_HY4F_QN_CONTAINER8=1 (a check of the low-bit kernels): round to the asked widths, store and compute as 8-bit
     static const bool container8 = [] { const char* v = std::getenv("IE_HY4F_QN_CONTAINER8"); return v && *v == '1'; }();
@@ -205,7 +207,7 @@ std::string Hy4fQ8Store::init(sycl::queue& q, const Hy4FlashModel& m, uint32_t f
     if (LAT_ % 32 || MI_ % 32) return "expert widths are not multiples of 32";
     n_slots_ = std::min(vram_slots, E_);
     if (n_slots_ < cfg.top_k) return "fewer VRAM slots a layer than experts a token picks";
-    n_live_ = n_slots_;
+    n_live_ = n_slots_; n_usable_ = n_slots_;
     const uint64_t gq = uint64_t(MI_) * Hy4fQFmt::row_bytes(fmt.gu, LAT_), dq = uint64_t(LAT_) * Hy4fQFmt::row_bytes(fmt.dn, MI_), gd = uint64_t(MI_) * (LAT_ / 32) * 2, dd = uint64_t(LAT_) * (MI_ / 32) * 2;
     const uint64_t src_g = uint64_t(MI_) * LAT_ * 2, src_d = uint64_t(LAT_) * MI_ * 2;        // a source matrix as BF16
     off_up_ = gq; off_down_ = 2 * gq; off_gate_d_ = 2 * gq + dq; off_up_d_ = off_gate_d_ + gd; off_down_d_ = off_up_d_ + gd;
@@ -293,10 +295,16 @@ std::string Hy4fQ8Store::init(sycl::queue& q, const Hy4FlashModel& m, uint32_t f
             // (the driver reports 64 KiB, but refused a 1.2 GB piece that was not a whole number of 2 MiB pages)
             const uint64_t g = std::max<uint64_t>(ex::get_mem_granularity(q.get_device(), q.get_context()), 2ull << 20);
             res_bytes_ = (uint64_t(n_slots_) * slot_bytes_ + g - 1) / g * g;
-            tail_off_ = res_bytes_ > lend_bytes ? (res_bytes_ - lend_bytes) / g * g : 0;
+            uint64_t ctx_total = 0; std::vector<uint64_t> cb;
+            for (uint64_t b : ctx_pieces) { cb.push_back((b + g - 1) / g * g); ctx_total += cb.back(); }
+            if (ctx_total + lend_bytes + uint64_t(cfg.top_k) * slot_bytes_ >= res_bytes_) { ctx_total = 0; cb.clear(); }   // (no room: no pieces)
+            const uint64_t ctx0 = res_bytes_ - ctx_total;
+            tail_off_ = ctx0 > lend_bytes ? (ctx0 - lend_bytes) / g * g : 0;
+            tail_bytes_ = ctx0 - tail_off_;
             lend_live_ = uint32_t(tail_off_ / slot_bytes_);
-            if (lend_live_ >= cfg.top_k) { lend_on_ = true; ph_head_.reserve(nL_); ph_tail_.reserve(nL_); }
+            if (lend_live_ >= cfg.top_k) { lend_on_ = true; ph_head_.reserve(nL_); ph_tail_.reserve(nL_); ctx_bytes_ = cb; ph_ctx_.resize(cb.size()); ctx_gone_.assign(cb.size(), 0); }
             else std::fprintf(stderr, "[hy4-flash] lending %.2f GiB a layer would leave %u expert slots: not lending\n", double(lend_bytes) / double(1ull << 30), lend_live_);
+            set_slot_bounds();
         }
         if (lend_on_) {
             namespace ex = sycl::ext::oneapi::experimental;
@@ -304,7 +312,8 @@ std::string Hy4fQ8Store::init(sycl::queue& q, const Hy4FlashModel& m, uint32_t f
                 const uintptr_t va = ex::reserve_virtual_mem(res_bytes_, *vm_ctx_);
                 if (tail_off_) { ph_head_.emplace_back(q.get_device(), *vm_ctx_, tail_off_); ph_head_.back().map(va, tail_off_, ex::address_access_mode::read_write); }
                 else ph_head_.emplace_back(q.get_device(), *vm_ctx_, size_t(2ull << 20));   // (a placeholder, never mapped)
-                ph_tail_.emplace_back(q.get_device(), *vm_ctx_, res_bytes_ - tail_off_); ph_tail_.back().map(va + tail_off_, res_bytes_ - tail_off_, ex::address_access_mode::read_write);
+                ph_tail_.emplace_back(q.get_device(), *vm_ctx_, tail_bytes_); ph_tail_.back().map(va + tail_off_, tail_bytes_, ex::address_access_mode::read_write);
+                for (uint32_t i = 0; i < ctx_bytes_.size(); ++i) { ph_ctx_[i].emplace_back(q.get_device(), *vm_ctx_, ctx_bytes_[i]); ph_ctx_[i].back().map(va + ctx_off(i), ctx_bytes_[i], ex::address_access_mode::read_write); }
                 dev_[l] = reinterpret_cast<uint8_t*>(va);
             } catch (const sycl::exception& x) { return std::string("device allocation failed (8-bit expert slots of layer ") + std::to_string(L0_ + l) + ", lending layout: " + x.what() + ")"; }
         } else dev_[l] = sycl::malloc_device<uint8_t>(size_t(n_slots_) * slot_bytes_, q);
@@ -442,12 +451,12 @@ uint8_t* Hy4fQ8Store::lend(sycl::queue& q) {
     if (lent_) return reinterpret_cast<uint8_t*>(lend_va_);
     activate_pending();                                          // (no upload may still be writing a slot being lent)
     q.wait();
-    const uint64_t tb = res_bytes_ - tail_off_;
+    const uint64_t tb = tail_bytes_;
     if (!lend_va_) lend_va_ = ex::reserve_virtual_mem(uint64_t(nL_) * tb, *vm_ctx_);
     for (uint32_t l = 0; l < nL_; ++l) {
         for (uint32_t s = lend_live_; s < n_slots_; ++s) {
             if (in_slot_[l][s] >= 0) slot_of_[l][size_t(in_slot_[l][s])] = -1;
-            in_slot_[l][s] = -1;
+            if (s < tail_slot_end_) in_slot_[l][s] = -1;          // (a context piece's slot keeps its expert, parked until take_back)
         }
         ex::unmap(dev_[l] + tail_off_, tb, *vm_ctx_);
         ph_tail_[l].map(lend_va_ + l * tb, tb, ex::address_access_mode::read_write);
@@ -460,24 +469,94 @@ void Hy4fQ8Store::take_back(sycl::queue& q, uint64_t token) {
     namespace ex = sycl::ext::oneapi::experimental;
     if (!lent_) return;
     q.wait();
-    const uint64_t tb = res_bytes_ - tail_off_;
+    const uint64_t tb = tail_bytes_;
     for (uint32_t l = 0; l < nL_; ++l) {
         ex::unmap(reinterpret_cast<void*>(lend_va_ + l * tb), tb, *vm_ctx_);
         ph_tail_[l].map(reinterpret_cast<uintptr_t>(dev_[l]) + tail_off_, tb, ex::address_access_mode::read_write);
     }
     n_live_ = n_slots_; lent_ = false;
-    for (uint32_t l = 0; l < nL_; ++l) {                         // the slots back: the best-scoring experts not resident
+    for (uint32_t l = 0; l < nL_; ++l)                           // the parked experts of the context pieces serve again
+        for (uint32_t sl = tail_slot_end_; sl < n_slots_; ++sl) {
+            const int32_t e = in_slot_[l][sl];
+            if (e < 0) continue;
+            if (slot_of_[l][size_t(e)] < 0) slot_of_[l][size_t(e)] = int32_t(sl); else in_slot_[l][sl] = -1;   // (it took another slot meanwhile)
+        }
+    fill_empty(q, token, lend_live_);
+}
+
+// the slots at or above s0 that hold no expert: the best-scoring experts not resident (copies on q)
+void Hy4fQ8Store::fill_empty(sycl::queue& q, uint64_t token, uint32_t s0) {
+    for (uint32_t l = 0; l < nL_; ++l) {
         std::vector<std::pair<float, uint32_t>> cand;
-        for (uint32_t e = 0; e < E_; ++e) if (slot_of_[l][e] < 0) cand.emplace_back(score_.size() == nL_ ? eff(l, e, token) : 0.f, e);
+        for (uint32_t e = 0; e < E_; ++e) if (slot_of_[l][e] < 0 && !pending(l, e)) cand.emplace_back(score_.size() == nL_ ? eff(l, e, token) : 0.f, e);
         std::sort(cand.begin(), cand.end(), [](const auto& x, const auto& y) { return x.first > y.first || (x.first == y.first && x.second < y.second); });
         size_t k = 0;
-        for (uint32_t s = lend_live_; s < n_slots_ && k < cand.size(); ++s) {
-            if (in_slot_[l][s] >= 0) continue;
+        for (uint32_t s = s0; s < n_slots_ && k < cand.size(); ++s) {
+            if (in_slot_[l][s] >= 0 || stamp_[l][s] == kDead) continue;
             const uint32_t e = cand[k++].second;
             q.memcpy(dev_[l] + size_t(s) * slot_bytes_, ram_[l] + size_t(e) * slot_bytes_, slot_bytes_);
             slot_of_[l][e] = int32_t(s); in_slot_[l][s] = int32_t(e); stamp_[l][s] = ++clock_;
         }
     }
+}
+
+// a slot any part of which lies in a released piece is dead (stamp kDead); tail_slot_end_ = the first slot wholly inside the pieces
+void Hy4fQ8Store::set_slot_bounds() {
+    n_usable_ = 0;
+    for (uint32_t sl = 0; sl < n_slots_; ++sl) {
+        const uint64_t a = uint64_t(sl) * slot_bytes_, b = a + slot_bytes_;
+        bool dead = b > res_bytes_;
+        for (uint32_t i = 0; i < ctx_bytes_.size() && !dead; ++i) dead = ctx_gone_[i] && a < ctx_off(i) + ctx_bytes_[i] && b > ctx_off(i);
+        for (uint32_t l = 0; l < nL_ && l < stamp_.size(); ++l) {
+            if (dead) stamp_[l][sl] = kDead; else if (stamp_[l][sl] == kDead) stamp_[l][sl] = 0;
+        }
+        n_usable_ += !dead;
+    }
+    const uint64_t ctx0 = tail_off_ + tail_bytes_;
+    tail_slot_end_ = std::min<uint32_t>(n_slots_, uint32_t((ctx0 + slot_bytes_ - 1) / slot_bytes_));
+}
+
+uint64_t Hy4fQ8Store::release_ctx(sycl::queue& q, uint32_t i) {
+    namespace ex = sycl::ext::oneapi::experimental;
+    if (i >= ctx_bytes_.size() || ctx_gone_[i]) return 0;
+    activate_pending();                                          // (no upload may still be writing a slot being dropped)
+    q.wait();
+    ctx_gone_[i] = 1; set_slot_bounds();
+    for (uint32_t l = 0; l < nL_; ++l) {
+        for (uint32_t s = 0; s < n_slots_; ++s) {
+            if (stamp_[l][s] != kDead) continue;
+            const int32_t e = in_slot_[l][s];
+            if (e >= 0 && slot_of_[l][size_t(e)] == int32_t(s)) slot_of_[l][size_t(e)] = -1;
+            in_slot_[l][s] = -1;
+        }
+        ex::unmap(dev_[l] + ctx_off(i), ctx_bytes_[i], *vm_ctx_);
+    }
+    ph_ctx_[i].clear();                                          // the physical memory goes back to the driver
+    vram_bytes_ -= uint64_t(nL_) * ctx_bytes_[i];
+    return uint64_t(nL_) * ctx_bytes_[i];
+}
+
+std::string Hy4fQ8Store::restore_ctx(sycl::queue& q, uint64_t token, uint32_t i) {
+    namespace ex = sycl::ext::oneapi::experimental;
+    if (i >= ctx_bytes_.size() || !ctx_gone_[i]) return {};
+    if (lent_) return "internal: a context piece cannot come back while the slots are lent";
+    activate_pending();
+    q.wait();
+    try {
+        ph_ctx_[i].reserve(nL_);
+        for (uint32_t l = 0; l < nL_; ++l) {
+            ph_ctx_[i].emplace_back(q.get_device(), *vm_ctx_, ctx_bytes_[i]);
+            ph_ctx_[i].back().map(reinterpret_cast<uintptr_t>(dev_[l]) + ctx_off(i), ctx_bytes_[i], ex::address_access_mode::read_write);
+        }
+    } catch (const sycl::exception& x) {
+        for (uint32_t l = 0; l < ph_ctx_[i].size(); ++l) { try { ex::unmap(dev_[l] + ctx_off(i), ctx_bytes_[i], *vm_ctx_); } catch (...) {} }
+        ph_ctx_[i].clear();
+        return std::string("a context piece of the expert slots could not be taken back: ") + x.what();
+    }
+    ctx_gone_[i] = 0; set_slot_bounds();
+    vram_bytes_ += uint64_t(nL_) * ctx_bytes_[i];
+    fill_empty(q, token, 0);
+    return {};
 }
 
 }  // namespace ie

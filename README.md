@@ -17,6 +17,11 @@
 
 </div>
 
+☕ **Buy me a coffee.** -- Unemployed and extremely grateful for any support -- If Mach X saves you time — or you want to see more fast local inference on Intel Arc —
+donations are welcome, one-time or monthly. All donations support the project.
+
+[![Buy me a coffee on Ko-fi](https://img.shields.io/badge/Buy%20me%20a%20coffee-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/redweasel) **[ko-fi.com/redweasel](https://ko-fi.com/redweasel)**
+
 > [!IMPORTANT]
 > ## 🚀 Qwen 4 — ready to run on Intel Arc the day it is released
 >
@@ -39,6 +44,7 @@
 
 **Latest**
 
+- **v0.2.45, November 20 — Hy4-flash gives its spare VRAM to experts:** the context cache is backed for 32K tokens and grows in steps to the full context only when a conversation gets that long (and shrinks again for the next short one), and the image tower loads at the first image. Until then that VRAM holds expert slots: 160 / 156 → 176 / 164 a layer on two Arc Pro B70 at `--ctx 262144`, 5–8 % fewer experts computed on the CPU per token. [Details](#-new-in-v0245)
 - **v0.2.44, November 19 — Tencent Hy4-flash runs, with images, tool calls and long prompts:** the 220B model (512 experts a layer, 16 a token, four n-gram memories) is served from an 8-bit expert pack made from Tencent's full-precision release: a 25,000-token prompt reads at 462–470 tok/s and replies decode at 20–26 tok/s on two Arc Pro B70 cards, with the output closer to exact arithmetic than the reference is in bfloat16. Also: sampling with no top-p cut no longer sorts the whole vocabulary every token (DeepSeek-V4.1, MiMo-V2.6, Hy4-flash: 9.3 → 1.3 ms a token), and DeepSeek-V4.1 keeps a parked conversation in RAM down to 12 GiB free (it was 24, which a 256 GB machine never had). [Details](#-new-in-v0244)
 - **v0.2.43, November 13 — DeepSeek-V4.1 reads images again:** from v0.2.36 through v0.2.42 every image request to DeepSeek-V4.1 failed with `the prompt holds fewer image placeholders than images`. The guard that keeps control-token spellings in a request plain text also caught the engine's own image placeholder. Fixed, with a test; a placeholder typed by a client still stays text. Also new: `IE_DS41_ACT_DUMP=<dir>` records DeepSeek-V4.1's internal activations (the stream entering every layer) while a file `RECORD` exists in that folder, for work on the weights; `scripts/ds41_acts.py` reads them.
 - **v0.2.42, November 13 — DeepSeek-V4.1's VRAM expert set follows the conversation too:** a hot RAM expert trades places with the coldest expert of the fixed VRAM set, about once a token and card, with no extra memory: **16.4 → 17.7 tok/s** on one conversation, **13.8 → 17.2 tok/s** with three requests at once, greedy replies identical on and off. Also: Flash-Next honours `--no-prompt-cache` at one request lane and says when it does not take `--prefill-chunk`, a contributed container build (`Containerfile.b70`), and the first four-card numbers measured by a user. [Details](#new-in-v0242).
@@ -233,6 +239,19 @@ class ([New in v0.2.6](#new-in-v026)).
 ---
 
 <a id="new-in-v0242"></a>
+## 🆕 New in v0.2.45
+
+### Hy4-flash: the VRAM a short conversation does not need holds experts
+
+Two allocations sat on the cards from the load on, whether a request used them or not: the indexed layers' context cache for the whole `--ctx` (2.4 GiB a card at 262,144) and the image tower (1.2 GiB on the first card). Both are now taken when needed.
+
+- **Elastic context.** An indexed layer's cache is a reserved address range backed for 32,768 tokens. When a conversation grows past a tier (64K, 128K, the full context) the expert slots give up a piece of their VRAM in every layer and the cache maps it; when a conversation at most half the lower tier follows, the piece goes back and its slots are refilled with the best-scoring experts. A page remap, not a copy. A 50,654-token prompt grows the cache in the middle of the read (461–469 tok/s) and, with every expert on the cards' arithmetic (`IE_HY4F_Q8_CPU=0`), produces the same reply token for token as the whole-cache allocation. `IE_HY4F_ELASTIC_CTX=0` allocates the whole cache at load, as before.
+- **The image tower loads at the first image.** It is still built at load (so a load that cannot see fails or warns there), measured and freed; the first image of a load takes about 3 s longer, once, and the tower stays resident after it. `IE_HY4F_VISION_LAZY=0` keeps it resident from the load.
+- **What it gives.** At `--ctx 262144` on 2 × Arc Pro B70: 160 / 156 → 176 / 164 expert slots a layer. On one reply replayed token for token, 5–8 % fewer experts miss the cards per token and a token takes 2–4 % less time; `ie serve` replies measured 22–28 tok/s that evening on a desktop with other work going on, so the gain is inside the run-to-run spread there. A conversation past 32K tokens gives part of it back, one past 128K all of it.
+- **Also in the source:** `ie-hy4flash-run` prints the decode alone by 50 tokens (experts computed on the CPU, their time, the token's time) and can replay a reply from a file for like-for-like timing.
+
+Not kept: the slot count rounded to a multiple of 2 instead of 4 (one card came up with 164 slots on one load and 166 on the next, which changes which experts run where and with it the exact tokens); a smaller prompt workspace (no slots gained).
+
 ## 🆕 New in v0.2.44
 
 ### Tencent Hy4-flash
@@ -2903,13 +2922,6 @@ Per-model design and measurement notes are in **[docs/](docs)**.
 
 Free to use, modify, and ship (including commercially). Apache-2.0's patent grant + retaliation clause protects you and downstream users.
 
-## Support
-
-☕ **Buy me a coffee.** -- Unemployed and extremely grateful for any support -- If Mach X saves you time — or you want to see more fast local inference on Intel Arc —
-donations are welcome, one-time or monthly. All donations support the project.
-
-[![Buy me a coffee on Ko-fi](https://img.shields.io/badge/Buy%20me%20a%20coffee-Ko--fi-FF5E5B?logo=ko-fi&logoColor=white)](https://ko-fi.com/redweasel)
-
-**[ko-fi.com/redweasel](https://ko-fi.com/redweasel)**
+## Requests
 
 Requests and suggestions are welcome — [open an issue](https://github.com/Red-Weasel/machx-inference-engine/issues).

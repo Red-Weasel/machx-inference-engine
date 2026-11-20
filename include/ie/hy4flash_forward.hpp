@@ -34,6 +34,8 @@ struct Hy4fOptions {
     // a prompt chunk of up to this many rows (> max_tokens) runs in VRAM the expert slots lend for it (8-bit experts only;
     // 0 = none): a long prompt streams each missed expert once per chunk, so fewer, bigger chunks read it faster
     uint32_t big_tokens = 0;
+    // bytes of the first card's VRAM the expert slots hold until release_extra() (the image tower, loaded at the first image)
+    uint64_t extra_piece_bytes = 0;
     uint32_t split_layer = 0;       // two cards: the first layer of the second card (0 = half the layers)
     uint32_t n_static = 0;          // experts a layer kept in VRAM (0 = all of them when they fit the tier's own check)
     uint32_t n_pinned = 0;          // experts a layer pinned in RAM (0 = the rest)
@@ -148,6 +150,7 @@ public:
     // the position a text row appended now would take (one past the largest axis of the last row; 0 at the start)
     int32_t  next_position() const { const size_t n = pos3_.size(); return n < 3 ? 0 : std::max({pos3_[n - 3], pos3_[n - 2], pos3_[n - 1]}) + 1; }
     void     reset() { rewind(0); }
+    std::string release_extra();
     void     rewind(uint32_t n);
     uint32_t n_pos() const { return n_pos_; }
     // Diagnostic: every forward() appends the streams ENTERING each layer, [n_layers, T, hc, dim] fp32, to *dst.
@@ -240,6 +243,7 @@ private:
     };
     struct Card;
     template <class T> T* dev(Card& c, size_t n);
+    std::string fit_context(uint32_t need);
     void mm(Card& c, const Mat& w, const sycl::half* x16, float* y32, uint32_t T, uint32_t N, uint32_t K);   // y32 [T, N] = x16 [T, K] . W^T
     std::string upload_card(Card& c);
     std::string alloc_rows(Card& c, size_t T); std::string rows_setup(Card& c); std::string rows_mode(bool big);

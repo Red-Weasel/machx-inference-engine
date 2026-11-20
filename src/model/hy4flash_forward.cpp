@@ -487,6 +487,11 @@ struct Hy4fForward::Card {
     sycl::half* dq16 = nullptr; size_t dq_need = 0;      // q8_dense: the fp16 scratch a many-row GEMM expands a matrix into
     std::vector<Dense> dense;
     std::vector<void*> owned; uint64_t bytes = 0, kv_bytes = 0;   // kv_bytes: the part of `bytes` that is context cache (grows with ctx)
+    // Elastic context (the indexed layers' latent caches): each cache is a reserved range of ctx rows, backed for el_caps[el_tier]
+    // tokens; the VRAM of the rest holds expert slots (Hy4fQ8Store context pieces) until a conversation grows into it.
+    int32_t extra_piece = -1;   // the store piece held for the caller (the image tower), released by release_extra()
+    bool el_on = false; uint32_t el_tier = 0; std::vector<uint32_t> el_caps; std::vector<uint64_t> el_back;   // [tier] tokens, bytes backed a cache
+    std::vector<uintptr_t> el_va; uint64_t el_full = 0; std::vector<std::vector<sycl::ext::oneapi::experimental::physical_mem>> el_ph;   // [cache]; [tier][cache]
     // the per-row workspace lives in an arena (alloc_rows): its own VRAM for max_tokens rows, or -- a prompt chunk of more rows
     // (big_tokens) -- the expert slots' lent tails (Hy4fQ8Store::lend); `measuring` lays it out without memory to size it
     uint8_t *arena_cur = nullptr, *arena_end = nullptr, *small_arena = nullptr; uint64_t small_bytes = 0, big_need = 0;
@@ -586,6 +591,17 @@ void Hy4fForward::free_all() {
         if (!c->q) continue;
         if (c->tier_on) { c->tier.free_storage(*c->q); c->tier_on = false; }
         if (c->q8_on) { c->q8.free_all(*c->q); c->q8_on = false; }
+        if (c->el_on) {
+            namespace ex = sycl::ext::oneapi::experimental;
+            try {
+                c->q->wait();
+                for (size_t b = 0; b < c->el_va.size(); ++b) {
+                    ex::unmap(reinterpret_cast<void*>(c->el_va[b]), c->el_back[c->el_tier], c->q->get_context());
+                    ex::free_virtual_mem(c->el_va[b], c->el_full, c->q->get_context());
+                }
+            } catch (...) {}
+            c->el_ph.clear(); c->el_va.clear(); c->el_on = false;
+        }
         for (void* p : c->owned) sycl::free(p, *c->q);
         std::sort(c->pinned.begin(), c->pinned.end()); c->pinned.erase(std::unique(c->pinned.begin(), c->pinned.end()), c->pinned.end());
         for (void* p : c->pinned) sycl::free(p, *c->q);
@@ -741,10 +757,23 @@ std::string Hy4fForward::upload_card(Card& c) {
             const uint32_t wcap = uint32_t((2ull * (uint64_t(cfg.window) + rows_max()) + 63u) / 64u * 64u);
             d.kv_win = !lw.indexed && kv_window() && wcap < ctx_;
             d.kv_cap = d.kv_win ? wcap : ctx_; d.kv_base = 0;
+            if (c.el_on && !d.kv_win && d.kv_cap == ctx_) {
+                namespace ex = sycl::ext::oneapi::experimental;
+                try {
+                    const uintptr_t va = ex::reserve_virtual_mem(c.el_full, q.get_context());
+                    if (c.el_ph.empty()) c.el_ph.resize(c.el_caps.size());
+                    c.el_ph[0].emplace_back(q.get_device(), q.get_context(), c.el_back[0]);
+                    c.el_ph[0].back().map(va, c.el_back[0], ex::address_access_mode::read_write);
+                    c.el_va.push_back(va); d.kv = reinterpret_cast<sycl::half*>(va);
+                } catch (const sycl::exception& x) { err = std::string("device allocation failed (latent cache, elastic): ") + x.what(); return; }
+                c.bytes += c.el_back[0]; c.kv_bytes += c.el_back[0];
+                KpQ{q, "fill"}.fill(d.kv, sycl::half(0.f), size_t(c.el_back[0] / 2)).wait();
+            } else {
             d.kv = dev<sycl::half>(c, size_t(d.kv_cap) * LW);
             if (!d.kv) { err = "device allocation failed (latent cache)"; return; }
             c.kv_bytes += size_t(d.kv_cap) * LW * 2;
             KpQ{q, "fill"}.fill(d.kv, sycl::half(0.f), size_t(d.kv_cap) * LW).wait();
+            }
             if (d.kv_win) {
                 if (kv_mirror_.size() < cfg.n_layers) kv_mirror_.resize(cfg.n_layers, {nullptr, 0});
                 if (!kv_mirror_[L].first) {            // one copy of the layer's keys in host RAM, whichever card asks first
@@ -1064,6 +1093,18 @@ std::string Hy4fForward::init(const std::vector<sycl::queue*>& qs, const Hy4Flas
             cards_.push_back(std::make_unique<Card>());
             Card& c = *cards_.back();
             c.q = qs[ci]; c.L0 = ci == 0 ? 0 : split; c.L1 = (ci + 1 == qs.size()) ? nL : split;
+            // Elastic context (IE_HY4F_ELASTIC_CTX=0: the whole cache at load, as before 2026-11-19): with the 8-bit slots in
+            // the lending layout, an indexed layer's cache is backed for 32,768 tokens and grows by tiers (x2) to ctx
+            static const bool elastic = [] { const char* v = std::getenv("IE_HY4F_ELASTIC_CTX"); return !(v && *v == '0'); }();
+            const uint32_t el_first = 32768;
+            if (elastic && opt_.q8_experts && opt_.big_tokens > opt_.max_tokens && ctx_ > el_first && std::max(c.L0, first_moe) < c.L1) {
+                const uint64_t g = 2ull << 20, row = (uint64_t(cfg.kv_lora_rank) + cfg.rope_dim) * 2;
+                c.el_full = (uint64_t(ctx_) * row + g - 1) / g * g;
+                for (uint64_t cap = el_first; cap < ctx_; cap *= 2) c.el_caps.push_back(uint32_t(cap));
+                c.el_caps.push_back(ctx_);
+                for (uint32_t cap : c.el_caps) c.el_back.push_back(cap == ctx_ ? c.el_full : std::min(c.el_full, (uint64_t(cap) * row + g - 1) / g * g));
+                c.el_on = true;
+            }
         }
         for (size_t ci = 0; ci < qs.size(); ++ci) {
             Card& c = *cards_[ci];
@@ -1104,6 +1145,7 @@ std::string Hy4fForward::init(const std::vector<sycl::queue*>& qs, const Hy4Flas
                         // sized from free VRAM, which moves by tens of MB from one load to the next: rounded down to a multiple
                         // of 4, so the count -- which experts run on the card and which on the CPU, and with it the exact
                         // tokens -- is the same load after load (2026-11-19: two loads gave different greedy text; pinned, the same)
+                        // (a multiple of 2 was tried 2026-11-19: card 1 came up with 164 slots on one load and 166 on the next)
                         if (!slots) slots = fit >= 4 ? fit / 4 * 4 : fit;
                         else if (slots > fit) { std::fprintf(stderr, "card %zu: %u expert slots a layer asked for, %u fit its free VRAM (%.2f GiB) with the margin -- using %u\n", ci, slots, fit, double(fr) / double(1ull << 30), fit); slots = fit; }
                         {   // where the card's memory goes (2026-11-19: is all of the VRAM used?)
@@ -1117,7 +1159,14 @@ std::string Hy4fForward::init(const std::vector<sycl::queue*>& qs, const Hy4Flas
                 }
                 q8_slots_used_.resize(qs.size(), 0); q8_slots_used_[ci] = slots;
                 const uint64_t lend = c.big_need ? (c.big_need + (c.L1 - first) - 1) / (c.L1 - first) + (1ull << 20) : 0;
-                if (auto e = c.q8.init(q, m, first, c.L1 - first, slots, ranking, qfmt, lend); !e.empty()) return "card " + std::to_string(ci) + " 8-bit experts: " + e;
+                std::vector<uint64_t> pieces;               // the VRAM each later context tier takes from the slots, a layer
+                if (c.el_on) for (size_t t = 0; t + 1 < c.el_caps.size(); ++t)
+                    pieces.push_back((uint64_t(c.el_va.size()) * (c.el_back[t + 1] - c.el_back[t]) + (c.L1 - first) - 1) / (c.L1 - first));
+                if (ci == 0 && opt_.extra_piece_bytes) { c.extra_piece = int32_t(pieces.size()); pieces.push_back((opt_.extra_piece_bytes + (c.L1 - first) - 1) / (c.L1 - first)); }
+                if (auto e = c.q8.init(q, m, first, c.L1 - first, slots, ranking, qfmt, lend, pieces); !e.empty()) return "card " + std::to_string(ci) + " 8-bit experts: " + e;
+                if (c.q8.ctx_pieces() != pieces.size()) return "card " + std::to_string(ci) + ": the expert slots cannot hold the context pieces (IE_HY4F_ELASTIC_CTX=0 allocates the whole context cache)";
+                if (c.el_on) std::fprintf(stderr, "[hy4-flash] card %zu: context cache backed for %u tokens (%.2f GiB); the VRAM of the rest (to %u tokens, %.2f GiB) holds expert slots until a conversation needs it\n",
+                                          ci, c.el_caps[0], double(c.el_va.size() * c.el_back[0]) / double(1ull << 30), ctx_, double(c.el_va.size() * (c.el_full - c.el_back[0])) / double(1ull << 30));
                 c.q8_on = true; st_.q8_build_s += c.q8.stats().build_s;
             }
             if (first < c.L1 && !opt_.exact_experts && !opt_.q8_experts) {
@@ -2498,6 +2547,53 @@ std::string Hy4fForward::run_card(Card& c, size_t ci, const int32_t* ids, uint32
     return {};
 }
 
+// The first card's extra piece (Hy4fOptions::extra_piece_bytes) leaves the expert slots: its VRAM is free for the caller.
+std::string Hy4fForward::release_extra() {
+    if (cards_.empty() || cards_[0]->extra_piece < 0) return "this load holds no extra piece";
+    Card& c = *cards_[0];
+    if (c.q8.ctx_gone(uint32_t(c.extra_piece))) return {};
+    try { if (!c.q8.release_ctx(*c.q, uint32_t(c.extra_piece))) return "the extra piece could not be released"; }
+    catch (const sycl::exception& x) { return std::string("releasing the extra piece: ") + x.what(); }
+    return {};
+}
+
+// The indexed layers' caches hold `need` tokens: a card whose backing is short takes the next context piece from its
+// expert slots (their experts become misses) and maps that VRAM behind the caches; a card backed for more than twice
+// the need gives the top tier back to the slots, refilled with the best-scoring experts (a new, shorter conversation).
+std::string Hy4fForward::fit_context(uint32_t need) {
+    namespace ex = sycl::ext::oneapi::experimental;
+    for (size_t ci = 0; ci < cards_.size(); ++ci) {
+        Card& c = *cards_[ci];
+        if (!c.el_on) continue;
+        sycl::queue& q = *c.q;
+        try {
+            while (c.el_caps[c.el_tier] < need) {
+                if (c.el_tier + 1 >= c.el_caps.size()) return "internal: the context cache has no further tier";
+                const uint32_t t = c.el_tier + 1;
+                if (!c.q8.release_ctx(q, t - 1)) return "internal: the expert slots hold no further context piece"; const uint64_t off = c.el_back[t - 1], add = c.el_back[t] - off;
+                for (size_t b = 0; b < c.el_va.size(); ++b) {
+                    c.el_ph[t].emplace_back(q.get_device(), q.get_context(), add);
+                    c.el_ph[t].back().map(c.el_va[b] + off, add, ex::address_access_mode::read_write);
+                    KpQ{q, "fill"}.fill(reinterpret_cast<sycl::half*>(c.el_va[b] + off), sycl::half(0.f), size_t(add / 2));
+                }
+                q.wait();
+                c.el_tier = t; c.bytes += c.el_va.size() * add; c.kv_bytes += c.el_va.size() * add;
+                std::fprintf(stderr, "[hy4-flash] card %zu: context cache grown to %u tokens (%u expert slots a layer now)\n", ci, c.el_caps[t], c.q8.vram_slots());
+            }
+            while (c.el_tier > 0 && uint64_t(need) * 2 <= c.el_caps[c.el_tier - 1] && !c.q8.lent()) {
+                const uint32_t t = c.el_tier; const uint64_t off = c.el_back[t - 1], add = c.el_back[t] - off;
+                q.wait();
+                for (size_t b = 0; b < c.el_va.size(); ++b) ex::unmap(reinterpret_cast<void*>(c.el_va[b] + off), add, q.get_context());
+                c.el_ph[t].clear();
+                c.el_tier = t - 1; c.bytes -= c.el_va.size() * add; c.kv_bytes -= c.el_va.size() * add;
+                if (auto e = c.q8.restore_ctx(q, st_.rows, t - 1); !e.empty()) { std::fprintf(stderr, "[hy4-flash] card %zu: %s (the slots stay as they are)\n", ci, e.c_str()); break; }
+                std::fprintf(stderr, "[hy4-flash] card %zu: context cache back to %u tokens (%u expert slots a layer now)\n", ci, c.el_caps[c.el_tier], c.q8.vram_slots());
+            }
+        } catch (const sycl::exception& x) { return std::string("context cache growth: ") + x.what(); }
+    }
+    return {};
+}
+
 std::string Hy4fForward::forward(const int32_t* ids, uint32_t T, std::vector<float>& logits, bool all_rows, const Hy4fRowInputs* in) {
     if (cards_.empty()) return "not initialised";
     const auto& cfg = m_->config();
@@ -2509,6 +2605,7 @@ std::string Hy4fForward::forward(const int32_t* ids, uint32_t T, std::vector<flo
     const auto t0 = std::chrono::steady_clock::now();
     // experts uploaded beside the last call's compute (promote_async) become resident here, at the same point for the same tokens
     for (auto& cp : cards_) if (cp->q8_on) cp->q8.activate_pending();
+    if (auto e = fit_context(pos0 + T); !e.empty()) return e;
     if (g_hp.on && (T == 1) == !g_hp.prompt) g_hp.t = std::chrono::steady_clock::now();
     if (m_->embed.w->dtype_str != "BF16") return "the token embedding is not BF16";
     const uint8_t* emb = m_->embed.w->data;

@@ -263,6 +263,13 @@ GenerateResult hy4f_run(Hy4FlashBundle& b, const std::vector<int32_t>& ids, cons
             for (auto& im : *mm->images) {
                 if (im.pos0 + im.n <= pos || im.pos0 >= pos + T) continue;
                 if (!im.encoded) {
+                    if (b.vis_lazy && !b.vis.ready()) {          // the first image of this load: the tower takes its VRAM from the expert slots
+                        const auto tv = std::chrono::steady_clock::now();
+                        if (auto e = b.fw.release_extra(); !e.empty()) return fail("image tower: " + e);
+                        if (auto e = b.vis.init(*b.queues[0], b.model, b.vis.max_px()); !e.empty()) return fail("image tower: " + e);
+                        std::fprintf(stderr, "[vision] hy4-flash: tower loaded on card 0 at the first image (%.2f GiB, %.0f ms; it stays resident)\n",
+                                     double(b.vis.device_bytes()) / 1073741824.0, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tv).count());
+                    }
                     if (auto e = b.vis.encode(im.pv, im.g, im.rows); !e.empty()) return fail("image: " + e);
                     im.encoded = true; std::vector<float>().swap(im.pv);
                 }
@@ -516,6 +523,17 @@ std::string Engine::hy4flash_load(const std::string& dir) {
     if (const char* v = std::getenv("IE_HY4F_BIG_CHUNK"); v && *v) b->big = uint32_t(std::strtoul(v, nullptr, 10)); else b->big = 8192;
     if (const char* v = std::getenv("IE_HY4F_BIG_MIN"); v && *v) b->big_min = uint32_t(std::strtoul(v, nullptr, 10));
     if (b->big > b->chunk) { b->big = std::min<uint32_t>(b->big, b->ctx); o.big_tokens = b->big; } else b->big = 0;
+    // The image tower is loaded at the first image (IE_HY4F_VISION_LAZY=0: at load, as before 2026-11-19): it was built above
+    // (so a load that cannot see still fails or warns here), measured and freed; the expert slots of the first card hold that
+    // VRAM (about 7 slots a layer) until release_extra(). Needs the slots' lending layout (the long-prompt chunks).
+    {
+        const char* lz = std::getenv("IE_HY4F_VISION_LAZY"); const char* el = std::getenv("IE_HY4F_ELASTIC_CTX");
+        if (b->vis_ready && o.big_tokens && !(lz && *lz == '0') && !(el && *el == '0')) {
+            o.extra_piece_bytes = b->vis.device_bytes() + (128ull << 20);
+            b->vis.free_all(); b->vis_lazy = true;
+            std::fprintf(stderr, "[vision] hy4-flash: the tower loads at the first image; until then its VRAM (%.2f GiB on card 0) holds expert slots\n", double(o.extra_piece_bytes) / 1073741824.0);
+        }
+    }
     // IE_HY4F_SLOTS=N: exactly N expert slots a layer on each card (default: what free VRAM holds, rounded down to a multiple of 4)
     if (const char* sv = std::getenv("IE_HY4F_SLOTS"); sv && *sv) o.q8_slots = uint32_t(std::strtoul(sv, nullptr, 10));
     // IE_HY4F_DRAFT=1: the checkpoint's drafter. OFF by default: at the owner's launch (thinking on, temperature 0.9) it
