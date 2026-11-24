@@ -1,0 +1,18 @@
+import assert from 'node:assert/strict';
+import { parseCSV as p } from './solution.mjs';
+const E = (t, want, o) => assert.deepEqual(p(t, o), want, JSON.stringify(t));
+E('', []); E('a', [['a']]); E('a,b\nc,d', [['a', 'b'], ['c', 'd']]); E('a,b\nc,d\n', [['a', 'b'], ['c', 'd']]);
+E('a,b\r\nc,d\r\n', [['a', 'b'], ['c', 'd']]); E('a\rb\r', [['a'], ['b']]); E('a\n\nb', [['a'], [''], ['b']]);
+E('\n', [['']]); E('\n\n', [[''], ['']]); E('a,', [['a', '']]); E(',', [['', '']]); E('a,\n', [['a', '']]);
+E('"a,b",c', [['a,b', 'c']]); E('"he said ""hi"""', [['he said "hi"']]); E('"x\ny",z\n', [['x\ny', 'z']]);
+E('"x\r\ny"', [['x\r\ny']]); E('""', [['']]); E('"",""\n', [['', '']]); E('a"b,c', [['a"b', 'c']]);
+E(' a , b ', [[' a ', ' b ']]); E('a;b,c', [['a', 'b,c']], { delimiter: ';' }); E('"a";b', [['a', 'b']], { delimiter: ';' }); E('"x;y";"z"\n', [['x;y', 'z']], { delimiter: ';' });
+assert.throws(() => p('"a",b', { delimiter: ';' }), SyntaxError); E('a\tb', [['a', 'b']], { delimiter: '\t' });
+E('"a"\r\n"b"', [['a'], ['b']]); E('"a"', [['a']]); E('x,"y"', [['x', 'y']]);
+for (const bad of ['"abc', 'a,"b', '"a"b', '"a" ,b', '"a""']) assert.throws(() => p(bad), SyntaxError, bad);
+for (const d of ['"', '\n', '\r', '', ';;', 5]) assert.throws(() => p('a', { delimiter: d }), TypeError, String(d));
+assert.throws(() => p(null), TypeError); assert.throws(() => p(5), TypeError);
+const rows = Array.from({ length: 2000 }, (_, i) => [`r${i}`, `"q,${i}"`, 'x\ny'].map((f, j) => j ? '"' + f.replace(/"/g, '""') + '"' : f).join(','));
+const out = p(rows.join('\r\n'));
+assert.equal(out.length, 2000); assert.deepEqual(out[1999], ['r1999', '"q,1999"', 'x\ny']);
+console.log('OK');

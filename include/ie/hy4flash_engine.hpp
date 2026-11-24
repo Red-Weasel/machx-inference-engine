@@ -34,6 +34,13 @@ struct Hy4FlashBundle {
     std::vector<std::pair<int32_t, std::string>> stream_text;
     uint32_t ctx = 0, chunk = 512, big = 0, big_min = 2048;   // big: a long prompt's chunks in VRAM the expert slots lend (more than big_min rows left)
     bool reuse = true;
+    // <dir>/unlock/ (optional, IE_HY4F_UNLOCK=0 ignores it): write maps for requests the model would decline, applied only
+    // to a request whose last prompt row routes to at least unlock_thr of the listed experts (the experts that fire on such
+    // requests; one list for a prompt that ends in the closed think tag, one for the open one). Every other request runs
+    // the model as released. See scripts/hy4flash_ablit/ and Hy4fForward::set_write_maps.
+    std::vector<std::vector<uint8_t>> unlock_gate[2];      // [think open, think closed][layer][expert]
+    std::vector<float> unlock_A[2], unlock_B[2]; uint32_t unlock_rank = 0, unlock_thr = 9; int32_t unlock_close_id = -1;
+    bool unlock_think = false;   // also for a prompt that ends in the open think tag (off: with the maps on, the reasoning loops -- measured 2026-11-20)
     // The checkpoint's drafter (DFly2): each decode step first drafts the tokens after the one just sampled, one pass of
     // the model verifies the block, and the drafts the sampler agrees with are kept. draft_conf: a draft is verified
     // while the drafter's own confidence head gives the drafts so far this chance of surviving together.

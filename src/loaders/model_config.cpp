@@ -13,6 +13,7 @@ ModelArch detect_arch(const GgufReader& g) {
     if (!kv) return ModelArch::kUnknown;
     const auto a = kv->as_string();
     if (a == "qwen35moe") return ModelArch::kQwen35Moe;
+    if (a == "xing4_0")   return ModelArch::kXing4;      // Xing4.0-29B-A4B: MLA + hyper-connections + 64-expert MoE (src/model/xing4.cpp)
     if (a == "qwen3moe")  return ModelArch::kQwen3Moe;   // standard MoE (Qwen3-Coder-30B)
     if (a == "qwen3next") return ModelArch::kQwen3Next;   // hybrid DeltaNet+attn+MoE (Qwen3-Next-80B)
     if (a == "gemma4")    return ModelArch::kGemma4;      // Gemma 4 (dense 31B + MoE 26B-A4B); per-layer head geom, sandwich norms, dual-path MoE

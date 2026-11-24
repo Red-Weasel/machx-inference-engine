@@ -146,6 +146,20 @@ inline std::optional<Recommendation> recommended_sampling(ModelArch arch, std::s
         r.note = "generation_config: temperature 0.9, top_p 1, top_k off";
         return r;
     }
+    if (arch == ModelArch::kInkling2) {
+        Recommendation r;
+        r.model = "Inkling 2 Mini";
+        r.source = "the checkpoint's generation_config.json";
+        r.thinking = {1.0, 1.0, 0, 0.0, 0.0, 1.0, "the default (the template's effort line, 0.9 unless a level is chosen)"};
+        r.instruct = RecommendedMode{1.0, 1.0, 0, 0.0, 0.0, 1.0,
+                      "thinking off = effort level 0 (the README: the lowest effort does not fully disable reasoning); one sampling set for both"};
+        r.effort = {{"none", "effort 0 (what thinking off sends)"}, {"minimal", "0.1"}, {"low", "0.2"}, {"medium", "0.7"},
+                    {"high", "0.9, the template's default"}, {"xhigh", "0.99"}, {"max", "0.99"}};
+        r.max_output_note = "not specified by the checkpoint";
+        r.context = 1048576;   // config.json text_config.model_max_length
+        r.note = "generation_config: do_sample, temperature 1.0; top_p / top_k not set (off); effort levels from chat_template.jinja";
+        return r;
+    }
     if (arch == ModelArch::kLaguna) {
         Recommendation r;
         r.model = "Laguna-S-2.1";

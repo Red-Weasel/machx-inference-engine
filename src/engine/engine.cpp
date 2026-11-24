@@ -7,7 +7,10 @@
 #include "ie/mimo26_engine.hpp"
 #include "ie/laguna_engine.hpp"
 #include "ie/hy4flash_engine.hpp"
+#include "ie/xing4_engine.hpp"
+#include "ie/lanes_serve.hpp"
 #include "ie/inkling_engine.hpp"
+#include "ie/inkling2_engine.hpp"
 #include "ie/mimo26_host_rules.hpp"  // mimo26_vision_refusal (vision_status_json)
 #include "ie/vision_required.hpp"   // vision_required_error: the image encoder is part of the load
 #include "ie/ds41_vision.hpp"        // kDs41VisMaxTok (vision_status_json)
@@ -801,6 +804,23 @@ struct Q4eBundle {
 // objects (Qwen4ExpModel::select_lane on A and on B). Stage 0 of the card pipe runs A's layers into the lane's host residual,
 // stage 1 runs B's layers and leaves the logits in B.logits(); the done callback samples them on card 1 with the engine's
 // own GPU sampler (the kernels --parallel 1 runs on card 0), so a lane's ids are the serial loop's.
+
+// 2026-11-20: the tool-call guard on a model that samples on the card -- the row (after the penalties) to the host, the
+// guard's mask, back (V halves each way, ~0.1 ms against a ~25 ms step; only for a request with tools)
+static void guard_mask_half(sycl::queue& q, sycl::half* lg, uint32_t V, const LanesFilter& f) {
+    std::vector<sycl::half> h(V);
+    q.memcpy(h.data(), lg, size_t(V) * sizeof(sycl::half)).wait();
+    std::vector<float> w(V);
+    for (uint32_t i = 0; i < V; ++i) w[i] = float(h[i]);
+    f.apply(w);
+    for (uint32_t i = 0; i < V; ++i) h[i] = w[i] < -60000.f ? sycl::half(-65504.f) : h[i];
+    q.memcpy(lg, h.data(), size_t(V) * sizeof(sycl::half)).wait();
+}
+// the request's tools for the Qwen family's lanes: chat() renders the prompt and reaches the lanes through generate(),
+// on this same thread
+thread_local std::string_view t_guard_tools;
+thread_local std::string_view t_guard_choice;
+thread_local bool t_guard_think = false;
 class Q4eLanesModel final : public LanesModel {
 public:
     // P4 B17: rows = the pipe groups the decoding lanes' 1-row steps (up to max_group a group; group_cap 0 = AUTO, one group
@@ -1253,6 +1273,7 @@ public:
                 sampling_penalties(q, lg, V, recent_[lane], uint32_t(window.size()), sp.repeat_penalty, sp.presence_penalty,
                                    sp.frequency_penalty);
             }
+            if (sp.filter) guard_mask_half(q, lg, V, *sp.filter);   // the tool-call guard
             sample_softmax_topk_topp(q, lg, pick_[lane], V, sp.temperature, sp.top_k, sp.top_p, sp.min_p, seed);
             q.memcpy(&pick, pick_[lane], sizeof(pick)).wait();
         } catch (const sycl::exception& x) { err = x.what(); }
@@ -1279,6 +1300,7 @@ public:
                     sampling_penalties(q, lg, V, recent_[lane], uint32_t(windows[r].size()), s.repeat_penalty, s.presence_penalty,
                                        s.frequency_penalty);
                 }
+                if (s.filter) guard_mask_half(q, lg, V, *s.filter);
                 sample_softmax_topk_topp(q, lg, picks_dev_ + r, V, s.temperature, s.top_k, s.top_p, s.min_p, seeds[r]);
             }
             q.memcpy(picks_host_, picks_dev_, G * sizeof(int32_t)).wait();
@@ -1290,6 +1312,8 @@ public:
     std::string detok(std::span<const int32_t> out) const override {
         return tok_.decode(out, /*skip_special=*/true, /*keep_special=*/std::span<const int32_t>(tool_, 2));
     }
+    std::string guard_detok(std::span<const int32_t> out) const override { return tok_.decode(out, /*skip_special=*/false); }
+    uint32_t vocab() const override { return b_.cfg.vocab; }
     std::string pipe_start(DoneFn done) override { return pipe_.start(std::move(done)); }
     bool        rows() const override { return rows_; }
     std::string pipe_start_rows(DoneFn done, RowsDoneFn rows_done) override { return pipe_.start(std::move(done), std::move(rows_done)); }
@@ -2057,7 +2081,7 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         err = "context and nonzero slot context must be at least 9 tokens";
         return nullptr;
     }
-    if (opts_in.parallel > kMaxParallel) {
+    if (opts_in.parallel > kMaxParallel && !(inkling2_dir(gguf_path) && opts_in.parallel <= kMaxParallelInkling2)) {
         err = "parallel " + std::to_string(opts_in.parallel) + " exceeds the engine's " + std::to_string(kMaxParallel);
         return nullptr;
     }
@@ -2075,6 +2099,14 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
     }
     if (hy4flash_dir(gguf_path)) {                   // Hy4-flash: the engine's directory (8-bit pack), its own runtime
         if (auto m = e->hy4flash_load(gguf_path); !m.empty()) { err = m; return nullptr; }
+        return e;
+    }
+    if (inkling2_dir(gguf_path)) {                   // Inkling 2 Mini: a safetensors directory, its own one-card runtime
+        if (auto m = e->inkling2_load(gguf_path); !m.empty()) { err = m; return nullptr; }
+        return e;
+    }
+    if (xing4_gguf(gguf_path)) {                     // Xing4: its own runtime on request lanes
+        if (auto m = e->xing4_load(gguf_path); !m.empty()) { err = m; return nullptr; }
         return e;
     }
     if (auto m = e->gguf_.open(gguf_path); !m.empty())   { err = "gguf: " + m;  return nullptr; }
@@ -2278,7 +2310,12 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
         // non-Q8 27B GGUFs that would otherwise need this packing).
         // TENSOR-PARALLEL path: IE_QWEN35_TP=1 + --gpus>1 → both cards on the same
         // token (Megatron). Mutually exclusive with the layer-split Q8 path below.
-        const bool use_tp = opts.n_gpus > 1 && std::getenv("IE_QWEN35_TP");
+        // 2026-11-21: IE_QWEN35_TP=1 = the split model's own tensor parallel (Qwen35SplitModel::set_tensor_parallel: every
+        // layer on both cards, half of each projection a card, the lanes / prompt cache / MTP rounds kept). The older
+        // FFN-only Qwen35TpModel (replicated attention + DeltaNet, no lanes, no cache) stays behind IE_QWEN35_TP=legacy.
+        const char* q35_tp_env = std::getenv("IE_QWEN35_TP");
+        const bool use_tp = opts.n_gpus > 1 && q35_tp_env && std::string_view(q35_tp_env) == "legacy";
+        bool split_tp = opts.n_gpus == 2 && q35_tp_env && *q35_tp_env == '1';
         // P4 B58: ONE card takes the split model too (one stage) when the file is one it packs natively (Q8_0 / Q6_K /
         // Q5_K / Q4_K, the last since 2026-10-20's c32 Q4_K): its prefill and decode kernels, prompt cache, --spec with
         // lookup drafts and restart points are the two-card path's. Measured 2026-10-05 (Q6_K, one B70, 2.4K / 10.7K-token
@@ -2324,11 +2361,22 @@ std::unique_ptr<Engine> Engine::load(const std::string& gguf_path,
             vocab = qcfg.dense.vocab;
         } else if (use_split) {
             const uint32_t ndev = opts.n_gpus > 1 ? opts.n_gpus : 1;
-            if (auto m = e->fleet_.init(ndev, "B70", false, /*shared_ctx=*/false); !m.empty()) { err = "fleet: " + m; return nullptr; }
+            // tensor parallel: one shared context with peer access (the card-to-card sums are pushes); without it the load
+            // goes on as the layer split, with a warning
+            if (auto m = e->fleet_.init(ndev, "B70", /*enable_p2p_transfers=*/split_tp, /*shared_ctx=*/split_tp); !m.empty()) { err = "fleet: " + m; return nullptr; }
             if (ndev > 1 && e->fleet_.size() < 2) { err = "layer-split needs >=2 GPUs (have " +
                                               std::to_string(e->fleet_.size()) + ")"; return nullptr; }
+            if (split_tp && (!e->fleet_.p2p() || !e->fleet_.shared_ctx())) {
+                std::fprintf(stderr, "[qwen35split] WARNING: IE_QWEN35_TP=1 needs peer access between the two cards (P2P %s, shared "
+                                     "context %s) -- loading the layer split instead\n", e->fleet_.p2p() ? "on" : "off",
+                             e->fleet_.shared_ctx() ? "yes" : "no");
+                split_tp = false;
+                if (auto m = e->fleet_.init(ndev, "B70", false, /*shared_ctx=*/false); !m.empty()) { err = "fleet: " + m; return nullptr; }
+            }
             const uint32_t n_tx = qcfg.n_transformer_layers();
             LayerPlan plan = LayerPlan::contiguous(n_tx, ndev);
+            if (split_tp) { plan.head_dev = 0; plan.embed_dev = 0; }   // the embedding and the head on card 0; every layer on both
+            e->qwen35_split_model_.set_tensor_parallel(split_tp);
             if (auto m = e->qwen35_split_model_.load(e->fleet_, plan, e->gguf_, qcfg, opts.max_ctx, opts.int8_kv); !m.empty())
                 { err = "model: " + m; return nullptr; }
             e->qwen35_split_ = true;
@@ -4586,6 +4634,7 @@ public:
                 sampling_penalties(q, lg, V_, recent_[lane], uint32_t(window.size()), sp.repeat_penalty, sp.presence_penalty,
                                    sp.frequency_penalty);
             }
+            if (sp.filter) guard_mask_half(q, lg, V_, *sp.filter);   // the tool-call guard
             sample_softmax_topk_topp(q, lg, pick_[lane], V_, sp.temperature, sp.top_k, sp.top_p, sp.min_p, seed);
             m_.fleet()->dev(m_.head_dev()).d2h(&pick, pick_[lane], sizeof(pick));   // pinned stage (issue #2)
         } catch (const sycl::exception& x) { err = x.what(); }
@@ -4612,6 +4661,7 @@ public:
                     sampling_penalties(q, lg, V_, recent_[lane], uint32_t(windows[r].size()), s.repeat_penalty, s.presence_penalty,
                                        s.frequency_penalty);
                 }
+                if (s.filter) guard_mask_half(q, lg, V_, *s.filter);
                 sample_softmax_topk_topp(q, lg, picks_dev_ + r, V_, s.temperature, s.top_k, s.top_p, s.min_p, seeds[r]);
             }
             q.memcpy(picks_host_, picks_dev_, G * sizeof(int32_t)).wait();
@@ -4623,6 +4673,8 @@ public:
     std::string detok(std::span<const int32_t> out) const override {
         return tok_.decode(out, /*skip_special=*/true, /*keep_special=*/std::span<const int32_t>(tool_, 2));
     }
+    std::string guard_detok(std::span<const int32_t> out) const override { return tok_.decode(out, /*skip_special=*/false); }
+    uint32_t vocab() const override { return V_; }
     std::string pipe_start(DoneFn done) override { return pipe_.start(std::move(done)); }
     bool        rows() const override { return rows_; }
     std::string pipe_start_rows(DoneFn done, RowsDoneFn rows_done) override { return pipe_.start(std::move(done), std::move(rows_done)); }
@@ -5172,6 +5224,16 @@ GenerateResult Engine::q35m_generate_lanes(const std::string& prompt, const Samp
     if (ids.empty()) { res.finish_reason = "length"; return res; }
     LanesRequest rq;
     rq.ids = &ids;
+    if (!t_guard_tools.empty() && !(std::getenv("IE_TOOL_GUARD") && *std::getenv("IE_TOOL_GUARD") == '0')) {   // every tool call valid
+        std::string gerr;
+        rq.guard = ToolGuard::make_xml(t_guard_tools, gerr);
+        if (!gerr.empty()) std::fprintf(stderr, "[lanes] tool-call guard off for this request: %s\n", gerr.c_str());
+        if (rq.guard && !t_guard_choice.empty()) {
+            rq.guard = rq.guard->with_choice(t_guard_choice, gerr);
+            if (!rq.guard) { res.finish_reason = "error: " + gerr; return res; }
+        }
+        rq.guard_think = t_guard_think;
+    }
     rq.sp.temperature = sp.temperature; rq.sp.top_k = sp.top_k; rq.sp.top_p = sp.top_p; rq.sp.min_p = sp.min_p;
     rq.sp.presence_penalty = sp.presence_penalty; rq.sp.frequency_penalty = sp.frequency_penalty;
     rq.sp.repeat_penalty = sp.repeat_penalty; rq.sp.repeat_window = sp.repeat_window;
@@ -5215,6 +5277,7 @@ GenerateResult Engine::q35m_generate_lanes(const std::string& prompt, const Samp
     res.answer_start = lr.answer_start;
     res.finish_reason = lr.finish_reason;
     res.cached_tokens = lr.cached_tokens;
+    res.lane = lr.lane; res.lane_ctx = lr.lane_ctx;
     res.completion_tokens = lr.completion_tokens;
     res.prefill_ms = lr.prefill_ms;
     res.decode_ms = lr.decode_ms;
@@ -5239,7 +5302,7 @@ public:
                   uint32_t pf_chunk, bool pipeline, bool rows, uint32_t group_cap)
         : m_(m), cache_(cache), tok_(tok), pf_chunk_(pf_chunk), pipeline_(pipeline), H_(m.config().dense.hidden),
           V_(m.config().dense.vocab), rows_(rows),
-          pipe_(m.n_lanes(), pf_chunk, H_ / 2, m.n_devices(),   // the residual [T, hidden] fp16 = hidden / 2 floats a row; P4 B58: one stage a card
+          pipe_(m.n_lanes(), pf_chunk, H_ / 2, m.n_stages(),   // the residual [T, hidden] fp16 = hidden / 2 floats a row; P4 B58: one stage a card (tensor parallel: one stage, both cards)
                 [this](uint32_t s, const Glm5LanePipe::Step& st) { return stage(s, st); },
                 [this](uint32_t s, std::span<const Glm5LanePipe::Step> steps, float* gw) { return stage_rows(s, steps, gw); },
                 Qwen35SplitModel::kMaxRows, group_cap) {
@@ -5431,6 +5494,7 @@ public:
                 sampling_penalties(q, lg, V_, recent_[lane], uint32_t(window.size()), sp.repeat_penalty, sp.presence_penalty,
                                    sp.frequency_penalty);
             }
+            if (sp.filter) guard_mask_half(q, lg, V_, *sp.filter);   // the tool-call guard
             sample_softmax_topk_topp(q, lg, pick_[lane], V_, sp.temperature, sp.top_k, sp.top_p, sp.min_p, seed);
             m_.fleet()->dev(m_.head_dev()).d2h(&pick, pick_[lane], sizeof(pick));   // pinned stage (issue #2)
         } catch (const sycl::exception& x) { err = x.what(); }
@@ -5456,6 +5520,7 @@ public:
                     sampling_penalties(q, lg, V_, recent_[lane], uint32_t(windows[r].size()), s.repeat_penalty, s.presence_penalty,
                                        s.frequency_penalty);
                 }
+                if (s.filter) guard_mask_half(q, lg, V_, *s.filter);
                 sample_softmax_topk_topp(q, lg, picks_dev_ + r, V_, s.temperature, s.top_k, s.top_p, s.min_p, seeds[r]);
             }
             q.memcpy(picks_host_, picks_dev_, G * sizeof(int32_t)).wait();
@@ -5467,6 +5532,8 @@ public:
     std::string detok(std::span<const int32_t> out) const override {
         return tok_.decode(out, /*skip_special=*/true, /*keep_special=*/std::span<const int32_t>(tool_, 2));
     }
+    std::string guard_detok(std::span<const int32_t> out) const override { return tok_.decode(out, /*skip_special=*/false); }
+    uint32_t vocab() const override { return V_; }
     std::string pipe_start(DoneFn done) override { return pipe_.start(std::move(done)); }
     bool        rows() const override { return rows_; }
     std::string pipe_start_rows(DoneFn done, RowsDoneFn rows_done) override { return pipe_.start(std::move(done), std::move(rows_done)); }
@@ -5595,7 +5662,7 @@ private:
     std::string run_pieces(uint32_t lane, const int32_t* ids, std::span<const Q27Piece> ps, const std::function<bool()>& stop,
                            size_t& done) {
         done = 0;
-        if (m_.n_devices() == 1) {   // P4 B58: one card, one stage: the pieces in order
+        if (m_.n_stages() == 1) {   // P4 B58: one card, one stage: the pieces in order (tensor parallel: one stage, both cards)
             for (size_t k = 0; k < ps.size(); ++k) {
                 if (k > 0 && stop && stop()) break;
                 std::string e0;
@@ -5767,8 +5834,10 @@ GenerateResult Engine::generate(const std::string& prompt,
     if (arch_ == ModelArch::kDeepSeek41) return ds41_generate(prompt, sp, on_token);
     if (arch_ == ModelArch::kMimo26) return mimo26_generate(prompt, sp, on_token);
     if (arch_ == ModelArch::kHy4Flash) return hy4flash_generate(prompt, sp, on_token);
+    if (arch_ == ModelArch::kXing4) return xing4_generate(prompt, sp, on_token);
     if (arch_ == ModelArch::kLaguna) return laguna_generate(prompt, sp, on_token);
     if (arch_ == ModelArch::kInkling) return inkling_generate(prompt, sp, on_token);
+    if (arch_ == ModelArch::kInkling2) return inkling2_generate(prompt, sp, on_token);
     if (q4e_ && q4e_->serve) return q4e_generate_lanes(prompt, sp, on_token, cache_prefix_len, shared_prefix_len);
     if (q35m_ && q35m_->serve) return q35m_generate_lanes(prompt, sp, on_token, cache_prefix_len, reply_cache, shared_prefix_len, anchor);
     if (q27_ && q27_->serve) return q35m_generate_lanes(prompt, sp, on_token, cache_prefix_len, reply_cache, shared_prefix_len);   // P4 B18
@@ -7607,6 +7676,8 @@ std::string Engine::serving_status_json() const {
     if (q4e_ && q4e_->serve) return q4e_->serve->status_json();   // P4 B8: Flash-Next's lanes
     if (q35m_ && q35m_->serve) return q35m_->serve->status_json(); // P4 B10: the crown split's lanes
     if (q27_ && q27_->serve) return q27_->serve->status_json();    // P4 B18: the 27B split's lanes
+    if (xg4_ && xg4_->serve) return xg4_->serve->status_json();    // xing4's lanes
+    if (inkling2_ && inkling2_->serve) return inkling2_serve_status(*inkling2_);   // Inkling 2: the per-card batch loops
     return {};
 }
 
@@ -7637,6 +7708,16 @@ GenerateResult Engine::q4e_generate_lanes(const std::string& prompt, const Sampl
     if (ids.empty()) { res.finish_reason = "length"; return res; }
     LanesRequest rq;
     rq.ids = &ids;
+    if (!t_guard_tools.empty() && !(std::getenv("IE_TOOL_GUARD") && *std::getenv("IE_TOOL_GUARD") == '0')) {   // every tool call valid
+        std::string gerr;
+        rq.guard = ToolGuard::make_xml(t_guard_tools, gerr);
+        if (!gerr.empty()) std::fprintf(stderr, "[lanes] tool-call guard off for this request: %s\n", gerr.c_str());
+        if (rq.guard && !t_guard_choice.empty()) {
+            rq.guard = rq.guard->with_choice(t_guard_choice, gerr);
+            if (!rq.guard) { res.finish_reason = "error: " + gerr; return res; }
+        }
+        rq.guard_think = t_guard_think;
+    }
     // 2026-10-23: the request's images (q35m_generate_lanes' rule): encoded now on this thread (the tower, under qvis_mu_),
     // staged on the lane in its serial turn (Q4eLanesModel::prefix_prepare); the request stays out of the prompt cache
     LanesVision vis;
@@ -7669,6 +7750,7 @@ GenerateResult Engine::q4e_generate_lanes(const std::string& prompt, const Sampl
     res.answer_start = lr.answer_start;
     res.finish_reason = lr.finish_reason;
     res.cached_tokens = lr.cached_tokens;
+    res.lane = lr.lane; res.lane_ctx = lr.lane_ctx;
     res.completion_tokens = lr.completion_tokens;
     res.prefill_ms = lr.prefill_ms;
     res.decode_ms = lr.decode_ms;
@@ -7679,6 +7761,7 @@ GenerateResult Engine::q4e_generate_lanes(const std::string& prompt, const Sampl
 uint32_t Engine::prompt_cache_slots() const {
     if (mimo26_) return mimo26_prompt_cache_slots();
     if (ds41_) return ds41_prompt_cache_slots();
+    if (inkling2_ && inkling2_->serve) return prompt_cache_on_ ? inkling2_serve_slots(*inkling2_) : 0u;   // one per slot
     // P4 B45 (3): the two Qwen splits keep many conversations in their FleetPrefixCache (the crown's lanes cache: the load
     // line's "up to N entries", q35m_lanes_init's set_limits; the 27B's shared-prefix cache: 12, IE_PROMPT_CACHE_MAX_ENTRIES),
     // so they report that limit -- Dream skips its end-of-turn verifier at 1 ("this engine keeps one conversation cached ...
@@ -7729,6 +7812,13 @@ std::string Engine::vision_status_json() const {
             if (hy4f_) { ready = hy4f_->vis_ready; reason = ready ? "" : hy4f_->vis_error; tokens = long(hy4f_->image_tokens); }
             else reason = "model not loaded";
             break;
+        case ModelArch::kInkling2:
+            if (inkling2_) {
+                ready = inkling2_vision_ready(*inkling2_);
+                reason = ready ? "" : "the vision tower was not loaded (IE_INKLING2_VISION=0, or its load failed: see the load log)";
+                tokens = long(inkling2_->vis_max_tokens);
+            } else reason = "model not loaded";
+            break;
         default:
             reason = "this architecture has no vision input";
     }
@@ -7738,14 +7828,14 @@ std::string Engine::vision_status_json() const {
 }
 
 std::string Engine::reasoning_effort_error(std::string_view effort) const {
-    if (arch_ == ModelArch::kDeepSeek41 || arch_ == ModelArch::kMimo26 || arch_ == ModelArch::kHy4Flash) return ie::reasoning_effort_error(reasoning_capabilities(arch_), effort);   // no GGUF template
+    if (arch_ == ModelArch::kDeepSeek41 || arch_ == ModelArch::kMimo26 || arch_ == ModelArch::kHy4Flash || arch_ == ModelArch::kXing4 || arch_ == ModelArch::kInkling2) return ie::arch_reasoning_effort_error(arch_, {}, effort);   // no GGUF template
     const auto* ct=gguf_.find_kv("tokenizer.chat_template");
-    return ie::reasoning_effort_error(reasoning_capabilities(arch_,
-        ct && ct->type==GgufValueType::kString?ct->as_string():std::string_view{}),effort);
+    return ie::arch_reasoning_effort_error(arch_,
+        ct && ct->type==GgufValueType::kString?ct->as_string():std::string_view{},effort);
 }
 
 std::string Engine::gguf_string(std::string_view key) const {
-    if (arch_ == ModelArch::kDeepSeek41 || arch_ == ModelArch::kMimo26 || arch_ == ModelArch::kHy4Flash) return {};   // no GGUF
+    if (arch_ == ModelArch::kDeepSeek41 || arch_ == ModelArch::kMimo26 || arch_ == ModelArch::kHy4Flash || arch_ == ModelArch::kXing4 || arch_ == ModelArch::kInkling2) return {};   // no GGUF
     const auto* ct = gguf_.find_kv(key);
     return ct && ct->type == GgufValueType::kString ? std::string(ct->as_string()) : std::string();
 }
@@ -7759,11 +7849,21 @@ GenerateResult Engine::chat(std::span<const ChatTurn> turns,
     if(auto error=reasoning_effort_error(reasoning_effort);!error.empty()) {
         GenerateResult r;r.finish_reason="error: "+error;return r;
     }
+    struct GuardTls {   // the request's tools for the Qwen family's lanes guard (q4e / q35m_generate_lanes), this call only
+        GuardTls(std::string_view t, std::string_view c, bool th) { t_guard_tools = t; t_guard_choice = c; t_guard_think = th; }
+        ~GuardTls() { t_guard_tools = {}; t_guard_choice = {}; t_guard_think = false; }
+    } guard_tls(sp.tool_guard ? tools_json : std::string_view(), sp.tool_choice, enable_thinking);
+    // the conversation's text: a tool it names may be called though not in `tools` (a harness listing its tools in the prompt)
+    std::string guard_text;
+    if (!tools_json.empty() && sp.tool_guard) for (const auto& t : turns) { guard_text += t.content; guard_text += '\n'; }
+    const ToolGuardPrompt guard_prompt(std::move(guard_text));
     if (arch_ == ModelArch::kDeepSeek41) return ds41_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
     if (arch_ == ModelArch::kMimo26) return mimo26_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
     if (arch_ == ModelArch::kHy4Flash) return hy4flash_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
+    if (arch_ == ModelArch::kXing4) return xing4_chat(turns, sp, on_token, enable_thinking, tools_json);
     if (arch_ == ModelArch::kLaguna) return laguna_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
     if (arch_ == ModelArch::kInkling) return inkling_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
+    if (arch_ == ModelArch::kInkling2) return inkling2_chat(turns, sp, on_token, enable_thinking, tools_json, reasoning_effort);
     // known_bugs 45 (2026-11-05): the request's own text never carries a control token. Every renderer below records the
     // request's byte ranges as it renders (PromptPiece, tokenizer.hpp) and hands them to t_chat_guard, held for this thread
     // until chat() returns; every encode on the way to the forward (encode_served) keeps a spelling inside them text.

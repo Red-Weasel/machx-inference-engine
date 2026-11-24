@@ -674,6 +674,11 @@ add_executable(ie_inkling_run inkling_run.cpp)
 target_link_libraries(ie_inkling_run PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_inkling_run PROPERTIES OUTPUT_NAME "ie-inkling-run")
 
+# Inkling 2 Mini (inkling2_loop) phase-1 forward pass + gate dumps (scripts/inkling2/gate.sh)
+add_executable(ie_inkling2_run ie_inkling2_run.cpp)
+target_link_libraries(ie_inkling2_run PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_inkling2_run PROPERTIES OUTPUT_NAME "ie-inkling2-run")
+
 add_executable(ie_ds41_expert_file ds41_expert_file.cpp)
 target_link_libraries(ie_ds41_expert_file PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_ds41_expert_file PROPERTIES OUTPUT_NAME "ie-ds41-expert-file")
@@ -709,6 +714,9 @@ set_target_properties(ie_hy4flash_mini PROPERTIES OUTPUT_NAME "ie-hy4flash-mini"
 add_executable(ie_hy4flash_run hy4flash_run.cpp)
 target_link_libraries(ie_hy4flash_run PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_hy4flash_run PROPERTIES OUTPUT_NAME "ie-hy4flash-run")
+add_executable(ie_xing4_run xing4_run.cpp)
+target_link_libraries(ie_xing4_run PRIVATE ie_core ie_sycl_flags)
+set_target_properties(ie_xing4_run PROPERTIES OUTPUT_NAME "ie-xing4-run")
 add_executable(ie_hy4flash_vision hy4flash_vision.cpp)
 target_link_libraries(ie_hy4flash_vision PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_hy4flash_vision PROPERTIES OUTPUT_NAME "ie-hy4flash-vision")
@@ -766,3 +774,13 @@ set_target_properties(ie_hy4flash_legbench PROPERTIES OUTPUT_NAME "ie-hy4flash-l
 add_executable(ie_hy4flash_quant hy4flash_quant.cpp)
 target_link_libraries(ie_hy4flash_quant PRIVATE ie_core ie_sycl_flags)
 set_target_properties(ie_hy4flash_quant PROPERTIES OUTPUT_NAME "ie-hy4flash-quant")
+
+# Card-to-card exchange cost (Inkling 2: can two cards work on one conversation's token?). SYCL only, no ie_core.
+add_executable(ie_xchg_bench ie_xchg_bench.cpp)
+target_link_libraries(ie_xchg_bench PRIVATE ie_sycl_flags)
+set_target_properties(ie_xchg_bench PROPERTIES OUTPUT_NAME "ie-xchg-bench")
+
+# Kernel launch cost: submitted one by one vs replayed from a recorded command graph. SYCL only, no ie_core.
+add_executable(ie_graph_bench ie_graph_bench.cpp)
+target_link_libraries(ie_graph_bench PRIVATE ie_sycl_flags)
+set_target_properties(ie_graph_bench PROPERTIES OUTPUT_NAME "ie-graph-bench")

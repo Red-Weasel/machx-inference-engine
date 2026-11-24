@@ -142,6 +142,7 @@ int32_t Ds41Generator::sample(std::vector<float>& lg, const std::vector<int32_t>
 
 int32_t Ds41Generator::sample_row(float* lg, size_t V, const std::vector<int32_t>& recent, const Ds41SampleParams& sp, uint64_t& rng,
                                   Ds41SampleStats* stats) {
+    if (sp.guard) sp.guard->apply_raw(lg, V);   // every tool call valid: the tokens that would break one are ruled out
     if (sp.repeat_penalty != 1.f && sp.repeat_window)
         for (size_t i = recent.size() > sp.repeat_window ? recent.size() - sp.repeat_window : 0; i < recent.size(); ++i) {
             const int32_t id = recent[i];
@@ -257,6 +258,7 @@ struct Ds41Emitter {
     const Tokenizer& tok; const std::vector<std::string>& stops; const std::function<bool(std::string_view)>& on_piece;
     std::vector<int32_t>& out_ids; std::vector<int32_t>& recent; Ds41GenStats& st;
     std::string pending, tail;                                    // bytes not yet complete UTF-8; emitted text tail for the stop strings
+    LaneGuard* guard = nullptr;                                   // the request's tool-call guard (advanced per committed id)
     size_t longest_stop = 0;
     uint32_t warm_mark = 0;                                       // P5: the committed token the steady-state window starts at
     std::chrono::steady_clock::time_point warm_t0{};
@@ -268,6 +270,7 @@ struct Ds41Emitter {
     bool repeating() const { return Ds41Generator::repeating(out_ids, st.n_gen); }
     bool push(int32_t id) {                                       // false: the run ended (st.stop_reason set)
         if (id == tok.eos_token_id()) { st.stop_reason = "eos"; return false; }
+        if (guard) guard->advance(id);
         out_ids.push_back(id); recent.push_back(id); ++st.n_gen;
         // Early-window rate, for the decode-variance question.
         if (st.n_gen == 1) decode_t0 = std::chrono::steady_clock::now();
@@ -411,7 +414,7 @@ std::string Ds41Generator::run(const std::vector<int32_t>& prompt_ids, uint32_t 
 
     std::vector<int32_t> recent(prompt_ids.end() - std::min<size_t>(prompt_ids.size(), sp.repeat_window), prompt_ids.end());
     uint64_t rng = sp.seed ? sp.seed : 0x2545F4914F6CDD1Dull;
-    Ds41Emitter em(tok_, stops, on_piece, out_ids, recent, st); em.warm_mark = warm_mark_;
+    Ds41Emitter em(tok_, stops, on_piece, out_ids, recent, st); em.warm_mark = warm_mark_; em.guard = sp.guard;
     const auto t1 = std::chrono::steady_clock::now();
     // Phase 58 (docs/deepseek41/97): prompt-lookup speculation (the policy: Ds41Generator::lookup_policy)
     const Ds41LookupPolicy lp = lookup_policy();

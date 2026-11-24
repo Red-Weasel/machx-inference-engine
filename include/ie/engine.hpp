@@ -73,9 +73,13 @@ struct LagunaBundle;
 // Tencent Hy4-flash (kHy4Flash): a model DIRECTORY (hy4flash_ie.json), the two-card forward with 8-bit experts, the
 // tokenizer.json tokenizer and the checkpoint's chat template. src/engine/hy4flash_engine.cpp.
 struct Hy4FlashBundle;
+struct Xing4Bundle;   // Xing4.0-29B-A4B (kXing4): src/engine/xing4_engine.cpp
 // Inkling-Small (kInkling): the GGUF, the one-card runtime (InklingModel), the GGUF's tokenizer and its chat format.
 // src/engine/inkling_engine.cpp (docs/inkling/00_PORT_PLAN.md P5).
 struct InklingBundle;
+// Inkling 2 Mini (kInkling2): a model DIRECTORY (config.json model_type inkling2_loop), the one-card runtime (Inkling2Model),
+// the tokenizer.json tokenizer and the checkpoint's chat template. src/engine/inkling2_engine.cpp.
+struct Inkling2Bundle;
 
 // Pinned (USM host) staging buffer for the host-bounced logits row. Every
 // multi-card / host-runtime path (DenseModelTP, qwen3next, qwen35 TP/split,
@@ -136,6 +140,10 @@ inline constexpr uint32_t kMaxTokensUnlimited = UINT32_MAX;
 struct VitalsWindow;   // ie/vitals.hpp
 
 struct SamplingParams {
+    // OpenAI tool_choice: "" / "auto", "none" (no call may start), "required" (the reply is a call), or a function name (a
+    // call of that tool). Enforced by the tool-call guard where an arch has one (Xing4, DeepSeek-V4.1).
+    std::string tool_choice;
+    bool     tool_guard     = true;   // request "ie_tool_guard": false turns the guard off for this request (A/B on one load)
     float    temperature    = 0.7f;
     uint32_t top_k          = 40;
     float    top_p          = 0.95f;
@@ -157,6 +165,9 @@ struct SamplingParams {
 // lane count that does not fit, with the numbers. The 27B split path's forward_slots has the same cap (Qwen35SplitModel::kMaxSlots).
 inline constexpr uint32_t kMaxParallel = 16;
 static_assert(kLanesAutoMax == kMaxParallel, "the auto lane pick's cap (ie/lanes_auto.hpp) is --parallel's");
+// Inkling 2 Mini only (its batch slots; with --gpus 2 a copy per card, N / 2 conversations each): --parallel up to this. The
+// command line admits it for every model; Engine::load refuses above kMaxParallel for any other arch, as before.
+inline constexpr uint32_t kMaxParallelInkling2 = 32;
 
 struct EngineOptions {
     uint32_t max_ctx       = 8192;
@@ -226,6 +237,10 @@ struct GenerateResult {
     size_t      answer_start      = std::string::npos;
     uint32_t    prompt_tokens     = 0;
     uint32_t    cached_tokens     = 0; // prompt tokens served from the prefix cache
+    // 2026-11-21: the request lane that served it and that lane's context (positions; 0 = not a lanes reply). The server
+    // reports them as usage.ie = {"lane", "ctx"} so a client can show each conversation's true limit.
+    uint32_t    lane              = 0;
+    uint32_t    lane_ctx          = 0;
     uint32_t    completion_tokens = 0;
     std::string finish_reason;        // "stop" | "length" | "abort"
     // deepseek41: a "length" reply cut off inside a tool call -- that call's name (docs/deepseek41/100).
@@ -277,6 +292,10 @@ public:
     static bool mimo26_dir(const std::string& path);
     // A Hy4-flash engine directory (it holds hy4flash_ie.json)?
     static bool hy4flash_dir(const std::string& path);
+    // An Inkling 2 Mini model directory (config.json model_type inkling2_loop)?
+    static bool inkling2_dir(const std::string& path);
+    // A Xing4 GGUF (general.architecture xing4_0)?
+    static bool xing4_gguf(const std::string& path);
     uint32_t  max_ctx() const noexcept { return opts_.max_ctx; }
     uint32_t  parallel() const noexcept { return opts_.parallel; }
     // P4 B38: the positions each of the request lanes 1..N-1 holds (lane 0 holds max_ctx); 0 with one lane. /props reports
@@ -635,6 +654,11 @@ private:
     GenerateResult hy4flash_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
                                  bool enable_thinking, std::string_view tools_json, std::string_view reasoning_effort);
     GenerateResult hy4flash_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token);
+    // xing4 (src/engine/xing4_engine.cpp): the GGUF load and the chat/generate routes, on request lanes
+    std::string    xing4_load(const std::string& path);
+    GenerateResult xing4_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
+                              bool enable_thinking, std::string_view tools_json);
+    GenerateResult xing4_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token);
     // laguna (src/engine/laguna_engine.cpp): the load (gguf_ already open) and the chat/generate routes
     std::string    laguna_load();
     GenerateResult laguna_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
@@ -645,6 +669,11 @@ private:
     GenerateResult inkling_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
                                 bool enable_thinking, std::string_view tools_json, std::string_view reasoning_effort);
     GenerateResult inkling_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token);
+    // inkling2 (src/engine/inkling2_engine.cpp): the directory load and the chat/generate routes
+    std::string    inkling2_load(const std::string& dir);
+    GenerateResult inkling2_chat(std::span<const ChatTurn> turns, const SamplingParams& sp, const TokenCallback& on_token,
+                                 bool enable_thinking, std::string_view tools_json, std::string_view reasoning_effort);
+    GenerateResult inkling2_generate(const std::string& prompt, const SamplingParams& sp, const TokenCallback& on_token);
     // qwen4exp forward, defined in engine.cpp (Q4eBundle is incomplete here).
     sycl::event q4e_forward(sycl::queue& q, const int32_t* ids, uint32_t T, uint32_t pos);
     // P4 B8: Flash-Next at --parallel N > 1 on two cards -- the request on a lane of the shared lanes module (engine.cpp).
@@ -732,10 +761,13 @@ private:
     std::unique_ptr<Mimo26Bundle> mimo26_;   // mimo_v2 only; frees its runtime in its own destructor
     std::unique_ptr<Hy4FlashBundle> hy4f_;   // hy4-flash only; frees its runtime in its own destructor
     std::mutex hy4f_mu_;                     // one request at a time on the one runtime
+    std::unique_ptr<Xing4Bundle> xg4_;       // xing4 only (its lanes server inside)
     std::unique_ptr<LagunaBundle> laguna_;   // laguna only; reads gguf_'s mapping, so it is declared after gguf_
     std::mutex laguna_mu_;                   // one request at a time on the one runtime
     std::unique_ptr<InklingBundle> inkling_; // inkling only; reads gguf_'s mapping, so it is declared after gguf_
     std::mutex inkling_mu_;
+    std::unique_ptr<Inkling2Bundle> inkling2_;   // inkling2 only; frees its runtime in its own destructor
+    std::mutex inkling2_mu_;                     // one request at a time on the one runtime
     uint32_t        ds4_vocab_ = 0;       // cached: vocab() cannot see into Ds4Bundle
     // DeepSeek-V4-Flash-Vision-Exp (docs/deepseek4/70_VISION_EXP_PORT_PLAN.md P3/P4).
     // load() finds the vision sidecar beside the GGUF and uploads the tower on

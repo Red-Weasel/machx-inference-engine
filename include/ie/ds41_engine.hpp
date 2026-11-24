@@ -5,6 +5,7 @@
 // One request at a time at --parallel 1 (the path the engine always had); --parallel N > 1 serves N requests at once on N
 // lanes (P4 B6b, Ds41Serve below, docs/deepseek41/P4_B6B_SERVE.md).
 #pragma once
+#include "ie/tool_guard.hpp"
 #include "ie/deepseek41.hpp"
 #include "ie/deepseek41_engram.hpp"
 #include <cstdio>
@@ -62,6 +63,7 @@ struct Ds41Serve {
         bool     lookup = false; Ds41NgramIndex idx;   // prompt-lookup speculation for this lane (Phase 58)
         std::vector<int32_t> out;                 // every committed id (the repetition rule)
         std::vector<int32_t> outbox;              // committed ids the request thread has not taken
+        std::unique_ptr<LaneGuard> guard;         // the request's tool-call guard (null: none)
         std::vector<float> first_logits, scratch; // the prompt's last row (kPromptReady); the sampler's copy of a row
         std::string finish;                       // "" while running; "stop" / "length" / "repetition" / "abort" / "error: ..."
         bool     want_stop = false;               // the request thread's cancel: honoured at the lane's next completion
@@ -104,6 +106,9 @@ struct Ds41Serve {
 };
 
 struct Ds41Bundle {
+    // the tool-call guard's token texts (built at the first guarded request)
+    std::vector<std::string>                    guard_pieces;
+    std::once_flag                              guard_once;
     DeepSeek41Model                             model;
     Ds41EngramTables                            tables;
     Tokenizer                                   tok;

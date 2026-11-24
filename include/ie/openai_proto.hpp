@@ -98,7 +98,8 @@ std::string chat_chunk_sse_tool_calls(const std::string& model, const std::strin
 std::string chat_chunk_sse_usage(const std::string& model, const std::string& id,
                                  int64_t created, uint32_t prompt_tokens,
                                  uint32_t completion_tokens,
-                                 uint32_t cached_tokens = 0);
+                                 uint32_t cached_tokens = 0, uint32_t lane = 0, uint32_t lane_ctx = 0,
+                                 double prefill_ms = 0, double restore_ms = 0, double decode_ms = 0);
 
 // root (non-empty only for a layout-named server): the underlying model id.
 std::string models_json(const std::string& model_id, const std::string& root = "");

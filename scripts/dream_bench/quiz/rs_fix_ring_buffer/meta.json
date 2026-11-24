@@ -1,0 +1,1 @@
+{"id": "rs_fix_ring_buffer", "area": "debugging", "lang": "rust", "kind": "fix", "file": "solution.rs", "timeout": 20}

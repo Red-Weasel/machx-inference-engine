@@ -6,6 +6,7 @@
 #include "nlohmann/json.hpp"
 
 #include <algorithm>
+#include <queue>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
@@ -638,7 +639,57 @@ void Tokenizer::bpe_merge_gemma(std::string_view seg, std::vector<int32_t>& out)
 // on ties); unresolved symbols fall back to <0xXX> byte tokens. The greedy
 // "merge the global-best pair each pass" is equivalent to llama's priority
 // queue (both repeatedly merge the highest-scoring mergeable bigram).
+// 2026-11-20: the same merges in O(n log n) (llama.cpp's llm_tokenizer_spm: symbols in a linked list, candidate bigrams in a
+// priority queue by (score desc, left position asc); a bigram whose symbols changed since it was queued is skipped). The
+// quadratic loop below (bpe_merge_spm_ref) re-scanned every pair after every merge over the WHOLE segment -- SPM has no
+// pre-split -- and took 4.85 s on Dream's 22,000-character opening (Xing4). IE_TOK_SPM_REF=1 runs the old loop.
 void Tokenizer::bpe_merge_spm(std::string_view seg, std::vector<int32_t>& out) const {
+    if (seg.empty()) return;
+    static const bool ref = [] { const char* v = std::getenv("IE_TOK_SPM_REF"); return v && *v == '1'; }();
+    if (ref) { bpe_merge_spm_ref(seg, out); return; }
+    struct Sym { int32_t prev, next; uint32_t off, len; int32_t id; };
+    std::vector<Sym> sy;
+    sy.reserve(seg.size());
+    for (size_t i = 0; i < seg.size();) {
+        const size_t n = std::min<size_t>(utf8_len(uint8_t(seg[i])), seg.size() - i);
+        sy.push_back({int32_t(sy.size()) - 1, int32_t(sy.size()) + 1, uint32_t(i), uint32_t(n), bpe_lookup_or_neg(seg.substr(i, n))});
+        i += n;
+    }
+    sy.back().next = -1;
+    struct Big { float score; int32_t left, right; uint32_t len; int32_t id; };
+    auto worse = [](const Big& a, const Big& b) { return a.score < b.score || (a.score == b.score && a.left > b.left); };
+    std::priority_queue<Big, std::vector<Big>, decltype(worse)> q(worse);
+    auto add = [&](int32_t l, int32_t r) {
+        if (l < 0 || r < 0) return;
+        const uint32_t len = sy[size_t(l)].len + sy[size_t(r)].len;
+        const int32_t id = bpe_lookup_or_neg(seg.substr(sy[size_t(l)].off, len));
+        if (id >= 0) q.push({scores_[size_t(id)], l, r, len, id});
+    };
+    for (int32_t i = 0; i + 1 < int32_t(sy.size()); ++i) add(i, i + 1);
+    while (!q.empty()) {
+        const Big b = q.top(); q.pop();
+        Sym& L = sy[size_t(b.left)];
+        Sym& R = sy[size_t(b.right)];
+        if (L.len == 0 || R.len == 0 || L.len + R.len != b.len) continue;   // a symbol changed since it was queued
+        L.len = b.len; L.id = b.id; R.len = 0;
+        L.next = R.next;
+        if (R.next >= 0) sy[size_t(R.next)].prev = b.left;
+        add(L.prev, b.left);
+        add(b.left, L.next);
+    }
+    static const char* kHex = "0123456789ABCDEF";
+    for (int32_t i = 0; i >= 0; i = sy[size_t(i)].next) {
+        const Sym& x = sy[size_t(i)];
+        if (x.id >= 0) { out.push_back(x.id); continue; }
+        for (unsigned char c : seg.substr(x.off, x.len)) {                   // byte fallback <0xXX>
+            const char buf[7] = {'<', '0', 'x', kHex[c >> 4], kHex[c & 15], '>', 0};
+            const int32_t bid = bpe_lookup_or_neg(std::string_view(buf, 6));
+            if (bid >= 0) out.push_back(bid);
+        }
+    }
+}
+
+void Tokenizer::bpe_merge_spm_ref(std::string_view seg, std::vector<int32_t>& out) const {
     if (seg.empty()) return;
     struct Sym { std::string s; int32_t id; };
     std::vector<Sym> syms;
@@ -1742,13 +1793,144 @@ std::string xml_param_type(const xjson& tools, std::string_view fn, std::string_
 }
 
 // Is `name` a function of the tools array? (No array: nothing to check against.)
-bool xml_known_function(const xjson& tools, std::string_view name) {
-    if (!tools.is_array() || tools.empty()) return true;
+bool xml_listed_function(const xjson& tools, std::string_view name) {
+    if (!tools.is_array()) return false;
     for (const auto& t : tools) {
         const xjson& f = (t.is_object() && t.contains("function") && t["function"].is_object()) ? t["function"] : t;
         if (f.is_object() && f.contains("name") && f["name"].is_string() && f["name"].get_ref<const std::string&>() == name) return true;
     }
     return false;
+}
+
+// 2026-11-21 (the owner's coaching quiz: all 58 of the 27B's calls in Dream came back as text): Dream offers only its
+// dispatcher (tool_call / tool_schema, plus task and fork_verifier_agent) and names the rest of its tools in the
+// dispatcher's description, one per line as "name — what it does" under "Available:". The models call those tools by
+// name (write_file, run_bash, ...), and Dream runs them; refusing them here turned every such call into text that only
+// Dream's own recovery could rescue. A name the catalog lists is a real call, the same rule as the tool guard's open names
+// (tool_guard.cpp). Names nowhere in the catalog still stay text (a quoted example, prose).
+bool xml_catalog_function(const xjson& tools, std::string_view name) {
+    if (!tools.is_array() || name.empty()) return false;
+    for (const auto& t : tools) {
+        const xjson& f = (t.is_object() && t.contains("function") && t["function"].is_object()) ? t["function"] : t;
+        if (!f.is_object() || !f.contains("name") || !f["name"].is_string()) continue;
+        const std::string& fn = f["name"].get_ref<const std::string&>();
+        if (fn != "tool_schema" && fn != "tool_call") continue;
+        if (!f.contains("description") || !f["description"].is_string()) continue;
+        const std::string& d = f["description"].get_ref<const std::string&>();
+        for (size_t at = d.find(name); at != std::string::npos; at = d.find(name, at + 1)) {
+            const bool line_start = at == 0 || d[at - 1] == '\n';
+            const std::string_view rest = std::string_view(d).substr(at + name.size());
+            // "name — ...", "name - ..." or (Dream since 2026-11-21) "name(arg, opt?) — ...": the name ends at the dash or the
+            // bracket, so "write_file" never matches a line for "write_file_x"
+            // (a tool with neither description nor arguments is its bare name on the line)
+            if (line_start && (rest.rfind(" \u2014 ", 0) == 0 || rest.rfind(" - ", 0) == 0 || rest.rfind("(", 0) == 0 ||
+                               rest.empty() || rest[0] == '\n' || rest[0] == '\r')) return true;
+        }
+    }
+    return false;
+}
+
+// 2026-11-21 (the owner's coaching quiz, Qwen3.8 Flash in Dream: 43 of 519 tool calls): inside the XML tool-call tags the
+// model sometimes HTML-escapes the code it writes -- `if capacity &lt; 0:` into a Python file -- although its chat template
+// passes argument text raw. Every such file is broken, and the model's repairs escaped further (&amp;lt;) until Dream's loop
+// guard ended the problem. A text value that holds entities and NO raw '<' is decoded once (&lt; &gt; &amp; &quot;
+// &#39; &apos;, one left-to-right pass, never twice). The model escapes '<' but often leaves '>' raw (>=, ->), so only a raw
+// '<' -- which any HTML / XML holds, where "&lt;" is meant -- keeps the value exactly as written. In the quiz run this decodes
+// 33 of the 34 escaped arguments; the one left is a sed command holding a raw '<' itself. IE_TOOL_UNESCAPE=0 turns it off.
+bool xml_unescape_text(std::string& v, bool force = false) {
+    static const bool on = [] { const char* e = std::getenv("IE_TOOL_UNESCAPE"); return !(e && *e == '0'); }();
+    if (!on || v.find('&') == std::string::npos) return false;
+    // markup always holds a raw '<'; a raw '>' (>=, ->, =>) does not mean markup. `force` (a shell command, or a file the call
+    // names with a source-code extension, where an entity is never the meant text): decoded even beside a raw '<' -- the model
+    // mixes `#include &lt;cctype&gt;` with raw '<' in one file
+    if (!force && v.find('<') != std::string::npos) return false;
+    static const std::pair<std::string_view, char> ents[] = {{"&lt;", '<'}, {"&gt;", '>'}, {"&amp;", '&'}, {"&quot;", '"'},
+                                                             {"&#39;", '\''}, {"&apos;", '\''}};
+    // An entity that sits directly between two quote characters -- "&lt;" in `s.replace("<", "&lt;")`, an escape table --
+    // is the program's own text and stays. Decoding happens only when an entity other than "&amp;" is decoded (a lone
+    // "&amp;" is a URL's query); with `force`, "&amp;" counts too ("&amp;lt;", the model's double escape, `a &amp;&amp; b`).
+    auto quote = [](char c) { return c == '"' || c == '\'' || c == '`'; };
+    std::string out;
+    out.reserve(v.size());
+    bool any = false;
+    for (size_t i = 0; i < v.size();) {
+        bool hit = false;
+        if (v[i] == '&')
+            for (const auto& e : ents)
+                if (v.compare(i, e.first.size(), e.first) == 0) {
+                    const size_t end = i + e.first.size();
+                    if (i > 0 && quote(v[i - 1]) && end < v.size() && quote(v[end])) break;   // the program's own text
+                    out += e.second; i = end; hit = true;
+                    if (force || e.first != "&amp;") any = true;
+                    break;
+                }
+        if (!hit) out += v[i++];
+    }
+    if (!any) return false;
+    v.swap(out);
+    return true;
+}
+
+// argument names whose value is free text (file content, a command, an edit's strings, a search): never parsed as JSON
+bool xml_free_text_arg(std::string_view k) {
+    static const std::string_view names[] = {"content", "contents", "text", "command", "cmd", "script", "old_string", "new_string",
+                                             "code", "body", "message", "prompt", "query", "pattern", "description", "notes",
+                                             "title", "path", "file", "file_path", "filename", "url", "search", "name", "data"};
+    for (auto n : names) if (k == n) return true;
+    return false;
+}
+
+bool xml_code_path(const xjson& args) {
+    static const std::string_view exts[] = {".py", ".pyi", ".c", ".h", ".cc", ".cpp", ".cxx", ".hpp", ".hh", ".hxx", ".rs", ".js",
+                                            ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".go", ".java", ".kt", ".rb", ".php", ".sh",
+                                            ".bash", ".zsh", ".lua", ".cs", ".swift", ".scala", ".zig"};
+    for (const char* k : {"path", "file", "file_path", "filename"}) {
+        if (!args.contains(k) || !args[k].is_string()) continue;
+        const std::string& p = args[k].get_ref<const std::string&>();
+        for (auto e : exts) if (p.size() > e.size() && p.compare(p.size() - e.size(), e.size(), e) == 0) return true;
+    }
+    return false;
+}
+
+// 2026-11-21 (Qwen3.8 Flash in Dream), after the parameters are read:
+//  * `{"arguments": "{\"command\": ..}"}` for a tool that has no `arguments` argument (the model wrapped the call as
+//    tool_call would): the inner object becomes the arguments;
+//  * HTML entities in text values decoded (xml_unescape_text), forced for a shell command and for a call whose path has a
+//    source-code extension; the strings inside `edits` too.
+void xml_fix_args(const xjson& tools, const std::string& name, xjson& args) {
+    if (!args.is_object()) return;
+    if (args.size() == 1 && args.contains("arguments") && name != "tool_call" && xml_param_type(tools, name, "arguments").empty()) {
+        xjson inner = args["arguments"];
+        if (inner.is_string()) inner = xjson::parse(inner.get<std::string>(), nullptr, /*allow_exceptions=*/false);
+        if (inner.is_object()) args = std::move(inner);
+    }
+    const bool code = xml_code_path(args);
+    const bool no_schema = !xml_listed_function(tools, name);
+    auto fix = [&](xjson& v, std::string_view key, bool top) {
+        if (!v.is_string()) return;
+        std::string s = v.get<std::string>();
+        // (run 3) a catalog tool's list / object written as a JSON string -- program_execute's tools "[]" -- is the list
+        if (top && no_schema && !xml_free_text_arg(key) && !s.empty() && (s[0] == '[' || s[0] == '{')) {
+            xjson j = xjson::parse(s, nullptr, /*allow_exceptions=*/false);
+            if (j.is_array() || j.is_object()) { v = std::move(j); return; }
+        }
+        const bool force = code || key == "command" || key == "cmd" || key == "script";
+        bool any = xml_unescape_text(s, force);
+        // (run 3) in source code and commands the model also escapes twice ("&amp;lt;"): decoded until it is plain
+        for (int pass = 0; force && pass < 2 && xml_unescape_text(s, true); ++pass) any = true;
+        if (any) v = s;
+    };
+    for (auto it = args.begin(); it != args.end(); ++it) {
+        if (it.value().is_array())
+            for (auto& el : it.value())
+                if (el.is_object()) for (auto jt = el.begin(); jt != el.end(); ++jt) fix(jt.value(), jt.key(), false);
+        fix(it.value(), it.key(), true);
+    }
+}
+
+bool xml_known_function(const xjson& tools, std::string_view name) {
+    if (!tools.is_array() || tools.empty()) return true;
+    return xml_listed_function(tools, name) || xml_catalog_function(tools, name);
 }
 
 // The value's text as the schema says: strings stay strings; boolean takes
@@ -1814,8 +1996,12 @@ bool xml_call_from_body(std::string_view body, const xjson& tools, xjson& call, 
     xjson args = xjson::object();
     std::string args_text;   // set when the arguments come as a string (the JSON form), else args.dump()
     if (f0 != std::string_view::npos) {
-        const size_t f1 = body.find('>', f0 + 10);
+        size_t f1 = body.find('>', f0 + 10);
         if (f1 == std::string_view::npos) return false;
+        // 2026-11-21 (Flash in Dream, DeepSWE abs-module-cache-flags): `<function=run_map_hu42` + newline + parameters --
+        // a header the model never closed. The name ends at the line's end; the parameters start on the next line.
+        if (const size_t nl = body.find('\n', f0 + 10); nl != std::string_view::npos && nl < f1 &&
+            body.substr(nl, f1 - nl).find('<') != std::string_view::npos) f1 = nl;
         name = std::string(xml_trim(body.substr(f0 + 10, f1 - (f0 + 10))));
         if (name.empty()) return false;
         const size_t fe = body.find("</function>", f1);
@@ -1835,7 +2021,23 @@ bool xml_call_from_body(std::string_view body, const xjson& tools, xjson& call, 
                 while (!v.empty() && (v.back() == '\n' || v.back() == ' ')) v.remove_suffix(1);
                 q = nx;
             }
-            if (!key.empty()) args[key] = xml_typed_value(xml_strip_one_newline(v), xml_param_type(tools, name, key));
+            if (!key.empty()) {
+                std::string val = xml_strip_one_newline(v);
+                // a catalog tool has no schema here: its values stay text (a file's content that starts with "{" is
+                // still text), except a plain integer or true / false
+                std::string ty = xml_param_type(tools, name, key);
+                if (ty.empty() && !xml_listed_function(tools, name)) {
+                    const bool integer = !val.empty() && val.find_first_not_of("-0123456789") == std::string::npos &&
+                                         val.find('-', 1) == std::string::npos && val != "-";
+                    // 2026-11-21: a list / object for an argument that is not free text (str_replace_edit's `edits`) stays a
+                    // list / object -- sent as a string, Dream refused it ("expected array"); file content, commands, the
+                    // edit strings stay text whatever they start with
+                    const bool json_ok = !xml_free_text_arg(key) && !val.empty() && (val[0] == '[' || val[0] == '{') &&
+                                         !xjson::parse(val, nullptr, /*allow_exceptions=*/false).is_discarded();
+                    ty = integer ? "integer" : (val == "true" || val == "false") ? "boolean" : json_ok ? "" : "string";
+                }
+                args[key] = xml_typed_value(val, ty);
+            }
         }
     } else if (xjson j = xjson::parse(xml_trim(body), nullptr, /*allow_exceptions=*/false);
                j.is_object() && j.contains("name") && j["name"].is_string()) {
@@ -1881,7 +2083,15 @@ bool xml_call_from_body(std::string_view body, const xjson& tools, xjson& call, 
             complete = true;
         }
     }
+    // (same reply) a name no tool has, with exactly the dispatcher's two arguments -- `name` a tool the request knows and
+    // `arguments` -- is the dispatcher's call with its own name garbled: it is read as `tool_call`. Only then; any other
+    // unknown name stays text.
+    if (!xml_known_function(tools, name) && args_text.empty() && args.is_object() && args.size() == 2 &&
+        args.contains("name") && args["name"].is_string() && args.contains("arguments") &&
+        xml_listed_function(tools, "tool_call") && xml_known_function(tools, args["name"].get<std::string>()))
+        name = "tool_call";
     if (!xml_known_function(tools, name)) return false;
+    if (args_text.empty()) xml_fix_args(tools, name, args);
     if (args_text.empty()) args_text = args.dump();
     call = {{"type", "function"}, {"function", {{"name", name}, {"arguments", args_text}}}};
     return true;

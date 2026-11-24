@@ -30,16 +30,20 @@
 #include <functional>
 #include <mutex>
 #include <span>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "ie/tool_guard.hpp"
+
 namespace ie {
 
 // The request's sampler settings (the engine's SamplingParams, without the engine header).
 struct LanesSampling {
+    const LanesFilter* filter = nullptr;   // set per step by LanesServe (never by the caller)
     float    temperature = 0.7f;
     uint32_t top_k = 40;
     float    top_p = 0.95f, min_p = 0.f;
@@ -78,6 +82,10 @@ struct LanesRequest {
     // query's prompt shares even after the template re-renders the turns between (the arch's snapshot there is kept through
     // the cache's supersede; Engine::chat sets it)
     bool anchor = false;
+    // 2026-11-20: every tool call valid -- the request's tools (ToolGuard::make); the sampler drops the tokens that would break a
+    // call. guard_think: the reply starts inside the reasoning (the prompt opened <think>). Null = no guard.
+    std::shared_ptr<const ToolGuard> guard;
+    bool guard_think = false;
 };
 
 struct LanesResult {
@@ -85,6 +93,7 @@ struct LanesResult {
     // P4 B27: the byte offset in `text` after the first generated </think> (GenerateResult::answer_start); npos when none.
     size_t answer_start = std::string::npos;
     uint32_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0, lane = 0;
+    uint32_t lane_ctx = 0;   // 2026-11-21: the positions the lane that served the request holds (prompt + reply fit in it)
     double   prefill_ms = 0, decode_ms = 0;
 };
 
@@ -217,6 +226,8 @@ public:
     virtual std::string pipe_stats() const { return {}; }
     // one id from the lane's logits: first = the prompt's (prompt_end's), else the step that just finished. window = the
     // repetition window (prompt tail + output), seed = rng + the ids sampled before.
+    // the vocabulary size (the tool-call guard's token table; 0 = the arch takes no guard)
+    virtual uint32_t vocab() const { return 0; }
     virtual int32_t sample(uint32_t lane, bool first, const LanesSampling& sp, std::span<const int32_t> window,
                            uint64_t seed, std::string& err) = 0;
     virtual void keep_logits(uint32_t lane) = 0;                // the done callback of the piece that reached T
@@ -231,6 +242,8 @@ public:
         return {};
     }
     virtual std::string detok(std::span<const int32_t> out) const = 0;   // the reply's text so far (whole)
+    // the tool-call guard's token texts: every special spelled (detok may hide </think>); default detok
+    virtual std::string guard_detok(std::span<const int32_t> out) const { return detok(out); }
     // the lane pipe: one step in flight per lane; `done(lane)` runs on the last stage's thread and may resubmit the lane once
     using DoneFn = std::function<void(uint32_t lane)>;
     virtual std::string pipe_start(DoneFn done) = 0;
@@ -474,6 +487,7 @@ public:
         bool     kept = false;                 // the pipe ran the prompt's last row (its logits kept)
         std::vector<int32_t> hist;             // prompt ++ committed ids (the repetition window's source)
         std::vector<int32_t> out, outbox;
+        std::unique_ptr<LaneGuard> guard;   // the request's tool-call guard state (null: no guard)
         std::string finish;
         bool     want_stop = false, lost = false, parked = false;
         uint32_t mark_at = 0;                  // P4 B15: plan.mark still due (0 = none)
@@ -570,6 +584,10 @@ private:
     Options     o_;
     std::vector<Lane> lanes_;
     mutable std::mutex mu_;
+    // each token's text inside a reply, for the tool-call guard (built at the first guarded request)
+    std::vector<std::string> pieces_;
+    std::once_flag pieces_once_;
+    const std::vector<std::string>& pieces();
     std::condition_variable cv_;
     bool     piping_ = false, pause_ = false, turn_busy_ = false, stopping_ = false;
     std::deque<uint32_t> fifo_;                // P4 B15: prompts whose pieces go through the pipe, in arrival order

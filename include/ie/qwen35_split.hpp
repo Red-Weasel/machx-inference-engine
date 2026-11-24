@@ -32,7 +32,10 @@
 #include "ie/qwen35_dense.hpp"       // MtpHead + Qwen35SpecCheckpoint (spec-decode)
 #include "ie/qwen4_vision.hpp"       // Qwen4VisSpan + the mrope slice / splice ranges (P4 B45 vision)
 
+#include <atomic>
+#include <condition_variable>
 #include <functional>
+#include <thread>
 #include <span>
 
 #include <sycl/sycl.hpp>
@@ -60,6 +63,19 @@ public:
                      uint32_t max_ctx = 2048, bool int8_kv = false);
 
     const Qwen35Config& config() const noexcept { return cfg_; }
+
+    // ---- 2026-11-21: TENSOR PARALLEL on two cards (IE_QWEN35_TP=1). Set before load(). Every layer runs on BOTH cards,
+    // each holding exactly half of every projection: full attention 12 of the 24 query heads and 2 of the 4 KV heads (the
+    // output projection split by its input), DeltaNet 8 of the 16 key heads and the 24 value heads that tile them (conv,
+    // state, gate, alpha/beta, A and dt by head; the output projection split by its input), the FFN gate/up by output and
+    // down by input. Two sums per layer (the attention/DeltaNet block and the FFN), pushed card to card (one shared
+    // context with peer access: push only, peer reads are not used) and ordered on the cards by events, never by the host.
+    // Each card reads half the weights per token and both work at once (the layer split runs them one after the other).
+    // The lanes, the prompt cache, the MTP rounds and the restart points are this model's own: to the lanes the pair is ONE
+    // stage (n_stages() == 1) whose step drives both cards. The embedding and the head stay on card 0.
+    void set_tensor_parallel(bool on) noexcept { tp_ = on; }
+    bool tensor_parallel() const noexcept { return tp_; }
+    uint32_t n_stages() const noexcept { return tp_ ? 1u : n_dev_; }
 
     // Per-card state accessors for the multi-GPU FleetPrefixCache (prompt/KV cache).
     // 27B is a DeltaNet+full-attn hybrid (dense FFN), so it snapshots BOTH per-card
@@ -383,6 +399,7 @@ private:
         sycl::half *ffn_gate = nullptr;  // [T, F 17408]
         sycl::half *ffn_up = nullptr;    // [T, F]
         sycl::half *ffn_h = nullptr;     // [T, F]
+        sycl::half *tp_rx[2] = {nullptr, nullptr};   // tensor parallel: the other card's partial sums land here ([T, hidden], two in turn)
     };
 
     DeviceFleet*  fleet_ = nullptr;
@@ -397,7 +414,32 @@ private:
     PipeFeed pipe_feed_[2];
     std::string ensure_pipe_feed(uint32_t rows);
 
-    std::vector<LayerW> layers_;              // global index L; ptrs on dev_of_layer[L]
+    std::vector<LayerW> layers_;              // global index L; ptrs on dev_of_layer[L] (tensor parallel: card 0's halves)
+
+    // ---- tensor parallel (set_tensor_parallel) ----
+    bool tp_ = false;
+    Qwen35Config tcfg_;                       // one card's dimensions (the head counts and the FFN width halved)
+    std::vector<LayerW> layers1_;             // card 1's halves
+    const Qwen35Config& wcfg() const noexcept { return tp_ ? tcfg_ : cfg_; }
+    const LayerW& lay(uint32_t dev, uint32_t L) const noexcept { return (tp_ && dev == 1) ? layers1_[L] : layers_[L]; }
+    bool on_dev(uint32_t L, uint32_t dev) const noexcept { return tp_ || plan_.dev_of_layer[L] == dev; }
+    // the sum of the two cards' partial [n] rows into buf on BOTH cards (each card's walk calls it at the same points)
+    void tp_ar(uint32_t dev, sycl::half* buf, uint64_t n);
+    void tp_bcast_x(uint32_t T);              // card 0's residual rows (the embedding) to card 1
+    // fn(0) on the calling thread and fn(1) on the twin thread at once; "" or the first error (a failed walk stops the other)
+    std::string tp_each(const std::function<std::string(uint32_t)>& fn);
+    void tp_twin_loop();
+    std::atomic<uint64_t> tp_seq_[2]{{0}, {0}};
+    sycl::event tp_ev_[2][2];
+    uint64_t tp_n_[2] = {0, 0};
+    std::atomic<bool> tp_abort_{false};
+    std::thread tp_thr_;
+    std::mutex tp_mu_;
+    std::condition_variable tp_cv_, tp_done_cv_;
+    const std::function<std::string(uint32_t)>* tp_job_ = nullptr;
+    uint64_t tp_go_ = 0, tp_done_ = 0;
+    std::string tp_err_;
+    bool tp_quit_ = false;
     void*  token_embd_ = nullptr;  DType token_embd_dtype_ = DType::kCount;   // packed AoS (lookup)
     float* output_norm_ = nullptr;
     SplitW output_;                           // lm_head (Q8_0-SoA when packed)

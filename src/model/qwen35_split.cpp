@@ -21,6 +21,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <stdexcept>
+#include <thread>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -74,6 +78,74 @@ struct LaneVerifyScope {
     LaneVerifyScope() { t_lane_verify = true; }
     ~LaneVerifyScope() { t_lane_verify = false; }
 };
+
+// 2026-11-21 tensor parallel: one card's half of a GGUF tensor, cut on the host before the usual upload. rows = output
+// rows (shape[1]; a 1-D tensor's elements), cols = input columns (shape[0], whole blocks of the tensor's type); {first,
+// count} ranges, empty = all. `whole`: the tensor is not cut (both cards hold all of it).
+struct TpCut { GgufTensorInfo ti{}; std::vector<uint8_t> buf; bool whole = false; };
+using TpRanges = std::vector<std::pair<uint64_t, uint64_t>>;
+
+std::string tp_slice(const GgufTensorInfo* t, const TpRanges& rows, const TpRanges& cols, TpCut& out) {
+    const TypeInfo* ti = type_info(t->dtype);
+    if (!ti || ti->row_meta_size) return "type " + std::string(type_name(t->dtype)) + " cannot be cut";
+    if (t->n_dims != 1 && t->n_dims != 2) return "expected a 1-D or 2-D tensor";
+    const bool one_d = t->n_dims == 1;
+    const uint64_t be = ti->block_size, bb = ti->block_bytes;
+    const uint64_t K = one_d ? 1 : t->shape[0], N = one_d ? t->shape[0] : t->shape[1];
+    if (one_d && be != 1) return "a quantized 1-D tensor";
+    if (K % be) return "rows are not whole blocks";
+    const uint64_t rb = K / be * bb;
+    if (rb * N != t->nbytes) return "size does not match its shape";
+    const TpRanges R = rows.empty() ? TpRanges{{0, N}} : rows;
+    const TpRanges C = cols.empty() ? TpRanges{{0, K}} : cols;
+    uint64_t nN = 0, nK = 0;
+    for (const auto& [f, n] : R) { if (f + n > N) return "row range past the tensor"; nN += n; }
+    for (const auto& [f, n] : C) {
+        if (f + n > K) return "column range past the tensor";
+        if (f % be || n % be) return "column range off the " + std::to_string(be) + "-element block grid";
+        nK += n;
+    }
+    out.buf.resize(nN * (nK / be * bb));
+    uint8_t* o = out.buf.data();
+    for (const auto& [f, n] : R)
+        for (uint64_t r = f; r < f + n; ++r) {
+            const uint8_t* src = t->data + r * rb;
+            for (const auto& [cf, cn] : C) { std::memcpy(o, src + cf / be * bb, cn / be * bb); o += cn / be * bb; }
+        }
+    out.ti = *t;
+    if (one_d) out.ti.shape[0] = nN; else { out.ti.shape[0] = nK; out.ti.shape[1] = nN; }
+    out.ti.nbytes = out.buf.size();
+    out.ti.data = out.buf.data();
+    return {};
+}
+
+// Card c's half of layer tensor `n` (the header's tensor-parallel note). DeltaNet: card c keeps key heads
+// [hk*c, hk*(c+1)) and the value heads that tile them (value head j reads key head j % n_k: the 27B's tiled repeat), so
+// its local tiled repeat over its hk key heads reproduces the pairing; the conv channels, gate rows, alpha/beta rows, A,
+// dt and the output projection's input columns follow those heads.
+std::string tp_cut(const GgufTensorInfo* t, std::string_view n, const Qwen35Config& cfg, uint32_t c, TpCut& out) {
+    const DenseConfig& d = cfg.dense;
+    const uint64_t HD = d.head_dim, nq = d.n_q_heads / 2, nkv = d.n_kv_heads / 2, Fh = d.ffn / 2;
+    const uint64_t SKH = cfg.ssm_n_k_heads, hk = SKH / 2, SHD = cfg.ssm_state, rep = cfg.ssm_n_v_heads / SKH;
+    const uint64_t VHD = cfg.ssm_inner / cfg.ssm_n_v_heads;
+    TpRanges vh, vch;   // value heads; their channels
+    for (uint64_t r = 0; r < rep; ++r) { vh.push_back({SKH * r + hk * c, hk}); vch.push_back({(SKH * r + hk * c) * VHD, hk * VHD}); }
+    if (n == "attn_qkv.weight" || n == "ssm_conv1d.weight") {   // [q: SKH*SHD | k: SKH*SHD | v: SI]
+        TpRanges r{{hk * c * SHD, hk * SHD}, {SKH * SHD + hk * c * SHD, hk * SHD}};
+        for (const auto& [f, k] : vch) r.push_back({2 * SKH * SHD + f, k});
+        return tp_slice(t, r, {}, out);
+    }
+    if (n == "attn_gate.weight") return tp_slice(t, vch, {}, out);
+    if (n == "ssm_alpha.weight" || n == "ssm_beta.weight" || n == "ssm_a" || n == "ssm_dt.bias") return tp_slice(t, vh, {}, out);
+    if (n == "ssm_out.weight") return tp_slice(t, {}, vch, out);
+    if (n == "attn_q.weight") return tp_slice(t, {{c * nq * 2 * HD, nq * 2 * HD}}, {}, out);   // per head [q | gate]
+    if (n == "attn_k.weight" || n == "attn_v.weight") return tp_slice(t, {{c * nkv * HD, nkv * HD}}, {}, out);
+    if (n == "attn_output.weight") return tp_slice(t, {}, {{c * nq * HD, nq * HD}}, out);
+    if (n == "ffn_gate.weight" || n == "ffn_up.weight") return tp_slice(t, {{c * Fh, Fh}}, {}, out);
+    if (n == "ffn_down.weight") return tp_slice(t, {}, {{c * Fh, Fh}}, out);
+    out.whole = true;   // the norms
+    return {};
+}
 
 // Host-side canonical Q6_K row dequant — mirrors ggml's dequantize_row_q6_K
 // (natural element order). COPY of qwen35_dense.cpp:dequant_q6_K_row
@@ -257,7 +329,12 @@ inline sycl::event dequant_q8_0_soa_to_Bt(sycl::queue& q, const int8_t* qs,
 
 }  // namespace
 
-Qwen35SplitModel::~Qwen35SplitModel() { free_all(); }
+Qwen35SplitModel::~Qwen35SplitModel() {
+    { std::lock_guard<std::mutex> lk(tp_mu_); tp_quit_ = true; }
+    tp_cv_.notify_all();
+    if (tp_thr_.joinable()) tp_thr_.join();
+    free_all();
+}
 
 void Qwen35SplitModel::free_all() {
     if (!fleet_) return;
@@ -418,19 +495,47 @@ std::string Qwen35SplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
     layers_.assign(n_layers, {});
     dn_local_.assign(n_layers, 0);
     kv_local_.assign(n_layers, 0);
+    if (tp_) {
+        if (n_dev_ != 2) return "tensor parallel: needs exactly two cards (" + std::to_string(n_dev_) + " in the plan)";
+        if (!fleet.shared_ctx() || !fleet.p2p())
+            return "tensor parallel: the two cards need one shared context with peer access (P2P)";
+        if (d.n_q_heads % 2 || d.n_kv_heads % 2 || d.ffn % 2 || cfg.ssm_n_k_heads % 2 ||
+            cfg.ssm_n_v_heads % cfg.ssm_n_k_heads || cfg.ssm_inner % cfg.ssm_n_v_heads)
+            return "tensor parallel: the head counts / FFN width do not halve";
+        tcfg_ = cfg;
+        tcfg_.dense.n_q_heads /= 2; tcfg_.dense.n_kv_heads /= 2; tcfg_.dense.ffn /= 2;
+        tcfg_.ssm_inner /= 2; tcfg_.ssm_n_k_heads /= 2; tcfg_.ssm_n_v_heads /= 2;
+        layers1_.assign(n_layers, {});
+        std::fprintf(stderr, "[qwen35split] tensor parallel: every layer on both cards, half of each projection a card "
+                             "(attention %u+%u heads, DeltaNet %u+%u key heads, FFN %u+%u), two card-to-card sums a layer\n",
+                     tcfg_.dense.n_q_heads, tcfg_.dense.n_q_heads, tcfg_.ssm_n_k_heads, tcfg_.ssm_n_k_heads,
+                     tcfg_.dense.ffn, tcfg_.dense.ffn);
+    }
 
-    for (uint32_t L = 0; L < n_layers; ++L) {
-        const uint32_t dev = plan.dev_of_layer[L];
+    for (uint32_t L = 0; L < n_layers; ++L)
+    for (uint32_t tpc = 0; tpc < (tp_ ? 2u : 1u); ++tpc) {
+        const uint32_t dev = tp_ ? tpc : plan.dev_of_layer[L];
         DeviceAllocator& a = fleet.dev(dev);
         auto& own = owned_[dev];
-        LayerW& w = layers_[L];
+        LayerW& w = (tp_ && dev == 1) ? layers1_[L] : layers_[L];
         w.is_linear = cfg.recurrent_layer(L);
+        // tensor parallel: this card's half of each tensor (tp_cut), alive until this layer's uploads are done
+        std::deque<TpCut> cuts;
+        auto TT = [&](const char* n) -> const GgufTensorInfo* {
+            const GgufTensorInfo* t = Tl(L, n);
+            if (!tp_ || !t) return t;
+            cuts.emplace_back();
+            if (auto m = tp_cut(t, n, cfg, dev, cuts.back()); !m.empty()) { err = std::string(n) + " (tensor-parallel cut): " + m; return nullptr; }
+            return cuts.back().whole ? t : &cuts.back().ti;
+        };
 
         auto LW = [&](const char* n) -> SplitW {
-            return build_split(a, Tl(L, n), own, err, dev_bytes_[dev]);
+            const GgufTensorInfo* t = TT(n);
+            if (!t && !err.empty()) return SplitW{};
+            return build_split(a, t, own, err, dev_bytes_[dev]);
         };
         auto F32 = [&](const char* n, float*& dst) -> std::string {
-            const auto* ti = Tl(L, n);
+            const auto* ti = TT(n);
             dst = dense::upload<float>(a, ti, own, err, DType::kF32);
             if (!err.empty()) return std::string(n) + ": " + err;
             if (ti) dev_bytes_[dev] += ti->nbytes;
@@ -450,13 +555,13 @@ std::string Qwen35SplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
             w.attn_gate = LW("attn_gate.weight"); if (!err.empty()) return layer_err("attn_gate");
             if (auto m = F32("ssm_a", w.ssm_a); !m.empty()) return "layer " + std::to_string(L) + " " + m;
             const uint32_t svh_pad = ((cfg.ssm_n_v_heads + 63u) / 64u) * 64u;   // 48 → 64
-            w.ssm_alpha = upload_f32_proj_fp16(a, Tl(L, "ssm_alpha.weight"), own, err, svh_pad);
+            w.ssm_alpha = upload_f32_proj_fp16(a, TT("ssm_alpha.weight"), own, err, svh_pad);
             if (!err.empty()) return layer_err("ssm_alpha");
-            w.ssm_beta  = upload_f32_proj_fp16(a, Tl(L, "ssm_beta.weight"), own, err, svh_pad);
+            w.ssm_beta  = upload_f32_proj_fp16(a, TT("ssm_beta.weight"), own, err, svh_pad);
             if (!err.empty()) return layer_err("ssm_beta");
             if (auto m = F32("ssm_dt.bias", w.ssm_dt_bias); !m.empty()) return "layer " + std::to_string(L) + " " + m;
             {   // ssm_conv1d [4, conv_ch] → cast fp16
-                const auto* ti = Tl(L, "ssm_conv1d.weight");
+                const auto* ti = TT("ssm_conv1d.weight");
                 if (auto m = F32("ssm_conv1d.weight", w.ssm_conv1d); !m.empty()) return "layer " + std::to_string(L) + " " + m;
                 const uint64_t n = ti->nbytes / sizeof(float);
                 w.ssm_conv1d_fp16 = static_cast<sycl::half*>(a.malloc(n * sizeof(sycl::half)));
@@ -465,7 +570,7 @@ std::string Qwen35SplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
                 cast_fp32_to_fp16(a.queue(), w.ssm_conv1d, w.ssm_conv1d_fp16, n).wait();
             }
             {   // ssm_norm [v_head_dim] → cast fp16
-                const auto* ti = Tl(L, "ssm_norm.weight");
+                const auto* ti = TT("ssm_norm.weight");
                 if (auto m = F32("ssm_norm.weight", w.ssm_norm); !m.empty()) return "layer " + std::to_string(L) + " " + m;
                 const uint64_t n = ti->nbytes / sizeof(float);
                 w.ssm_norm_fp16 = static_cast<sycl::half*>(a.malloc(n * sizeof(sycl::half)));
@@ -491,11 +596,13 @@ std::string Qwen35SplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
     // Per-card hybrid caches: count each card's linear/full-attn layers, assign
     // card-local indices, init one DeltaNetState + one KvCache per card.
     std::vector<uint32_t> n_lin(n_dev_, 0), n_full(n_dev_, 0);
-    for (uint32_t L = 0; L < n_layers; ++L) {
-        const uint32_t dev = plan.dev_of_layer[L];
-        if (layers_[L].is_linear) dn_local_[L] = n_lin[dev]++;
-        else                      kv_local_[L] = n_full[dev]++;
-    }
+    for (uint32_t L = 0; L < n_layers; ++L)
+        for (uint32_t tpc = 0; tpc < (tp_ ? 2u : 1u); ++tpc) {   // (tensor parallel: both cards hold every layer, same local index)
+            const uint32_t dev = tp_ ? tpc : plan.dev_of_layer[L];
+            if (layers_[L].is_linear) dn_local_[L] = n_lin[dev]++;
+            else                      kv_local_[L] = n_full[dev]++;
+        }
+    const Qwen35Config& W = wcfg();   // one card's head counts (tensor parallel: half)
     dn_.resize(n_dev_); kv_.resize(n_dev_);
     cur_.assign(n_dev_, 0);   // P4 B18: every card acts on lane 0 (the live state) until select_lane
     max_ctx_ = max_ctx;
@@ -503,10 +610,10 @@ std::string Qwen35SplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
         if (n_lin[dev]) {
             DeltaNetStateConfig dc{};
             dc.n_layers_linear = n_lin[dev];
-            dc.n_v_heads       = cfg.ssm_n_v_heads;       // 48
-            dc.v_head_dim      = cfg.ssm_state;           // 128
-            dc.k_head_dim      = cfg.ssm_state;           // 128
-            dc.conv_channels   = cfg.ssm_inner + 2u * cfg.ssm_n_k_heads * cfg.ssm_state;  // 10240
+            dc.n_v_heads       = W.ssm_n_v_heads;         // 48 (tensor parallel: 24)
+            dc.v_head_dim      = W.ssm_state;             // 128
+            dc.k_head_dim      = W.ssm_state;             // 128
+            dc.conv_channels   = W.ssm_inner + 2u * W.ssm_n_k_heads * W.ssm_state;  // 10240 (tensor parallel: 5120)
             dc.conv_kernel     = cfg.ssm_conv_kernel;     // 4
             if (auto m = dn_[dev].init(fleet.dev(dev), dc); !m.empty())
                 return "dn cache dev " + std::to_string(dev) + ": " + m;
@@ -514,7 +621,7 @@ std::string Qwen35SplitModel::load(DeviceFleet& fleet, const LayerPlan& plan,
         if (n_full[dev]) {
             KvCacheConfig kc{};
             kc.n_layers_full = n_full[dev];
-            kc.n_kv_heads    = d.n_kv_heads;              // 4
+            kc.n_kv_heads    = W.dense.n_kv_heads;        // 4 (tensor parallel: 2)
             kc.max_ctx       = max_ctx;
             kc.head_dim      = d.head_dim;                // 256
             kc.use_int8      = int8_kv;                   // --int8-kv: halve KV (int8 shadow + fp16 scales)
@@ -569,7 +676,7 @@ void Qwen35SplitModel::free_ws(uint32_t dev) {
                     static_cast<void*>(w.dn_beta_h), static_cast<void*>(w.dn_alpha64),
                     static_cast<void*>(w.dn_beta64),
                     static_cast<void*>(w.ffn_gate), static_cast<void*>(w.ffn_up),
-                    static_cast<void*>(w.ffn_h)})
+                    static_cast<void*>(w.ffn_h), static_cast<void*>(w.tp_rx[0]), static_cast<void*>(w.tp_rx[1])})
         if (p) alloc.free(p);
     w = Workspace{};
 }
@@ -583,17 +690,18 @@ std::string Qwen35SplitModel::ensure_ws(uint32_t dev, uint32_t max_T) {
     auto ah = [&](size_t n) { return static_cast<sycl::half*>(alloc.malloc(n * sizeof(sycl::half))); };
     auto af = [&](size_t n) { return static_cast<float*>(alloc.malloc(n * sizeof(float))); };
 
-    const DenseConfig& d = cfg_.dense;
+    const Qwen35Config& C = wcfg();   // one card's dimensions
+    const DenseConfig& d = C.dense;
     const uint64_t T   = max_T;
     const uint32_t H   = d.hidden;                          // 5120
     const uint32_t N_q = d.n_q_heads * d.head_dim;          // 6144
     const uint32_t N_qg = N_q * 2u;                         // 12288
     const uint32_t N_kv = d.n_kv_heads * d.head_dim;        // 1024
     const uint32_t F   = d.ffn;                             // 17408
-    const uint32_t SI  = cfg_.ssm_inner;                    // 6144
-    const uint32_t cvc = SI + 2u * cfg_.ssm_n_k_heads * cfg_.ssm_state;  // 10240
-    const uint32_t Vd  = cfg_.ssm_n_v_heads * cfg_.ssm_state;            // 6144
-    const uint32_t Nv  = cfg_.ssm_n_v_heads;               // 48
+    const uint32_t SI  = C.ssm_inner;                    // 6144
+    const uint32_t cvc = SI + 2u * C.ssm_n_k_heads * C.ssm_state;  // 10240
+    const uint32_t Vd  = C.ssm_n_v_heads * C.ssm_state;            // 6144
+    const uint32_t Nv  = C.ssm_n_v_heads;               // 48
     const uint32_t Nvp = ((Nv + 63u) / 64u) * 64u;         // 64
 
     w.x          = ah(T * H);
@@ -630,6 +738,11 @@ std::string Qwen35SplitModel::ensure_ws(uint32_t dev, uint32_t max_T) {
     w.ffn_gate   = ah(T * F);
     w.ffn_up     = ah(T * F);
     w.ffn_h      = ah(T * F);
+    if (tp_) {
+        w.tp_rx[0] = ah(T * H);
+        w.tp_rx[1] = ah(T * H);
+        if (!w.tp_rx[0] || !w.tp_rx[1]) return "qwen35split tensor-parallel receive buffers alloc failed on dev " + std::to_string(dev);
+    }
 
     if (!w.x || !w.x_normed || !w.attn_block || !w.positions || !w.positions3 || !w.qg || !w.q ||
         !w.gate || !w.k || !w.v || !w.attn_out || !w.dn_qkv || !w.dn_conv ||
@@ -813,7 +926,8 @@ sycl::event Qwen35SplitModel::sgemv(uint32_t dev, const sycl::half* A, const Spl
 void Qwen35SplitModel::card_layers(uint32_t dev, uint32_t T, uint32_t start_pos, KvCache& kv, DeltaNetState& dn,
                                    Qwen35SpecCheckpoint* ckp, bool verify, bool mrope, float* vpart, void* vtable,
                                    uint64_t vfloats, const std::function<void(sycl::queue&, int)>* mark) {
-    const DenseConfig& dc = cfg_.dense;
+    const Qwen35Config& C = wcfg();   // one card's dimensions (tensor parallel: half the heads / FFN)
+    const DenseConfig& dc = C.dense;
     const uint32_t H    = dc.hidden;                    // 5120
     const uint32_t HD   = dc.head_dim;                  // 256
     const uint32_t N_q  = dc.n_q_heads  * HD;           // 6144
@@ -822,7 +936,7 @@ void Qwen35SplitModel::card_layers(uint32_t dev, uint32_t T, uint32_t start_pos,
     const uint32_t F    = dc.ffn;                       // 17408
     const uint32_t rope_n = dc.rope_dim;                // 64 (partial)
     const float    eps  = dc.rms_eps;
-    const uint32_t n_layers = cfg_.n_transformer_layers();
+    const uint32_t n_layers = C.n_transformer_layers();
     const uint32_t n_kv = dc.n_kv_heads;
     Workspace& w = ws_[dev];
     auto& q = fleet_->dev(dev).queue();
@@ -852,18 +966,18 @@ void Qwen35SplitModel::card_layers(uint32_t dev, uint32_t T, uint32_t start_pos,
     }
 
     for (uint32_t L = 0; L < n_layers; ++L) {
-        if (plan_.dev_of_layer[L] != dev) continue;
-        const LayerW& w_l = layers_[L];
+        if (!on_dev(L, dev)) continue;
+        const LayerW& w_l = lay(dev, L);
         // pre-attn norm
         DPE(dev, kNorm, rms_norm_f32w(q, w.x, w_l.attn_norm, w.x_normed, T, H, eps));
 
         if (w_l.is_linear) {
             // ---- gated-DeltaNet (27B conventions: separate ssm_alpha/beta,
             // tile repeat 16→48). Lifted verbatim from qwen35_dense.cpp. ----
-            const uint32_t SKH = cfg_.ssm_n_k_heads;          // 16
-            const uint32_t SVH = cfg_.ssm_n_v_heads;          // 48
-            const uint32_t SHD = cfg_.ssm_state;              // 128
-            const uint32_t SI  = cfg_.ssm_inner;              // 6144
+            const uint32_t SKH = C.ssm_n_k_heads;          // 16
+            const uint32_t SVH = C.ssm_n_v_heads;          // 48
+            const uint32_t SHD = C.ssm_state;              // 128
+            const uint32_t SI  = C.ssm_inner;              // 6144
             const uint32_t conv_ch = SI + 2u * SKH * SHD;     // 10240
             const uint32_t kw  = SKH * SHD;                   // 2048
             const uint32_t rep = SVH / SKH;                   // 3 (16→48)
@@ -884,7 +998,7 @@ void Qwen35SplitModel::card_layers(uint32_t dev, uint32_t T, uint32_t start_pos,
                 Qwen35SpecCheckpoint& ck = *ckp;
                 const uint64_t ce = dn.conv_elems_per_layer();
                 {
-                    const uint32_t km1 = cfg_.ssm_conv_kernel - 1;
+                    const uint32_t km1 = C.ssm_conv_kernel - 1;
                     const uint32_t ch  = conv_ch;
                     const sycl::half* xin = w.dn_qkv;
                     const sycl::half* pst = conv_state;
@@ -904,10 +1018,10 @@ void Qwen35SplitModel::card_layers(uint32_t dev, uint32_t T, uint32_t start_pos,
                     });
                 }
                 depthwise_conv1d_causal(q, w.dn_qkv, w_l.ssm_conv1d_fp16, conv_state,
-                                        w.dn_conv, T, conv_ch, cfg_.ssm_conv_kernel);
+                                        w.dn_conv, T, conv_ch, C.ssm_conv_kernel);
             } else {
             DPE(dev, kDnConv, depthwise_conv1d_causal(q, w.dn_qkv, w_l.ssm_conv1d_fp16, conv_state,
-                                    w.dn_conv, T, conv_ch, cfg_.ssm_conv_kernel));
+                                    w.dn_conv, T, conv_ch, C.ssm_conv_kernel));
             }
             DPE(dev, kDnMisc, cast_qkv_split_fp16_to_fp32(q, w.dn_conv, w.dn_qpre, w.dn_kpre, w.dn_vpre, T, kw, SI));
             DPE(dev, kDnMisc, l2_norm_scale(q, w.dn_qpre, w.dn_qpre, T * SKH, SHD, qscale, 1e-6f));
@@ -1143,6 +1257,7 @@ void Qwen35SplitModel::card_layers(uint32_t dev, uint32_t T, uint32_t start_pos,
         if (mark) (*mark)(q, w_l.is_linear ? 0 : 1);   // pre-norm + DeltaNet/attn block
 
         // residual + pre-FFN (post-attention) norm (27B fused order) → dense SwiGLU
+        tp_ar(dev, w.attn_block, uint64_t(T) * H);   // tensor parallel: the block's two halves summed on both cards
         DPE(dev, kNorm, residual_add_rms_norm_fused(q, w.x, w.attn_block, w_l.post_attn_norm,
                                     w.x_normed, T, H, eps));
         if (verify && T >= 2 && T <= 16 &&
@@ -1162,6 +1277,7 @@ void Qwen35SplitModel::card_layers(uint32_t dev, uint32_t T, uint32_t start_pos,
         }
         DPE(dev, kElem, swiglu(q, w.ffn_gate, w.ffn_up, w.ffn_h, uint64_t(T) * F));
         sgemv(dev, w.ffn_h, w_l.ffn_down, w.attn_block, F, H, T);
+        tp_ar(dev, w.attn_block, uint64_t(T) * H);   // tensor parallel: the FFN's two halves
         DPE(dev, kElem, residual_add(q, w.x, w.attn_block, w.x, uint64_t(T) * H));
         if (mark) (*mark)(q, 2);   // post-norm + dense SwiGLU FFN
     }
@@ -1241,15 +1357,9 @@ std::string Qwen35SplitModel::forward(const int32_t* input_ids, uint32_t T,
 
     // device-by-device: copy residual in from prior card, run this card's layers.
     sgemv_pad_ = true;   // P4 B48: the layer loops' operands are workspace buffers (cleared before the head)
-    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+    // P4 B48: the verify rows' partials / table, allocated at the first verify (in owned_)
+    auto vrows_alloc = [&](uint32_t dev) {
         Workspace& w = ws_[dev];
-        auto& q = fleet_->dev(dev).queue();
-        if (dev > 0) {   // residual hand-off at the card boundary (ONE copy)
-            fleet_->copy_across(dev - 1, w.x, dev, ws_[dev - 1].x,
-                                uint64_t(T) * H * sizeof(sycl::half));
-            g_dp27.phase(DecodeProf::kHand);
-        }
-        // P4 B48: the verify rows' partials / table, allocated at the first verify (in owned_)
         if (spec_verify_gemv_ && spec_rows_on() && T >= 2 && T <= kFaDecodeRowsMax && kv_[dev].ready() && w.attn_partials) {
             if (vrows_partials_.size() != n_dev_) { vrows_partials_.assign(n_dev_, nullptr); vrows_table_.assign(n_dev_, nullptr); }
             const uint32_t max_ctx = kv_[dev].config().max_ctx;
@@ -1266,6 +1376,28 @@ std::string Qwen35SplitModel::forward(const int32_t* input_ids, uint32_t T,
                 }
             }
         }
+    };
+    if (tp_) {   // tensor parallel: card 0's embedding rows to card 1, then both cards' walks at once
+        tp_bcast_x(T);
+        for (uint32_t dev = 0; dev < n_dev_; ++dev) vrows_alloc(dev);
+        const std::function<std::string(uint32_t)> walk = [&](uint32_t dev) -> std::string {
+            card_layers(dev, T, start_pos, kv_[dev], dn_[dev], ckpt_mode ? &(*ckpts)[dev] : nullptr, spec_verify_gemv_, vis_.n != 0,
+                        vrows_partials_.size() == n_dev_ ? vrows_partials_[dev] : nullptr,
+                        vrows_table_.size() == n_dev_ ? vrows_table_[dev] : nullptr, vrows_partials_floats_, nullptr);
+            fleet_->dev(dev).queue().wait();
+            return {};
+        };
+        if (auto e = tp_each(walk); !e.empty()) { sgemv_pad_ = false; return "tensor parallel: " + e; }
+    } else
+    for (uint32_t dev = 0; dev < n_dev_; ++dev) {
+        Workspace& w = ws_[dev];
+        auto& q = fleet_->dev(dev).queue();
+        if (dev > 0) {   // residual hand-off at the card boundary (ONE copy)
+            fleet_->copy_across(dev - 1, w.x, dev, ws_[dev - 1].x,
+                                uint64_t(T) * H * sizeof(sycl::half));
+            g_dp27.phase(DecodeProf::kHand);
+        }
+        vrows_alloc(dev);
         if (prof) { q.wait(); pf_last = pclk::now(); }
         card_layers(dev, T, start_pos, kv_[dev], dn_[dev], ckpt_mode ? &(*ckpts)[dev] : nullptr, spec_verify_gemv_, vis_.n != 0,
                     vrows_partials_.size() == n_dev_ ? vrows_partials_[dev] : nullptr,
@@ -1482,7 +1614,8 @@ sycl::event Qwen35SplitModel::kq_gemv(uint32_t dev, const sycl::half* A, const S
 // DeltaNet state is dn[i], its KV kv[i] (layout and attention bound by kv[i]'s own max_ctx), its position positions[i].
 std::string Qwen35SplitModel::stage_card_rows(uint32_t dev, uint32_t T, const uint32_t* positions, KvCache* const* kv,
                                               DeltaNetState* const* dn) {
-    const DenseConfig& dc = cfg_.dense;
+    const Qwen35Config& C = wcfg();   // one card's dimensions (tensor parallel: half the heads / FFN)
+    const DenseConfig& dc = C.dense;
     const uint32_t H     = dc.hidden;
     const uint32_t HD    = dc.head_dim;
     const uint32_t N_q   = dc.n_q_heads * HD;
@@ -1491,7 +1624,7 @@ std::string Qwen35SplitModel::stage_card_rows(uint32_t dev, uint32_t T, const ui
     const uint32_t F     = dc.ffn;
     const uint32_t rope_n = dc.rope_dim;
     const float    eps   = dc.rms_eps;
-    const uint32_t n_layers = cfg_.n_transformer_layers();
+    const uint32_t n_layers = C.n_transformer_layers();
     Workspace& w = ws_[dev];
     auto& q = fleet_->dev(dev).queue();
     static const bool dec_vec = []{
@@ -1526,15 +1659,15 @@ std::string Qwen35SplitModel::stage_card_rows(uint32_t dev, uint32_t T, const ui
     }
 
     for (uint32_t L = 0; L < n_layers; ++L) {
-        if (plan_.dev_of_layer[L] != dev) continue;
-        const LayerW& w_l = layers_[L];
+        if (!on_dev(L, dev)) continue;
+        const LayerW& w_l = lay(dev, L);
         rms_norm_f32w(q, w.x, w_l.attn_norm, w.x_normed, T, H, eps);
 
         if (w_l.is_linear) {
-            const uint32_t SKH = cfg_.ssm_n_k_heads;
-            const uint32_t SVH = cfg_.ssm_n_v_heads;
-            const uint32_t SHD = cfg_.ssm_state;
-            const uint32_t SI  = cfg_.ssm_inner;
+            const uint32_t SKH = C.ssm_n_k_heads;
+            const uint32_t SVH = C.ssm_n_v_heads;
+            const uint32_t SHD = C.ssm_state;
+            const uint32_t SI  = C.ssm_inner;
             const uint32_t conv_ch = SI + 2u * SKH * SHD;
             const uint32_t kw  = SKH * SHD;
             const uint32_t rep = SVH / SKH;
@@ -1550,7 +1683,7 @@ std::string Qwen35SplitModel::stage_card_rows(uint32_t dev, uint32_t T, const ui
                     w.dn_qkv  + uint64_t(i) * conv_ch, w_l.ssm_conv1d_fp16,
                     conv_state,
                     w.dn_conv + uint64_t(i) * conv_ch,
-                    /*T=*/1, conv_ch, cfg_.ssm_conv_kernel);
+                    /*T=*/1, conv_ch, C.ssm_conv_kernel);
             }
             cast_qkv_split_fp16_to_fp32(q, w.dn_conv, w.dn_qpre, w.dn_kpre,
                                         w.dn_vpre, T, kw, SI);
@@ -1652,6 +1785,7 @@ std::string Qwen35SplitModel::stage_card_rows(uint32_t dev, uint32_t T, const ui
             sgemv_rows(dev, w.attn_out, w_l.attn_output, w.attn_block, N_q, H, T);
         }
 
+        tp_ar(dev, w.attn_block, uint64_t(T) * H);
         residual_add_rms_norm_fused(q, w.x, w.attn_block, w_l.post_attn_norm,
                                     w.x_normed, T, H, eps);
         if (T >= 2 && T <= 16 && w_l.ffn_gate.q8_qs && w_l.ffn_up.q8_qs) {
@@ -1667,6 +1801,7 @@ std::string Qwen35SplitModel::stage_card_rows(uint32_t dev, uint32_t T, const ui
         }
         swiglu(q, w.ffn_gate, w.ffn_up, w.ffn_h, uint64_t(T) * F);
         sgemv_rows(dev, w.ffn_h, w_l.ffn_down, w.attn_block, F, H, T);
+        tp_ar(dev, w.attn_block, uint64_t(T) * H);
         residual_add(q, w.x, w.attn_block, w.x, uint64_t(T) * H);
     }
     return {};
@@ -1676,6 +1811,7 @@ std::string Qwen35SplitModel::forward_slots(uint32_t N, const int32_t* ids,
                                             const uint32_t* positions,
                                             const uint32_t* slots,
                                             sycl::half* out_logits_host) {
+    if (tp_) return "forward_slots: the slot banks (IE_QWEN35_LANES=0) do not run tensor parallel; the request lanes (the default) do";
     if (N == 0)         return "forward_slots: N == 0";
     if (N > n_banks_)   return "forward_slots: N exceeds allocated banks";
     if (N > kMaxSlots)  return "forward_slots: N > 16 (batched int-dot leaf cap)";
@@ -1798,7 +1934,7 @@ std::string Qwen35SplitModel::init_lanes(uint32_t n_lanes, uint32_t lane_ctx, ui
                                          LanesAutoFit* fit) {
     if (fit) fit->cards.clear();
     else if (n_lanes < 2) return {};
-    if (!fleet_ || n_dev_ < 1 || n_dev_ > 2 || plan_.embed_dev != 0 || plan_.head_dev != n_dev_ - 1)   // (P4 B58: one card = one stage)
+    if (!fleet_ || n_dev_ < 1 || n_dev_ > 2 || plan_.embed_dev != 0 || plan_.head_dev != (tp_ ? 0u : n_dev_ - 1))   // (P4 B58: one card = one stage; tensor parallel: card 0 holds both)
         return "request lanes need the one- or two-card plan (embedding on card 0, head on the last card)";
     if (!lane_kv_.empty()) return "request lanes are already allocated";
     if (n_lanes > kMaxRows) return "request lanes: " + std::to_string(n_lanes) + " lanes, at most " + std::to_string(kMaxRows);
@@ -1816,8 +1952,8 @@ std::string Qwen35SplitModel::init_lanes(uint32_t n_lanes, uint32_t lane_ctx, ui
     for (uint32_t dev = 0; dev < n_dev_; ++dev) {
         uint64_t need = 0;
         for (uint32_t L = 0; L < layers_.size(); ++L) {
-            if (plan_.dev_of_layer[L] != dev) continue;
-            const LayerW& l = layers_[L];
+            if (!on_dev(L, dev)) continue;
+            const LayerW& l = lay(dev, L);
             for (const SplitW* w : {&l.ffn_gate, &l.ffn_up, &l.ffn_down, &l.attn_q, &l.attn_k, &l.attn_v, &l.attn_output,
                                     &l.attn_qkv, &l.attn_gate, &l.ssm_out})
                 if (w->q8_qs || w->kq_lo) need = std::max<uint64_t>(need, uint64_t(w->K) * w->N);   // (B21: c32 dequants too)
@@ -1851,7 +1987,7 @@ std::string Qwen35SplitModel::init_lanes(uint32_t n_lanes, uint32_t lane_ctx, ui
         // cache) come out of the free memory before the reserve is kept
         const uint64_t logits_b = dev == plan_.head_dev ? uint64_t(1 + kMaxRows) * cfg_.dense.vocab * sizeof(sycl::half) : 0ull;
         const uint64_t rows_partials_b = kv_[dev].ready()
-            ? uint64_t(kMaxRows) * fa2_decode_rows_partials_floats(cfg_.dense.n_q_heads, cfg_.dense.n_kv_heads, cfg_.dense.head_dim,
+            ? uint64_t(kMaxRows) * fa2_decode_rows_partials_floats(wcfg().dense.n_q_heads, wcfg().dense.n_kv_heads, cfg_.dense.head_dim,
                                                                   kv_[dev].config().max_ctx) * sizeof(float)
             : 0ull;
         if (fit) {   // P4 B30: measured here, picked below
@@ -1895,7 +2031,7 @@ std::string Qwen35SplitModel::init_lanes(uint32_t n_lanes, uint32_t lane_ctx, ui
     rows_table_.assign(n_dev_, nullptr);
     for (uint32_t dev = 0; dev < n_dev_; ++dev) {
         if (!kv_[dev].ready()) continue;
-        rows_partials_floats_ = fa2_decode_rows_partials_floats(cfg_.dense.n_q_heads, cfg_.dense.n_kv_heads, cfg_.dense.head_dim,
+        rows_partials_floats_ = fa2_decode_rows_partials_floats(wcfg().dense.n_q_heads, wcfg().dense.n_kv_heads, cfg_.dense.head_dim,
                                                                 kv_[dev].config().max_ctx);
         void* p = fleet_->dev(dev).malloc(uint64_t(kMaxRows) * rows_partials_floats_ * sizeof(float));
         void* t = fleet_->dev(dev).malloc(kFaDecodeRowsTableBytes);
@@ -2075,8 +2211,13 @@ std::string Qwen35SplitModel::forward_stage(uint32_t dev, uint32_t lane, const i
     if (uint64_t(pos0) + T > lane_ctx(lane))
         return "forward_stage: rows [" + std::to_string(pos0) + ", " + std::to_string(pos0 + T) + ") past lane " +
                std::to_string(lane) + "'s " + std::to_string(lane_ctx(lane)) + " positions";
-    if (auto m = ensure_ws(dev, T); !m.empty()) return m;
-    cur_[dev] = lane;
+    if (tp_ && dev != 0) return "forward_stage: tensor parallel runs as one stage (card 0)";
+    const uint32_t nd = tp_ ? 2u : 1u;   // the cards this stage drives
+    for (uint32_t k = 0; k < nd; ++k) {
+        const uint32_t d = tp_ ? k : dev;
+        if (auto m = ensure_ws(d, T); !m.empty()) return m;
+        cur_[d] = lane;
+    }
     auto& q = fleet_->dev(dev).queue();
     Workspace& w = ws_[dev];
     const uint32_t H = cfg_.dense.hidden;
@@ -2089,28 +2230,33 @@ std::string Qwen35SplitModel::forward_stage(uint32_t dev, uint32_t lane, const i
                ", inside its image prompt (" + std::to_string(lv->n) + " rows)";
     // forward()'s per-card order: positions, the reset at pos 0, the embedding (card 0) or the residual in (card 1), the
     // layers, then the residual out (card 0) or the head on the last row (card 1)
-    if (lv && !rows_walk) upload_positions(dev, pos0, T, *lv);
-    else {
-        std::vector<int32_t> pos(T);
-        for (uint32_t t = 0; t < T; ++t) pos[t] = int32_t(pos0 + t) + (lv ? lv->delta : 0);
-        fleet_->dev(dev).h2d(w.positions, pos.data(), T * sizeof(int32_t));
-    }
-    if (pos0 == 0) {
-        if (dn_at(dev).ready()) dn_at(dev).reset(q);
-        if (kv_at(dev).ready()) kv_at(dev).reset();
+    for (uint32_t k = 0; k < nd; ++k) {
+        const uint32_t d = tp_ ? k : dev;
+        if (lv && !rows_walk) upload_positions(d, pos0, T, *lv);
+        else {
+            std::vector<int32_t> pos(T);
+            for (uint32_t t = 0; t < T; ++t) pos[t] = int32_t(pos0 + t) + (lv ? lv->delta : 0);
+            fleet_->dev(d).h2d(ws_[d].positions, pos.data(), T * sizeof(int32_t));
+        }
+        if (pos0 == 0) {
+            if (dn_at(d).ready()) dn_at(d).reset(fleet_->dev(d).queue());
+            if (kv_at(d).ready()) kv_at(d).reset();
+        }
     }
     const uint64_t xb = uint64_t(T) * H * sizeof(sycl::half);
     if (dev == plan_.embed_dev) {
         if (auto m = embed_rows(ids, T); !m.empty()) return m;
         if (lv) splice_vision(w.x, pos0, T, *lv);
     } else fleet_->dev(dev).h2d(w.x, x_host, xb);
-    if (!rows_walk) {
-        stage_card_prefill(dev, T, pos0, lv != nullptr);
-    } else {
-        KvCache* kv = &kv_at(dev);
-        DeltaNetState* dn = &dn_at(dev);
-        if (auto m = stage_card_rows(dev, 1, &pos0, &kv, &dn); !m.empty()) return m;
-    }
+    if (tp_) tp_bcast_x(T);
+    const std::function<std::string(uint32_t)> walk = [&](uint32_t d) -> std::string {
+        if (!rows_walk) { stage_card_prefill(d, T, pos0, lv != nullptr); return {}; }
+        KvCache* kv = &kv_at(d);
+        DeltaNetState* dn = &dn_at(d);
+        return stage_card_rows(d, 1, &pos0, &kv, &dn);
+    };
+    if (tp_) { if (auto m = tp_each(walk); !m.empty()) return "tensor parallel: " + m; }
+    else if (auto m = walk(dev); !m.empty()) return m;
     if (dev != plan_.head_dev) { fleet_->dev(dev).d2h(x_host, w.x, xb); return {}; }
     lane_keep_hidden(lane, T - 1, pos0 + T - 1);   // (2026-10-21: the next MTP round's conditioning; no-op without rounds)
     rms_norm_f32w(q, w.x + uint64_t(T - 1) * H, output_norm_, w.x_normed, 1, H, cfg_.dense.rms_eps);
@@ -2131,7 +2277,10 @@ std::string Qwen35SplitModel::forward_stage_rows(uint32_t dev, std::span<const u
         for (uint32_t j = 0; j < i; ++j)
             if (lanes[j] == lanes[i]) return "forward_stage_rows: lane " + std::to_string(lanes[i]) + " twice";
     }
-    if (auto m = ensure_ws(dev, G); !m.empty()) return m;
+    if (tp_ && dev != 0) return "forward_stage_rows: tensor parallel runs as one stage (card 0)";
+    const uint32_t nd = tp_ ? 2u : 1u;
+    for (uint32_t k = 0; k < nd; ++k)
+        if (auto m = ensure_ws(tp_ ? k : dev, G); !m.empty()) return m;
     auto& q = fleet_->dev(dev).queue();
     Workspace& w = ws_[dev];
     const uint32_t H = cfg_.dense.hidden, V = cfg_.dense.vocab;
@@ -2145,14 +2294,19 @@ std::string Qwen35SplitModel::forward_stage_rows(uint32_t dev, std::span<const u
             return "forward_stage_rows: lane " + std::to_string(lanes[i]) + " at " + std::to_string(pos0[i]) + ", inside its image prompt";
         pos[i] += v.delta;
     }
-    fleet_->dev(dev).h2d(w.positions, pos, G * sizeof(int32_t));
+    for (uint32_t k = 0; k < nd; ++k) { const uint32_t d = tp_ ? k : dev; fleet_->dev(d).h2d(ws_[d].positions, pos, G * sizeof(int32_t)); }
     const uint64_t xb = uint64_t(G) * H * sizeof(sycl::half);
     if (dev == plan_.embed_dev) { if (auto m = embed_rows(ids, G); !m.empty()) return m; }
     else fleet_->dev(dev).h2d(w.x, x_host, xb);
-    KvCache* kv[kMaxRows];
-    DeltaNetState* dn[kMaxRows];
-    for (uint32_t i = 0; i < G; ++i) { kv[i] = &lane_kv(lanes[i], dev); dn[i] = &lane_dn(lanes[i], dev); }
-    if (auto m = stage_card_rows(dev, G, pos0, kv, dn); !m.empty()) return m;
+    if (tp_) tp_bcast_x(G);
+    const std::function<std::string(uint32_t)> walk = [&](uint32_t d) -> std::string {
+        KvCache* kv[kMaxRows];
+        DeltaNetState* dn[kMaxRows];
+        for (uint32_t i = 0; i < G; ++i) { kv[i] = &lane_kv(lanes[i], d); dn[i] = &lane_dn(lanes[i], d); }
+        return stage_card_rows(d, G, pos0, kv, dn);
+    };
+    if (tp_) { if (auto m = tp_each(walk); !m.empty()) return "tensor parallel: " + m; }
+    else if (auto m = walk(dev); !m.empty()) return m;
     if (dev != plan_.head_dev) { fleet_->dev(dev).d2h(x_host, w.x, xb); return {}; }
     for (uint32_t i = 0; i < G; ++i) lane_keep_hidden(lanes[i], i, pos0[i]);   // (2026-10-21: the lanes' MTP rounds)
     // forward_slots' head: the G rows normalised, the batched lm_head
@@ -2231,7 +2385,12 @@ std::string Qwen35SplitModel::lane_draft(uint32_t lane, int32_t next, uint32_t p
     if (!m.have_h || m.h_pos + 1 != pos) return {};
     auto& qh = fleet_->dev(plan_.head_dev).queue();
     std::vector<int32_t> d;
-    if (ds.temperature > 0.f)
+    // 2026-11-21: the lanes judge a draft one-hot (kept while the model's own sample equals it, lanes_serve draft_landed),
+    // so a SAMPLED draft is kept with probability sum_x p(x) q(x) -- two independent draws must coincide -- while the
+    // draft head's top token is kept with p(top). Both are exact (the reply is always the model's own sample).
+    // IE_QWEN35_DRAFT_SAMPLED=1 = the sampled drafts as before; default: the top token at every temperature.
+    static const bool sampled = [] { const char* v = std::getenv("IE_QWEN35_DRAFT_SAMPLED"); return v && *v == '1'; }();
+    if (ds.temperature > 0.f && sampled)
         mtp_.draft_device_sampled(qh, m.h_last, next, /*p_base=*/0, lmtp_V_, d, ds.temperature, ds.top_k, ds.top_p, ds.min_p, ds.seed);
     else
         mtp_.draft_device_argmax(qh, m.h_last, next, /*p_base=*/0, lmtp_V_, d);
@@ -2249,8 +2408,13 @@ std::string Qwen35SplitModel::forward_stage_verify(uint32_t dev, uint32_t lane, 
     if (pos0 == 0 || uint64_t(pos0) + T > lane_ctx(lane))
         return "forward_stage_verify: rows [" + std::to_string(pos0) + ", " + std::to_string(pos0 + T) + ") on lane " +
                std::to_string(lane) + " (1.." + std::to_string(lane_ctx(lane)) + ")";
-    if (auto m = ensure_ws(dev, T); !m.empty()) return m;   // (init_lanes sized it for kMaxRows: never grows here)
-    cur_[dev] = lane;
+    if (tp_ && dev != 0) return "forward_stage_verify: tensor parallel runs as one stage (card 0)";
+    const uint32_t nd = tp_ ? 2u : 1u;
+    for (uint32_t k = 0; k < nd; ++k) {
+        const uint32_t d = tp_ ? k : dev;
+        if (auto m = ensure_ws(d, T); !m.empty()) return m;   // (init_lanes sized it for kMaxRows: never grows here)
+        cur_[d] = lane;
+    }
     auto& q = fleet_->dev(dev).queue();
     Workspace& w = ws_[dev];
     const uint32_t H = cfg_.dense.hidden;
@@ -2260,18 +2424,24 @@ std::string Qwen35SplitModel::forward_stage_verify(uint32_t dev, uint32_t lane, 
         return "forward_stage_verify: lane " + std::to_string(lane) + " at " + std::to_string(pos0) + ", inside its image prompt";
     int32_t pos[16];
     for (uint32_t t = 0; t < T; ++t) pos[t] = int32_t(pos0 + t) + (lv ? lv->delta : 0);
-    fleet_->dev(dev).h2d(w.positions, pos, T * sizeof(int32_t));
+    for (uint32_t k = 0; k < nd; ++k) { const uint32_t d = tp_ ? k : dev; fleet_->dev(d).h2d(ws_[d].positions, pos, T * sizeof(int32_t)); }
     const uint64_t xb = uint64_t(T) * H * sizeof(sycl::half);
     if (dev == plan_.embed_dev) { if (auto m = embed_rows(ids, T); !m.empty()) return m; }
     else fleet_->dev(dev).h2d(w.x, x_host, xb);
+    if (tp_) tp_bcast_x(T);
     LaneMtp& m = lmtp_[lane];
-    KvCache& kv = lane_kv(lane, dev);
-    DeltaNetState& dn = lane_dn(lane, dev);
-    for (uint32_t l = 0; l < uint32_t(m.kvsnap[dev].size()); ++l) m.kvsnap[dev][l] = kv.length(l);
-    LaneVerifyScope verify_scope;   // sgemv's verify route on this card's thread only
-    const bool rows_attn = kv.ready() && dev < rows_partials_.size() && rows_partials_[dev];
-    card_layers(dev, T, pos0, kv, dn, dn.ready() ? &m.ck[dev] : nullptr, /*verify=*/true, /*mrope=*/false,
-                rows_attn ? rows_partials_[dev] : nullptr, rows_attn ? rows_table_[dev] : nullptr, rows_partials_floats_, nullptr);
+    const std::function<std::string(uint32_t)> walk = [&](uint32_t d) -> std::string {
+        KvCache& kv = lane_kv(lane, d);
+        DeltaNetState& dn = lane_dn(lane, d);
+        for (uint32_t l = 0; l < uint32_t(m.kvsnap[d].size()); ++l) m.kvsnap[d][l] = kv.length(l);
+        LaneVerifyScope verify_scope;   // sgemv's verify route on this card's thread only (each tensor-parallel thread sets its own)
+        const bool rows_attn = kv.ready() && d < rows_partials_.size() && rows_partials_[d];
+        card_layers(d, T, pos0, kv, dn, dn.ready() ? &m.ck[d] : nullptr, /*verify=*/true, /*mrope=*/false,
+                    rows_attn ? rows_partials_[d] : nullptr, rows_attn ? rows_table_[d] : nullptr, rows_partials_floats_, nullptr);
+        return {};
+    };
+    if (tp_) { if (auto e = tp_each(walk); !e.empty()) return "tensor parallel: " + e; }
+    else if (auto e = walk(dev); !e.empty()) return e;
     if (dev != plan_.head_dev) { fleet_->dev(dev).d2h(x_host, w.x, xb); return {}; }
     // forward()'s spec head: the rows' final residual (the next round's conditioning), then lm_head over every row
     q.memcpy(m.d_hid, w.x, xb);
@@ -2312,6 +2482,90 @@ std::string Qwen35SplitModel::lane_round_keep(uint32_t lane, uint32_t kept) {
     return {};
 }
 
+// ===========================================================================
+// 2026-11-21 TENSOR PARALLEL machinery (the header's note).
+// ===========================================================================
+// One sum: each card pushes its partial rows into the other card's receive buffer (a peer WRITE from its own in-order
+// queue, after the kernels that made them), the two threads swap the push events, and each card adds the other's rows
+// to its own once that push has landed (an event dependency on the card, no host wait). Both cards compute
+// float(a) + float(b) in the same order of operands' values, so their residuals stay bit-identical. Two receive buffers
+// in turn: the other card can only push sum s + 2 after this card's add of sum s (it waits for this card's push of
+// s + 1, queued after that add).
+void Qwen35SplitModel::tp_ar(uint32_t dev, sycl::half* buf, uint64_t n) {
+    if (!tp_) return;
+    auto& q = fleet_->dev(dev).queue();
+    const uint64_t s = tp_n_[dev]++;
+    const uint32_t k = uint32_t(s & 1), peer = dev ^ 1u;
+    tp_ev_[dev][k] = q.memcpy(ws_[peer].tp_rx[k], buf, n * sizeof(sycl::half));
+    tp_seq_[dev].store(s + 1, std::memory_order_release);
+    while (tp_seq_[peer].load(std::memory_order_acquire) <= s) {
+        if (tp_abort_.load(std::memory_order_relaxed)) throw std::runtime_error("the other card's walk stopped");
+        std::this_thread::yield();
+    }
+    const sycl::event got = tp_ev_[peer][k];
+    const sycl::half* rx = ws_[dev].tp_rx[k];
+    q.submit([&](sycl::handler& h) {
+        h.depends_on(got);
+        h.parallel_for(sycl::range<1>(n), [=](sycl::id<1> i) { buf[i] = sycl::half(float(buf[i]) + float(rx[i])); });
+    });
+}
+
+void Qwen35SplitModel::tp_bcast_x(uint32_t T) {
+    const uint64_t b = uint64_t(T) * cfg_.dense.hidden * sizeof(sycl::half);
+    const sycl::event e = fleet_->dev(0).queue().memcpy(ws_[1].x, ws_[0].x, b);   // a push from card 0
+    fleet_->dev(1).queue().submit([&](sycl::handler& h) { h.depends_on(e); h.single_task([] {}); });
+}
+
+std::string Qwen35SplitModel::tp_each(const std::function<std::string(uint32_t)>& fn) {
+    {
+        std::lock_guard<std::mutex> lk(tp_mu_);
+        if (!tp_thr_.joinable()) tp_thr_ = std::thread([this] { tp_twin_loop(); });
+        tp_job_ = &fn;
+        ++tp_go_;
+    }
+    tp_cv_.notify_all();
+    std::string e0;
+    try { e0 = fn(0); }
+    catch (const sycl::exception& x) { e0 = x.what(); }
+    catch (const std::exception& x) { e0 = x.what(); }
+    if (!e0.empty()) tp_abort_.store(true);
+    std::string e1;
+    {
+        std::unique_lock<std::mutex> lk(tp_mu_);
+        tp_done_cv_.wait(lk, [&] { return tp_done_ == tp_go_; });
+        e1 = tp_err_;
+        tp_job_ = nullptr;
+    }
+    if (e0.empty() && e1.empty()) return {};
+    // a walk stopped part-way: both cards drained, the sums' counters back in step for the next step
+    for (uint32_t d = 0; d < 2; ++d) try { fleet_->dev(d).queue().wait(); } catch (...) {}
+    tp_n_[0] = tp_n_[1] = 0;
+    tp_seq_[0].store(0); tp_seq_[1].store(0);
+    tp_abort_.store(false);
+    return !e0.empty() ? "card 0: " + e0 : "card 1: " + e1;
+}
+
+void Qwen35SplitModel::tp_twin_loop() {
+    uint64_t seen = 0;
+    for (;;) {
+        const std::function<std::string(uint32_t)>* f = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(tp_mu_);
+            tp_cv_.wait(lk, [&] { return tp_quit_ || tp_go_ != seen; });
+            if (tp_quit_) return;
+            seen = tp_go_;
+            f = tp_job_;
+        }
+        std::string e;
+        try { e = (*f)(1); if (e.empty()) fleet_->dev(1).queue().wait(); }
+        catch (const sycl::exception& x) { e = x.what(); }
+        catch (const std::exception& x) { e = x.what(); }
+        if (!e.empty()) tp_abort_.store(true);
+        { std::lock_guard<std::mutex> lk(tp_mu_); tp_err_ = e; tp_done_ = seen; }
+        tp_done_cv_.notify_all();
+    }
+}
+
 std::string Qwen35SplitModel::rows_off_reason() const {
     if (lane_kv_.empty() || !rows_logits_) return "the request lanes are not initialised";
     if (!output_.int_dot()) return "the head is not Q8_0/Q6_K/Q5_K/Q4_K";
@@ -2343,7 +2597,8 @@ std::string Qwen35SplitModel::rows_off_reason() const {
 void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t start_pos, bool mrope) {
     Workspace& w = ws_[dev];
     auto& q = fleet_->dev(dev).queue();
-    const DenseConfig& dc = cfg_.dense;
+    const Qwen35Config& C = wcfg();   // one card's dimensions (tensor parallel: half the heads / FFN)
+    const DenseConfig& dc = C.dense;
     const uint32_t H    = dc.hidden;
     const uint32_t HD   = dc.head_dim;
     const uint32_t N_q  = dc.n_q_heads  * HD;
@@ -2352,7 +2607,7 @@ void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t sta
     const uint32_t F    = dc.ffn;
     const uint32_t rope_n = dc.rope_dim;
     const float    eps  = dc.rms_eps;
-    const uint32_t n_layers = cfg_.n_transformer_layers();
+    const uint32_t n_layers = C.n_transformer_layers();
     const uint32_t n_kv = dc.n_kv_heads;
     const uint64_t per_layer_kv =
         uint64_t(n_kv) * (kv_at(dev).ready() ? kv_at(dev).config().max_ctx : 0u) * HD;
@@ -2360,15 +2615,15 @@ void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t sta
     g_pf27.start(dev, q);
     sgemv_pad_ = true;
     for (uint32_t L = 0; L < n_layers; ++L) {
-        if (plan_.dev_of_layer[L] != dev) continue;
-        const LayerW& w_l = layers_[L];
+        if (!on_dev(L, dev)) continue;
+        const LayerW& w_l = lay(dev, L);
         rms_norm_f32w(q, w.x, w_l.attn_norm, w.x_normed, T, H, eps);
         g_pf27.mark(dev, q, PfProf27::kElem);
         if (w_l.is_linear) {
-            const uint32_t SKH = cfg_.ssm_n_k_heads;
-            const uint32_t SVH = cfg_.ssm_n_v_heads;
-            const uint32_t SHD = cfg_.ssm_state;
-            const uint32_t SI  = cfg_.ssm_inner;
+            const uint32_t SKH = C.ssm_n_k_heads;
+            const uint32_t SVH = C.ssm_n_v_heads;
+            const uint32_t SHD = C.ssm_state;
+            const uint32_t SI  = C.ssm_inner;
             const uint32_t conv_ch = SI + 2u * SKH * SHD;
             const uint32_t kw  = SKH * SHD;
             const uint32_t rep = SVH / SKH;
@@ -2377,7 +2632,7 @@ void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t sta
             sycl::half* conv_state = dn_at(dev).conv_state_ptr() +
                 uint64_t(dn_local_[L]) * dn_at(dev).conv_elems_per_layer();
             depthwise_conv1d_causal(q, w.dn_qkv, w_l.ssm_conv1d_fp16, conv_state,
-                                    w.dn_conv, T, conv_ch, cfg_.ssm_conv_kernel);
+                                    w.dn_conv, T, conv_ch, C.ssm_conv_kernel);
             cast_qkv_split_fp16_to_fp32(q, w.dn_conv, w.dn_qpre, w.dn_kpre, w.dn_vpre, T, kw, SI);
             l2_norm_scale(q, w.dn_qpre, w.dn_qpre, T * SKH, SHD, qscale, 1e-6f);
             l2_norm_scale(q, w.dn_kpre, w.dn_kpre, T * SKH, SHD, 1.0f,   1e-6f);
@@ -2449,6 +2704,7 @@ void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t sta
             g_pf27.mark(dev, q, PfProf27::kElem);
             sgemv(dev, w.attn_out, w_l.attn_output, w.attn_block, N_q, H, T);
         }
+        tp_ar(dev, w.attn_block, uint64_t(T) * H);
         residual_add_rms_norm_fused(q, w.x, w.attn_block, w_l.post_attn_norm,
                                     w.x_normed, T, H, eps);
         g_pf27.mark(dev, q, PfProf27::kElem);
@@ -2457,6 +2713,7 @@ void Qwen35SplitModel::stage_card_prefill(uint32_t dev, uint32_t T, uint32_t sta
         swiglu(q, w.ffn_gate, w.ffn_up, w.ffn_h, uint64_t(T) * F);
         g_pf27.mark(dev, q, PfProf27::kElem);
         sgemv(dev, w.ffn_h, w_l.ffn_down, w.attn_block, F, H, T);
+        tp_ar(dev, w.attn_block, uint64_t(T) * H);
         residual_add(q, w.x, w.attn_block, w.x, uint64_t(T) * H);
         g_pf27.mark(dev, q, PfProf27::kElem);
     }
@@ -2807,7 +3064,9 @@ std::string Qwen35SplitModel::spec_step(int32_t token, uint32_t pos, sycl::half*
         ++s.look_rounds; s.look_rows += look.size();
     } else {
         s.drafted.clear();
-        if (ds && ds->temperature > 0.f)
+        // 2026-11-21: the top token at every temperature (one-hot verify; see lane_draft), IE_QWEN35_DRAFT_SAMPLED=1 = sampled
+        static const bool sampled = [] { const char* v = std::getenv("IE_QWEN35_DRAFT_SAMPLED"); return v && *v == '1'; }();
+        if (ds && ds->temperature > 0.f && sampled)
             mtp_.draft_device_sampled(qh, s.h_last, token, /*p_base=*/0, s.V, s.drafted,
                                       ds->temperature, ds->top_k, ds->top_p, ds->min_p, ds->seed);
         else

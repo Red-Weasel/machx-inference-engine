@@ -25,7 +25,7 @@ const char* USAGE =
   "usage: ie <run|serve> <model.gguf> [--ctx N] [--port P] [--host H] [--gpus N]\n"
   "                                [--prefill-chunk N] [--spec] [--parallel N] [--temp F]\n"
   "                                [--vram-reserve-gib F]\n"
-  "                                (--parallel N|auto = 1..16 concurrent generations, default auto:\n"
+  "                                (--parallel N|auto = 1..16 concurrent generations (Inkling 2: 1..32), default auto:\n"
   "                                 the load picks N; what >1 does depends on the arch: `ie serve --help`.\n"
   "                                 Not yet compatible with --int8-kv.)\n"
   "                                (--max-queue N = requests allowed to WAIT for a generation\n"

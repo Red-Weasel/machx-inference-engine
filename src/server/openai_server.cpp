@@ -46,6 +46,24 @@ static void on_stop_signal(int sig) {
 // image rows, bounce copies) are freed into glibc's per-thread arenas, which otherwise keep them: live, a day of
 // Dream image traffic grew ie serve by ~30 GB of freed-but-held heap until the machine ran out of RAM
 // (docs/deepseek41/99). IE_MALLOC_TRIM=0 turns it off.
+// IE_SERVE_RECORD=<file>: every chat request (its raw body: messages, tools, settings) and the reply (text, reasoning,
+// tool calls, finish) appended as one JSON line -- a local record of a client's real traffic, for calibration sets (GPTQ)
+// and evaluations made from what the client actually sends. Off unless set; the file stays on this machine.
+static void record_exchange(const std::string& body, const GenerateResult& r) {
+    static const char* path = std::getenv("IE_SERVE_RECORD");
+    if (!path || !*path) return;
+    static std::mutex mu;
+    nlohmann::json j;
+    j["ts"] = uint64_t(std::time(nullptr));
+    j["request"] = nlohmann::json::parse(body, nullptr, false);
+    if (j["request"].is_discarded()) j["request"] = body;
+    j["reply"] = {{"content", r.text}, {"reasoning", r.reasoning_content}, {"tool_calls", r.tool_calls_json},
+                  {"finish", r.finish_reason}, {"prompt_tokens", r.prompt_tokens}, {"completion_tokens", r.completion_tokens}};
+    const std::string line = j.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace) + "\n";
+    std::lock_guard<std::mutex> lk(mu);
+    if (FILE* f = std::fopen(path, "ab")) { std::fwrite(line.data(), 1, line.size(), f); std::fclose(f); }
+    else std::fprintf(stderr, "[record] IE_SERVE_RECORD: cannot open %s\n", path);
+}
 // A generation the engine stopped as repetition is a bug report: keep the request that
 // produced it (bounded, newest wins) so it can be replayed exactly (docs/deepseek41/101).
 static void keep_repeating_request(const std::string& body) {
@@ -335,6 +353,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
             const bool separate_thinking_ns =
                 (eng.arch() == ModelArch::kDeepSeek4 || eng.arch() == ModelArch::kGlm5Next || eng.arch() == ModelArch::kDeepSeek41 || eng.arch() == ModelArch::kMimo26 ||
                  eng.arch() == ModelArch::kLaguna || eng.arch() == ModelArch::kInkling || eng.arch() == ModelArch::kHy4Flash ||
+                 eng.arch() == ModelArch::kXing4 || eng.arch() == ModelArch::kInkling2 ||
                  eng.chatml_thinking())
                 && cr.enable_thinking;
             std::string acc_ns;
@@ -372,6 +391,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 },
                 cr.enable_thinking, cr.tools_json, cr.reasoning_effort);
             release_free_heap();
+            record_exchange(req.body, r);
             if (r.finish_reason == "repetition") keep_repeating_request(req.body);
             if (stopped_ns) {
                 r.finish_reason = "stop";
@@ -495,7 +515,9 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 const bool structured = ds4 || eng.arch() == ModelArch::kGlm5Next || eng.arch() == ModelArch::kDeepSeek41 || mimo ||
                                         eng.arch() == ModelArch::kLaguna ||   // GLM's tool-call format, parsed by the engine
                                         eng.arch() == ModelArch::kInkling ||  // its stream translated to </think> / <tool_call>
-                                        eng.arch() == ModelArch::kHy4Flash;   // its tags streamed in GLM's spelling, parsed by the engine
+                                        eng.arch() == ModelArch::kHy4Flash ||  // its tags streamed in GLM's spelling, parsed by the engine
+                                        eng.arch() == ModelArch::kXing4 ||     // the same
+                                        eng.arch() == ModelArch::kInkling2;    // its stream translated to </think> / <tool_call>
                 const std::string DSML_OPEN = (ds41 || ds4) ? "<｜DSML｜" : "<｜DSML｜tool_calls";   // bare token: see kDsmlOpen above
                 static const std::string THINK_CLOSE = "</think>";
                 // P4 B35: a Qwen thinking template with thinking on: the text before the model's first </think> (which
@@ -637,6 +659,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                         return sink_alive;
                     }, cr.enable_thinking, cr.tools_json, cr.reasoning_effort);
                 release_free_heap();
+                record_exchange(raw_body, r);
                 if (r.finish_reason == "repetition") keep_repeating_request(raw_body);
                 if (r.finish_reason == "context_length_exceeded") {
                     std::string ev =
@@ -720,7 +743,7 @@ int run_openai_server(Engine& eng, const std::string& model_id,
                 // (without this the client accounts zeros).
                 auto us = oai::chat_chunk_sse_usage(model_id, id, created,
                                                     r.prompt_tokens, r.completion_tokens,
-                                                    r.cached_tokens);
+                                                    r.cached_tokens, r.lane, r.lane_ctx, r.prefill_ms, r.restore_ms, r.decode_ms);
                 if (cr.ie_vitals && vw.active) us = oai::sse_add_field(us, "ie_vitals_summary", oai::vitals_summary_json(vw, r));
                 sink.write(us.data(), us.size());
                 static const std::string done = "data: [DONE]\n\n";

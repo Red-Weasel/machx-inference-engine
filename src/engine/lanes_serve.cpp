@@ -361,14 +361,42 @@ void LanesServe::quota_kick() {
 // A sampled id into the lane (mu held) -- the engine's emit rule: a stop id ends the lane with "stop" and is not committed;
 // otherwise the id is committed (the repetition window, the outbox) and the budget may end it with "length". True while the
 // lane goes on.
+// 2026-11-21 (Qwen3.8 Flash in Dream, coaching quiz py_ds_rollback_dsu): a reply that repeated the same two lines inside
+// an unclosed write_file call for 27,123 tokens -- 27 minutes, until the harness's time limit -- with the reply budget at
+// 60,000. A reply whose last W tokens are one block of at most 256 tokens over and over (out[i] == out[i - p] for every i in
+// the window) never recovers. It ends with "length" (the client sees a cut reply and the agent retries) and a log line.
+// W = IE_LANES_REPEAT_STOP tokens (default 2048: at least 8 repeats of the longest block; a run that long is no data a
+// coding agent writes by hand); 0 = off. Checked every 64 tokens past W.
+static bool lanes_runaway(const std::vector<int32_t>& out, uint32_t& period) {
+    static const uint32_t W = [] {
+        const char* v = std::getenv("IE_LANES_REPEAT_STOP");
+        return v ? uint32_t(std::max(0, std::atoi(v))) : 2048u;
+    }();
+    if (W < 64 || out.size() < W || out.size() % 64) return false;
+    const size_t n = out.size();
+    for (uint32_t p = 1; p <= 256 && p < W; ++p) {
+        size_t i = n - 1;
+        for (; i >= n - W + p; --i) if (out[i] != out[i - p]) break;
+        if (i < n - W + p) { period = p; return true; }
+    }
+    return false;
+}
+
 bool LanesServe::commit(Lane& l, int32_t id) {
     if (!l.rq->sp.ignore_eos && m_.is_stop(id)) { l.finish = "stop"; return false; }
+    if (l.guard) l.guard->advance(id);
     ++l.n_new; ++tokens_;
     l.hist.push_back(id);
     if (l.idx_on) { l.idx.push(id); if (l.look_blocked) --l.look_blocked; }   // (P4 B55)
     l.out.push_back(id);
     l.outbox.push_back(id);
     if (l.n_new >= l.max_new) { l.finish = "length"; return false; }
+    if (uint32_t p = 0; lanes_runaway(l.out, p)) {
+        std::fprintf(stderr, "[lanes] a reply repeated one %u-token block for its last %zu+ tokens (%u generated): ended as \"length\" "
+                             "(IE_LANES_REPEAT_STOP=0 = off)\n", p, size_t(2048), l.n_new);
+        l.finish = "length";
+        return false;
+    }
     return true;
 }
 
@@ -441,11 +469,24 @@ void LanesServe::on_idle0() {
 }
 
 int32_t LanesServe::sample_into(Lane& l, uint32_t li, bool first, std::string& err) {
-    const LanesSampling& sp = l.rq->sp;
+    LanesSampling sp = l.rq->sp;
+    if (l.guard) sp.filter = l.guard.get();
     const std::span<const int32_t> win = sp.penalties() ? lanes_penalty_window(l.hist, sp.repeat_window)
                                                         : std::span<const int32_t>{};
     return m_.sample(li, first, sp, win, l.rq->rng + l.n_new, err);
 }
+
+// ------------------------------------------------------------------------------------------------ the tool-call guard
+const std::vector<std::string>& LanesServe::pieces() {
+    std::call_once(pieces_once_, [&] {
+        const auto t0 = Clock::now();
+        const uint32_t V = m_.vocab();
+        pieces_ = tool_guard_pieces(V, [&](const int32_t* ids, size_t n) { return m_.guard_detok(std::span<const int32_t>(ids, n)); });
+        std::fprintf(stderr, "[%s] tool-call guard: %u token texts in %.0f ms\n", m_.tag(), V, ms_since(t0));
+    });
+    return pieces_;
+}
+
 
 // The pipe's done callback (the last stage's thread): a prefill piece landed, or a decode step's row is sampled here.
 void LanesServe::on_done(uint32_t li) {
@@ -484,10 +525,13 @@ void LanesServe::on_done_rows(std::span<const uint32_t> lanes) {
         std::vector<const LanesSampling*> sps;
         std::vector<std::span<const int32_t>> wins;
         std::vector<uint64_t> seeds;
+        std::vector<LanesSampling> gsp;   // the guarded lanes' settings with their filter (reserved: the pointers stay)
+        gsp.reserve(dec.size());
         for (uint32_t li : dec) {   // (the windows view each lane's history: nothing commits before sample_rows returns)
             const Lane& l = lanes_[li];
             const LanesSampling& sp = l.rq->sp;
-            sps.push_back(&sp);
+            if (l.guard) { gsp.push_back(sp); gsp.back().filter = l.guard.get(); sps.push_back(&gsp.back()); }
+            else sps.push_back(&sp);
             wins.push_back(sp.penalties() ? lanes_penalty_window(l.hist, sp.repeat_window) : std::span<const int32_t>{});
             seeds.push_back(l.rq->rng + l.n_new);
         }
@@ -952,7 +996,7 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     const auto t_req = Clock::now();
     Clock::time_point t_dec{};
     // P4 B55: the prompt's n-gram index, built before the serve mutex is taken
-    const bool look_on = o_.look && m_.look_rows() >= 3;
+    const bool look_on = o_.look && m_.look_rows() >= 3 && !rq.guard;   // (drafted rows skip the guard: none with it)
     Ds41NgramIndex look_idx;
     if (look_on) look_idx.reset(ids);
     auto alive = [&] { return !on_token || on_token(std::string_view{}); };   // the server's liveness probe (an empty piece)
@@ -977,8 +1021,15 @@ LanesResult LanesServe::run(const LanesRequest& rq, const LanesTokenFn& on_token
     const uint32_t lane = uint32_t(li);
     r.lane = lane;
     Lane& l = lanes_[lane];
+    r.lane_ctx = l.cap;
     l.busy = true; l.phase = Lane::Phase::kPrefill; l.rq = &rq; l.finish.clear();
     l.want_stop = l.lost = l.parked = l.kept = l.ahead = l.held = l.recut = l.qheld = l.qfree = false; l.bypass = 0;
+    l.guard.reset();
+    if (rq.guard && m_.vocab()) {
+        l.guard = std::make_unique<LaneGuard>();
+        l.guard->g = rq.guard.get(); l.guard->st = rq.guard->start(rq.guard_think); l.guard->pieces = &pieces();
+        l.guard->stop = [this](int32_t id) { return m_.is_stop(id); };
+    }
     l.outbox.clear(); l.out.clear(); l.pend = 0; l.next = -1; l.steps = l.chunks = 0; l.cb_ms = 0;
     // (P4 B39: the callbacks of the other lanes may read these while the prepare runs: a new prompt with no plan yet)
     l.plan = LanesPlan{}; l.pos = l.reused = l.chunk_at = l.mark_at = l.snap_at = l.piece_max = 0; l.preparing = true;

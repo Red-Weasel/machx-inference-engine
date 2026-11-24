@@ -513,6 +513,7 @@ struct Hy4fForward::Card {
     float *eg_emb32 = nullptr, *eg_v32 = nullptr, *eg_k32 = nullptr, *eg_stat = nullptr; sycl::half* eg_emb16 = nullptr;
     sycl::half *ex_gu = nullptr, *ex_dn = nullptr, *ex_x16 = nullptr, *ex_h16 = nullptr; float *ex_gu32 = nullptr, *ex_d32 = nullptr, *ex_w = nullptr; int32_t* ex_rows = nullptr;
     float *abl_B = nullptr, *abl_coef = nullptr; uint32_t abl_cap = 0; uint64_t abl_version = 0;
+    float *wm_A = nullptr, *wm_B = nullptr; uint64_t wm_version = 0; uint32_t wm_cap = 0;   // this card's layers of the write maps
     float* steer = nullptr; uint64_t steer_version = 0;      // this card's layers of the steering vectors [L1 - L0, hc, dim]
     sycl::half* head = nullptr; float *final_norm = nullptr, *head_fn = nullptr, *head_base = nullptr, *head_scale = nullptr, *logits = nullptr;
 };
@@ -2277,6 +2278,15 @@ std::string Hy4fForward::set_expert_mask(const std::vector<std::pair<uint32_t, u
     return {};
 }
 
+std::string Hy4fForward::set_write_maps(const float* A, const float* B, uint32_t r) {
+    if (r > 64) return "write maps of rank above 64";
+    ++wm_version_; wm_r_ = r; if (wm_gain_.empty()) wm_gain_.resize(size_t(2) * m_->config().n_layers);
+    if (!r) { wm_A_.clear(); wm_B_.clear(); return {}; }
+    const size_t n = size_t(2) * m_->config().n_layers * r * m_->config().dim;
+    wm_A_.assign(A, A + n); wm_B_.assign(B, B + n);
+    return {};
+}
+
 std::string Hy4fForward::set_ablation(const float* basis, uint32_t k, float strength) {
     if (k > 256) return "more than 256 ablation directions";
     abl_k_ = k; abl_strength_ = strength; ++abl_version_;
@@ -2316,6 +2326,36 @@ std::string Hy4fForward::run_card(Card& c, size_t ci, const int32_t* ids, uint32
         if (!c.steer) { c.steer = dev<float>(c, size_t(c.L1 - c.L0) * HH); if (!c.steer) return "device allocation failed (steering vectors)"; }
         KpQ{q, "memcpy"}.memcpy(c.steer, steer_.data() + size_t(c.L0) * HH, size_t(c.L1 - c.L0) * HH * 4).wait(); c.steer_version = steer_version_;
     }
+    // a sublayer's write y (c.y32, [T, H]) before it is added to the streams: recorded, then mapped (see set_write_maps)
+    auto write_hook = [&](uint32_t L, uint32_t kind, const float* gain) {
+        if (wrec_) {
+            const uint32_t R = std::min(T, wrec_rows_); const size_t at = wrec_->size();
+            wrec_->resize(at + size_t(wrec_rows_) * H, 0.f);          // (a call shorter than `rows`: zero rows first)
+            KpQ{q, "memcpy"}.memcpy(wrec_->data() + at + size_t(wrec_rows_ - R) * H, c.y32 + size_t(T - R) * H, size_t(R) * H * 4).wait();
+        }
+        if (!wm_r_) return;
+        // on the host (a search tool's path: the y of a call round-trips; the result of a search is baked into the weights)
+        const uint32_t r = wm_r_; const size_t per = size_t(2) * r * H;
+        const float* A = wm_A_.data() + size_t(L) * per + size_t(kind) * r * H; const float* B = wm_B_.data() + size_t(L) * per + size_t(kind) * r * H;
+        bool any = false; for (size_t i = 0; i < size_t(r) * H && !any; ++i) any = B[i] != 0.f;
+        if (!any) return;
+        auto& gh = wm_gain_[size_t(L) * 2 + kind];
+        if (gh.empty()) { gh.resize(H); KpQ{q, "memcpy"}.memcpy(gh.data(), gain, size_t(H) * 4).wait(); }
+        wm_y_.resize(size_t(T) * H);
+        KpQ{q, "memcpy"}.memcpy(wm_y_.data(), c.y32, size_t(T) * H * 4).wait();
+        const float* g = gh.data(); float* yh = wm_y_.data();
+        #pragma omp parallel for schedule(static) if (T > 4)
+        for (int64_t t = 0; t < int64_t(T); ++t) {
+            float* yr = yh + size_t(t) * H; float coef[64];
+            for (uint32_t k = 0; k < r; ++k) { double sacc = 0; const float* a = A + size_t(k) * H; for (uint32_t jx = 0; jx < H; ++jx) sacc += double(a[jx]) * yr[jx]; coef[k] = float(sacc); }
+            for (uint32_t k = 0; k < r; ++k) { const float ck = coef[k]; const float* b = B + size_t(k) * H; for (uint32_t jx = 0; jx < H; ++jx) yr[jx] += ck * b[jx]; }
+            double ss = 0; uint32_t n = 0;
+            for (uint32_t jx = 0; jx < H; ++jx) if (std::fabs(g[jx]) > 1e-6f) { const double u = double(yr[jx]) / g[jx]; ss += u * u; ++n; }
+            const float sc = n ? float(1.0 / std::sqrt(ss / double(n) + double(eps))) : 1.f;
+            for (uint32_t jx = 0; jx < H; ++jx) yr[jx] *= sc;
+        }
+        KpQ{q, "memcpy"}.memcpy(c.y32, wm_y_.data(), size_t(T) * H * 4).wait();
+    };
     if (c.any_tp) stage_helper(*cards_[1 - ci], T, pos0);          // the other card computes half of this card's split layers
     if (ci == 0) ablate();                                         // the embeddings
     for (uint32_t L = c.L0; L < c.L1; ++L) {
@@ -2352,7 +2392,7 @@ std::string Hy4fForward::run_card(Card& c, size_t ci, const int32_t* ids, uint32
         }
         hc_mixes(q, c.S, d.hc_a_fn, c.mix, c.mix_part, T, 2 * hc, HH, false);
         tick(q, "a.hc_mixes");
-        const bool fz = fuse_small_steps() && T <= kSmallRows && H <= 4096 && hc <= 8 && !range_on() && !prof_on_ && !abl_k_ && steer_.empty();
+        const bool fz = fuse_small_steps() && T <= kSmallRows && H <= 4096 && hc <= 8 && !range_on() && !prof_on_ && !abl_k_ && steer_.empty() && !wm_r_ && !wrec_;
         if (fz) hy4f_hc_apply_norm(q, c.S, c.mix_part, kHcParts, d.hc_a_base, d.hc_a_scale, c.pre, c.post, c.x, d.attn_norm, c.xn16, c.xn32, T, hc, H, HH, eps, cfg.hc_eps, cfg.hc_magnitude, eps);
         else {
         hc_apply(q, c.S, c.mix, d.hc_a_base, d.hc_a_scale, c.pre, c.post, c.x, T, hc, H, eps, cfg.hc_eps, cfg.hc_magnitude, c.mix_part, HH);
@@ -2371,7 +2411,7 @@ std::string Hy4fForward::run_card(Card& c, size_t ci, const int32_t* ids, uint32
         else if (auto e = attention(c, d, lw, L, T, pos0); !e.empty()) return e;
         tick(q, "a.o_norm");
         if (fz) hy4f_norm_post_add(q, c.o32, tp_add_, nullptr, d.post_norm, c.post, c.S, T, hc, H, eps);
-        else post_add(q, c.S, c.post, c.y32, T, hc, H);
+        else { write_hook(L, 0, d.post_norm); post_add(q, c.S, c.post, c.y32, T, hc, H); }
         tail_fused_ = false; tp_add_ = nullptr;
         ablate();
         tick(q, "a.post_add");
@@ -2503,7 +2543,7 @@ std::string Hy4fForward::run_card(Card& c, size_t ci, const int32_t* ids, uint32
             }
         }
         tick(q, "f.axpy+norm");
-        if (!ffn_tail_done) post_add(q, c.S, c.post, c.y32, T, hc, H);
+        if (!ffn_tail_done) { write_hook(L, 1, lw.moe ? d.moe_norm : d.mlp_post_norm); post_add(q, c.S, c.post, c.y32, T, hc, H); }
         if (!steer_.empty()) {
             float* S = c.S; const float* v = c.steer + size_t(L - c.L0) * HH; const float al = steer_alpha_;
             KpQ{q, "Hy4fSteerK"}.parallel_for<class Hy4fSteerK>(sycl::range<2>(T, HH), [=](sycl::id<2> i) { S[i[0] * HH + i[1]] += al * v[i[1]]; });

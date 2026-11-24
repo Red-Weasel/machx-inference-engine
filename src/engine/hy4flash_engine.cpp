@@ -253,6 +253,7 @@ GenerateResult hy4f_run(Hy4FlashBundle& b, const std::vector<int32_t>& ids, cons
     r.cache_source = L ? "live" : "none";
     std::vector<float> logits;
     uint32_t last_rows = 1;                                // rows of the latest forward(): the drafter reads the row a token was sampled from
+    bool fed_rows = false;
     for (size_t pos = L; pos < ids.size();) {             // the prompt in chunks; the liveness probe between them
         const size_t left = ids.size() - pos;
         const uint32_t T = uint32_t(b.big > b.chunk && left > std::max<size_t>(b.chunk, b.big_min) ? std::min<size_t>(b.big, left) : std::min<size_t>(b.chunk, left));
@@ -279,10 +280,33 @@ GenerateResult hy4f_run(Hy4FlashBundle& b, const std::vector<int32_t>& ids, cons
             rin.pos3 = mm->pos3->data() + pos * 3; rin.is_embed = mm->is_embed->data() + pos; rin.embeds = emb.data(); rp = &rin;
         }
         if (auto e = b.fw.forward(ids.data() + pos, T, logits, false, rp); !e.empty()) return fail("prompt read: " + e);
+        fed_rows = true;
         if (mm && mm->images) for (const auto& im : *mm->images) if (im.pos0 + im.n > pos && im.pos0 + im.n <= pos + T) b.live_images.push_back({im.pos0, im.n, im.hash});   // (its last row is in)
         b.live.insert(b.live.end(), ids.begin() + long(pos), ids.begin() + long(pos + T));
         pos += T;
         if (pos < ids.size() && on_token && !on_token(std::string_view{})) { r.finish_reason = "abort"; return r; }   // the client went away
+    }
+    // The unlock (see the bundle): the prompt's last row tells whether this is a request the maps are for; then its last 4
+    // rows are read again with the maps on and the reply is generated with them. They are off again when the request ends.
+    struct MapsOff { Hy4fForward& fw; bool on = false; ~MapsOff() { if (on) fw.set_write_maps(nullptr, nullptr, 0); } } maps_off{b.fw};
+    if (b.unlock_rank && fed_rows && ids.size() > 4 && (b.unlock_think || ids.back() == b.unlock_close_id)) {
+        const int um = ids.back() == b.unlock_close_id ? 1 : 0;
+        const auto& cfgu = b.model.config(); const auto& gate = b.unlock_gate[um];
+        const auto& rt = b.fw.last_routes(); uint32_t flags = 0;
+        for (uint32_t Lx = 0; Lx < cfgu.n_layers && Lx < rt.size() && Lx < gate.size(); ++Lx) {
+            if (rt[Lx].size() < cfgu.top_k) continue;
+            for (size_t k = rt[Lx].size() - cfgu.top_k; k < rt[Lx].size(); ++k) if (rt[Lx][k] >= 0 && gate[Lx][size_t(rt[Lx][k])]) ++flags;
+        }
+        if (flags >= b.unlock_thr) {
+            const size_t p0 = ids.size() - 4;
+            Hy4fRowInputs rin; std::vector<float> emb; const Hy4fRowInputs* rp = nullptr;
+            if (mm && mm->images && !mm->images->empty()) { rin.pos3 = mm->pos3->data() + p0 * 3; rin.is_embed = mm->is_embed->data() + p0; rin.embeds = emb.data(); rp = &rin; }
+            b.fw.rewind(uint32_t(p0));
+            b.fw.set_write_maps(b.unlock_A[um].data(), b.unlock_B[um].data(), b.unlock_rank); maps_off.on = true;
+            if (auto e = b.fw.forward(ids.data() + p0, 4, logits, false, rp); !e.empty()) return fail("prompt read (unlock): " + e);
+            last_rows = 4;
+        }
+        std::fprintf(stderr, "[hy4-flash] unlock: detector %u (threshold %u) -- %s\n", flags, b.unlock_thr, maps_off.on ? "maps on for this reply" : "the model as released");
     }
     r.prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_pf).count();
 
@@ -556,6 +580,34 @@ std::string Engine::hy4flash_load(const std::string& dir) {
         } else std::fprintf(stderr, "[hy4-flash] no %s/expert_ranking.u32: the cards start with the first experts of each layer (slower until the residency has adapted)\n", dir.c_str());
     }
     if (auto e = b->fw.init(qs, b->model, o); !e.empty()) return "hy4-flash: " + e;
+    {   // <dir>/unlock/unlock.json: {"rank": r, "threshold": n}, maps.A.f32 / maps.B.f32, gate_think.txt, gate_nothink.txt
+        const char* uv = std::getenv("IE_HY4F_UNLOCK"); const std::string ud = dir + "/unlock";
+        std::ifstream uj(ud + "/unlock.json");
+        if (uj && !(uv && *uv == '0')) {
+            try {
+                const auto j = nlohmann::json::parse(uj); const uint32_t rk = j.value("rank", 0u); b->unlock_thr = j.value("threshold", 9u); b->unlock_think = j.value("thinking", false);
+                const size_t n = size_t(2) * c.n_layers * rk * c.dim; bool ok = rk && rk <= 64;
+                for (int g = 0; g < 2 && ok; ++g) {          // maps_think.{A,B}.f32 and maps_nothink.{A,B}.f32
+                    b->unlock_A[g].resize(n); b->unlock_B[g].resize(n);
+                    const std::string mp = ud + (g ? "/maps_nothink" : "/maps_think");
+                    std::ifstream fA(mp + ".A.f32", std::ios::binary), fB(mp + ".B.f32", std::ios::binary);
+                    ok = fA && fB && fA.read(reinterpret_cast<char*>(b->unlock_A[g].data()), std::streamsize(n * 4)) && fB.read(reinterpret_cast<char*>(b->unlock_B[g].data()), std::streamsize(n * 4));
+                }
+                size_t ng[2] = {0, 0};
+                for (int g = 0; g < 2 && ok; ++g) {
+                    b->unlock_gate[g].assign(c.n_layers, std::vector<uint8_t>(c.n_experts, 0));
+                    std::ifstream gf(ud + (g ? "/gate_nothink.txt" : "/gate_think.txt")); uint32_t gl, ge;
+                    while (gf >> gl >> ge) if (gl < c.n_layers && ge < c.n_experts) { b->unlock_gate[g][gl][ge] = 1; ++ng[g]; }
+                    ok = ng[g] >= b->unlock_thr;
+                }
+                const auto cl = b->tok.encode("</think:opensource>", true);
+                ok = ok && cl.size() == 1;
+                if (ok) { b->unlock_rank = rk; b->unlock_close_id = cl[0];
+                          std::fprintf(stderr, "[hy4-flash] unlock: write maps of rank %u for requests the detector flags (%zu / %zu experts, threshold %u); every other request runs the model as released%s. IE_HY4F_UNLOCK=0 turns it off\n", rk, ng[0], ng[1], b->unlock_thr, b->unlock_think ? "" : "; requests with thinking on are never touched"); }
+                else std::fprintf(stderr, "[hy4-flash] %s is incomplete: the unlock is off\n", ud.c_str());
+            } catch (const std::exception& x) { std::fprintf(stderr, "[hy4-flash] %s/unlock.json: %s -- the unlock is off\n", ud.c_str(), x.what()); }
+        }
+    }
     b->reuse = opts_.prompt_cache;
     b->draft = b->fw.has_drafter();
     if (b->draft) std::fprintf(stderr, "[hy4-flash] drafter on (IE_HY4F_DRAFT=1; DFly2: up to %u drafts a step, verified while its confidence is above %.2f)\n", b->fw.draft_width(), double(b->draft_conf));

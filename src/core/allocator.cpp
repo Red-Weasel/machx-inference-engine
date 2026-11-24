@@ -707,6 +707,8 @@ std::string DeviceFleet::init(uint32_t n_request, std::string_view name_filter,
                                 std::string(name_filter) + "'";
     const uint32_t n = std::min(n_request, available);
     devs_.clear();
+    shared_ctx_.reset();   // (a second init starts clean: the 27B's tensor parallel re-inits as the layer split without P2P)
+    p2p_ = false;
     devs_.resize(n);   // DeviceAllocator default-constructs (no queue yet)
     for (uint32_t i = 0; i < n; ++i)
         if (auto e = devs_[i].init(name_filter, i); !e.empty())

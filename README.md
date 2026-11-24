@@ -44,6 +44,7 @@ donations are welcome, one-time or monthly. All donations support the project.
 
 **Latest**
 
+- **v0.2.46, November 23 — Inkling 2 Mini runs, with images, two cards on one conversation, and up to 24 agents:** Thinking Machines' 26B model (24 layers, the middle 12 run three times a token) is served from its own NVFP4 / MXFP8 weights: [62 tok/s on one card, 82 on two](#new-in-v0246), prompts read at 734 tok/s. Tool-call ids are now unique for the life of the server. Also in this release: Xing4.0-29B-A4B, a tool-call guard on the daily architectures, and a first LoRA trainer for the cards (`scripts/train`).
 - **v0.2.45, November 20 — Hy4-flash gives its spare VRAM to experts:** the context cache is backed for 32K tokens and grows in steps to the full context only when a conversation gets that long (and shrinks again for the next short one), and the image tower loads at the first image. Until then that VRAM holds expert slots: 160 / 156 → 176 / 164 a layer on two Arc Pro B70 at `--ctx 262144`, 5–8 % fewer experts computed on the CPU per token. [Details](#-new-in-v0245)
 - **v0.2.44, November 19 — Tencent Hy4-flash runs, with images, tool calls and long prompts:** the 220B model (512 experts a layer, 16 a token, four n-gram memories) is served from an 8-bit expert pack made from Tencent's full-precision release: a 25,000-token prompt reads at 462–470 tok/s and replies decode at 20–26 tok/s on two Arc Pro B70 cards, with the output closer to exact arithmetic than the reference is in bfloat16. Also: sampling with no top-p cut no longer sorts the whole vocabulary every token (DeepSeek-V4.1, MiMo-V2.6, Hy4-flash: 9.3 → 1.3 ms a token), and DeepSeek-V4.1 keeps a parked conversation in RAM down to 12 GiB free (it was 24, which a 256 GB machine never had). [Details](#-new-in-v0244)
 - **v0.2.43, November 13 — DeepSeek-V4.1 reads images again:** from v0.2.36 through v0.2.42 every image request to DeepSeek-V4.1 failed with `the prompt holds fewer image placeholders than images`. The guard that keeps control-token spellings in a request plain text also caught the engine's own image placeholder. Fixed, with a test; a placeholder typed by a client still stays text. Also new: `IE_DS41_ACT_DUMP=<dir>` records DeepSeek-V4.1's internal activations (the stream entering every layer) while a file `RECORD` exists in that folder, for work on the weights; `scripts/ds41_acts.py` reads them.
@@ -239,6 +240,47 @@ class ([New in v0.2.6](#new-in-v026)).
 ---
 
 <a id="new-in-v0242"></a>
+## 🆕 New in v0.2.46
+
+### Inkling 2 Mini (`inkling2_loop`)
+
+[Inkling 2 Mini](https://huggingface.co/thinkingmachines/Inkling-2-Mini) has 26.4B parameters, 128 experts a layer of which a token uses 8, and a loop: layers 6 to 17 run three passes, so a token is 48 layer calls. `ie serve <directory>` runs the publisher's 19 GB checkpoint as it is, with the experts kept in NVFP4 / MXFP8 on the card and decoded in the kernels. The forward pass was checked call by call against the publisher's reference code.
+
+Measured on Arc Pro B70 cards, November 23, single runs:
+
+| Launch | Decode at context 30 / 2K / 8K / 32K | Prompt reading at 2K / 8K / 25K |
+|---|---|---|
+| One card, one conversation (`--ctx 32768`) | 62.4 / 58.6 / 56.5 / 49.0 tok/s | 734 / 696 / 624 tok/s |
+| Two cards, one conversation (`--gpus 2 --parallel 1`) | 82.4 / 78.1 / 75.8 / 64.4 tok/s | 868 / 843 / 789 tok/s |
+
+Many conversations at temperature 1.0, through HTTP, `--gpus 2 --ctx 16384`, a copy of the model on each card:
+
+| At once | Each | Total |
+|---|---|---|
+| 6 | 38.6 tok/s | |
+| 12 | 27.3 tok/s | 302 tok/s |
+| 24 (`--parallel 24`) | 18.6 tok/s | 380 tok/s |
+
+- **Two cards on one token.** Each card holds a full copy; attention heads, four of the eight experts and the output rows are split, and the cards exchange results on the device. The output matches one card bit for bit in the checks we ran. On this driver a queue barrier does not order a read of the other card's memory, so the cards synchronise on a flag word.
+- **Prompt reading.** Attention shares key tiles across query rows, and the experts run on the matrix engines with the activations fed as fp16 plus their fp16 remainder, which lands within 2e-7 of the fp32 path.
+- **A long prompt no longer starves the others.** While other conversations decode, prompt reading gets 45 % of the card's time (`IE_INKLING2_PREFILL_SHARE`). A 25K prompt arriving beside five decoding conversations starts in 98 s and the five keep 49 % of their speed.
+- **Images.** Single images, several in one request, images in tool results, and video sent as ordered frames. Images above 4096 image tokens (about 2560 × 2560) are scaled down, which the publisher's code does not do.
+- **Sampling on the card.** Temperature, top-k, top-p, min-p and the repetition penalties are drawn on the card for multi-conversation serving.
+- **Run-time ablation sets.** A set file beside the model (`ie_ablation.json`) edits the stream as the engine runs. It works only in Mach X; `scripts/inkling2_ablit/bake.py` writes a refusal set into the weights for other runtimes.
+
+Known limits:
+
+- **The draft head is built but not served.** It drafts correctly, but verifying a draft reads every expert its tokens picked, and decoding with it was slower than without it (56 against 60 tok/s on code).
+- With several conversations, asking the same prompt twice can differ at a near-tie, because a cached re-ask recomputes the last row with a different attention kernel.
+- Contexts above 131K have not been measured on this model.
+
+### Also new
+
+- **Tool-call ids are unique for the life of the server** (`call_<salt>_<n>`). They used to be `call_0`, `call_1`, ... in every response, so a multi-turn client could send back an id that matched several earlier calls. A client that treats ids as opaque strings is unaffected.
+- **Xing4.0-29B-A4B** in `ie serve`: Q8_0 and K-quants on two cards, with request lanes.
+- **A tool-call guard** keeps the calls a model writes valid for the request's tools (Xing4, DeepSeek-V4.1, the Qwen XML form, MiMo-V2.6). `"ie_tool_guard": false` turns it off for a request.
+- **`machx-train` (`scripts/train`)**: LoRA fine-tuning of Inkling 2 Mini on one or two B70 cards, about 370 tok/s on two. It has only had short test runs so far, and no run has yet been shown to improve the model.
+
 ## 🆕 New in v0.2.45
 
 ### Hy4-flash: the VRAM a short conversation does not need holds experts

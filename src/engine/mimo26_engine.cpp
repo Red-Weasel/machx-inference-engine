@@ -536,6 +536,26 @@ std::string Engine::mimo26_load(const std::string& dir) {
 
 namespace {
 
+// the request's tool-call guard (Qwen XML, MiMo's spelling): every call names a real tool, the schema's keys, typed values.
+// IE_TOOL_GUARD=0 off. cerr: a bad tool_choice.
+std::unique_ptr<LaneGuard> mimo26_guard(Mimo26Bundle& b, const std::string& tools_json, bool thinking, const std::string& choice, std::string& cerr) {
+    static const bool on = !(std::getenv("IE_TOOL_GUARD") && *std::getenv("IE_TOOL_GUARD") == '0');
+    if (!on || tools_json.empty()) return nullptr;
+    std::string err;
+    auto g = ToolGuard::make_xml(tools_json, err);
+    if (!g) { if (!err.empty()) std::fprintf(stderr, "[mimo26] tool-call guard off for this request: %s\n", err.c_str()); return nullptr; }
+    if (!choice.empty()) { g = g->with_choice(choice, cerr); if (!g) return nullptr; }
+    std::call_once(b.guard_once, [&] {
+        b.guard_pieces = tool_guard_pieces(b.tok.vocab_size(), [&](const int32_t* ids, size_t n) {
+            return b.tok.decode(std::span<const int32_t>(ids, n), /*skip_special=*/false); });
+    });
+    auto l = std::make_unique<LaneGuard>();
+    l->keep = g; l->g = g.get(); l->st = g->start(thinking); l->pieces = &b.guard_pieces;
+    const std::vector<int32_t> eos = b.eos;
+    l->stop = [eos](int32_t id) { return std::find(eos.begin(), eos.end(), id) != eos.end(); };
+    return l;
+}
+
 GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, const SamplingParams& sp, const TokenCallback& on_token,
                               bool chat, bool thinking, const std::string& tools_json) {
     GenerateResult r;
@@ -663,6 +683,10 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
     p.repeat_penalty = sp.repeat_penalty; p.repeat_window = sp.repeat_window;
     p.seed = sp.seed ? sp.seed : uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
     uint64_t rng = p.seed;
+    std::string gcerr;
+    const auto guard = mimo26_guard(b, sp.tool_guard ? tools_json : std::string(), thinking, sp.tool_choice, gcerr);
+    if (!gcerr.empty()) { r.finish_reason = "error: " + gcerr; return r; }
+    p.guard = guard.get();
     std::vector<int32_t> recent(ids.end() - std::min<size_t>(ids.size(), 512), ids.end());
     std::string text, pending;
     const auto t_dec = std::chrono::steady_clock::now();
@@ -670,6 +694,7 @@ GenerateResult mimo26_run_ids(Mimo26Bundle& b, const std::vector<int32_t>& ids, 
     // one sampled token out: false = stop (an eos id, not emitted) or abort (the callback declined)
     auto emit = [&](int32_t id) -> bool {
         if (!sp.ignore_eos && std::find(b.eos.begin(), b.eos.end(), id) != b.eos.end()) { r.finish_reason = "stop"; return false; }
+        if (guard) guard->advance(id);
         ++r.completion_tokens;
         if (vit) vit->add_token(sv.has_H, sv.H, sv.margin);   // sv: the sample that produced id (the last one taken)
         recent.push_back(id);
@@ -863,6 +888,7 @@ void serve_end(Mimo26Serve& s, SLane& l, const std::string& finish, bool lost) {
 // window, and the lane ends with "length" at max_new. True while the lane goes on.
 bool serve_commit(Mimo26Bundle& b, SLane& l, int32_t id, const Ds41SampleStats& st) {
     if (!l.ignore_eos && std::find(b.eos.begin(), b.eos.end(), id) != b.eos.end()) { l.finish = "stop"; return false; }
+    if (l.guard) l.guard->advance(id);
     ++l.n_new; ++b.serve.tokens;
     l.outbox.push_back({id, st.has_H, st.H, st.margin});
     l.recent.push_back(id);
@@ -1184,6 +1210,9 @@ GenerateResult mimo26_run_lanes(Mimo26Bundle& b, const std::vector<int32_t>& ids
     VitalsWindow* const vit = sp.vitals;
     if (vit) vit->active = true;
     if (chat) r.tool_calls_json = "[]";
+    std::string gcerr;   // the request's tool-call guard, before any lane is taken
+    auto guard0 = mimo26_guard(b, sp.tool_guard ? tools_json : std::string(), thinking, sp.tool_choice, gcerr);
+    if (!gcerr.empty()) { r.finish_reason = "error: " + gcerr; return r; }
     r.prompt_tokens = uint32_t(ids.size());
     if (ids.empty()) { r.finish_reason = "error: empty prompt"; return r; }
     for (int32_t id : ids) if (id < 0) { r.finish_reason = "error: mimo_v2 image input: images are served at --parallel 1 only (P4 B4)"; return r; }
@@ -1215,6 +1244,7 @@ GenerateResult mimo26_run_lanes(Mimo26Bundle& b, const std::vector<int32_t>& ids
     l.sp.repeat_penalty = sp.repeat_penalty; l.sp.repeat_window = sp.repeat_window;
     l.sp.seed = sp.seed ? sp.seed : uint64_t(std::chrono::steady_clock::now().time_since_epoch().count());
     l.rng = l.sp.seed; l.ignore_eos = sp.ignore_eos;
+    l.guard = std::move(guard0); l.sp.guard = l.guard.get();
     l.recent.assign(ids.end() - std::ptrdiff_t(std::min<size_t>(ids.size(), 512)), ids.end());
     const uint32_t room = l.cap - uint32_t(ids.size());
     l.max_new = sp.max_tokens == 0 ? room : std::min(sp.max_tokens, room); l.n_new = 0;

@@ -631,8 +631,9 @@ add_test(NAME glm5_lanes_test COMMAND glm5_lanes_test)
 add_executable(lanes_serve_test
   unit/lanes_serve_test.cpp
   ${CMAKE_SOURCE_DIR}/src/engine/lanes_serve.cpp
+  ${CMAKE_SOURCE_DIR}/src/engine/tool_guard.cpp
   ${CMAKE_SOURCE_DIR}/src/model/glm5_lanes.cpp)
-target_include_directories(lanes_serve_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(lanes_serve_test PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party)
 add_test(NAME lanes_serve_test COMMAND lanes_serve_test)
 
 # Host-only (no GPU, no SYCL): the crown split's request lanes (P4 B10, include/ie/q35m_lanes.hpp) -- the per-lane VRAM
@@ -641,8 +642,9 @@ add_test(NAME lanes_serve_test COMMAND lanes_serve_test)
 add_executable(q35m_lanes_test
   unit/q35m_lanes_test.cpp
   ${CMAKE_SOURCE_DIR}/src/engine/lanes_serve.cpp
+  ${CMAKE_SOURCE_DIR}/src/engine/tool_guard.cpp
   ${CMAKE_SOURCE_DIR}/src/model/glm5_lanes.cpp)
-target_include_directories(q35m_lanes_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(q35m_lanes_test PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party)
 add_test(NAME q35m_lanes_test COMMAND q35m_lanes_test)
 
 # P4 B18: the Qwen3.8-27B split's request lanes (include/ie/q27_lanes.hpp) -- the prefill ops against --parallel 1's pipelined
@@ -651,8 +653,9 @@ add_test(NAME q35m_lanes_test COMMAND q35m_lanes_test)
 add_executable(q27_lanes_test
   unit/q27_lanes_test.cpp
   ${CMAKE_SOURCE_DIR}/src/engine/lanes_serve.cpp
+  ${CMAKE_SOURCE_DIR}/src/engine/tool_guard.cpp
   ${CMAKE_SOURCE_DIR}/src/model/glm5_lanes.cpp)
-target_include_directories(q27_lanes_test PRIVATE ${CMAKE_SOURCE_DIR}/include)
+target_include_directories(q27_lanes_test PRIVATE ${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/third_party)
 add_test(NAME q27_lanes_test COMMAND q27_lanes_test)
 
 # Host-only (no GPU, no SYCL): the deep prefill pipeline's scheduling (include/ie/deep_pipe.hpp, 2026-11-08: Flash-Next's
@@ -686,6 +689,11 @@ add_test(NAME mimo26_chat_test COMMAND mimo26_chat_test)
 add_executable(hy4flash_template_test unit/hy4flash_template_test.cpp)
 target_link_libraries(hy4flash_template_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME hy4flash_template_test COMMAND hy4flash_template_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+# Inkling 2 Mini serving: the native chat template against the checkpoint's Jinja renders (+ token ids when the model is on
+# disk), the request-text ranges, the effort table, the reply parser and its stream (host-only).
+add_executable(inkling2_serve_test unit/inkling2_serve_test.cpp)
+target_link_libraries(inkling2_serve_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME inkling2_serve_test COMMAND inkling2_serve_test WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 # speculative sampling's accept / resample step: the returned token follows the model's distribution (host-only, Monte Carlo).
 add_executable(spec_accept_test unit/spec_accept_test.cpp)
 target_link_libraries(spec_accept_test PRIVATE ie_core ie_sycl_flags)
@@ -824,6 +832,11 @@ add_test(NAME inkling_manifest_test COMMAND inkling_manifest_test)
 add_executable(inkling_config_test unit/inkling_config_test.cpp)
 target_link_libraries(inkling_config_test PRIVATE ie_core ie_sycl_flags)
 add_test(NAME inkling_config_test COMMAND inkling_config_test)
+
+# Inkling 2 Mini phase-1 ops vs the numpy reference (fixtures: scripts/inkling2/gen_ops_fixtures.py); needs one GPU
+add_executable(inkling2_ops_test unit/inkling2_ops_test.cpp)
+target_link_libraries(inkling2_ops_test PRIVATE ie_core ie_sycl_flags)
+add_test(NAME inkling2_ops_test COMMAND inkling2_ops_test)
 
 # GgufReader must leave kernel readahead ON over every shard mapping: MADV_RANDOM
 # zeroes the VMA's ra_pages and turns each mmap fault into one blocking 4 KiB

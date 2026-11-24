@@ -247,7 +247,30 @@ void ds41_finish_text(GenerateResult& r, const std::string& text, bool chat, boo
     if (chat) r.text = ds41_visible_content(r.text);
 }
 
-GenerateResult ds41_run_ids(Ds41Bundle& b, const std::vector<int32_t>& ids, const SamplingParams& sp, const TokenCallback& on_token, bool split_thinking, bool chat = false) {
+// the request's tool-call guard (DSML): every call it writes names a real tool, the schema's keys, typed values. IE_TOOL_GUARD=0 off.
+std::unique_ptr<LaneGuard> ds41_guard(Ds41Bundle& b, std::string_view tools_json, bool thinking, const std::string& choice, std::string& cerr) {
+    static const bool on = !(std::getenv("IE_TOOL_GUARD") && *std::getenv("IE_TOOL_GUARD") == '0');
+    if (!on || tools_json.empty()) return nullptr;
+    std::string err;
+    auto g = ToolGuard::make_dsml(tools_json, err);
+    if (!g) { if (!err.empty()) std::fprintf(stderr, "[deepseek41] tool-call guard off for this request: %s\n", err.c_str()); return nullptr; }
+    if (!choice.empty()) { g = g->with_choice(choice, cerr); if (!g) return nullptr; }   // tool_choice none / required / a function
+    std::call_once(b.guard_once, [&] {
+        const auto t0 = std::chrono::steady_clock::now();
+        b.guard_pieces = tool_guard_pieces(b.tok.vocab_size(), [&](const int32_t* ids, size_t n) {
+            return b.tok.decode(std::span<const int32_t>(ids, n), /*skip_special=*/false); });
+        std::fprintf(stderr, "[deepseek41] tool-call guard: %zu token texts in %.0f ms\n", b.guard_pieces.size(),
+                     std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    });
+    auto l = std::make_unique<LaneGuard>();
+    l->keep = g; l->g = g.get(); l->st = g->start(thinking); l->pieces = &b.guard_pieces;
+    const int32_t eos = b.tok.eos_token_id();
+    l->stop = [eos](int32_t id) { return id == eos; };
+    return l;
+}
+
+GenerateResult ds41_run_ids(Ds41Bundle& b, const std::vector<int32_t>& ids, const SamplingParams& sp, const TokenCallback& on_token, bool split_thinking, bool chat = false,
+                            std::string_view tools_json = {}) {
     GenerateResult r;
     // Block time 0 on THIS thread, as the tier's init sets it on the loading thread: ie serve runs a request on an
     // HTTP pool thread, and that thread's team (the engram gather, every token) spun 200 ms after each region --
@@ -256,6 +279,10 @@ GenerateResult ds41_run_ids(Ds41Bundle& b, const std::vector<int32_t>& ids, cons
     if (chat) r.tool_calls_json = "[]"; // authoritative native parser, including no calls
     Ds41SampleParams p; p.temperature = sp.temperature; p.top_k = sp.top_k; p.top_p = sp.top_p; p.min_p = sp.min_p;
     p.repeat_penalty = sp.repeat_penalty; p.repeat_window = sp.repeat_window; p.seed = sp.seed;
+    std::string cerr;
+    const auto guard = ds41_guard(b, sp.tool_guard ? tools_json : std::string_view(), split_thinking, sp.tool_choice, cerr);
+    if (!cerr.empty()) { r.finish_reason = "error: " + cerr; return r; }
+    p.guard = guard.get();
     const uint32_t max_new = sp.max_tokens == 0 || ids.size() + sp.max_tokens > b.fwd.capacity() ? (uint32_t(ids.size()) < b.fwd.capacity() ? b.fwd.capacity() - uint32_t(ids.size()) : 0) : sp.max_tokens;
     Ds41Generator gen(b.fwd, b.tok); if (b.drafter.ready()) gen.set_drafter(&b.drafter, b.qs.back());
     gen.set_lookup(b.lookup ? 1 : 0);
@@ -324,6 +351,7 @@ void serve_end(Ds41Serve& s, SLane& l, const std::string& finish, bool lost) {
 // lane goes on.
 bool serve_commit(Ds41Bundle& b, SLane& l, int32_t id) {
     if (id == b.tok.eos_token_id()) { l.finish = "stop"; return false; }
+    if (l.guard) l.guard->advance(id);
     ++l.n_new; ++b.serve.tokens;
     if (l.n_new == 1) l.t_first = SClock::now();
     else if (l.n_new == 100) l.early_ms = serve_ms(l.t_first);
@@ -616,7 +644,7 @@ std::string serve_prompt_end(Ds41Bundle& b, SLane& l, std::vector<float>& lg) {
 }
 
 GenerateResult ds41_run_lanes(Ds41Bundle& b, const std::vector<int32_t>& ids, const SamplingParams& sp, const TokenCallback& on_token,
-                              bool split_thinking, bool chat, Ds41Forward::VisionProvider vis = nullptr) {
+                              bool split_thinking, bool chat, Ds41Forward::VisionProvider vis = nullptr, std::string_view tools_json = {}) {
     GenerateResult r;
     if (chat) r.tool_calls_json = "[]"; // authoritative native parser, including no calls
     Ds41Serve& s = b.serve;   // (this thread runs no forward: the serial worker and the pipe's stage threads do)
@@ -638,6 +666,10 @@ GenerateResult ds41_run_lanes(Ds41Bundle& b, const std::vector<int32_t>& ids, co
     auto alive = [&] { return !on_token || on_token(std::string_view{}); };   // the server's liveness probe (an empty fragment)
     auto fits = [&] { for (const auto& l : s.lanes) if (!l.busy && l.cap > T) return true; return false; };
 
+    // the request's tool-call guard, before any lane is taken (a bad tool_choice is an error with nothing to undo)
+    std::string cerr;
+    auto guard0 = ds41_guard(b, sp.tool_guard ? tools_json : std::string_view(), split_thinking, sp.tool_choice, cerr);
+    if (!cerr.empty()) { r.finish_reason = "error: " + cerr; return r; }
     std::unique_lock<std::mutex> lk(s.mu);
     // 1. a lane, chosen under the serial turn; a prompt only lane 0 holds waits for lane 0
     int li = -1;
@@ -659,7 +691,8 @@ GenerateResult ds41_run_lanes(Ds41Bundle& b, const std::vector<int32_t>& ids, co
     l.busy = true; l.phase = SPhase::kPrefill; l.prompt = &ids; l.finish.clear(); l.want_stop = l.lost = l.parked = false; l.last_tp = 0;
     l.outbox.clear(); l.out.clear(); l.first_logits.clear(); l.rows.clear(); l.pend = 0; l.next = -1;
     l.steps = l.chunks = l.passes = l.pass_rows = l.accepted = l.plain = 0; l.cb_ms = l.early_ms = 0;
-    l.sp = p; l.rng = p.seed ? p.seed : 0x2545F4914F6CDD1Dull;
+    l.guard = std::move(guard0);
+    l.sp = p; l.sp.guard = l.guard.get(); l.rng = p.seed ? p.seed : 0x2545F4914F6CDD1Dull;
     l.recent.assign(ids.end() - std::ptrdiff_t(std::min<size_t>(ids.size(), p.repeat_window)), ids.end());
     l.lookup = s.lookup; l.idx = std::move(idx);
     l.max_new = ds41_reply_budget(T, sp.max_tokens, l.cap); l.n_new = 0;   // (T < l.cap: the lane fits the prompt)
@@ -902,8 +935,8 @@ GenerateResult Engine::ds41_chat(std::span<const ChatTurn> turns, const Sampling
     if (!err.empty()) { r.finish_reason = "error: " + err; return r; }
     auto ids = ds41_->tok.encode(prompt, /*allow_special=*/true, content);
     const bool lanes = !ds41_->serve.lanes.empty();   // P4 B6b: --parallel > 1
-    if (images.empty()) return lanes ? ds41_run_lanes(*ds41_, ids, sp, on_token, enable_thinking, /*chat=*/true)
-                                     : ds41_run_ids(*ds41_, ids, sp, on_token, enable_thinking, /*chat=*/true);
+    if (images.empty()) return lanes ? ds41_run_lanes(*ds41_, ids, sp, on_token, enable_thinking, /*chat=*/true, nullptr, tools_json)
+                                     : ds41_run_ids(*ds41_, ids, sp, on_token, enable_thinking, /*chat=*/true, tools_json);
 
     // every placeholder becomes its image's span: START, (IMAGE x w, NEW_LINE) x h, END -- all image positions
     const int32_t ph = int32_t(ds41_->model.config().image_token_id);
@@ -941,9 +974,9 @@ GenerateResult Engine::ds41_chat(std::span<const ChatTurn> turns, const Sampling
     };
     // P4 B6b: on the lanes the provider is set on the request's lane in its serial turn, and cleared there once every image
     // position is in (the pipe runs text positions only)
-    if (lanes) return ds41_run_lanes(b, full, sp, on_token, enable_thinking, /*chat=*/true, std::move(provider));
+    if (lanes) return ds41_run_lanes(b, full, sp, on_token, enable_thinking, /*chat=*/true, std::move(provider), tools_json);
     b.fwd.set_vision_provider(std::move(provider));
-    GenerateResult res = ds41_run_ids(b, full, sp, on_token, enable_thinking, /*chat=*/true);
+    GenerateResult res = ds41_run_ids(b, full, sp, on_token, enable_thinking, /*chat=*/true, tools_json);
     b.fwd.clear_vision();                                             // the provider captures this frame's locals
     return res;
 }

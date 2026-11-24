@@ -102,6 +102,7 @@ private:
     // llm_tokenizer_spm), <0xXX> byte fallback. Caller does add_space_prefix +
     // spaces→U+2581. Appends ids to `out`.
     void               bpe_merge_spm(std::string_view seg, std::vector<int32_t>& out) const;
+    void               bpe_merge_spm_ref(std::string_view seg, std::vector<int32_t>& out) const;   // the quadratic original
 
     // Vocab: owned strings; lookup map references vocab_[i].
     std::vector<std::string>                          vocab_;

@@ -7,6 +7,7 @@
 // its logits back as fp32 on the host), streaming detokenisation that never emits a partial
 // UTF-8 sequence, and the stop conditions: eos, the token budget, stop strings.
 #pragma once
+#include "ie/tool_guard.hpp"
 #include "ie/deepseek41_dspark.hpp"
 #include "ie/deepseek41_forward.hpp"
 #include "ie/tokenizer.hpp"
@@ -28,6 +29,7 @@ struct Ds41SampleParams {
     float    repeat_penalty = 1.f;  // 1: off; > 1 divides positive logits of recent ids, multiplies negative ones
     uint32_t repeat_window = 64;    // recent ids the penalty sees (prompt tail + output)
     uint64_t seed = 42;
+    LaneGuard* guard = nullptr;     // 2026-11-20: the request's tool-call guard (sample_row filters through it; the run advances it)
 };
 
 // What sample_row saw of the distribution it drew from (ie_vitals, docs/mimo26/IE_VITALS.md). Filled only when asked

@@ -253,11 +253,17 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "read_qwen35_config: %s\n", err.c_str()); return 1;
         }
         if (is_q35_split) {
-            if (auto err = fleet.init(n_gpus); !err.empty()) {
+            // 2026-11-21: IE_QWEN35_TP=1 = the split model's tensor parallel (every layer on both cards; the PPL gate against
+            // the layer split on the same text)
+            const char* tpv = std::getenv("IE_QWEN35_TP");
+            const bool q35_tp = n_gpus == 2 && tpv && *tpv == '1';
+            if (auto err = fleet.init(n_gpus, "B70", /*enable_p2p_transfers=*/q35_tp, /*shared_ctx=*/q35_tp); !err.empty()) {
                 std::fprintf(stderr, "fleet.init: %s\n", err.c_str()); return 1;
             }
             if (fleet.size() < 2) { std::fprintf(stderr, "split needs >=2 GPUs (have %u)\n", fleet.size()); return 1; }
             ie::LayerPlan plan = ie::LayerPlan::contiguous(qcfg.n_transformer_layers(), n_gpus);
+            if (q35_tp) { plan.embed_dev = 0; plan.head_dev = 0; q35split.set_tensor_parallel(true); }
+            std::fprintf(stderr, "[ppl] 27B on 2 cards: %s\n", q35_tp ? "TENSOR PARALLEL" : "layer split");
             if (auto err = q35split.load(fleet, plan, g, qcfg, max_ctx, int8_kv); !err.empty()) {
                 std::fprintf(stderr, "qwen35_split load: %s\n", err.c_str()); return 1;
             }

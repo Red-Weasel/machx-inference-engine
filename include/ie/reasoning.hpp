@@ -28,9 +28,15 @@ inline ReasoningCapabilities reasoning_capabilities(ModelArch arch, std::string_
         return {true,{"high","max"},"high","on/off selects Hy4-flash's reasoning mode (off = no_think); the effort is the template's high or max"};
     if (arch == ModelArch::kLaguna)
         return {true,{}, {},"on/off selects Laguna's thinking prompt (off renders </think>)"};
+    if (arch == ModelArch::kXing4)
+        return {true,{}, {},"on/off selects Xing4's thinking prompt (off renders </think>)"};
     if (arch == ModelArch::kInkling)
         return {true,{"minimal","low","medium","high","xhigh","max"},"high",
                 "Inkling's 'Thinking effort level' line: off = 0; the effort picks the level (minimal 0.1 ... high 0.9, max 0.99)"};
+    if (arch == ModelArch::kInkling2)
+        return {true,{"none","minimal","low","medium","high","xhigh","max"},"high",
+                "Inkling 2's 'Thinking effort level' line (chat_template.jinja): off = 0; none 0, minimal 0.1, low 0.2, medium 0.7, "
+                "high 0.9 (the template's default), xhigh / max 0.99"};
     if (arch == ModelArch::kGptOss)
         return {false,{"low","medium","high"},"high","Harmony controls effort, with no reasoning-off switch"};
     if ((arch==ModelArch::kLlama3 || arch==ModelArch::kQwen3Dense) &&
@@ -66,7 +72,19 @@ inline bool chatml_think_split(ModelArch arch, std::string_view tmpl) {
     return tf == DenseConfig::TemplateFamily::kChatML || tf == DenseConfig::TemplateFamily::kAuto;
 }
 inline bool known_reasoning_effort(std::string_view v) {
-    return v=="low" || v=="medium" || v=="high" || v=="xhigh" || v=="max";
+    return v=="low" || v=="medium" || v=="high" || v=="xhigh" || v=="max" ||
+           v=="none" || v=="minimal";   // Inkling 2's template names: only kInkling2 takes them (arch_reasoning_effort_error)
+}
+// "none" and "minimal" parse for every request (known_reasoning_effort) because Inkling 2's template names them; every
+// other arch refuses them exactly as it did before they were added: the request parser's message (a 400), the CLI's.
+inline bool inkling2_only_effort(std::string_view v) { return v=="none" || v=="minimal"; }
+inline constexpr const char* kUnknownEffortRequest = "invalid request setting: unknown reasoning_effort level";
+inline constexpr const char* kUnknownEffortCli = "--reasoning-effort requires a supported model effort level";
+inline std::string reasoning_effort_error(const ReasoningCapabilities& r, std::string_view effort);
+// A request's effort for this arch (and its GGUF template): "" = accepted.
+inline std::string arch_reasoning_effort_error(ModelArch arch, std::string_view tmpl, std::string_view effort) {
+    if (arch != ModelArch::kInkling2 && inkling2_only_effort(effort)) return kUnknownEffortRequest;
+    return reasoning_effort_error(reasoning_capabilities(arch, tmpl), effort);
 }
 inline std::string reasoning_effort_error(const ReasoningCapabilities& r, std::string_view effort) {
     if (effort.empty()) return {}; // keep the architecture's default

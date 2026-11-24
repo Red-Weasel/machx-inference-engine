@@ -2,7 +2,10 @@
 #include "ie/reasoning.hpp"
 #include "nlohmann/json.hpp"
 
+#include <atomic>
 #include <cctype>
+#include <chrono>
+#include <random>
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
@@ -14,6 +17,21 @@ using nlohmann::json;
 using ojson = nlohmann::ordered_json;   // preserves client key order (tools)
 
 namespace ie::oai {
+
+// A tool-call id must be unique within a conversation: the client sends it back as tool_call_id and a renderer names
+// the tool result after the call that carries it. "call_<index>" (and the streaming "call_chatcmpl_<index>") repeated
+// in every response, so in a multi-turn session a result matched every earlier call with that index. One id per call
+// for the life of the process, with a per-process salt so a server restart inside a conversation cannot collide.
+static std::string next_tool_call_id() {
+    static const std::string salt = [] {
+        char b[16];
+        std::snprintf(b, sizeof b, "%06llx", static_cast<unsigned long long>(
+            std::chrono::steady_clock::now().time_since_epoch().count() ^ (static_cast<unsigned long long>(std::random_device{}()) << 7)) & 0xffffffULL);
+        return std::string(b);
+    }();
+    static std::atomic<unsigned long long> n{0};
+    return "call_" + salt + "_" + std::to_string(n.fetch_add(1));
+}
 
 // Decode a base64 payload (standard alphabet, '=' padding, whitespace
 // tolerated). Returns false on any other character.
@@ -191,6 +209,18 @@ static ChatRequest parse_chat_request_impl(const std::string& body, ChatRequest 
             }
         }
         if (!j["tools"].empty()) out.tools_json = j["tools"].dump();
+    }
+    if (j.contains("ie_tool_guard") && j["ie_tool_guard"].is_boolean()) out.sampling.tool_guard = j["ie_tool_guard"].get<bool>();
+    if (j.contains("tool_choice")) {   // "auto" | "none" | "required" | {"type": "function", "function": {"name": N}}
+        const auto& tc = j["tool_choice"];
+        if (tc.is_string()) {
+            const std::string v = tc.get<std::string>();
+            if (v != "auto" && v != "none" && v != "required") { out.error = "tool_choice: auto, none, required or a function"; return out; }
+            out.sampling.tool_choice = v == "auto" ? "" : v;
+        } else if (tc.is_object() && tc.contains("function") && tc["function"].is_object() && tc["function"].contains("name") &&
+                   tc["function"]["name"].is_string()) {
+            out.sampling.tool_choice = "fn:" + tc["function"]["name"].get<std::string>();
+        } else if (!tc.is_null()) { out.error = "tool_choice: auto, none, required or a function"; return out; }
     }
     // `stop`: a string or an array of up to 4 strings (OpenAI); empty strings
     // are ignored, any other shape is a 400.
@@ -490,7 +520,7 @@ static json parse_response_tool_calls(const std::string& text,
                 json fn;
                 fn["name"] = lname;
                 fn["arguments"] = largs;
-                calls.push_back({{"id", "call_" + std::to_string(idx)},
+                calls.push_back({{"id", next_tool_call_id()},
                                  {"index", idx},
                                  {"type", "function"},
                                  {"function", fn}});
@@ -511,7 +541,7 @@ static json parse_response_tool_calls(const std::string& text,
             } else {
                 fn["arguments"] = "{}";
             }
-            calls.push_back({{"id", "call_" + std::to_string(idx)},
+            calls.push_back({{"id", next_tool_call_id()},
                              {"index", idx},
                              {"type", "function"},
                              {"function", fn}});
@@ -524,7 +554,7 @@ static json parse_response_tool_calls(const std::string& text,
                 json fn;
                 fn["name"] = lname;
                 fn["arguments"] = largs;
-                calls.push_back({{"id", "call_" + std::to_string(idx)},
+                calls.push_back({{"id", next_tool_call_id()},
                                  {"index", idx},
                                  {"type", "function"},
                                  {"function", fn}});
@@ -536,6 +566,20 @@ static json parse_response_tool_calls(const std::string& text,
         pos = e + CLOSE.size();
     }
     return calls;
+}
+
+// 2026-11-21 (asked by Dream's evaluations view): the request's exact timings in llama.cpp's shape, so a client can show
+// the read and the write speed without estimating. prompt_n = the prompt tokens READ (the cached ones are cache_n),
+// prompt_ms = the whole prefill phase (cache_ms of it restoring the cached prefix), predicted_n / predicted_ms = the reply.
+static json timings_json(uint32_t prompt_tokens, uint32_t cached_tokens, uint32_t completion_tokens,
+                         double prefill_ms, double restore_ms, double decode_ms) {
+    const uint32_t fresh = prompt_tokens > cached_tokens ? prompt_tokens - cached_tokens : 0;
+    json t = {{"prompt_n", fresh}, {"cache_n", cached_tokens}, {"prompt_ms", prefill_ms}, {"cache_ms", restore_ms},
+              {"predicted_n", completion_tokens}, {"predicted_ms", decode_ms}};
+    const double read_ms = prefill_ms - restore_ms;
+    t["prompt_per_second"] = read_ms > 0 ? fresh * 1000.0 / read_ms : 0.0;
+    t["predicted_per_second"] = decode_ms > 0 ? completion_tokens * 1000.0 / decode_ms : 0.0;
+    return t;
 }
 
 std::string chat_completion_json(const std::string& model,
@@ -552,7 +596,7 @@ std::string chat_completion_json(const std::string& model,
             int idx = 0;
             for (auto& tc : pre) {
                 if (!tc.is_object()) { pre = json::array(); break; }
-                if (!tc.contains("id")) tc["id"] = "call_" + std::to_string(idx);
+                if (!tc.contains("id")) tc["id"] = next_tool_call_id();
                 ++idx;
             }
             if (!pre.empty()) { calls = pre; content = r.text; }
@@ -581,6 +625,9 @@ std::string chat_completion_json(const std::string& model,
                   {"completion_tokens", r.completion_tokens},
                   {"total_tokens", r.prompt_tokens + r.completion_tokens},
                   {"prompt_tokens_details", {{"cached_tokens", r.cached_tokens}}}};
+    if (r.lane_ctx) j["usage"]["ie"] = {{"lane", r.lane}, {"ctx", r.lane_ctx}};   // the lane that served it and its context
+    if (r.prefill_ms > 0 || r.decode_ms > 0)
+        j["timings"] = timings_json(r.prompt_tokens, r.cached_tokens, r.completion_tokens, r.prefill_ms, r.restore_ms, r.decode_ms);
     return j.dump(-1, ' ', false, json::error_handler_t::replace);
 }
 
@@ -625,7 +672,7 @@ std::string chat_chunk_sse_tool_calls_json(const std::string& model, const std::
     for (auto& tc : calls) {
         if (!tc.is_object()) return {};
         tc["index"] = idx++;
-        if (!tc.contains("id")) tc["id"] = "call_" + id.substr(0, 8) + "_" + std::to_string(idx);
+        if (!tc.contains("id")) tc["id"] = next_tool_call_id();
     }
     json j = base(model, id, created, "chat.completion.chunk");
     j["choices"] = json::array({{
@@ -650,13 +697,16 @@ std::string chat_chunk_sse(const std::string& model, const std::string& id,
 
 std::string chat_chunk_sse_usage(const std::string& model, const std::string& id,
                                  int64_t created, uint32_t prompt_tokens,
-                                 uint32_t completion_tokens, uint32_t cached_tokens) {
+                                 uint32_t completion_tokens, uint32_t cached_tokens, uint32_t lane, uint32_t lane_ctx,
+                                 double prefill_ms, double restore_ms, double decode_ms) {
     json j = base(model, id, created, "chat.completion.chunk");
     j["choices"] = json::array();   // OpenAI's usage chunk carries no choices
     j["usage"] = {{"prompt_tokens", prompt_tokens},
                   {"completion_tokens", completion_tokens},
                   {"total_tokens", prompt_tokens + completion_tokens},
-                  {"prompt_tokens_details", {{"cached_tokens", cached_tokens}}}};
+ {"prompt_tokens_details", {{"cached_tokens", cached_tokens}}}};
+    if (lane_ctx) j["usage"]["ie"] = {{"lane", lane}, {"ctx", lane_ctx}};
+    if (prefill_ms > 0 || decode_ms > 0) j["timings"] = timings_json(prompt_tokens, cached_tokens, completion_tokens, prefill_ms, restore_ms, decode_ms);
     return "data: " + j.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n";
 }
 

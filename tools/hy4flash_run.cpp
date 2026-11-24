@@ -254,7 +254,21 @@ int main(int argc, char** argv) {
         std::ofstream frh, frl;
         if (!routes_out.empty()) { frh.open(routes_out + ".hist.u16", std::ios::binary); frl.open(routes_out + ".last.i32", std::ios::binary); }
         std::vector<uint16_t> rhist(size_t(c.n_layers) * c.n_experts); std::vector<int32_t> rlast(size_t(c.n_layers) * c.top_k);
-        std::vector<float> dump;
+        // IE_HY4F_GATE=<file of "layer expert" lines> [IE_HY4F_GATE_THR=n, default 6]: a candidate's write maps are applied
+        // only to a prompt whose last row routes to at least n of the listed experts (the experts that fire on the kind of
+        // request the maps are for): its last 4 rows are read again with the maps on and the reply is generated with them;
+        // every other prompt runs the unmodified model.
+        std::vector<std::vector<uint8_t>> gate; uint32_t gate_thr = 6; std::vector<float> candA, candB; uint32_t candR = 0;
+        if (const char* v = std::getenv("IE_HY4F_GATE"); v && *v) {
+            gate.assign(c.n_layers, std::vector<uint8_t>(c.n_experts, 0)); std::ifstream gf(v); uint32_t gl, ge2;
+            while (gf >> gl >> ge2) if (gl < c.n_layers && ge2 < c.n_experts) gate[gl][ge2] = 1;
+        }
+        if (const char* v = std::getenv("IE_HY4F_GATE_THR"); v && *v) gate_thr = uint32_t(std::atoi(v));
+        std::vector<float> dump, wdump;
+        // IE_HY4F_WRITES_OUT=<file> [IE_HY4F_WRITES_ROWS=n]: every prompt's sublayer writes, [2 * n_layers][n][dim] fp32 a prompt
+        std::ofstream fw_out; uint32_t writes_rows = 1;
+        if (const char* v = std::getenv("IE_HY4F_WRITES_OUT"); v && *v) fw_out.open(v, std::ios::binary);
+        if (const char* v = std::getenv("IE_HY4F_WRITES_ROWS"); v && *v) writes_rows = uint32_t(std::max(1, std::atoi(v)));
         auto esc = [](const std::string& x) {
             std::string o; char b[8];
             for (unsigned char ch : x) {
@@ -270,7 +284,8 @@ int main(int argc, char** argv) {
         };
         // --ablate-list: the whole batch once per candidate (name, a raw fp32 [k, dim] orthonormal basis file, k, strength);
         // "none" as the file = the unmodified model. --gen-out lines then carry the candidate's name.
-        struct Cand { std::string name, file; uint32_t k = 0; float strength = 1.f; std::string mask, steer; float alpha = 0.f; };   // steer: raw fp32 [n_layers, hc, dim]      // mask: a text file of "layer expert" lines, "" = none
+        struct Cand { std::string name, file; uint32_t k = 0; float strength = 1.f; std::string mask, steer; float alpha = 0.f; std::string maps; uint32_t rank = 0; };   // maps: <prefix>.A.f32 / .B.f32, [2 * n_layers][rank][dim]
+   // steer: raw fp32 [n_layers, hc, dim]      // mask: a text file of "layer expert" lines, "" = none
         std::vector<Cand> cands;
         if (!ablate_list.empty()) {
             std::ifstream f(ablate_list); std::string line;
@@ -281,10 +296,11 @@ int main(int argc, char** argv) {
                 if (std::getline(ss, st, '\t')) cd.strength = float(std::atof(st.c_str()));
                 std::getline(ss, cd.mask, '\t');
                 { std::string al; if (std::getline(ss, cd.steer, '\t') && std::getline(ss, al, '\t')) cd.alpha = float(std::atof(al.c_str())); }
+                { std::string rk; if (std::getline(ss, cd.maps, '\t') && std::getline(ss, rk, '\t')) cd.rank = uint32_t(std::atoi(rk.c_str())); }
                 cands.push_back(cd);
             }
             if (cands.empty()) { std::fprintf(stderr, "no candidates in %s\n", ablate_list.c_str()); return 2; }
-        } else cands.push_back({"", "none", 0, 1.f, "", "", 0.f});
+        } else cands.push_back({"", "none", 0, 1.f, "", "", 0.f, "", 0});
         t0 = std::chrono::steady_clock::now(); uint64_t fed = 0, made = 0;
         for (const Cand& cd : cands) {
         if (cd.file == "none" || cd.k == 0) fw.set_ablation(nullptr, 0);
@@ -309,6 +325,15 @@ int main(int argc, char** argv) {
                 fw.set_steering(sv.data(), cd.alpha);
                 std::printf("  steering: %s, alpha %.2f\n", cd.steer.c_str(), double(cd.alpha));
             } else fw.set_steering(nullptr, 0.f);
+            if (!cd.maps.empty() && cd.maps != "none" && cd.rank) {
+                const size_t n = size_t(2) * c.n_layers * cd.rank * c.dim; std::vector<float> A(n), B(n);
+                std::ifstream fA(cd.maps + ".A.f32", std::ios::binary), fB(cd.maps + ".B.f32", std::ios::binary);
+                if (!fA || !fB || !fA.read(reinterpret_cast<char*>(A.data()), std::streamsize(n * 4)) || !fB.read(reinterpret_cast<char*>(B.data()), std::streamsize(n * 4))) { std::fprintf(stderr, "candidate %s: cannot read the write maps %s.{A,B}.f32 at rank %u\n", cd.name.c_str(), cd.maps.c_str(), cd.rank); return 2; }
+                candA = A; candB = B; candR = cd.rank;
+                if (gate.empty()) { if (auto e = fw.set_write_maps(A.data(), B.data(), cd.rank); !e.empty()) { std::fprintf(stderr, "%s\n", e.c_str()); return 2; } }
+                else fw.set_write_maps(nullptr, nullptr, 0);
+                std::printf("  write maps: %s, rank %u%s\n", cd.maps.c_str(), cd.rank, gate.empty() ? "" : " (gated)");
+            } else { fw.set_write_maps(nullptr, nullptr, 0); candR = 0; }
             if (!cd.name.empty()) { std::printf("candidate %s (%u directions, strength %.2f, %zu experts masked)\n", cd.name.c_str(), cd.k, double(cd.strength), mk.size()); std::fflush(stdout); }
         }
         for (size_t pi = 0; pi < prompts.size(); ++pi) {
@@ -319,6 +344,7 @@ int main(int argc, char** argv) {
                 const uint32_t T = uint32_t(std::min<size_t>(chunk, p.size() - pos));
                 const bool last = pos + T == p.size();
                 dump.clear(); fw.set_stream_dump(last && fa.is_open() ? &dump : nullptr, true);
+                wdump.clear(); fw.record_writes(last && fw_out.is_open() ? &wdump : nullptr, writes_rows);
                 if (auto e = fw.forward(p.data() + pos, T, logits, false); !e.empty()) { std::fprintf(stderr, "prompt '%s' at %zu: %s\n", name.c_str(), pos, e.c_str()); return 1; }
                 if (frh.is_open()) {
                     const auto& rt = fw.last_routes();
@@ -333,7 +359,21 @@ int main(int argc, char** argv) {
                 frh.write(reinterpret_cast<const char*>(rhist.data()), std::streamsize(rhist.size() * 2));
                 frl.write(reinterpret_cast<const char*>(rlast.data()), std::streamsize(rlast.size() * 4));
             }
-            fw.set_stream_dump(nullptr);
+            uint32_t flags = 0;
+            if (!gate.empty()) {
+                const auto& rt = fw.last_routes();
+                for (uint32_t L = 0; L < c.n_layers && L < rt.size(); ++L) {
+                    if (rt[L].size() < c.top_k) continue;
+                    for (size_t k = rt[L].size() - c.top_k; k < rt[L].size(); ++k) if (rt[L][k] >= 0 && gate[L][size_t(rt[L][k])]) ++flags;
+                }
+                if (candR && flags >= gate_thr && p.size() > 4) {
+                    fw.rewind(uint32_t(p.size() - 4));
+                    fw.set_write_maps(candA.data(), candB.data(), candR);
+                    if (auto e = fw.forward(p.data() + p.size() - 4, 4, logits, false); !e.empty()) { std::fprintf(stderr, "prompt '%s' (gated re-read): %s\n", name.c_str(), e.c_str()); return 1; }
+                }
+            }
+            fw.set_stream_dump(nullptr); fw.record_writes(nullptr);
+            if (fw_out.is_open()) fw_out.write(reinterpret_cast<const char*>(wdump.data()), std::streamsize(wdump.size() * 4));
             fed += p.size();
             if (fa.is_open()) fa.write(reinterpret_cast<const char*>(dump.data()), std::streamsize(dump.size() * 4));
             if (fl.is_open()) fl.write(reinterpret_cast<const char*>(logits.data()), std::streamsize(size_t(V) * 4));
@@ -346,7 +386,8 @@ int main(int argc, char** argv) {
                     if (auto e = fw.forward(&next, 1, logits, false); !e.empty()) { std::fprintf(stderr, "prompt '%s' step %u: %s\n", name.c_str(), i, e.c_str()); return 1; }
                 }
                 made += gen.size();
-                fg << "{\"candidate\": \"" << esc(cd.name) << "\", \"name\": \"" << esc(name) << "\", \"ids\": [";
+                if (!gate.empty()) fw.set_write_maps(nullptr, nullptr, 0);
+                fg << "{\"candidate\": \"" << esc(cd.name) << "\", \"name\": \"" << esc(name) << "\", \"flags\": " << flags << ", \"ids\": [";
                 for (size_t i = 0; i < gen.size(); ++i) fg << (i ? ", " : "") << gen[i];
                 fg << "], \"text\": \"" << esc(tok.decode(std::span<const int32_t>(gen.data(), gen.size()), false)) << "\"}\n";
                 fg.flush();

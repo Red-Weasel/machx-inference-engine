@@ -8,7 +8,7 @@ int main() {
     for (auto args : {std::vector<std::string>{"--ctx", "-1"},
             {"--ctx", "1"}, {"--ctx", "8"}, {"--slot-ctx", "8"},
             {"--ctx", "12abc"}, {"--temp", "nan"}, {"--top-p", "0"},
-            {"--parallel", "17"}, {"--parallel", "0"}, {"--prefill-chunk", "0"}, {"--threads", "0"},
+            {"--parallel", "33"}, {"--parallel", "0"}, {"--prefill-chunk", "0"}, {"--threads", "0"},
             {"--slot-ctx", "9000", "--ctx", "8000"}, {"--seed", "-1"},
             {"--stop", ""}, {"--thinking", "maybe"}, {"--unknown"}, {"--temp"},
             {"--reasoning-effort","ultra"}, {"--reasoning-effort"},
@@ -24,6 +24,10 @@ int main() {
     for (const char* n : {"1", "4", "5", "8", "16"})
         assert(ie::parse_launch_options({"--parallel", n}).engine.parallel == uint32_t(std::atoi(n)));
     static_assert(ie::kMaxParallel == 16);
+    // 17..32 parse (Inkling 2's cap, ie::kMaxParallelInkling2); Engine::load refuses them for every other arch
+    for (const char* n : {"17", "24", "32"})
+        assert(ie::parse_launch_options({"--parallel", n}).engine.parallel == uint32_t(std::atoi(n)));
+    static_assert(ie::kMaxParallelInkling2 == 32);
     auto minimal = ie::parse_launch_options({"--ctx", "9", "--slot-ctx", "9"});
     assert(minimal.engine.max_ctx == 9 && minimal.engine.slot_ctx == 9);
     assert(minimal.max_queue == 8 && !minimal.max_queue_set);

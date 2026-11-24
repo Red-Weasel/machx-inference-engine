@@ -13,6 +13,9 @@
 #include "ie/mimo26_prefix_cache.hpp"
 #include "ie/mimo26_vision.hpp"
 #include "ie/tokenizer.hpp"
+#include "ie/tool_guard.hpp"
+
+#include <mutex>
 
 #include <sycl/sycl.hpp>
 
@@ -52,6 +55,7 @@ struct Mimo26Serve {
         Ds41SampleParams sp; bool ignore_eos = false, vitals = false;   // vitals: the request asked for ie_vitals (stats per sample)
         uint64_t rng = 0; std::vector<int32_t> recent;   // the sampler's state and repetition window (prompt tail + output)
         std::vector<Tok> outbox;                  // committed ids the request thread has not taken
+        std::unique_ptr<LaneGuard> guard;         // the request's tool-call guard (null: none)
         std::vector<std::pair<uint32_t, uint32_t>> drafts;   // draft passes (offered, accepted) it has not taken
         std::string finish;                       // "" while running; "stop" / "length" / "abort" / "error: ..."
         bool want_stop = false;                   // the request thread's cancel: honoured at the lane's next completion
@@ -144,6 +148,8 @@ inline uint32_t mimo26_draft_k_weighted(uint32_t pool, const double* acc, uint32
 }
 
 struct Mimo26Bundle {
+    std::vector<std::string>                  guard_pieces;   // the tool-call guard's token texts (built at the first guarded request)
+    std::once_flag                            guard_once;
     Mimo26Model                               model;
     Tokenizer                                 tok;
     std::vector<std::unique_ptr<sycl::queue>> queues;

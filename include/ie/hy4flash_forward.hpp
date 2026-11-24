@@ -156,6 +156,14 @@ public:
     // Diagnostic: every forward() appends the streams ENTERING each layer, [n_layers, T, hc, dim] fp32, to *dst.
     // last_row_only: [n_layers, hc, dim] of the call's last row (what an activation recording of a prompt keeps).
     void set_stream_dump(std::vector<float>* dst, bool last_row_only = false) { dump_ = dst; dump_last_ = last_row_only; }
+    // The writes (for a weight edit fitted to them): every sublayer -- attention, then the FFN, of every layer -- adds
+    // post_i * y to the streams, y = gain (.) v / rms(v). record_writes: the last `rows` rows of every y of a call are
+    // appended to dst ([2 * n_layers][rows][dim] fp32 a call, before any map). set_write_maps: y <- y + B (A^T y) with a
+    // rank-r pair per write (A, B: [2 * n_layers][r][dim] fp32, write index 2 * L + {0 attention, 1 FFN}; zeros = leave it),
+    // then y is brought back to the norm's unit rms in y / gain -- what replacing the sublayer's last linear map W by
+    // (I + G^-1 B A^T G) W does (G = diag(gain)), so a set of maps found here bakes into the weights exactly. r = 0: off.
+    void record_writes(std::vector<float>* dst, uint32_t rows = 1) { wrec_ = dst; wrec_rows_ = rows ? rows : 1; }
+    std::string set_write_maps(const float* A, const float* B, uint32_t r);
     // Diagnostic: experts picked per layer of the last call, [n_layers][T * top_k] (empty rows for the dense layer).
     const std::vector<std::vector<int32_t>>& last_routes() const { return routes_; }
     // Diagnostic (the mini gate): the reference's discrete choices by absolute position -- routes [MoE layer ordinal][n_pos][top_k]
@@ -291,6 +299,8 @@ private:
     std::vector<float> steer_; float steer_alpha_ = 0.f; uint64_t steer_version_ = 0;
     std::map<uint32_t, std::vector<int32_t>> eg_lookup_; std::vector<uint64_t> h_eg_rows_; std::vector<const uint8_t*> h_eg_addr_;   // the n-gram step's host tables
     std::vector<std::vector<uint8_t>> mask_; std::vector<float> h_bias_;      // [n_layers][E] 1 = masked; the masked bias of the layer in hand
+    std::vector<float> wm_y_; std::vector<std::vector<float>> wm_gain_;
+    std::vector<float> wm_A_, wm_B_; uint32_t wm_r_ = 0; uint64_t wm_version_ = 0; std::vector<float>* wrec_ = nullptr; uint32_t wrec_rows_ = 1;
     std::vector<float> abl_basis_; uint32_t abl_k_ = 0; float abl_strength_ = 1.f; uint64_t abl_version_ = 0;
     Stats st_;
 };

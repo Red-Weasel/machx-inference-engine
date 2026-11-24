@@ -126,7 +126,7 @@ inline LaunchOptions parse_launch_options(const std::vector<std::string>& args) 
         else if (flag == "--vram-reserve-gib") out.vram_reserve_gib = double(number(0, 24));
         else if (flag == "--parallel") {   // P4 B30: "auto" = the default
             if (i + 1 < args.size() && args[i + 1] == "auto") { ++i; e.parallel = kLanesAuto; }
-            else e.parallel = uint32_t(integer(1, kMaxParallel));
+            else e.parallel = uint32_t(integer(1, kMaxParallelInkling2));   // > kMaxParallel: Inkling 2 only (Engine::load)
         }
         else if (flag == "--max-queue") { out.max_queue = uint32_t(integer(0, 1024)); out.max_queue_set = true; }
         else if (flag == "--slot-ctx") e.slot_ctx = uint32_t(integer(0, INT32_MAX));

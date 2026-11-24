@@ -110,6 +110,141 @@ std::string name_of(const ie::ChatmlToolCalls& r, size_t i) {
     return json::parse(r.tool_calls_json).at(i)["function"]["name"].get<std::string>();
 }
 
+// 2026-11-21: a request that offers a dispatcher (tool_call / tool_schema) whose description lists the catalog,
+// one "name — what it does" per line under "Available:". Calls to catalog names are real calls; their values stay text
+// (no schema), except plain integers / booleans; a name outside the catalog stays text.
+void dispatcher_catalog() {
+    const std::string tools = R"([
+      {"type":"function","function":{"name":"tool_schema","description":"Find tools.\nAvailable:\nread_file — read a file\nwrite_file — write or append to a text file\nrun_bash — run a shell command\n","parameters":{"type":"object","properties":{"name":{"type":"string"}}}}},
+      {"type":"function","function":{"name":"tool_call","description":"Run one tool by its exact name.","parameters":{"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object"}}}}}
+    ])";
+    {
+        const std::string t = "<tool_call>\n<function=write_file>\n<parameter=path>\nconf.json\n</parameter>\n<parameter=content>\n{\"a\": 1}\n</parameter>\n"
+                              "<parameter=append>\nfalse\n</parameter>\n</function>\n</tool_call>";
+        const auto r = ie::parse_chatml_xml_tool_calls(t, tools);
+        check(!r.tool_calls_json.empty() && name_of(r, 0) == "write_file", "catalog: write_file is a real call");
+        const json a = args_of(r, 0);
+        check(a["path"] == "conf.json" && a["content"].is_string() && a["content"] == "{\"a\": 1}" && a["append"] == false,
+              "catalog: content that looks like JSON stays text; a boolean stays a boolean");
+    }
+    {
+        const auto r = ie::parse_chatml_xml_tool_calls("<tool_call>\n<function=read_file>\n<parameter=path>\nx.py\n</parameter>\n"
+                                                       "<parameter=offset>\n120\n</parameter>\n</function>\n</tool_call>", tools);
+        const json a = args_of(r, 0);
+        check(name_of(r, 0) == "read_file" && a["offset"] == 120, "catalog: a plain integer is an integer");
+    }
+    {
+        const auto r = ie::parse_chatml_xml_tool_calls("<tool_call>\n<function=run_bash>\n<parameter=command>\n123\n</parameter>\n</function>\n</tool_call>", tools);
+        check(name_of(r, 0) == "run_bash", "catalog: run_bash is a real call");
+    }
+    {
+        const auto r = ie::parse_chatml_xml_tool_calls("<tool_call>\n<function=delete_everything>\n<parameter=path>\n/\n</parameter>\n</function>\n</tool_call>", tools);
+        check(r.tool_calls_json.empty(), "catalog: a name the catalog does not list stays text");
+    }
+    {   // 2026-11-21: Dream's catalog lines with signatures, "name(args) — ..."
+        const std::string sig = R"([{"type":"function","function":{"name":"tool_schema","description":"Find tools.\nAvailable:\nwrite_file(path, content, append?) \u2014 write a file\nrun_bash(command) \u2014 run a shell command\n","parameters":{"type":"object","properties":{}}}}])";
+        const auto r = ie::parse_chatml_xml_tool_calls("<tool_call>\n<function=write_file>\n<parameter=path>\na\n</parameter>\n<parameter=content>\nb\n</parameter>\n</function>\n</tool_call>", sig);
+        check(name_of(r, 0) == "write_file", "catalog with signatures: write_file(path, ...) is a real call");
+        const auto r2 = ie::parse_chatml_xml_tool_calls("<tool_call>\n<function=write>\n<parameter=path>\na\n</parameter>\n</function>\n</tool_call>", sig);
+        check(r2.tool_calls_json.empty(), "catalog with signatures: a prefix of a listed name stays text");
+        const std::string bare = R"([{"type":"function","function":{"name":"tool_schema","description":"Available:\nrun_bash(command) \u2014 x\nnoop\ntail_tool","parameters":{"type":"object","properties":{}}}}])";
+        check(name_of(ie::parse_chatml_xml_tool_calls("<tool_call>\n<function=noop>\n</function>\n</tool_call>", bare), 0) == "noop" &&
+              name_of(ie::parse_chatml_xml_tool_calls("<tool_call>\n<function=tail_tool>\n</function>\n</tool_call>", bare), 0) == "tail_tool",
+              "catalog: a bare name on its own line (mid and last) is a real call");
+    }
+    {   // without a dispatcher, an unlisted name still stays text (unchanged)
+        const auto r = ie::parse_chatml_xml_tool_calls("<tool_call>\n<function=write_file>\n<parameter=path>\na\n</parameter>\n</function>\n</tool_call>",
+                                                       R"([{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{}}}}])");
+        check(r.tool_calls_json.empty(), "no dispatcher: an unlisted name stays text");
+    }
+}
+
+// 2026-11-21: a text argument the model HTML-escaped (no raw '<' / '>') is decoded once; one with raw markup is left as written
+void html_escaped_args() {
+    const std::string tools = R"([{"type":"function","function":{"name":"write_file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}}}}}])";
+    auto content_of = [&](const std::string& body) {
+        const auto r = ie::parse_chatml_xml_tool_calls("<tool_call>\n<function=write_file>\n<parameter=path>\nx\n</parameter>\n<parameter=content>\n" + body +
+                                                       "\n</parameter>\n</function>\n</tool_call>", tools);
+        return r.tool_calls_json.empty() ? std::string("<no call>") : args_of(r, 0)["content"].get<std::string>();
+    };
+    check(content_of("if capacity &lt; 0 and b &gt;= 2:\n    s = &quot;a&amp;b&quot;") == "if capacity < 0 and b >= 2:\n    s = \"a&b\"",
+          "escaped: &lt; &gt; &quot; &amp; decoded");
+    check(content_of("x = 1 &amp;lt; 2") == "x = 1 &amp;lt; 2", "escaped twice (only &amp;): left as written");
+    check(content_of("a &lt; b &amp;&amp; c") == "a < b && c", "&lt; with &amp;: one pass decodes both");
+    check(content_of("<p>a &lt; b</p>") == "<p>a &lt; b</p>", "raw markup: the entities are meant, left as written");
+    check(content_of("curl 'h?a=1&amp;b=2'") == "curl 'h?a=1&amp;b=2'", "only &amp;: left as written");
+    check(content_of("for (i = 0; i < n; i++)") == "for (i = 0; i < n; i++)", "plain code: unchanged");
+    check(content_of("while i &lt; n:\n    if v >= x: return a -> b") == "while i < n:\n    if v >= x: return a -> b",
+          "escaped '<' beside raw '>' (the model's mix): decoded");
+}
+
+// 2026-11-21 run 2 (Flash in Dream): a catalog tool's list argument, mixed escaping in source files and commands, a wrapped call
+void flash_run2() {
+    const std::string tools = R"([{"type":"function","function":{"name":"tool_schema","description":"Available:\nwrite_file(path, content, append?) — write\nstr_replace_edit(path, old_string?, new_string?, edits?) — edit\nrun_bash(command) — run\n","parameters":{"type":"object","properties":{}}}}])";
+    auto call = [&](const std::string& fn, const std::string& params) {
+        return ie::parse_chatml_xml_tool_calls("<tool_call>\n<function=" + fn + ">\n" + params + "</function>\n</tool_call>", tools);
+    };
+    auto P = [](const std::string& k, const std::string& v) { return "<parameter=" + k + ">\n" + v + "\n</parameter>\n"; };
+    {
+        const auto r = call("str_replace_edit", P("path", "s.mjs") + P("edits", R"([{"old_string": "a < b", "new_string": "a <= b"}])"));
+        const json a = args_of(r, 0);
+        check(a["edits"].is_array() && a["edits"][0]["new_string"] == "a <= b", "catalog: edits (a JSON list) stays a list");
+    }
+    {
+        const auto r = call("write_file", P("path", "solution.hpp") + P("content", "#include <string>\n#include &lt;cctype&gt;\nbool f(int a) { return a &lt; 3; }"));
+        check(args_of(r, 0)["content"] == "#include <string>\n#include <cctype>\nbool f(int a) { return a < 3; }",
+              "source file: mixed raw '<' and &lt; decoded");
+    }
+    {
+        const auto r = call("write_file", P("path", "page.html") + P("content", "<p>a &lt; b</p>"));
+        check(args_of(r, 0)["content"] == "<p>a &lt; b</p>", "an .html file keeps its entities");
+    }
+    {
+        const auto r = call("run_bash", P("command", "cat > t.cpp <<'EOF'\nint main() { return 1 &lt; 2; }\nEOF\ng++ t.cpp &amp;&amp; ./a.out"));
+        check(args_of(r, 0)["command"] == "cat > t.cpp <<'EOF'\nint main() { return 1 < 2; }\nEOF\ng++ t.cpp && ./a.out",
+              "a shell command: decoded beside its raw '<'");
+    }
+    {
+        const auto r = call("run_bash", P("arguments", R"({"command": "ls -la"})"));
+        const json a = args_of(r, 0);
+        check(a.size() == 1 && a["command"] == "ls -la", "a call wrapped in `arguments`: unwrapped");
+    }
+    {   // an escape table in source code keeps its entities; the mixed-escape operators around it are still decoded
+        const auto r = call("write_file", P("path", "esc.py") + P("content", "def esc(s):\n    if len(s) &lt; 1: return s\n    return s.replace(\"<\", \"&lt;\").replace('&', '&amp;')"));
+        check(args_of(r, 0)["content"] == "def esc(s):\n    if len(s) < 1: return s\n    return s.replace(\"<\", \"&lt;\").replace('&', '&amp;')",
+              "source file: an entity directly inside quotes is the program's own text");
+    }
+    {   // run 3: escaped twice in a source file; a list written as a JSON string through the JSON call form
+        const auto r = call("write_file", P("path", "solution.py") + P("content", "if times &amp;lt; 0 and a &amp;amp;lt; b:"));
+        check(args_of(r, 0)["content"] == "if times < 0 and a < b:", "source file: escaped twice / three times decoded to plain");
+        const auto r2 = ie::parse_chatml_xml_tool_calls(R"(<tool_call>
+{"name": "run_bash", "arguments": {"command": "echo hi", "tools": "[]", "opts": "{\"k\": 1}"}}
+</tool_call>)", tools);
+        const json a2 = args_of(r2, 0);
+        check(a2["tools"].is_array() && a2["opts"].is_object() && a2["command"] == "echo hi", "a list / object written as a string becomes the list / object");
+    }
+    {
+        const auto r = call("write_file", P("path", "notes.md") + P("content", "{\"a\": 1}"));
+        check(args_of(r, 0)["content"].is_string(), "file content that is JSON stays text");
+    }
+}
+
+// 2026-11-21 (DeepSWE abs-module-cache-flags): the dispatcher's call with a garbled, unclosed function header
+void garbled_dispatcher() {
+    const std::string tools = R"([{"type":"function","function":{"name":"tool_schema","description":"Available:\ngrep(pattern, path?) — search\nrun_bash(command) — run\n","parameters":{"type":"object","properties":{}}}},{"type":"function","function":{"name":"tool_call","description":"Call a tool.","parameters":{"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object"}},"required":["name","arguments"]}}}])";
+    const std::string reply = "<tool_call>\n<function=run_map_hu42\n<parameter=arguments>\n{\"pattern\": \"Map struct\", \"path\": \"object\"}\n</parameter>\n<parameter=name>\ngrep\n</parameter>\n</function>\n</tool_call>";
+    const auto r = ie::parse_chatml_xml_tool_calls(reply, tools);
+    check(name_of(r, 0) == "tool_call", "garbled unclosed header with the dispatcher's arguments: read as tool_call");
+    const json a = args_of(r, 0);
+    check(a["name"] == "grep" && a["arguments"].is_object() && a["arguments"]["pattern"] == "Map struct", "its name and arguments are kept");
+    const auto r2 = ie::parse_chatml_xml_tool_calls("<tool_call>\n<function=run_map_hu42\n<parameter=arguments>\n{}\n</parameter>\n<parameter=name>\nno_such_tool\n</parameter>\n</function>\n</tool_call>", tools);
+    check(r2.tool_calls_json.empty(), "garbled header naming a tool nobody has: stays text");
+    const auto r3 = ie::parse_chatml_xml_tool_calls("<tool_call>\n<function=run_map_hu42>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>", tools);
+    check(r3.tool_calls_json.empty(), "an unknown name with other arguments: stays text");
+    const auto r4 = ie::parse_chatml_xml_tool_calls("<tool_call>\n<function=run_bash>\n<parameter=command>\nls\n</parameter>\n</function>\n</tool_call>", tools);
+    check(name_of(r4, 0) == "run_bash" && args_of(r4, 0)["command"] == "ls", "a well-formed call is unchanged");
+}
+
 void parser() {
     // 1. One XML call, every schema type, a multi-line string, an unknown parameter.
     {
@@ -205,7 +340,7 @@ void parser() {
         const json body = json::parse(ie::oai::chat_completion_json("m", gr, "id1", 7));
         const json msg = body["choices"][0]["message"];
         check(body["choices"][0]["finish_reason"] == "tool_calls" && msg["tool_calls"].size() == 2 &&
-              msg["tool_calls"][0]["id"] == "call_0" && msg["tool_calls"][1]["id"] == "call_1" &&
+              msg["tool_calls"][0]["id"].get<std::string>().rfind("call_", 0) == 0 && msg["tool_calls"][0]["id"] != msg["tool_calls"][1]["id"] &&
               msg["tool_calls"][1]["function"]["name"] == "recall" && msg["content"].is_null(),
               "server: chat_completion_json -> two structured calls, null content");
         const std::string frame = ie::oai::chat_chunk_sse_tool_calls_json("m", "chatcmpl-1", 7, r.tool_calls_json);
@@ -827,6 +962,14 @@ int main(int argc, char** argv) {
     renderer_ranges();
     std::printf("parser:\n");
     parser();
+    std::printf("dispatcher catalog:\n");
+    dispatcher_catalog();
+    std::printf("HTML-escaped arguments:\n");
+    html_escaped_args();
+    std::printf("Flash run 2:\n");
+    flash_run2();
+    std::printf("garbled dispatcher:\n");
+    garbled_dispatcher();
     std::printf("B35 the reasoning split:\n");
     think_split();
     think_reply();

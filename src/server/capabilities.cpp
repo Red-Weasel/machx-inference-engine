@@ -15,9 +15,11 @@
 namespace ie {
 std::string server_reasoning_error(const std::string& path,std::string_view effort) {
     if(effort.empty())return {};
+    if(inkling2_only_effort(effort) && !Engine::inkling2_dir(path))return kUnknownEffortCli;   // refused as before these names parsed
     if(Engine::ds41_dir(path))return reasoning_effort_error(reasoning_capabilities(ModelArch::kDeepSeek41),effort);
     if(Engine::mimo26_dir(path))return reasoning_effort_error(reasoning_capabilities(ModelArch::kMimo26),effort);
     if(Engine::hy4flash_dir(path))return reasoning_effort_error(reasoning_capabilities(ModelArch::kHy4Flash),effort);
+    if(Engine::inkling2_dir(path))return reasoning_effort_error(reasoning_capabilities(ModelArch::kInkling2),effort);
     GgufReader g;
     if(auto e=g.open(path);!e.empty())return "gguf: "+e;
     const auto* ct=g.find_kv("tokenizer.chat_template");
@@ -32,7 +34,7 @@ bool server_supports_arch(ModelArch arch) noexcept {
         case ModelArch::kGemma4: case ModelArch::kGptOss:
         case ModelArch::kDeepSeek4: case ModelArch::kQwen4Exp:
         case ModelArch::kGlm5Next: case ModelArch::kDeepSeek41: case ModelArch::kMimo26:
-        case ModelArch::kLaguna: case ModelArch::kInkling: case ModelArch::kHy4Flash: return true;
+        case ModelArch::kLaguna: case ModelArch::kInkling: case ModelArch::kHy4Flash: case ModelArch::kXing4: case ModelArch::kInkling2: return true;
         default: return false;
     }
 }
@@ -41,8 +43,114 @@ bool server_streams_experts(ModelArch arch) noexcept {
            arch == ModelArch::kGlm5Next || arch == ModelArch::kDeepSeek41 || arch == ModelArch::kMimo26 ||
            arch == ModelArch::kLaguna || arch == ModelArch::kInkling || arch == ModelArch::kHy4Flash;
 }
+// 2026-11-21 (owner request): the launch that is used and tested on this machine (2 x Arc Pro B70, 256 GB RAM), every
+// load field a client's model screen shows, each as {value, why, source}, so Dream's "Use recommendations" can fill the
+// whole form instead of only the sampler. The values are docs/MODEL_SETTINGS.md's "Launch (tested)" rows; a model
+// without a tested launch gets null rather than a guess. file_type: the GGUF's general.file_type (7 Q8_0, 15 Q4_K_M,
+// 16 Q5_K_S, 17 Q5_K_M, 18 Q6_K); -1 when not a GGUF.
+static nlohmann::json recommended_launch(ModelArch arch, int64_t file_type, const std::string& model_name) {
+    using nlohmann::json;
+    auto s = [](json v, std::string why, std::string src) { return json{{"value", std::move(v)}, {"why", std::move(why)}, {"source", std::move(src)}}; };
+    const std::string doc = "docs/MODEL_SETTINGS.md, tested launch ";
+    auto contains = [&](const char* k) { return model_name.find(k) != std::string::npos; };
+    json L;
+    switch (arch) {
+    case ModelArch::kQwen35Dense: {
+        const bool q8 = file_type == 7 || file_type < 0, q5 = file_type == 16 || file_type == 17;
+        const std::string src = doc + "2026-10-18";
+        L = {{"gpus", s(2, "the layer split over both cards; tensor parallel gives nothing on this dense model", src)},
+             {"ctx", s(q8 ? 222222 : 250000, q8 ? "the most that fits beside the Q8_0 weights with the request lanes" : "the smaller Q6_K / Q5_K file leaves room for more context", src)},
+             {"parallel", s(q5 ? 16 : 8, "request lanes decode together through the card pipe: more total tokens per second (one request ~23-29 tok/s, three together ~15 each)", src)},
+             {"slot_ctx", s(q8 ? 60000 : 50000, "context of each extra lane; lane 0 keeps the full ctx", src)},
+             {"prefill_chunk", s(2048, "prompt rows read per forward: the measured prompt-read rate (2,962-3,001 tok/s on Q8_0) is at 2048", src)},
+             {"thinking", s(true, "the daily mode; requests can still turn it off", src)},
+             {"reasoning_effort", s("xhigh", "the tested launch's effort", src)},
+             {"spec", s(true, "the model's own MTP draft head, on every lane; exact at any temperature", src)},
+             {"spec_k", s(3, "3 drafted tokens a round is the head's default and the tested setting", src)},
+             {"int8_kv", s(false, "measured slower on this dense model and forces one card and one lane", "docs/MODEL_SETTINGS.md, Known")}};
+        break; }
+    case ModelArch::kQwen4Exp: {
+        const std::string src = doc + "2026-10-23";
+        L = {{"gpus", s(2, "the model and its expert cache need both cards", src)},
+             {"ctx", s(262000, "the tested context; lane 0's buffers grow on demand, so unused context costs no expert slots", src)},
+             {"parallel", s(4, "four request lanes (use 1 for a single conversation at a time)", src)},
+             {"slot_ctx", s(75000, "context of each extra lane", src)},
+             {"prefill_chunk", s(2048, "the tested prompt-read chunk", src)},
+             {"thinking", s(true, "the daily mode", src)},
+             {"reasoning_effort", s("xhigh", "the tested launch's effort", src)},
+             {"spec", s(true, "the MTP draft head (needs mtp-head.gguf beside the model); exact at any temperature", src)},
+             {"spec_k", s(3, "the certified draft length", src)},
+             {"int8_kv", s(false, "not available on this model", "ie capabilities")}};
+        break; }
+    case ModelArch::kQwen35Moe: {
+        const std::string src = doc + "2026-10-17";
+        L = {{"gpus", s(2, "both cards", src)}, {"ctx", s(262144, "the tested context", src)},
+             {"parallel", s(6, "six request lanes", src)}, {"slot_ctx", s(40000, "context of each extra lane", src)},
+             {"prefill_chunk", s(2048, "the tested prompt-read chunk", src)}, {"thinking", s(true, "the daily mode", src)},
+             {"spec", s(false, "not part of the tested launch (prompt-lookup drafts exist; not measured at this launch)", src)},
+             {"int8_kv", s(false, "forces one card and one lane", "ie capabilities")}};
+        break; }
+    case ModelArch::kDeepSeek41: {
+        const std::string src = doc + "2026-10-20";
+        L = {{"gpus", s(2, "both cards; experts live in system RAM", src)}, {"ctx", s(265000, "the tested context (500K starved the expert reserve and thrashed)", src)},
+             {"parallel", s(4, "four request lanes", src)}, {"slot_ctx", s(75000, "context of each extra lane", src)},
+             {"prefill_chunk", s(2048, "the tested prompt-read chunk", src)}, {"thinking", s(true, "the daily mode", src)},
+             {"reasoning_effort", s("high", "the tested launch's effort; the card uses max for its agent/coding benchmark", src)},
+             {"vram_reserve_gib", s(0, "a reserve trades decode speed for nothing on this machine; never raise it", src)}};
+        break; }
+    case ModelArch::kMimo26: {
+        const std::string src = doc + "2026-10-14";
+        const bool base = !contains("UNCENSORED") && contains("Base");
+        L = {{"gpus", s(2, "both cards; experts in system RAM", src)}, {"ctx", s(base ? 200000 : 250000, "the tested context", src)},
+             {"parallel", s(1, "the tested launch serves one conversation at a time", src)}, {"slot_ctx", s(75000, "context of an extra lane if parallel is raised", src)},
+             {"prefill_chunk", s(2048, "the tested prompt-read chunk", src)}, {"thinking", s(true, "the daily mode", src)},
+             {"vram_reserve_gib", s(base ? 0.5 : 1.0, "headroom the expert tier leaves on each card at this launch", src)}};
+        break; }
+    case ModelArch::kGlm5Next: {
+        const std::string src = doc + "2026-10-04";
+        L = {{"gpus", s(2, "at most two layer stages", src)}, {"ctx", s(264000, "the tested context", src)},
+             {"parallel", s(1, "the GLM server resets state per request; one at a time", src)},
+             {"prefill_chunk", s(1024, "GLM's own chunk: 1024, not 2048", src)}, {"thinking", s(true, "GLM always reasons", src)},
+             {"reasoning_effort", s("max", "the tested launch's effort", src)}};
+        break; }
+    case ModelArch::kDeepSeek4: {
+        const std::string src = doc + "2025-09 (measured on an earlier driver stack)";
+        const bool vision = contains("Vision") || contains("vision");
+        L = {{"gpus", s(2, "both cards", src)}, {"ctx", s(300000, "the tested context", src)},
+             {"parallel", s(1, "images work at one lane only", src)},
+             {"prefill_chunk", s(vision ? 512 : 2048, vision ? "the vision variant reads prompts in 512-row chunks" : "the tested prompt-read chunk", src)},
+             {"thinking", s(true, "the daily mode", src)}, {"reasoning_effort", s("high", "the tested launch's effort", src)}};
+        break; }
+    case ModelArch::kHy4Flash: {
+        const std::string src = "README v0.2.44 (2026-11-19)";
+        L = {{"gpus", s(2, "both cards; experts in system RAM", src)}, {"ctx", s(262144, "the measured context", src)},
+             {"parallel", s(1, "one request at a time is what the backend serves", src)}, {"thinking", s(true, "the measured mode", src)}};
+        break; }
+    case ModelArch::kLlama3:
+        if (contains("Nanbeige")) {
+            const std::string src = doc + "2026-10-29";
+            L = {{"gpus", s(2, "two cards: 28-29 tok/s (one card fits only ctx 8192, 19.3 tok/s)", src)},
+                 {"ctx", s(65536, "the tested context on two cards", src)},
+                 {"parallel", s(1, "no request lanes on this path yet; more requests queue", src)},
+                 {"thinking", s(true, "the daily mode", src)}, {"spec", s(true, "prompt-lookup drafts: repeated text 2.7x faster, other text unchanged", src)}};
+        }
+        break;
+    default: break;
+    }
+    if (L.is_null()) return nullptr;
+    // The fields a request carries rather than the load: one answer for every model, with the reason.
+    L["repeat_last_n"] = s(64, "how far back the presence / frequency / repetition penalties look; only matters when one of them is "
+                              "non-zero (the instruct mode's presence 1.5). No card names a value; the engine default", "engine default");
+    L["frequency_penalty"] = s(0, "no card recommends one", "engine default");
+    L["seed"] = s(0, "0 = a new random seed each request; set a number only to reproduce a reply exactly", "engine default");
+    L["stop"] = s(json::array(), "the chat template ends replies itself; extra stop strings can cut tool calls", "engine default");
+    L["prompt_cache"] = s(true, "later turns reuse the read prompt instead of re-reading it", "engine default");
+    return L;
+}
+
 std::string server_capabilities_json(const std::string& model_path) {
     using nlohmann::json;
+    int64_t file_type = -1;
     ModelArch arch = ModelArch::kUnknown;
     std::string name;
     std::string chat_template, model_name, base_repo;
@@ -50,6 +158,7 @@ std::string server_capabilities_json(const std::string& model_path) {
     if (!model_path.empty() && Engine::ds41_dir(model_path)) { arch = ModelArch::kDeepSeek41; name = "deepseek_v41"; }
     else if (!model_path.empty() && Engine::mimo26_dir(model_path)) { arch = ModelArch::kMimo26; name = "mimo_v2"; }
     else if (!model_path.empty() && Engine::hy4flash_dir(model_path)) { arch = ModelArch::kHy4Flash; name = "hy_v4_flash"; }
+    else if (!model_path.empty() && Engine::inkling2_dir(model_path)) { arch = ModelArch::kInkling2; name = "inkling2_loop"; }
     else if (!model_path.empty()) {
         GgufReader g;
         if (auto e = g.open(model_path); !e.empty()) throw std::runtime_error("gguf: " + e);
@@ -62,6 +171,7 @@ std::string server_capabilities_json(const std::string& model_path) {
         // P4 B20: what recommended_sampling matches the exact weights on
         if (auto t=g.find_kv("general.name");t && t->type==GgufValueType::kString)model_name=t->as_string();
         if (auto t=g.find_kv("general.base_model.0.repo_url");t && t->type==GgufValueType::kString)base_repo=t->as_string();
+        if (auto t=g.find_kv("general.file_type"))file_type=t->as_int();
         // 2026-10-28 (serving campaign P1, its gate's finding): a dense file keeps a prompt cache only when it runs on the
         // fleet class, which loads the dtypes and geometry of dense_fleet_rules.hpp (a Q8_0 / Q5_K file stays on the
         // cache-less DenseModel). --int8-kv is a load option, not known here: it also keeps the old path.
@@ -91,7 +201,8 @@ std::string server_capabilities_json(const std::string& model_path) {
         arch == ModelArch::kQwen35Dense || arch == ModelArch::kQwen3Next ||
         arch == ModelArch::kGemma4 || arch == ModelArch::kQwen4Exp ||
         arch == ModelArch::kDeepSeek4 || arch == ModelArch::kDeepSeek41 || arch == ModelArch::kMimo26 ||
-        arch == ModelArch::kLaguna || arch == ModelArch::kInkling || arch == ModelArch::kGlm5Next || arch == ModelArch::kHy4Flash;
+        arch == ModelArch::kLaguna || arch == ModelArch::kInkling || arch == ModelArch::kGlm5Next || arch == ModelArch::kHy4Flash ||
+        arch == ModelArch::kXing4 || arch == ModelArch::kInkling2;
     // v0.2.21: the 35B-A3B class (lookup drafts on the request lanes, P4 B55) and Flash-Next (lookup drafts at one lane, B56; its
     // MTP head only with a --spec-head path, B63) take --spec too, so a client's load screen can offer it.
     // 2026-10-28 (serving campaign P2): the dense fleet class takes --spec too (prompt-lookup drafts at one lane).
@@ -160,6 +271,14 @@ std::string server_capabilities_json(const std::string& model_path) {
             {"resolution","request > CLI/env > the recommendation for the request's mode > library default; "
                           "a request or server default of temperature 0 (greedy) takes nothing from it"}};
     }
+    // directory models (DS4.1 / MiMo / Hy4) have no general.name: match on the folder name instead
+    j["recommended_launch"] = generic ? json(nullptr) : recommended_launch(arch, file_type, model_name.empty() ? model_path : model_name);
+    // the reply limit: the publisher's answer budget where the card states one (a smaller cap cuts long files and tool
+    // calls off mid-way, which a client then sees as a broken call)
+    if (j["recommended_launch"].is_object() && rec && rec->max_output)
+        j["recommended_launch"]["max_tokens"] = {{"value", rec->max_output},
+            {"why", "the model card's answer budget; a lower cap cuts long files and tool calls off mid-way"},
+            {"source", (rec->source && *rec->source) ? std::string(rec->source) : std::string("model card")}};
     if(reasoning.thinking)j["load"].push_back("thinking");
     if (arch == ModelArch::kMimo26 || arch == ModelArch::kDeepSeek41) {   // the auto expert tier honours a VRAM headroom knob;
         j["load"].push_back("vram_reserve_gib");                              // Dream sends the advertised default EXPLICITLY, so it

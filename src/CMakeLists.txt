@@ -87,8 +87,12 @@ add_library(ie_core
   ops/hy4flash_ix_gpu.cpp
   ops/hy4flash_fuse.cpp
   ops/hy4flash_moe_grp.cpp
+  ops/xing4_ops.cpp
+  ops/xing4_attn.cpp
+  ops/xing4_moe_xmx.cpp
   ops/mimo26_ops.cpp
   ops/inkling_ops.cpp
+  ops/inkling2_ops.cpp
   ops/laguna_ops.cpp
   ops/deepseek4_cache.cpp
   ops/attention.cpp
@@ -115,6 +119,9 @@ add_library(ie_core
   model/qwen4exp.cpp
   model/laguna.cpp
   model/inkling.cpp
+  model/inkling2.cpp
+  model/inkling2_vision.cpp
+  model/inkling2_draft.cpp
   model/qwen4_vision.cpp
   model/qwen4_image.cpp
   model/ds4_vision.cpp
@@ -151,6 +158,7 @@ add_library(ie_core
   model/hy4flash.cpp
   model/hy4flash_host.cpp
   model/hy4flash_forward.cpp
+  model/xing4.cpp
   model/hy4flash_q8.cpp
   model/hy4flash_vision.cpp
   model/mimo26.cpp
@@ -167,7 +175,10 @@ add_library(ie_core
   engine/mimo26_engine.cpp
   engine/laguna_engine.cpp
   engine/hy4flash_engine.cpp
+  engine/xing4_engine.cpp
+  engine/tool_guard.cpp
   engine/inkling_engine.cpp
+  engine/inkling2_engine.cpp
   engine/glm5_server.cpp
   engine/lanes_serve.cpp
   server/openai_proto.cpp
