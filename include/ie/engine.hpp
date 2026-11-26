@@ -144,6 +144,8 @@ struct SamplingParams {
     // call of that tool). Enforced by the tool-call guard where an arch has one (Xing4, DeepSeek-V4.1).
     std::string tool_choice;
     bool     tool_guard     = true;   // request "ie_tool_guard": false turns the guard off for this request (A/B on one load)
+    std::string lane;                 // request "ie_lane": "main" = the harness's main conversation (Inkling 2's main lane: the
+                                      // full-context lane on card 0 when --parallel > 1 on 2 cards); anything else = a sub-agent
     float    temperature    = 0.7f;
     uint32_t top_k          = 40;
     float    top_p          = 0.95f;

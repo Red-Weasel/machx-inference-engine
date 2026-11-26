@@ -211,6 +211,7 @@ static ChatRequest parse_chat_request_impl(const std::string& body, ChatRequest 
         if (!j["tools"].empty()) out.tools_json = j["tools"].dump();
     }
     if (j.contains("ie_tool_guard") && j["ie_tool_guard"].is_boolean()) out.sampling.tool_guard = j["ie_tool_guard"].get<bool>();
+    if (j.contains("ie_lane") && j["ie_lane"].is_string()) out.sampling.lane = j["ie_lane"].get<std::string>();
     if (j.contains("tool_choice")) {   // "auto" | "none" | "required" | {"type": "function", "function": {"name": N}}
         const auto& tc = j["tool_choice"];
         if (tc.is_string()) {

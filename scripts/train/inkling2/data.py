@@ -35,7 +35,7 @@ _THINK = re.compile(r"^\s*<think>(.*?)</think>\s*", re.S)
 _CALL = re.compile(r"<tool_call>\s*<function=([^>\n]+)>(.*?)</function>\s*</tool_call>", re.S)
 _PARAM = re.compile(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", re.S)
 _QWEN_TOOLS = re.compile(r"^\s*# Tools\s*\n.*?</IMPORTANT>\s*", re.S)
-SAMPLE_DIR = os.path.join(os.environ.get("IE_DATA_DRIVE", os.path.expanduser("~/data")), "inkling2-train-exports/dream-sample")
+SAMPLE_DIR = os.environ.get("MACHX_TRAIN_SAMPLE_DIR", os.path.expanduser("~/.local/share/machx-train/dream-sample"))
 ROLES = ("system", "user", "assistant", "tool")
 
 

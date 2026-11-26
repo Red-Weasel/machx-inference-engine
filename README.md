@@ -44,6 +44,7 @@ donations are welcome, one-time or monthly. All donations support the project.
 
 **Latest**
 
+- **v0.2.47, November 26 — Inkling 2 Mini gives the main conversation its full context beside five sub-agents:** at `--gpus 2 --parallel 6 --ctx 256000` every lane used to hold 32,768 positions, the main conversation's too. Now card 0 holds [one lane at the full 256,000](#new-in-v0247) for requests marked `"ie_lane": "main"`, and card 1 holds the other five at 66,560 (was 32,768). Images work on every lane, and training tools for a harness are included.
 - **v0.2.46, November 23 — Inkling 2 Mini runs, with images, two cards on one conversation, and up to 24 agents:** Thinking Machines' 26B model (24 layers, the middle 12 run three times a token) is served from its own NVFP4 / MXFP8 weights: [62 tok/s on one card, 82 on two](#new-in-v0246), prompts read at 734 tok/s. Tool-call ids are now unique for the life of the server. Also in this release: Xing4.0-29B-A4B, a tool-call guard on the daily architectures, and a first LoRA trainer for the cards (`scripts/train`).
 - **v0.2.45, November 20 — Hy4-flash gives its spare VRAM to experts:** the context cache is backed for 32K tokens and grows in steps to the full context only when a conversation gets that long (and shrinks again for the next short one), and the image tower loads at the first image. Until then that VRAM holds expert slots: 160 / 156 → 176 / 164 a layer on two Arc Pro B70 at `--ctx 262144`, 5–8 % fewer experts computed on the CPU per token. [Details](#-new-in-v0245)
 - **v0.2.44, November 19 — Tencent Hy4-flash runs, with images, tool calls and long prompts:** the 220B model (512 experts a layer, 16 a token, four n-gram memories) is served from an 8-bit expert pack made from Tencent's full-precision release: a 25,000-token prompt reads at 462–470 tok/s and replies decode at 20–26 tok/s on two Arc Pro B70 cards, with the output closer to exact arithmetic than the reference is in bfloat16. Also: sampling with no top-p cut no longer sorts the whole vocabulary every token (DeepSeek-V4.1, MiMo-V2.6, Hy4-flash: 9.3 → 1.3 ms a token), and DeepSeek-V4.1 keeps a parked conversation in RAM down to 12 GiB free (it was 24, which a 256 GB machine never had). [Details](#-new-in-v0244)
@@ -240,6 +241,34 @@ class ([New in v0.2.6](#new-in-v026)).
 ---
 
 <a id="new-in-v0242"></a>
+## 🆕 New in v0.2.47
+
+### Inkling 2 Mini: a full-context main lane beside the sub-agents
+
+Before, `--gpus 2 --parallel N` gave every conversation slot 32,768 positions whatever `--ctx` said, the main conversation's too, and a harness then compacted it to 32K. Now, with `--parallel` above 1 on two cards and `--ctx` above the lanes' size:
+
+- **Card 0 holds one lane at the full `--ctx`** for the main conversation. A request with `"ie_lane": "main"` goes there, and so does any prompt too long for the other lanes.
+- **Card 1 holds the other lanes** at `--slot-ctx` when given, otherwise at the most positions that fit. A second `"main"` request takes a free lane there while the main lane is busy.
+- **`/props` reports both sizes:** `n_ctx` is the main lane's, and `slot_ctx` is the other lanes'.
+- **Images work on every lane.** The image tower on card 0 encodes them for whichever lane runs the request.
+- **To turn it off,** set `IE_INKLING2_MAIN_LANE=0` for the old layout, with every lane the same size.
+
+Measured on 2 × Arc Pro B70, November 26, `--gpus 2 --ctx 256000 --parallel 6`:
+
+| | |
+|---|---|
+| Layout | card 0: 1 lane × 256,000; card 1: 5 lanes × 66,560 (was 6 × 32,768) |
+| 1 main + 5 other requests at once | the main one on card 0, all five on card 1, all finished |
+| 100,850-token prompt, needle in the middle | found, in the main lane; the same prompt without the mark was routed there too |
+| An image on a sub-agent lane and on the main lane | described correctly on both |
+
+### Also new
+
+- **Training tools for a harness** (`scripts/train/`):
+  - `dream_rl.py` trains on real Dream agent sessions graded by hidden tests (GRPO, or supervised on the model's own passing sessions).
+  - `merge.py` averages several fine-tunes' weight changes onto one base.
+  - `coding_dataset/` runs held-out tasks through Dream or straight through the engine, and adds a scorecard and a setup audit.
+
 ## 🆕 New in v0.2.46
 
 ### Inkling 2 Mini (`inkling2_loop`)

@@ -5,6 +5,9 @@
   machx-train --model PATH --data FILE.jsonl --out NEW_FOLDER --metrics FILE.jsonl [--eval FILE.jsonl]
               [--max-steps N] [--max-examples N] [--cards 0,1] [--max-len N] [--resume] [--tools-sample FILE]
 
+A data file of sessions trains by supervised fine-tuning; a file of tasks whose lines carry a "reward" (grpo_rewards.py)
+trains by GRPO, reinforcement learning on the model's own attempts scored by the reward (grpo.py).
+
 Contract (Dream docs/training.md): the probe answers within seconds with one JSON line as the LAST stdout line
 {"arch", "supported", "reason", "needs_gib_per_card"}; PATH is a checkpoint folder or a GGUF file. A run exits 0 with
 NEW_FOLDER a complete model folder, or non-zero with a plain-words last stderr line. SIGTERM: the step under way
@@ -23,6 +26,7 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, HERE)                  # python3 -I leaves the script's own folder off the path (grpo.py lives here)
 ENGINE_ROOT = os.path.dirname(os.path.dirname(HERE))
 VENV = os.path.expanduser("~/models/inkling2-train")            # torch 2.15 + XPU, transformers 5.24 with the Inkling 2 code
 GPU_CHECK = os.path.join(ENGINE_ROOT, "scripts", "inkling2", "gpu_check.sh")
@@ -188,6 +192,17 @@ def run(a):
     if avail < need:
         fail(f"not enough free memory on this computer to load the model ({avail:.0f} GiB available, {need} GiB needed)")
 
+    import grpo
+    if grpo.is_grpo_file(a.data):                        # tasks with rewards: reinforcement learning (grpo.py)
+        if a.resume:
+            fail("a GRPO run cannot be resumed yet; start it again")
+        if free_gb < 20 + 21 + 20:
+            fail(f"not enough free disk space beside the output folder for GRPO ({free_gb:.0f} GB free, 61 GB "
+                 "needed: the result, the engine's working copy of the model, and 20 GB for the system)")
+        if len(cards) != 2:
+            fail("GRPO needs both cards (the engine writes the attempts on both)")
+        return grpo.run(a, spec, model, out, cards, fail, VENV, HERE)
+
     work = out + ".work"
     if os.path.isdir(work) and not a.resume:
         shutil.rmtree(work)
@@ -281,6 +296,17 @@ def main():
     ap.add_argument("--resume", action="store_true", help="continue the run whose work folder is <out>.work")
     ap.add_argument("--tools-sample", default="", help="a Dream request sample (python -m dream.request_sample) for "
                     "the tool declarations; default: the newest in the dream-sample folder")
+    g = ap.add_argument_group("GRPO (used when the data file's lines carry a 'reward'; see grpo.py)")
+    g.add_argument("--group", type=int, default=8, help="attempts at each task (default 8)")
+    g.add_argument("--tasks-per-step", type=int, default=8, help="tasks a step (default 8)")
+    g.add_argument("--max-new", type=int, default=6144, help="new tokens an attempt may write (default 6144)")
+    g.add_argument("--lr", type=float, default=1e-5, help="learning rate (default 1e-5)")
+    g.add_argument("--eval-attempts", type=int, default=3, help="attempts at each held-out task per check (default 3)")
+    g.add_argument("--parallel", type=int, default=12, help="attempts the engine writes at once (default 12)")
+    g.add_argument("--port", type=int, default=18695, help="the engine's port during the run (default 18695)")
+    g.add_argument("--eval-every", type=int, default=0, help="held-out check every N steps (default: about 10 checks)")
+    g.add_argument("--patience", type=int, default=3, help="stop after N held-out checks without improvement")
+    g.add_argument("--seed", type=int, default=0)
     a = ap.parse_args()
     if a.probe:
         return probe(a.model)

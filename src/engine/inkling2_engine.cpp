@@ -593,6 +593,7 @@ struct Ink2Card {
 struct Ink2Serve {
     std::vector<std::unique_ptr<Ink2Card>> cards;
     std::mutex route_mu;
+    bool main_lane = false;   // card 0 = ONE full-context lane for the main conversation; card 1+ = the sub-agents' lanes
     uint32_t total_slots() const { uint32_t n = 0; for (const auto& c : cards) n += c->slots; return n; }
     ~Ink2Serve() {
         for (auto& c : cards) { { std::lock_guard<std::mutex> lk(c->mu); c->stop = true; } c->cv.notify_all(); }
@@ -884,6 +885,8 @@ void Ink2Card::loop() {
     }
 }
 
+static inline uint32_t ids_size_of(const Ink2Job& j) { return uint32_t(j.ids.size()); }
+
 // The request's side: route, wait for the stream text, probe the connection, take the result.
 GenerateResult ink2_serve_run(Inkling2Bundle& b, std::vector<int32_t> ids, const SamplingParams& sp, const TokenCallback& on_token,
                               Inkling2ReplyParser* parser, const Ink2Images* im = nullptr) {
@@ -891,7 +894,8 @@ GenerateResult ink2_serve_run(Inkling2Bundle& b, std::vector<int32_t> ids, const
     GenerateResult r0;
     r0.prompt_tokens = uint32_t(ids.size());
     if (ids.empty()) { r0.finish_reason = "error: empty prompt"; return r0; }
-    const uint32_t ctx = sv.cards[0]->ctx;
+    uint32_t ctx = 0;
+    for (const auto& c : sv.cards) ctx = std::max(ctx, c->ctx);
     if (ids.size() >= ctx) { r0.finish_reason = "context_length_exceeded"; return r0; }
     auto job = std::make_unique<Ink2Job>();
     job->keyed = ink2_keyed(ids, im);
@@ -900,10 +904,24 @@ GenerateResult ink2_serve_run(Inkling2Bundle& b, std::vector<int32_t> ids, const
     job->sp = sp;
     job->parser = parser;
     Ink2Card* card = nullptr;
-    {   // the card: the one holding the longest common prefix in a free slot (>= 64 tokens), else the less loaded one
+    {   // the card: the one holding the longest common prefix in a free slot (>= 64 tokens), else the less loaded one.
+        // Main lane: "ie_lane": "main" always goes to card 0's full-context lane; any other request to card 1+ (the
+        // sub-agents' lanes), unless its prompt does not fit their context, then to the main lane too
         std::lock_guard<std::mutex> rl(sv.route_mu);
+        auto eligible = [&](const Ink2Card& c) {
+            if (!sv.main_lane) return c.ctx > ids_size_of(*job);
+            if (sp.lane == "main") {   // the main lane; a second "main" conversation takes a free sub-agent lane meanwhile
+                const Ink2Card& m = *sv.cards[0];
+                const bool main_busy = m.load.load() >= m.slots;
+                return c.idx == 0 || (main_busy && c.ctx > ids_size_of(*job) && c.load.load() < c.slots);
+            }
+            bool small_fits = false;
+            for (const auto& o : sv.cards) small_fits |= o->idx != 0 && o->ctx > ids_size_of(*job);
+            return small_fits ? (c.idx != 0 && c.ctx > ids_size_of(*job)) : c.idx == 0;
+        };
         uint32_t best = 0;
         for (auto& c : sv.cards) {
+            if (!eligible(*c)) continue;
             std::lock_guard<std::mutex> lk(c->mu);
             for (uint32_t s = 0; s < c->slots; ++s) {
                 if (c->owner[s]) continue;
@@ -914,8 +932,9 @@ GenerateResult ink2_serve_run(Inkling2Bundle& b, std::vector<int32_t> ids, const
         if (best < 64) {
             card = nullptr;
             for (auto& c : sv.cards)
-                if (!card || c->load.load() < card->load.load()) card = c.get();
+                if (eligible(*c) && (!card || c->load.load() < card->load.load())) card = c.get();
         }
+        if (!card) { r0.finish_reason = "context_length_exceeded"; return r0; }
         card->load.fetch_add(1);
         std::lock_guard<std::mutex> lk(card->mu);
         card->waiting.push_back(job.get());
@@ -952,6 +971,17 @@ std::string inkling2_serve_start_impl(const std::string& dir, Inkling2Bundle& b,
     auto sv = std::make_shared<Ink2Serve>();
     const Inkling2Config& c = b.model.config();
     const uint32_t sctx = std::max<uint32_t>(512, std::min<uint32_t>(max_ctx, slot_ctx_opt ? slot_ctx_opt : 32768u));
+    // Main lane (default with --parallel > 1 on 2+ cards and --ctx above the lanes' size; IE_INKLING2_MAIN_LANE=0 = off):
+    // card 0 holds ONE lane at the full --ctx (or the most that fits) for the harness's main conversation, the other cards
+    // the remaining lanes at the most positions that fit them (up to --ctx). Without it every lane was 32768, the main
+    // conversation's too (a harness then compacts the owner's chat to 32K).
+    const char* mlv = std::getenv("IE_INKLING2_MAIN_LANE");
+    // --slot-ctx then sizes the sub-agents' lanes only (Dream's "sub-agent context": every lane after the first)
+    const bool main_lane = asked >= 2 && n_cards >= 2 && max_ctx > sctx && !(mlv && std::string(mlv) == "0");
+    sv->main_lane = main_lane;
+    if (!main_lane && !slot_ctx_opt && max_ctx > sctx)   // said, not silent: a harness reading ctx sees the slot's
+        std::fprintf(stderr, "[inkling2] NOTE: each of the %u conversation slots holds %u positions, not --ctx %u; "
+                     "--slot-ctx N gives every slot more (fewer slots then fit a card)\n", asked, sctx, max_ctx);
     // slot prompt chunk: 256 on a card where it keeps every asked slot (the matrix-engine experts fill their tiles: a
     // 25K prompt arriving while 5 slots decode is read in 98 s instead of 120 at the default share, the others at 49 %
     // of their speed instead of 52 %), else 128; IE_INKLING2_SLOT_CHUNK sets it
@@ -977,33 +1007,62 @@ std::string inkling2_serve_start_impl(const std::string& dir, Inkling2Bundle& b,
         }
         cd->name = "card " + std::to_string(k);
         const sycl::device dv = cd->q->get_device();
-        const uint32_t want = asked / n_cards + (k < asked % n_cards ? 1u : 0u);
+        uint32_t want = asked / n_cards + (k < asked % n_cards ? 1u : 0u);
+        if (main_lane) {   // card 0: the main lane; cards 1+: the other asked - 1 lanes, spread
+            const uint32_t rest = asked - 1, others = n_cards - 1;
+            want = k == 0 ? 1u : rest / others + (k - 1 < rest % others ? 1u : 0u);
+            if (dv.has(sycl::aspect::ext_intel_free_memory)) {
+                const uint64_t fr = dv.get_info<sycl::ext::intel::info::device::free_memory>();
+                const uint32_t ch = chunk_set ? chunk : big;
+                uint32_t got = 0;                                         // the most positions (1024 steps) that fit `want` lanes
+                const uint32_t top = (k > 0 && slot_ctx_opt) ? std::min(slot_ctx_opt, max_ctx) : max_ctx;   // sub-agents: --slot-ctx
+                for (uint32_t t = top & ~1023u; t >= 4096 && !got; t -= 1024)
+                    if (uint64_t(want) * Inkling2Model::batch_slot_bytes(c, t, ch, b.model.batch_kv_bf16()) + margin <= fr) got = t;
+                if (got && k > 0 && slot_ctx_opt && got < (top & ~1023u))
+                    std::fprintf(stderr, "[inkling2] %s: %u sub-agent lanes of --slot-ctx %u do not fit: %u positions each\n",
+                                 cd->name.c_str(), want, slot_ctx_opt, got);
+                if (got >= 4096) {
+                    cd->ctx = std::min(got, max_ctx);
+                    cd->chunk = ch;
+                    cper = Inkling2Model::batch_slot_bytes(c, cd->ctx, ch, b.model.batch_kv_bf16());
+                }
+            }
+        }
+        const uint32_t cctx = cd->ctx;
+        const size_t cper0 = main_lane ? cper : per;
         uint32_t fit = want;
         std::string why;
-        if (dv.has(sycl::aspect::ext_intel_free_memory)) {
+        if (main_lane && dv.has(sycl::aspect::ext_intel_free_memory)) {
+            const uint64_t fr = dv.get_info<sycl::ext::intel::info::device::free_memory>();
+            fit = fr > margin ? uint32_t(std::min<uint64_t>(want, (fr - margin) / cper0)) : 0u;
+            why = std::to_string(fr >> 20) + " MiB free after the model";
+        } else if (dv.has(sycl::aspect::ext_intel_free_memory)) {
             const uint64_t fr = dv.get_info<sycl::ext::intel::info::device::free_memory>();
             fit = fr > margin ? uint32_t(std::min<uint64_t>(want, (fr - margin) / per)) : 0u;
             why = std::to_string(fr >> 20) + " MiB free after the model";
             if (!chunk_set && big > chunk && fr > margin && (fr - margin) / per_big >= want) { cd->chunk = big; cper = per_big; }
         } else why = "free memory not reported";
-        if (fit == 0) return "inkling2 " + cd->name + ": not even one conversation slot of " + std::to_string(sctx) +
-                             " positions fits (" + std::to_string(per >> 20) + " MiB each, " + why + "); lower --slot-ctx";
+        if (fit == 0) return "inkling2 " + cd->name + ": not even one conversation slot of " + std::to_string(cctx) +
+                             " positions fits (" + std::to_string(cper0 >> 20) + " MiB each, " + why + "); lower --slot-ctx";
         if (fit < want)
             std::fprintf(stderr, "[inkling2] %s: %u slots of %u positions do NOT fit (%zu MiB each, %s, 1 GiB kept free): serving %u\n",
-                         cd->name.c_str(), want, sctx, per >> 20, why.c_str(), fit);
-        if (auto e = cd->model->batch_begin(fit, sctx, cd->chunk); !e.empty()) return "inkling2 " + cd->name + ": " + e;
+                         cd->name.c_str(), want, cctx, cper0 >> 20, why.c_str(), fit);
+        if (auto e = cd->model->batch_begin(fit, cctx, cd->chunk); !e.empty()) return "inkling2 " + cd->name + ": " + e;
         cd->slots = fit;
         cd->live.assign(fit, {});
         cd->owner.assign(fit, nullptr);
         cd->used_at.assign(fit, 0);
         total += fit;
         std::fprintf(stderr, "[inkling2] %s (%s): %u conversation slots x %u positions (%zu MiB each, keys / values %s, prompt chunk %u, "
-                             "%.2f GiB on the card)\n", cd->name.c_str(), dv.get_info<sycl::info::device::name>().c_str(), fit, sctx, cper >> 20,
-                     b.model.batch_kv_bf16() ? "bf16" : "fp32", cd->chunk, (cd->model->device_bytes()) / 1073741824.0);
+                             "%.2f GiB on the card)%s\n", cd->name.c_str(), dv.get_info<sycl::info::device::name>().c_str(), fit, cctx, cper >> 20,
+                     b.model.batch_kv_bf16() ? "bf16" : "fp32", cd->chunk, (cd->model->device_bytes()) / 1073741824.0,
+                     main_lane ? (k == 0 ? " = the MAIN lane (requests with \"ie_lane\": \"main\", and any prompt too long for the others)"
+                                         : " = the sub-agents' lanes") : "");
         sv->cards.push_back(std::move(cd));
     }
     for (auto& cd : sv->cards) cd->th = std::thread([p = cd.get()] { p->loop(); });
-    slot_ctx_out = sctx;
+    slot_ctx_out = 0;
+    for (const auto& cd : sv->cards) slot_ctx_out = std::max(slot_ctx_out, cd->ctx);   // the main lane's, when there is one
     b.serve = std::move(sv);
     return {};
 }
@@ -1175,8 +1234,13 @@ std::string Engine::inkling2_load(const std::string& dir) {
             std::fprintf(stderr, "[inkling2] --parallel %u: %u conversation slots fit; serving %u at once (more requests wait)\n",
                          opts_.parallel, total, total);
         opts_.parallel = total;                             // /props total_slots
-        opts_.max_ctx = sctx;                               // every slot holds sctx positions: /props n_ctx and slot_ctx
-        lane_ctx_ = sctx;
+        opts_.max_ctx = sctx;                               // /props n_ctx: the largest lane (the main lane's, when there is one)
+        lane_ctx_ = sctx;                                   // /props slot_ctx: the sub-agents' lanes (Dream sizes sub-agents by it)
+        if (b->serve && b->serve->main_lane) {
+            uint32_t sub_ctx = 0;
+            for (const auto& cd : b->serve->cards) if (cd->idx != 0) sub_ctx = sub_ctx ? std::min(sub_ctx, cd->ctx) : cd->ctx;
+            if (sub_ctx) lane_ctx_ = sub_ctx;
+        }
         b->ctx = sctx;
     } else if (auto e = b->model.reserve(b->ctx); !e.empty()) return "inkling2: reserving the state for ctx " + std::to_string(b->ctx) + ": " + e;
     if (!many) {

@@ -84,3 +84,42 @@ Two cards, real run on about 10,000-token sessions: 365 to 373 tok/s. One card i
    (`worker.py`), export (`export.py`), and dispatch to its worker in `run()`.
 3. Before trusting a gradient on the card: repeat one forward / backward (`det.py`), compare with the CPU
    (`bench.py`), check for routing or other discrete choices that a checkpoint recompute can change.
+
+## GRPO: reinforcement learning with checked rewards (2026-11-24)
+
+Give `--data` a file of TASKS instead of sessions and machx-train runs GRPO: the model makes several attempts at each
+task, a reward scores every attempt, and the model is pushed toward its own better attempts. A task line:
+
+    {"id": "...", "messages": [{"role": "user", "content": "..."}], "reward": {"type": "tests", ...}}
+
+Only `messages` is sent to the model. Reward types (`grpo_rewards.py`): `tests` (the answer is taken from the reply's
+last fenced block or `ANSWER:` line, written beside the task's test files, and every check command must pass, each in a
+4 GiB scope), `exact`, `regex`, `command` (your own scorer: JSON on stdin, a number on the last stdout line). A reply cut
+off at the token limit scores 0.
+
+How a step runs (`grpo.py`): the engine serves the current model on both cards and writes `--group` (8) attempts at
+`--tasks-per-step` (4) tasks; the engine stops; the attempts are scored; within each task the advantage is
+(reward - mean) / std, and a task whose attempts all scored the same is dropped (nothing to learn); the training
+processes (`inkling2/grpo_worker.py`, parked in host memory while the engine ran) take one LoRA update and rewrite the
+engine's working copy of the model, so the next attempts come from the updated model. A held-out pass rate is measured
+before the first step and about 10 times a run, `--eval-attempts` (3) tries at every held-out task (`eval_success_rate`
+in the metrics); the folder gets the step with the best held-out pass rate, and only a step that BEATS the starting
+model counts: if none does, no folder is written and the run says so (exit 3). Defaults since the first real run
+(2026-11-24: 10 steps at 4 tasks and learning rate 2e-5 dropped the held-out pass rate 78.8 -> 69.2 %, nearly all of it
+one family): learning rate 1e-5, 8 tasks a step. Every attempt is also written live to `attempts.jsonl` beside the
+metrics file (Dream's left-column view). Options: `--group --tasks-per-step --max-new --lr --eval-attempts --parallel
+--port --eval-every --patience`.
+Needs both cards and 61 GB free beside the output (the result plus the engine's working copy).
+
+Coding tasks ready to use: `coding_dataset/to_grpo_tasks.py` turns the checked tasks (451, hidden tests, mutants proven
+to fail) into `train.grpo.jsonl` (399) and `heldout.grpo.jsonl` (52, four whole families):
+
+    machx-train --model <model folder> --data train.grpo.jsonl --eval heldout.grpo.jsonl --out <new folder> --metrics m.jsonl --max-steps 20
+
+Checked so far (2026-11-24, no GPU): the reward gives 1 to every reference answer and 0 to every mutant, missing answer
+and cut-off reply (12 tasks, all four languages); the controller ran end to end with a stand-in engine and stand-in
+training processes (steps, advantages summing to 0 per task, held-out checks, the folder and its record); an attempt
+renders with labels on the model's reply only, and the training prompt is byte-identical to the engine's (effort 0.9).
+NOT yet run on the cards: the real training step, parking the model in host memory, the engine serving the working
+copy, and the time a step takes. Not built: KL to the base model (beta = 0, as in DAPO / Dr. GRPO), several updates
+per batch, attempts inside Dream's agent loop (tasks are single replies for now).

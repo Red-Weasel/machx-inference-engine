@@ -49,6 +49,21 @@ def export(base, out, adapter_tensors, meta, training_md, log=print):
     dst = os.path.join(tmp, WEIGHTS)
     shutil.copyfile(os.path.join(base, WEIGHTS), dst)
     log(f"export: weight file copied in {time.time() - t0:.0f} s")
+    changed = patch_attention(src, dst, adapter_tensors, meta)
+    info = {"base": os.path.abspath(base), "tensors_patched": len(changed),
+            "elements_changed": sum(c["elements_changed"] for c in changed),
+            "elements_in_patched_tensors": sum(c["elements"] for c in changed), "changed": changed}
+    json.dump(info, open(os.path.join(tmp, "EXPORT_INFO.json"), "w"), indent=1)
+    with open(os.path.join(tmp, "TRAINING.md"), "w") as f:
+        f.write(training_md)
+    os.rename(tmp, out)
+    log(f"export: {len(changed)} tensors patched, folder written in {time.time() - t0:.0f} s")
+    return info
+
+
+def patch_attention(src, dst, adapter_tensors, meta):
+    """Overwrite the adapted attention tensors of the weight file `dst` (a byte copy of src's file) in place with
+    bf16(fp32(W) + scale * B @ A), W read from `src` (a SafetensorsReader of the base weights). Returns the change list."""
     changed = []
     with open(dst, "r+b") as f:
         for key in meta["keys"]:
@@ -67,12 +82,4 @@ def export(base, out, adapter_tensors, meta, training_md, log=print):
                             "elements": W.numel()})
         f.flush()
         os.fsync(f.fileno())
-    info = {"base": os.path.abspath(base), "tensors_patched": len(changed),
-            "elements_changed": sum(c["elements_changed"] for c in changed),
-            "elements_in_patched_tensors": sum(c["elements"] for c in changed), "changed": changed}
-    json.dump(info, open(os.path.join(tmp, "EXPORT_INFO.json"), "w"), indent=1)
-    with open(os.path.join(tmp, "TRAINING.md"), "w") as f:
-        f.write(training_md)
-    os.rename(tmp, out)
-    log(f"export: {len(changed)} tensors patched, folder written in {time.time() - t0:.0f} s")
-    return info
+    return changed
